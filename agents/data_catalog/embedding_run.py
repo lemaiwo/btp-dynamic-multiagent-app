@@ -3,9 +3,11 @@
 Design addendum (l), point 2: ``POST /admin/api/data-catalog/embeddings/run``
 starts it (``agents/data_catalog/embedding_routes.py``), and it embeds every
 embeddable node whose text changed (``embeddings.refresh_vectors`` with no
-scope, batches of ``embeddings.BATCH_SIZE``), with the model the route
-resolved when it started it; a run of all nodes also drops the vectors of
-every other model.
+scope and ``commit_batches``: batches of ``embeddings.BATCH_SIZE``, each
+committed when it is embedded), with the model the route resolved when it
+started it; a run of all nodes also drops the vectors of every other model.
+A save that changes the model in effect meanwhile ends the run as
+``ModelChanged`` before its next write: nothing more is written or dropped.
 
 **One at a time per process**: :func:`start` checks and sets in one step
 (no ``await`` between the two, so two requests cannot both start one). The
@@ -15,12 +17,11 @@ kept in memory: another app instance knows nothing of them, and a restart
 forgets them; the vectors themselves are rows and survive.
 
 A failure is the run's ``error_class`` (the exception class, never its
-text: an httpx error names the URL) and nothing is written (the vectors are
-written in one transaction at the end, as ``refresh_vectors`` does). The
-lifespan cancels a run at shutdown (:func:`cancel_all`); a cancelled run's
-``finished_at`` stays ``null``. Nothing needs a shielded save: an
-interrupted run leaves the vectors as they were, and the next run sends the
-same texts again.
+text: an httpx error names the URL); ``embedded`` counts the batches that
+were committed before it, and the next run sends only what is still stale.
+The lifespan cancels a run at shutdown (:func:`cancel_all`); a cancelled
+run's ``finished_at`` stays ``null``. Nothing needs a shielded save: the
+batch in flight is lost at worst and sent again by the next run.
 """
 
 from __future__ import annotations
@@ -69,6 +70,11 @@ def start(model: str) -> bool:
     return True
 
 
+def _committed() -> int:
+    # ``done`` is reported after each committed batch.
+    return _progress["done"] if _progress is not None else 0
+
+
 def _report(done: int, total: int) -> None:
     global _progress
     _progress = {"done": done, "total": total}
@@ -83,16 +89,18 @@ async def _run(model: str, started_at: str) -> None:
     try:
         async with agents_db.SessionLocal() as db:
             embedded = await embeddings.refresh_vectors(
-                db, model=model, on_progress=_report, strict=True
+                db, model=model, on_progress=_report, commit_batches=True
             )
             await db.commit()
         outcome["embedded"] = embedded
         logger.info("data catalogue: embedding run with %s wrote %d vector(s)", model, embedded)
     except asyncio.CancelledError:
         outcome["error_class"] = "CancelledError"
+        outcome["embedded"] = _committed()
         raise
     except Exception as exc:  # noqa: BLE001 - the class is the run's outcome; no text leaves
         outcome["error_class"] = type(exc).__name__
+        outcome["embedded"] = _committed()
         logger.warning("data catalogue: embedding run failed (%s)", type(exc).__name__)
     finally:
         if outcome["error_class"] != "CancelledError":

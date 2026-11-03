@@ -47,7 +47,7 @@ import os
 import time
 from array import array
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 from sqlalchemy import delete, select
@@ -146,6 +146,23 @@ async def _deployed() -> list[str]:
     return deployed
 
 
+def note_running(running: Iterable[str]) -> None:
+    """AI Core's own list of deployments (``agents.aicore_deployments``, read
+    by the admin's status, PUT and run) names these embedding models
+    RUNNING. When the cached discovery list disagrees about the embedding
+    models (one reached RUNNING after a deploy, or one stopped), it is
+    dropped: the admin who sees RUNNING must not get "no model in effect"
+    for the next ten minutes. Discovery itself creates its client per call,
+    so its next answer is fresh."""
+    global _deployed_cache, _cache_epoch
+    if _deployed_cache is None:
+        return
+    cached = {m for m in _deployed_cache[2] if "embed" in m.casefold()}
+    if cached != {m for m in running if isinstance(m, str)}:
+        _deployed_cache = None
+        _cache_epoch += 1
+
+
 async def resolve_model_detail() -> tuple[str | None, str]:
     """``(model, source)``: the embedding model to use, or ``None``, and
     where it came from, one of :data:`SOURCES`, in the order of the module
@@ -182,11 +199,9 @@ async def _create(model: str, texts: list[str]) -> list[list[float]]:
     return [list(d.embedding) for d in data]
 
 
-async def _embed_batches(
-    texts: list[str], model: str, on_batch: Callable[[int], None] | None = None
-) -> list[list[float]]:
+async def _embed_batches(texts: list[str], model: str) -> list[list[float]]:
     """One vector per text, in batches of :data:`BATCH_SIZE`; raises on any
-    failure. ``on_batch(done)`` after each batch (the admin's run shows it)."""
+    failure."""
     out: list[list[float]] = []
     for start in range(0, len(texts), BATCH_SIZE):
         chunk = [t[:MAX_TEXT_CHARS] for t in texts[start : start + BATCH_SIZE]]
@@ -194,8 +209,6 @@ async def _embed_batches(
         if len(vectors) != len(chunk):
             raise ValueError("vector count")
         out.extend(vectors)
-        if on_batch is not None:
-            on_batch(len(out))
     return out
 
 
@@ -307,25 +320,55 @@ async def vector_counts(db: AsyncSession, model: str | None) -> dict[str, int]:
     return {"nodes": len(nodes), "vectors": len(stored), "stale": len(_changed(nodes, stored))}
 
 
+class ModelChanged(Exception):
+    """The admin's run: the model in effect is no longer the one the run
+    embeds with (a save changed it or switched embeddings off meanwhile)."""
+
+
+async def _write(
+    db: AsyncSession, todo: list[tuple[int, str, str]], vectors: list[list[float]], model: str
+) -> None:
+    """The new vectors of ``todo``; every older vector of those nodes, of any
+    model, goes."""
+    from agents.data_catalog.importer import batched
+
+    for chunk in batched([nid for nid, _, _ in todo]):
+        await db.execute(delete(DataCatalogVector).where(DataCatalogVector.node_id.in_(chunk)))
+    for (nid, _, digest), vector in zip(todo, vectors):
+        db.add(DataCatalogVector(node_id=nid, model=model, text_hash=digest, vector=pack(vector)))
+
+
+async def _still_in_effect(model: str) -> None:
+    if await resolve_model() != model:
+        raise ModelChanged()
+
+
 async def refresh_vectors(
     db: AsyncSession,
     *,
     scope: tuple[str, str] | None = None,
     model: str | None = None,
     on_progress: Callable[[int, int], None] | None = None,
-    strict: bool = False,
+    commit_batches: bool = False,
 ) -> int:
     """Embed every embeddable node (of ``scope``, or all) whose text changed
     since its vector was made; drop vectors of another model (a node's, when
     it is sent again; every one, after a refresh of all nodes that did not
-    fail). Returns how many vectors were written; 0 without a model. Does
-    not commit.
+    fail). Returns how many vectors were written; 0 without a model.
 
-    For the admin's run (``agents.data_catalog.embedding_run``): ``model``
-    is used instead of resolving one (the run names it in its ``last_run``),
-    ``on_progress(done, total)`` is called once the nodes to send are known
-    and after each batch, and ``strict`` raises an embedding failure instead
-    of answering 0, so the run can report its class.
+    The import and startup path (the default) holds one transaction and does
+    not commit; an embedding failure writes nothing and answers 0.
+
+    The admin's run (``agents.data_catalog.embedding_run``) passes ``model``
+    (resolved once, named in its ``last_run``), ``on_progress(done, total)``
+    (called once the nodes to send are known and after each committed batch)
+    and ``commit_batches``: each batch is written and COMMITTED as soon as it
+    is embedded, so a failure at batch 70 of 80 keeps the 69 that were paid
+    for and the next run sends only what is still stale. An embedding failure
+    is raised (the run reports its class). Before each write and before the
+    drop of other models the model is resolved again: when a save changed
+    it, :class:`ModelChanged` is raised and nothing more is written or
+    dropped. The caller commits the drop at the end.
     """
     model = model or await resolve_model()
     if not model:
@@ -334,25 +377,23 @@ async def refresh_vectors(
     todo = _changed(nodes, await _stored_hashes(db, [n.id for n in nodes], model))
     if on_progress is not None:
         on_progress(0, len(todo))
-    if todo:
-        texts = [t for _, t, _ in todo]
-        if strict:
-            batch = None if on_progress is None else (lambda done: on_progress(done, len(todo)))
-            vectors: list[list[float]] | None = await _embed_batches(texts, model, batch)
-        else:
-            vectors = await embed_texts(texts, model)
-        if vectors is None:
+    if commit_batches:
+        for start in range(0, len(todo), BATCH_SIZE):
+            chunk = todo[start : start + BATCH_SIZE]
+            vectors = await _embed_batches([t for _, t, _ in chunk], model)
+            await _still_in_effect(model)
+            await _write(db, chunk, vectors, model)
+            await db.commit()
+            if on_progress is not None:
+                on_progress(start + len(chunk), len(todo))
+    elif todo:
+        found = await embed_texts([t for _, t, _ in todo], model)
+        if found is None:
             return 0
-        from agents.data_catalog.importer import batched
-
-        for chunk in batched([nid for nid, _, _ in todo]):
-            await db.execute(
-                delete(DataCatalogVector).where(DataCatalogVector.node_id.in_(chunk))
-            )
-        for (nid, _, digest), vector in zip(todo, vectors):
-            db.add(DataCatalogVector(node_id=nid, model=model, text_hash=digest,
-                                     vector=pack(vector)))
+        await _write(db, todo, found, model)
     if scope is None:
+        if commit_batches:
+            await _still_in_effect(model)
         # The search reads the vectors of the effective model only: those of
         # a model switched away from are dead weight.
         await db.execute(delete(DataCatalogVector).where(DataCatalogVector.model != model))

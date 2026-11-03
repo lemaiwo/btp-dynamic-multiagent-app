@@ -13,33 +13,41 @@ whose body reader it shares, capped at 4 KB here). Every route carries
   (``available``), the counts (``embeddings.vector_counts``), the run
   (``agents/data_catalog/embedding_run.py``), the resource group a deploy
   goes to and ``aicore_error`` (the code when AI Core could not be read: the
-  rest of the status is answered all the same, with both lists empty).
+  rest of the status is answered all the same; ``available`` is then empty,
+  so no deploy is offered for a model whose live state is unknown).
 * ``PUT ""`` ``{enabled, model}`` -- both keys required; ``model`` ``null``
   (automatic) or a model AI Core lists a deployment of, in any status (the
   status then says whether it embeds). Answers the status.
-* ``POST /run`` -- 202 ``{running: true}``; 409 while a run is in flight or
-  when no model is in effect.
+* ``POST /run`` -- 202 ``{running: true}``; 409 while a run is in flight,
+  or when no model is in effect (then with ``X-Embeddings-Error: no_model``,
+  so the panel can tell the two apart).
 * ``POST /deploy`` ``{model}`` -- 202 ``{deployment_id, status, created}``.
   It bills, so it is logged as ONE WARNING naming the model, the caller's
   principal and the resource group, written once AI Core has confirmed that
   the scenario offers the model and before the request is sent (a request
-  whose answer is lost may still have made a deployment). Idempotent in
+  whose answer is lost may still have made a deployment), and its answer as
+  one INFO line (deployment id, status, whether it was created). Idempotent in
   ``agents.aicore_deployments.deploy``: a live deployment is answered and
   nothing is made. The deploy runs in a task of its own that the request
   only waits for (at most :data:`DEPLOY_WAIT_SECONDS`): a client that goes
   away must not cancel it between the create AI Core may already have
   received and the release of the module's deploy lock. A wait that runs out
-  is ``deploy_failed`` (the deployment may still appear in the list). No
-  undeploy here: that is an operations step.
+  is ``deploy_failed`` (the deployment may still appear in the list). The
+  lifespan waits for a deploy in flight at shutdown, bounded and without
+  cancelling it (:func:`drain_deploys`). No undeploy here: that is an
+  operations step.
 
 AI Core (``agents.aicore_deployments``, imported where it is called): a
 model the scenario does not offer is a 422 at ``model``; every other failure
 is a 502 with the module's fixed text and its code in ``X-Embeddings-Error``
 (``aicore_unavailable``, ``token_failed``, ``deploy_failed``); an exception
 of another kind is ``aicore_unavailable``, logged by its class. The two
-lists are cached for :data:`LISTS_CACHE_SECONDS`, because the panel polls
-the status every 2 s while a run is in flight; a deploy drops the cache, and
-the PUT's check reads the deployments fresh.
+lists are cached for :data:`LISTS_CACHE_SECONDS`, a failed read as well,
+because the panel polls the status every 2 s while a run is in flight and a
+read may take its whole 30 s timeout; a deploy drops the cache, and the
+PUT's check reads the deployments fresh. Every fresh list of deployments is
+handed to ``embeddings.note_running``, so the model in effect follows what
+AI Core says is RUNNING instead of a discovery cached for ten minutes.
 """
 
 from __future__ import annotations
@@ -65,6 +73,8 @@ router = APIRouter(prefix="/api/data-catalog/embeddings", tags=["data-catalog"])
 
 BODY_BYTES = 4 * 1024
 LISTS_CACHE_SECONDS = 10.0
+# How long the shutdown waits for a deploy in flight.
+DEPLOY_DRAIN_SECONDS = 15.0
 # Above the module's own bounds: four calls of at most 30 s each.
 DEPLOY_WAIT_SECONDS = 150.0
 ERROR_HEADER = "X-Embeddings-Error"
@@ -92,7 +102,9 @@ class RunBody(_Strict):
 
 # The clock of the lists' cache (a seam for the tests).
 _clock = time.monotonic
-_lists_cache: tuple[float, list[dict[str, Any]], list[dict[str, Any]]] | None = None
+_lists_cache: (
+    tuple[float, list[dict[str, Any]], list[dict[str, Any]], str | None] | None
+) = None
 # Deploys in flight, held so a task whose request went away is not
 # collected; each is dropped when it ends.
 _deploys: set[asyncio.Task] = set()
@@ -138,31 +150,37 @@ async def _attempt(call: Callable[[], Awaitable[list[dict[str, Any]]]]) -> tuple
         return None, _code(exc)
 
 
+def _note(deployed: list[dict[str, Any]]) -> None:
+    embeddings.note_running(d["model"] for d in deployed if d["status"] == "RUNNING")
+
+
 async def _lists() -> tuple[list[dict[str, Any]], list[dict[str, Any]], str | None]:
-    """``(deployed, offered, error)``; only an answer of both is cached."""
+    """``(deployed, offered, error)``, cached, a failed read included."""
     global _lists_cache
     now = _clock()
     if _lists_cache is not None and now - _lists_cache[0] < LISTS_CACHE_SECONDS:
-        return _lists_cache[1], _lists_cache[2], None
+        return _lists_cache[1], _lists_cache[2], _lists_cache[3]
     from agents import aicore_deployments as aicore
 
     (deployed, failed), (offered, refused) = await asyncio.gather(
         _attempt(aicore.list_deployments), _attempt(aicore.list_models)
     )
-    error = failed or refused
-    if error is None:
-        _lists_cache = (now, deployed, offered)
-    return deployed or [], offered or [], error
+    if failed is None:
+        _note(deployed)
+    deployed, offered, error = deployed or [], offered or [], failed or refused
+    _lists_cache = (now, deployed, offered, error)
+    return deployed, offered, error
 
 
 async def _status() -> dict[str, Any]:
     from agents import aicore_deployments as aicore
 
+    # The lists first: what they say is RUNNING is what the model resolves on.
+    deployed, offered, error = await _lists()
     model, source = await embeddings.resolve_model_detail()
     async with agents_db.SessionLocal() as db:
         setting = await agents_db.get_embedding_setting(db)
         counts = await embeddings.vector_counts(db, model)
-    deployed, offered, error = await _lists()
     live = {d["model"] for d in deployed if d["status"] in aicore.LIVE_STATUSES}
     return {
         "setting": setting,
@@ -170,7 +188,7 @@ async def _status() -> dict[str, Any]:
         "source": source,
         "env_override": bool((os.environ.get(embeddings.MODEL_ENV) or "").strip()),
         "deployed": deployed,
-        "available": [m for m in offered if m["model"] not in live],
+        "available": [] if error else [m for m in offered if m["model"] not in live],
         "nodes": counts["nodes"],
         "vectors": counts["vectors"],
         "stale": counts["stale"],
@@ -202,6 +220,7 @@ async def api_put_setting(request: Request) -> dict[str, Any]:
         from agents import aicore_deployments as aicore
 
         deployed = await _aicore(aicore.list_deployments)
+        _note(deployed)
         if body.model not in {d["model"] for d in deployed}:
             raise HTTPException(status_code=422, detail=MODEL_NOT_DEPLOYED)
     async with agents_db.SessionLocal() as db:
@@ -217,9 +236,10 @@ async def api_run(request: Request) -> dict[str, bool]:
     await _json_body(request, RunBody, empty_ok=True, limit=BODY_BYTES)
     if embedding_run.running():
         raise HTTPException(status_code=409, detail=RUN_IN_FLIGHT)
+    await _lists()  # a deployment that reached RUNNING since counts now
     model = await embeddings.resolve_model()
     if not model:
-        raise HTTPException(status_code=409, detail=NO_MODEL)
+        raise HTTPException(status_code=409, detail=NO_MODEL, headers={ERROR_HEADER: "no_model"})
     # Checked again in the one step that starts it: the resolve awaited.
     if not embedding_run.start(model):
         raise HTTPException(status_code=409, detail=RUN_IN_FLIGHT)
@@ -256,8 +276,28 @@ async def api_deploy(request: Request) -> dict[str, Any]:
         raise _refused(_code(exc)) from None
     finally:
         reset_cache()
-    return {
+    answer = {
         "deployment_id": made["deployment_id"],
         "status": made["status"],
         "created": bool(made.get("created")),
     }
+    logger.info(
+        "AI Core deployment of %s answered: %s, status %s, created %s",
+        model, answer["deployment_id"], answer["status"], answer["created"],
+    )
+    return answer
+
+
+async def drain_deploys(timeout: float = DEPLOY_DRAIN_SECONDS) -> int:
+    """Wait at most ``timeout`` for the deploys in flight (shutdown), without
+    cancelling them: a create may already be with AI Core. Answers how many
+    are still running, logged as one WARNING."""
+    pending = {t for t in _deploys if not t.done()}
+    if pending:
+        _, pending = await asyncio.wait(pending, timeout=timeout)
+    if pending:
+        logger.warning(
+            "%d AI Core deployment request(s) still running at shutdown; "
+            "the next deploy of that model finds what they made", len(pending),
+        )
+    return len(pending)

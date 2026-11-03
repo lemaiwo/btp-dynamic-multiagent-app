@@ -48,6 +48,7 @@ from agents.db import SessionLocal  # noqa: E402
 from tests.test_data_catalog_embeddings import (  # noqa: E402
     DEPLOYED,
     SECRET,
+    Clock,
     Discovery,
     _defaults,  # noqa: F401
     store,
@@ -118,7 +119,7 @@ def aicore(monkeypatch) -> FakeAICore:
 class Embedder:
     """Stands in for the embedding call (``embeddings._create``): a vector
     per text; ``hold`` stops the call of that batch (0-based) until
-    ``release`` is set; ``boom`` raises instead."""
+    ``release`` is set; ``boom`` raises instead, from batch ``boom_at`` on."""
 
     def __init__(self) -> None:
         self.batches: list[list[str]] = []
@@ -126,6 +127,7 @@ class Embedder:
         self.reached = asyncio.Event()
         self.release = asyncio.Event()
         self.boom: Exception | None = None
+        self.boom_at = 0
 
     async def __call__(self, model: str, texts: list[str]) -> list[list[float]]:
         index = len(self.batches)
@@ -133,7 +135,7 @@ class Embedder:
         if self.hold == index:
             self.reached.set()
             await self.release.wait()
-        if self.boom is not None:
+        if self.boom is not None and index >= self.boom_at:
             raise self.boom
         return [[1.0, float(len(t)), 0.5] for t in texts]
 
@@ -279,13 +281,72 @@ async def test_an_unreachable_ai_core_still_answers_the_status(
     assert body["nodes"] == 4 and body["effective_model"] == LARGE
 
 
-async def test_the_ai_core_lists_are_cached_briefly_between_polls(
+async def test_nothing_is_offered_for_a_deploy_while_the_deployments_are_unknown(
     client, aicore, discovery, catalogue
 ):
+    aicore.fail = {"list_deployments": "aicore_unavailable"}
+    body = (await client.get(BASE)).json()
+    assert (body["available"], body["aicore_error"]) == ([], "aicore_unavailable")
+
+
+@pytest.mark.parametrize("fail", [{}, {"list_deployments": "aicore_unavailable"}])
+async def test_the_ai_core_lists_are_cached_briefly_between_polls(
+    monkeypatch, client, aicore, discovery, catalogue, fail
+):
+    """A failed read too: the panel polls every 2 s, and a read may take
+    the whole 30 s of its timeout."""
+    clock = Clock()
+    monkeypatch.setattr(embedding_routes, "_clock", clock)
+    aicore.fail = dict(fail)
     await client.get(BASE)
+    clock.now += embedding_routes.LISTS_CACHE_SECONDS - 1
     await client.get(BASE)
     assert aicore.calls.count("list_deployments") == 1
     assert aicore.calls.count("list_models") == 1
+    clock.now += 2
+    await client.get(BASE)
+    assert aicore.calls.count("list_deployments") == 2
+
+
+async def test_a_deployment_that_reaches_running_is_used_at_the_next_status(
+    monkeypatch, client, aicore, catalogue, embedder
+):
+    """AI Core's own list says RUNNING: the discovery the model is resolved
+    with must not answer from its ten-minute cache, or "Compute" is refused
+    with "no model" until a save resets it."""
+    found = Discovery(["gpt-4o"])
+    monkeypatch.setattr(shared, "_discover_deployed_models", found)
+    aicore.deployments = []
+    body = (await client.get(BASE)).json()
+    assert (body["effective_model"], body["source"]) == (None, "none")
+    r = await client.post(f"{BASE}/deploy", json={"model": SMALL})
+    assert r.status_code == 202 and r.json()["status"] == "PENDING"
+    assert (await client.get(BASE)).json()["effective_model"] is None
+    aicore.deployments[0]["status"] = "RUNNING"  # minutes later
+    found.models = ["gpt-4o", SMALL]
+    embedding_routes.reset_cache()  # the 10 s of the panel's cache are over
+    body = (await client.get(BASE)).json()
+    assert (body["effective_model"], body["source"]) == (SMALL, "discovery")
+    assert (await client.post(f"{BASE}/run")).status_code == 202
+    await finished()
+    assert embedding_run.last_run()["model"] == SMALL
+
+
+async def test_an_admin_model_that_reaches_running_is_used_at_the_next_run(
+    monkeypatch, client, aicore, catalogue, embedder
+):
+    found = Discovery(["gpt-4o"])
+    monkeypatch.setattr(shared, "_discover_deployed_models", found)
+    aicore.deployments = [{"model": SMALL, "status": "PENDING", "deployment_id": "d-9"}]
+    r = await client.put(BASE, json={"enabled": True, "model": SMALL})
+    assert (r.json()["effective_model"], r.json()["source"]) == (None, "setting")
+    aicore.deployments[0]["status"] = "RUNNING"
+    found.models = ["gpt-4o", SMALL]
+    embedding_routes.reset_cache()
+    # No status in between: the run reads AI Core's list itself.
+    assert (await client.post(f"{BASE}/run")).status_code == 202
+    await finished()
+    assert embedding_run.last_run()["model"] == SMALL
 
 
 # --- the setting --------------------------------------------------------------------------
@@ -428,7 +489,20 @@ async def test_a_run_without_a_model_is_refused(client, aicore, catalogue, embed
     await store(0, None)
     r = await client.post(f"{BASE}/run")
     assert r.status_code == 409 and r.json() == {"detail": "No embedding model is in effect"}
+    assert r.headers["X-Embeddings-Error"] == "no_model"
     assert embedding_run._task is None and embedder.batches == []
+
+
+async def test_two_runs_started_at_once_make_one_run(client, aicore, discovery, catalogue,
+                                                     embedder):
+    first, second = await asyncio.gather(client.post(f"{BASE}/run"),
+                                         client.post(f"{BASE}/run"))
+    assert sorted((first.status_code, second.status_code)) == [202, 409]
+    refused = first if first.status_code == 409 else second
+    assert refused.json() == {"detail": "An embedding run is already in progress"}
+    assert "X-Embeddings-Error" not in refused.headers
+    await finished()
+    assert sum(len(b) for b in embedder.batches) == 4
 
 
 async def test_a_run_takes_no_body_but_an_empty_object(client, aicore, discovery, catalogue,
@@ -454,15 +528,93 @@ async def test_a_failed_run_keeps_its_error_class_and_the_stored_vectors(
     assert SECRET not in caplog.text and "RuntimeError" in caplog.text
 
 
-async def test_the_run_is_cancelled_at_shutdown(client, aicore, discovery, catalogue, embedder):
+async def test_a_run_commits_each_batch_so_a_failure_keeps_what_was_paid_for(
+    monkeypatch, client, aicore, discovery, catalogue, embedder
+):
+    monkeypatch.setattr(embeddings, "BATCH_SIZE", 2)
+    embedder.boom, embedder.boom_at = RuntimeError("batch 2 failed"), 1
+    assert (await client.post(f"{BASE}/run")).status_code == 202
+    await finished()
+    body = (await client.get(BASE)).json()
+    last = body["last_run"]
+    assert (last["embedded"], last["error_class"]) == (2, "RuntimeError")
+    assert (body["vectors"], body["stale"]) == (2, 2)
+    assert {nid for nid, _ in await vectors_stored()} == {catalogue["sales"], catalogue["Order"]}
+    embedder.boom, embedder.batches = None, []
+    assert (await client.post(f"{BASE}/run")).status_code == 202
+    await finished()
+    # Only what is still stale is sent again.
+    assert [[t.split(" | ")[0] for t in b] for b in embedder.batches] == [["Item", "Release"]]
+
+
+async def test_a_run_whose_model_was_changed_meanwhile_stops_and_drops_nothing(
+    monkeypatch, client, aicore, discovery, catalogue, embedder
+):
+    monkeypatch.setattr(embeddings, "BATCH_SIZE", 2)
+    await add_vector(catalogue["Release"], SMALL)
+    aicore.deployments.append({"model": SMALL, "status": "RUNNING", "deployment_id": "d-2"})
+    embedder.hold = 1
+    assert (await client.post(f"{BASE}/run")).status_code == 202
+    await asyncio.wait_for(embedder.reached.wait(), 5)
+    r = await client.put(BASE, json={"enabled": True, "model": SMALL})
+    assert r.status_code == 200 and r.json()["running"] is True
+    embedder.release.set()
+    await finished()
+    last = embedding_run.last_run()
+    assert (last["model"], last["embedded"], last["error_class"]) == (LARGE, 2, "ModelChanged")
+    # Batch 1 is not written and the other model's vector is not dropped.
+    assert await vectors_stored() == {(catalogue["sales"], LARGE), (catalogue["Order"], LARGE),
+                                      (catalogue["Release"], SMALL)}
+
+
+async def test_a_run_switched_off_meanwhile_drops_nothing_at_its_end(
+    monkeypatch, client, aicore, discovery, catalogue, embedder
+):
+    await add_vector(catalogue["Release"], SMALL)
     embedder.hold = 0
+    assert (await client.post(f"{BASE}/run")).status_code == 202
+    await asyncio.wait_for(embedder.reached.wait(), 5)
+    assert (await client.put(BASE, json={"enabled": False, "model": None})).status_code == 200
+    embedder.release.set()
+    await finished()
+    assert embedding_run.last_run()["error_class"] == "ModelChanged"
+    assert await vectors_stored() == {(catalogue["Release"], SMALL)}
+
+
+async def test_the_run_is_cancelled_at_shutdown_and_keeps_its_committed_batches(
+    monkeypatch, client, aicore, discovery, catalogue, embedder
+):
+    monkeypatch.setattr(embeddings, "BATCH_SIZE", 2)
+    embedder.hold = 1
     assert (await client.post(f"{BASE}/run")).status_code == 202
     await asyncio.wait_for(embedder.reached.wait(), 5)
     await embedding_run.cancel_all()
     assert embedding_run.running() is False
     last = embedding_run.last_run()
     assert last["finished_at"] is None and last["error_class"] == "CancelledError"
-    assert await vectors_stored() == set()
+    assert last["embedded"] == 2
+    assert {nid for nid, _ in await vectors_stored()} == {catalogue["sales"], catalogue["Order"]}
+
+
+async def test_the_counts_read_more_hashes_than_one_in_list_holds(discovery):
+    """``_stored_hashes`` batches its ``IN (...)``: 1,200 nodes."""
+    await _clear_catalogue()
+    try:
+        async with SessionLocal() as s:
+            rows = [DataCatalogNode(kind="entity", source_kind="odata", source_name="big",
+                                    name=f"E{i}") for i in range(1200)]
+            s.add_all(rows)
+            await s.flush()
+            for row in rows[:1100]:
+                s.add(DataCatalogVector(
+                    node_id=row.id, model=LARGE, text_hash=embeddings.text_hash(
+                        embeddings.node_text(row)), vector=embeddings.pack([1.0])))
+            await s.commit()
+        async with SessionLocal() as s:
+            assert await embeddings.vector_counts(s, LARGE) == {
+                "nodes": 1200, "vectors": 1100, "stale": 100}
+    finally:
+        await _clear_catalogue()
 
 
 def test_the_lifespan_cancels_the_run_at_shutdown():
@@ -470,7 +622,9 @@ def test_the_lifespan_cancels_the_run_at_shutdown():
 
     import app as app_module
 
-    assert "embedding_run.cancel_all()" in inspect.getsource(app_module.lifespan)
+    source = inspect.getsource(app_module.lifespan)
+    assert "embedding_run.cancel_all()" in source
+    assert "drain_embedding_deploys()" in source
 
 
 # --- the deploy -----------------------------------------------------------------------------
@@ -619,6 +773,38 @@ async def test_a_timeout_inside_the_deploy_is_not_the_wait_running_out(
     r = await client.post(f"{BASE}/deploy", json={"model": SMALL})
     assert r.status_code == 502 and r.headers["X-Embeddings-Error"] == "aicore_unavailable"
     assert "TimeoutError" in caplog.text
+
+
+async def test_the_answer_of_a_deploy_is_logged_at_info(client, aicore, discovery, caplog):
+    caplog.set_level(logging.INFO, logger=embedding_routes.__name__)
+    r = await client.post(f"{BASE}/deploy", json={"model": SMALL})
+    assert r.status_code == 202
+    lines = [rec.getMessage() for rec in caplog.records
+             if rec.name == embedding_routes.__name__ and rec.levelno == logging.INFO]
+    assert lines == [f"AI Core deployment of {SMALL} answered: d-3, status PENDING, created True"]
+
+
+async def test_the_shutdown_waits_for_a_deploy_in_flight_without_cancelling_it(
+    monkeypatch, client, aicore, discovery
+):
+    entered, gate = asyncio.Event(), asyncio.Event()
+    real = aicore.deploy
+
+    async def slow(model: str) -> dict[str, Any]:
+        entered.set()
+        await gate.wait()
+        return await real(model)
+
+    monkeypatch.setattr(aicore_deployments, "deploy", slow)
+    request = asyncio.create_task(client.post(f"{BASE}/deploy", json={"model": SMALL}))
+    await asyncio.wait_for(entered.wait(), 5)
+    in_flight = list(embedding_routes._deploys)
+    assert await embedding_routes.drain_deploys(0.05) == 1  # bounded; not cancelled
+    assert not in_flight[0].done()
+    gate.set()
+    assert await embedding_routes.drain_deploys(5) == 0
+    assert (await request).status_code == 202
+    assert any(d["model"] == SMALL for d in aicore.deployments)
 
 
 # --- the search mode ------------------------------------------------------------------------

@@ -55,6 +55,9 @@ from agents.auth import (  # noqa: E402
 )
 from agents.chat_app import dynamic_chat_app  # noqa: E402
 from agents.data_catalog import embedding_run  # noqa: E402
+from agents.data_catalog.embedding_routes import (  # noqa: E402
+    drain_deploys as drain_embedding_deploys,
+)
 from agents.db import (  # noqa: E402
     SessionLocal,
     init_db,
@@ -388,6 +391,7 @@ async def lifespan(app: FastAPI):
     await ide_runner.cancel_all()
     await webchat_run.cancel_all_chat_runs()
     await embedding_run.cancel_all()
+    await drain_embedding_deploys()
     # An approved trace whose ARC-1 call is in flight runs in its own task,
     # not in a run: let it record its outcome (armed / failed) rather than
     # leave the approval `approved` with nothing behind it. Each call is
