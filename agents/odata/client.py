@@ -183,7 +183,9 @@ MAX_STRUCTURE_DEPTH = 10
 # What `ODataClient.call` passes on whole (a generic service's complex answer,
 # `_returned`): one structure, or a collection of them. Over the cap it is
 # refused, never cut (`clip_result`).
-WHOLE_RETURNS = ("structure", "collection")
+WHOLE_STRUCTURE = "structure"
+WHOLE_COLLECTION = "collection"
+WHOLE_RETURNS = (WHOLE_STRUCTURE, WHOLE_COLLECTION)
 # The hints of the two refusals of such an answer: no page to continue from,
 # so the model can only ask for less or say so.
 _WHOLE_TOO_LARGE_HINT = "narrow the call, or tell the user the module's answer is too large"
@@ -636,6 +638,22 @@ def _server_paged(payload: Any, name: str) -> bool:
     if isinstance(d, dict) and set(d) == {name} and isinstance(d[name], dict):
         d = d[name]
     return isinstance(d, dict) and "__next" in d
+
+
+def _paged_refusal() -> ODataError:
+    """The answer to a call whose rows SAP paged: the first page is not the
+    whole table, and a call has no page to continue from."""
+    return ODataError(
+        "result_too_large",
+        "SAP sent only the first part of this operation's answer; nothing of it was returned",
+        hint=_WHOLE_PAGED_HINT,
+    )
+
+
+def _says_its_type(row: dict) -> bool:
+    """Whether a row names its type (a non-empty ``__metadata.type``)."""
+    meta = row.get("__metadata")
+    return isinstance(meta, dict) and isinstance(meta.get("type"), str) and meta["type"] != ""
 
 
 class ODataClient:
@@ -2148,13 +2166,18 @@ class ODataClient:
         object, or a list of objects, that is positively complex-type data
         (``_is_structure``) is ``structure`` / ``collection``
         (``WHOLE_RETURNS``) with every property, the bookkeeping dropped as
-        for a read (``_value``: no ``__metadata``, no annotation). What fails
-        that test falls to the rule above, which withholds it (or, for rows
-        of the set the import is bound to, cuts them to that set's fields).
-        Such a collection that SAP paged (``__next``, ``_server_paged``) is
-        the refusal ``result_too_large``: the first page is not the table,
-        and there is no page to continue from. A ``whole`` plan only reads,
-        so the refusal never follows a change.
+        for a read (``_value``: no ``__metadata``, no annotation); one object
+        without a property is ``nothing``. An import bound to a catalogue
+        entity set takes this path only for rows that each name their
+        complex type (``_says_its_type``): a row without a type could be one
+        of that set's entities, whose non-selectable fields must not pass.
+        What fails falls to the rule above, which cuts rows of the set to its
+        fields or withholds the answer. Such a collection that SAP paged
+        (``__next``, ``_server_paged``) is the refusal ``result_too_large``:
+        the first page is not the table, and there is no page to continue
+        from. So is a paged collection of catalogue entities on a read of a
+        ``generic`` service (an ``odata`` service keeps its answer). Both
+        refusals are for reads only, so neither ever follows a change.
 
         A single JSON scalar is passed on for a call that only reads (it is
         the whole point of such a function): a number or a boolean as it
@@ -2188,16 +2211,15 @@ class ODataClient:
             if isinstance(rows, list) and all(
                 isinstance(row, dict) and _is_structure(row, entity_types) for row in rows
             ):
-                structure, collection = WHOLE_RETURNS
-                if shape == "collection" and _server_paged(payload, plan.name):
-                    raise ODataError(
-                        "result_too_large",
-                        "SAP sent only the first part of this operation's answer; "
-                        "nothing of it was returned",
-                        hint=_WHOLE_PAGED_HINT,
-                    )
                 whole = [_value(row) for row in rows]
-                return (collection, whole) if shape == "collection" else (structure, whole[0])
+                if shape != "collection" and whole[0] == {}:
+                    return "nothing", None  # an object without a property carries nothing
+                if plan.result_set is None or all(_says_its_type(row) for row in rows):
+                    if shape == "collection" and _server_paged(payload, plan.name):
+                        raise _paged_refusal()
+                    if shape == "collection":
+                        return WHOLE_COLLECTION, whole
+                    return WHOLE_STRUCTURE, whole[0]
         target = plan.result_set
         if shape not in ("entity", "collection") or target is None or not target.entity_type:
             return "withheld", None
@@ -2214,6 +2236,11 @@ class ODataClient:
         rows = value if many else [value]
         if not self._rows_are_of(payload, rows, target, many):
             return "withheld", None
+        if many and self._kind == "generic" and not plan.changes:
+            # A generic read only: an `odata` service keeps its answer (a
+            # decision of its own), and no refusal may follow a change.
+            if _server_paged(payload, plan.name):
+                raise _paged_refusal()
         cut = [self._row(row, target, names, []) for row in rows]
         return ("entities", cut) if many else ("entity", cut[0])
 

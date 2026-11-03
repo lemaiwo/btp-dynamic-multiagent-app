@@ -72,7 +72,8 @@ from .urls import MAX_SEGMENT, V4_COMPARABLE_TYPES, join_path
 
 # What one parameter value of a function may weigh: it travels in the path.
 MAX_PARAM_VALUE_CHARS = common.MAX_KEY_VALUE_CHARS
-# What a call answered, as `V4Dialect.parse_call` names it (as in V2).
+# What a call answered, as `V4Dialect.parse_call` names it: V2's shapes but
+# `structure`, which only the whole answer of a generic (V2) service needs.
 CALL_SHAPES = ("none", "value", "entity", "collection", "other")
 # The longest `@odata.context` that is looked at.
 MAX_CONTEXT_CHARS = 2000

@@ -727,6 +727,13 @@ async def test_rows_of_the_bound_set_keep_its_catalogue_cut_without_returns():
         out = await execute(tools, **BOUND_CALL)
         assert (out["returned"], out["result"]) == ("entity", cut)
         assert "EUR" not in json.dumps(out)
+    # Rows that say no type at all are no complex data either: the entity rule
+    # decides, and it cannot tie them to the set, so it withholds them.
+    for answer in ({"d": {"results": [LH]}}, {"d": {MONTHS: LH}}, {"d": LH}):
+        sap.answer = answer
+        out = await execute(tools, **BOUND_CALL)
+        assert out == _withheld(), answer
+        assert "EUR" not in json.dumps(out)
     (sent, *_) = sap.requests
     assert dict(sent.url.params) == {"CARRID": "'LH'", "$format": "json"}
 
