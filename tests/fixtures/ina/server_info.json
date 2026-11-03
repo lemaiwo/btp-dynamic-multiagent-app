@@ -1,0 +1,17 @@
+{
+  "ServerInfo": {"ServerType": "BW", "Client": "100", "SystemId": "XYZ", "Version": "7.5"},
+  "Services": [
+    {
+      "Service": "Analytics",
+      "Capabilities": [
+        {"Capability": "AggregationNOPNULL", "MinVersion": "1", "MaxVersion": "1"},
+        {"Capability": "ClientCapabilities"},
+        {"Capability": "ResultSetCellFormatString"},
+        {"Capability": "SupportsComplexFilters"},
+        {"Capability": "Variables"}
+      ]
+    },
+    {"Service": "Catalog", "Capabilities": [{"Capability": "Catalog"}]},
+    {"Service": "ValueHelp", "Capabilities": [{"Capability": "ValueHelpWithAttributes"}]}
+  ]
+}
