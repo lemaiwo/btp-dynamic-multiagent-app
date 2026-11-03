@@ -33,11 +33,13 @@ def data_catalog_toolset(
     scope = frozenset(sources)
 
     async def find_data_source(question: str) -> dict[str, Any]:
-        """Find the SAP data source (service, entity set or operation) that can
-        answer a question. Call it before searching operations when you do not
-        know which source holds the data. Answers at most five candidates with
-        their purpose, keys and related entities; an empty list means none of
-        your sources holds that data."""
+        """Find the SAP data source (service, entity set, operation or
+        analytical query) that can answer a question. Call it before searching
+        operations or describing a query when you do not know which source
+        holds the data. Answers at most five candidates with their purpose,
+        keys and related entities; for an analytical query (kind ``query``)
+        pass the returned name as ``query`` to run_query. An empty list means
+        none of your sources holds that data."""
         from agents.db import SessionLocal
 
         text = " ".join(str(question or "").split())[:QUESTION_MAX]

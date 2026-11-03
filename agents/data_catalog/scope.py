@@ -2,7 +2,11 @@
 
 A source is ``(source_kind, source_name)``: ``("odata", <service>)`` for every
 service of the agent's ``builtin:odata`` entries and ``("ina", <query>)`` for
-every query of its ``builtin:ina`` entries. A ``generic`` service is attached
+every query of its ``builtin:ina`` entry. A row with more than one
+``builtin:ina`` entry (which the gate and storage refuse, so it passed
+neither) has no InA source at all: the registry builds no InA tools for it
+and leaves their queries out of the agent's scope (``no_ina``), and the
+context view and the admin test search read this scope. A ``generic`` service is attached
 through ``builtin:odata`` like any catalogue service and is named ``("odata",
 <service>)`` here, as the registry names it; `node_sources` widens such a
 name to the kind its nodes are stored under.
@@ -20,6 +24,7 @@ from typing import Any
 
 from agents.data_catalog.models import CATALOGUE_KINDS, INA, ODATA
 from agents.db import ina_entries, odata_entries
+from agents.ina import BUILTIN_INA_URL
 
 Source = tuple[str, str]
 
@@ -46,13 +51,27 @@ def listed_names(blocks: list[dict[str, Any]], key: str) -> set[str]:
     return names
 
 
+def _ina_entry_count(servers: list[Any]) -> int:
+    """How many ``builtin:ina`` entries a server list holds, counted as the
+    registry counts them: by URL in any spelling storage accepts (edge
+    whitespace, a trailing ``/``, the case), with a block or without."""
+    return sum(
+        1
+        for server in servers
+        if isinstance(server, dict)
+        and str(server.get("url") or "").strip().rstrip("/").lower() == BUILTIN_INA_URL
+    )
+
+
 def allowed_sources_of(agent: Any) -> set[Source]:
     """The sources of an agent row (``AgentConfig``), of one server entry
-    (``{"url": "builtin:odata", "oauth": {...}}``) or of a list of them."""
+    (``{"url": "builtin:odata", "oauth": {...}}``) or of a list of them; no
+    InA source when there is more than one ``builtin:ina`` entry."""
     servers = _servers_of(agent)
-    return {(ODATA, n) for n in listed_names(odata_entries(servers), "services")} | {
-        (INA, n) for n in listed_names(ina_entries(servers), "queries")
-    }
+    sources = {(ODATA, n) for n in listed_names(odata_entries(servers), "services")}
+    if _ina_entry_count(servers) <= 1:
+        sources |= {(INA, n) for n in listed_names(ina_entries(servers), "queries")}
+    return sources
 
 
 def node_sources(allowed: set[Source]) -> set[Source]:

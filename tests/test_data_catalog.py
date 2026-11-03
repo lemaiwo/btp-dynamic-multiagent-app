@@ -647,6 +647,7 @@ async def test_above_ten_sources_the_index_is_replaced_by_the_tool(monkeypatch):
     assert "## OData services" not in instructions and "Title svc-00" not in instructions
     assert "You can reach 11 SAP data sources" in instructions
     assert "`find_data_source`" in instructions
+    assert "run_query" not in instructions  # no analytical query: no line about one
     _, instructions = await seen_by_model(build.specialists["ten"])
     assert "## OData services" in instructions and "Title svc-09" in instructions
 

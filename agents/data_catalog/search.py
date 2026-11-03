@@ -20,6 +20,11 @@ candidate's ``keys`` are its readable children marked ``is_key``; a relation
 to a node outside the scope is dropped. Hints inherit: a candidate without a
 purpose or "not for" shows its source's; a node without a label shows its
 name.
+
+An InA query is answered under its registration's slug (``source_name``),
+as a candidate and as the end of a relation: ``run_query`` takes that slug,
+and the model never gets the query's InA object name (``agents.ina.tools``),
+which is the node's ``name``.
 """
 
 from __future__ import annotations
@@ -33,7 +38,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from agents.access import BASIC, agent_allowed
 from agents.data_catalog.embeddings import cosine, embed_question, resolve_model, unpack
 from agents.data_catalog.importer import batched
-from agents.data_catalog.models import DataCatalogEdge, DataCatalogNode, DataCatalogVector
+from agents.data_catalog.models import (
+    INA,
+    DataCatalogEdge,
+    DataCatalogNode,
+    DataCatalogVector,
+)
 from agents.data_catalog.scope import node_sources
 from agents.odata.search import _hits
 
@@ -111,6 +121,15 @@ def _lexical(
 
 def _visible(node: DataCatalogNode) -> bool:
     return bool(node.readable) or bool(node.writable)
+
+
+def _answered_name(node: DataCatalogNode) -> str:
+    """The name a candidate or a relation answers for ``node``: the slug of
+    an InA query's registration (what ``run_query`` takes; its InA object
+    name never reaches the model), the node's name for every other node."""
+    if node.source_kind == INA and node.kind == "query":
+        return node.source_name
+    return node.name
 
 
 async def _vectors(
@@ -212,8 +231,8 @@ async def _relations(
                     "kind": edge.kind,
                     "to": {
                         "source_name": other.source_name,
-                        "name": other.name,
-                        "label": other.label or other.name,
+                        "name": _answered_name(other),
+                        "label": other.label or _answered_name(other),
                     },
                 }
             )
@@ -233,8 +252,8 @@ def _out(
         "source_kind": node.source_kind,
         "source_name": node.source_name,
         "kind": node.kind,
-        "name": node.name,
-        "label": node.label or node.name,
+        "name": _answered_name(node),
+        "label": node.label or _answered_name(node),
         "purpose": node.purpose or (source.purpose if source is not None else ""),
         "not_for": node.not_for or (source.not_for if source is not None else ""),
         "keys": keys,

@@ -528,6 +528,8 @@ async def test_above_ten_sources_the_index_is_replaced_by_the_catalogue_tool():
     assert "## Analytical queries" not in instructions and "Purpose of q-00" not in instructions
     assert "You can reach 11 SAP data sources" in instructions
     assert "`describe_query` and `run_query`" in instructions
+    # The search answers a query under its slug, what run_query takes.
+    assert "pass the returned name as `query` to `run_query`" in instructions
     assert "search_operations" not in instructions
     _, instructions = await seen_by_model(build.specialists["ten"])
     assert "## Analytical queries" in instructions and "Purpose of q-09" in instructions
@@ -552,6 +554,7 @@ async def test_odata_and_ina_sources_count_together():
     assert "`odata_search_operations` and `odata_execute_operation` for an OData service" in (
         instructions)
     assert "`ina_describe_query` and `ina_run_query` for an analytical query" in instructions
+    assert "pass the returned name as `query` to `ina_run_query`" in instructions
 
 
 async def test_the_activity_line_of_a_run_holds_no_data():

@@ -31,6 +31,7 @@ import app as app_module  # noqa: E402
 from agents.data_catalog import search  # noqa: E402
 from agents.data_catalog.models import DataCatalogEdge, DataCatalogNode, utcnow  # noqa: E402
 from agents.data_catalog.scope import allowed_sources_of  # noqa: E402
+from agents.data_catalog.tool import data_catalog_toolset  # noqa: E402
 from agents.db import (  # noqa: E402
     AgentConfig,
     InaQuery,
@@ -44,6 +45,7 @@ from tests.test_data_catalog import (  # noqa: E402
     BILLING,
     SECRET,
     _clean,  # noqa: F401
+    _tools,
     add_agent,
     add_service,
     edges,
@@ -59,6 +61,9 @@ from tests.test_data_catalog import (  # noqa: E402
 pytestmark = pytest.mark.usefixtures("real_agents_and_mcp")
 
 
+# Named as ZCL_AGENT_DATA_MODEL names them (the recorded `$metadata`,
+# tests/fixtures/odata/zagent_data_metadata.xml): a set `<OBJ>Set` of the
+# entity type `ZAGENT_DATA_SRV.<OBJ>`, where `<OBJ>` is the table or view.
 GENERIC_DATA: dict[str, Any] = {
     "name": "agent-data",
     "kind": "generic",
@@ -69,12 +74,12 @@ GENERIC_DATA: dict[str, Any] = {
     "service_path": "/sap/opu/odata/sap/ZAGENT_DATA_SRV",
     "definition": {
         "entity_sets": [
-            {"name": "ZC_ONCALL", "title": "On-call duty rows",
-             "entity_type": "ZAGENT_DATA_SRV.ZC_ONCALLType",
+            {"name": "ZC_ONCALLSet", "title": "On-call duty rows",
+             "entity_type": "ZAGENT_DATA_SRV.ZC_ONCALL",
              "keys": [{"name": "EMPLOYEE"}], "operations": ["list"],
              "fields": [{"name": "EMPLOYEE", "label": "Employee", "selectable": True}]},
-            {"name": "SCARR", "title": "Airline",
-             "entity_type": "ZAGENT_DATA_SRV.SCARRType",
+            {"name": "SCARRSet", "title": "Airline",
+             "entity_type": "ZAGENT_DATA_SRV.SCARR",
              "keys": [{"name": "CARRID"}], "operations": ["list"],
              "fields": [{"name": "CARRID", "label": "Airline code", "selectable": True}]},
         ],
@@ -288,8 +293,8 @@ async def test_same_object_links_across_kinds_by_name(ina_query, generic_service
     await add_agent("flights", odata_server("flights"))
     await rebuild()
     query = await node("oncall", "query", "2CZC_ONCALL")
-    view = await node("agent-data", "entity", "ZC_ONCALL")
-    table = await node("agent-data", "entity", "SCARR")
+    view = await node("agent-data", "entity", "ZC_ONCALLSet")
+    table = await node("agent-data", "entity", "SCARRSet")
     carriers = await node("flights", "entity", "Carriers")
     roster = await node("flights", "entity", "OnCall")
     assert [e.kind for e in await edge_between(query, view)] == ["same_object"]  # 2C<view>
@@ -307,7 +312,7 @@ async def test_same_object_links_across_kinds_by_name(ina_query, generic_service
 async def test_curated_edges_survive_a_reimport_and_are_not_doubled(ina_query, generic_service):
     await rebuild()
     query = await node("oncall", "query", "2CZC_ONCALL")
-    view = await node("agent-data", "entity", "ZC_ONCALL")
+    view = await node("agent-data", "entity", "ZC_ONCALLSet")
     order = await node("sales-orders", "entity", "A_SalesOrder")
     async with SessionLocal() as db:
         db.add(DataCatalogEdge(from_id=view.id, to_id=query.id, kind="same_object",
@@ -338,6 +343,28 @@ def test_the_scope_of_an_agent_holds_its_ina_queries():
     assert allowed_sources_of(ina_server("q2")) == {("ina", "q2")}
 
 
+async def test_two_ina_entries_give_the_scope_no_ina_source(client, ina_query, generic_service):
+    """The registry builds no InA tools for a row with more than one
+    ``builtin:ina`` entry, and none of their queries enters the agent's
+    catalogue scope (`no_ina`); the scope the context view and the admin
+    test search read holds none either. A second entry counts in any
+    spelling and also without a block, as the registry counts it."""
+    second = {"url": " Builtin:INA/ ", "auth_mode": "destination"}
+    assert allowed_sources_of([ina_server("oncall"), ina_server("oncall")]) == set()
+    assert allowed_sources_of([ina_server("oncall"), second, odata_server("agent-data")]) == {
+        ("odata", "agent-data")}
+    assert allowed_sources_of([ina_server("oncall"), odata_server("agent-data")]) == {
+        ("ina", "oncall"), ("odata", "agent-data")}  # one entry: its queries
+    await add_agent("twice", ina_server("oncall"), second, odata_server("agent-data"))
+    await rebuild()
+    question = {"question": "standby hours per team"}
+    r = await client.post(f"{API}/search", json={**question, "agent": "twice"})
+    assert r.status_code == 200 and r.json()["scope"] == "agent"
+    assert all(c["source_kind"] != "ina" for c in r.json()["candidates"])
+    r = await client.post(f"{API}/search", json={**question, "agent": "standby"})
+    assert r.json()["candidates"][0]["source_kind"] == "ina"  # the control: one entry
+
+
 async def test_an_odata_scope_reaches_a_generic_service(generic_service, ina_query):
     """The registry and ``allowed_sources_of`` name a catalogue service
     ``("odata", name)`` whatever its kind; the search finds its nodes."""
@@ -349,7 +376,7 @@ async def test_an_odata_scope_reaches_a_generic_service(generic_service, ina_que
             db, allowed_sources={("odata", "agent-data")}, tier="basic")
         other = await search.find_sources(
             db, "airline", allowed_sources={("odata", "oncall")}, tier="basic")
-    assert found[0]["source_kind"] == "generic" and found[0]["name"] == "SCARR"
+    assert found[0]["source_kind"] == "generic" and found[0]["name"] == "SCARRSet"
     assert found[0]["keys"] == ["CARRID"]
     assert [s["name"] for s in listed] == ["agent-data"]
     assert other == []  # an InA query of that name is not an OData service
@@ -365,7 +392,7 @@ async def test_the_boost_counts_dimensions_and_measures(ina_query):
         by_dimension = await search.find_sources(
             db, "per calendar month", allowed_sources=allowed, tier="basic")
     for found in (by_measure, by_dimension):
-        assert found[0]["kind"] == "query" and found[0]["name"] == "2CZC_ONCALL"
+        assert found[0]["kind"] == "query" and found[0]["name"] == "oncall"
         assert found[0]["source_kind"] == "ina" and found[0]["keys"] == []
         assert found[0]["purpose"] == "Analyse on-call duty per team"  # the source's
         assert found[0]["not_for"] == "Payroll"
@@ -381,6 +408,39 @@ async def test_the_keys_of_a_candidate_come_from_any_child_kind(ina_query):
         found = await search.find_sources(
             db, "team", allowed_sources={("ina", "oncall")}, tier="basic")
     assert found[0]["keys"] == ["ZTEAM"]
+
+
+async def test_an_ina_query_is_named_by_its_registration_never_its_object_name(
+    ina_query, generic_service
+):
+    """`run_query` takes the registration's slug and the model never gets the
+    InA object name (agents/ina/tools.py): a candidate and a relation of an
+    InA query answer ``name`` = the slug, in the search and in the tool."""
+    await rebuild()
+    allowed = {("ina", "oncall"), ("odata", "agent-data")}
+    async with SessionLocal() as db:
+        found = await search.find_sources(
+            db, "on-call duty standby hours", allowed_sources=allowed, tier="basic", k=10)
+    tool = _tools(data_catalog_toolset(sources=frozenset(allowed), scope_tier="basic"))
+    answer = await tool["find_data_source"]("on-call duty standby hours")
+    for candidates in (found, answer["candidates"]):
+        assert "2CZC_ONCALL" not in json.dumps(candidates)
+        [query] = [c for c in candidates if c["kind"] == "query"]
+        assert (query["source_name"], query["name"], query["label"]) == (
+            "oncall", "oncall", "On-call analysis")
+        [view] = [c for c in candidates if c["name"] == "ZC_ONCALLSet"]
+        assert {"kind": "same_object", "to": {"source_name": "oncall", "name": "oncall",
+                                               "label": "On-call analysis"}} in view["relations"]
+    # A query node without a label falls back to the slug, not to its name.
+    query_node = await node("oncall", "query", "2CZC_ONCALL")
+    async with SessionLocal() as db:
+        row = await db.get(DataCatalogNode, query_node.id)
+        row.label, row.curated_at = "", utcnow()
+        await db.commit()
+        found = await search.find_sources(
+            db, "on-call duty standby hours", allowed_sources=allowed, tier="basic", k=10)
+    assert "2CZC_ONCALL" not in json.dumps(found)
+    assert [c["label"] for c in found if c["kind"] == "query"] == ["oncall"]
 
 
 # --- admin routes: sources of every kind, detail per kind, links ---------------------
@@ -439,7 +499,7 @@ async def test_the_detail_of_an_ina_source(client, ina_query, generic_service):
     [edge] = body["edges"]  # the imported link to the generic view
     assert (edge["kind"], edge["curated"]) == ("same_object", False) and edge["id"]
     assert {edge["from_node"]["name"], edge["to_node"]["name"]} == {"2CZC_ONCALL",
-                                                                    "ZC_ONCALL"}
+                                                                    "ZC_ONCALLSet"}
     assert {edge["from_node"]["source_kind"], edge["to_node"]["source_kind"]} == {
         "ina", "generic"}
 
@@ -460,7 +520,7 @@ async def test_the_detail_of_a_generic_source_has_the_odata_shape(client, generi
     body = r.json()
     assert set(body) == {"source", "entities", "functions", "edges", "used_by"}
     assert body["source"]["source_kind"] == "generic" and body["used_by"] == ["data"]
-    assert [e["node"]["name"] for e in body["entities"]] == ["ZC_ONCALL", "SCARR"]
+    assert [e["node"]["name"] for e in body["entities"]] == ["ZC_ONCALLSet", "SCARRSet"]
     assert [f["name"] for f in body["entities"][1]["fields"]] == ["CARRID"]
     assert [f["name"] for f in body["functions"]] == ["MONTH_NAMES_GET"]
     # The catalogue's own handle names the same row, as the rebuild route does.
@@ -475,7 +535,7 @@ async def test_an_agent_scope_reaches_its_generic_service(client, generic_servic
     assert {n["group"] for n in r.json()["nodes"]} == {"generic:agent-data"}
     r = await client.post(f"{API}/search", json={"question": "airline", "agent": "data"})
     assert r.json()["scope"] == "agent"
-    assert r.json()["candidates"][0]["name"] == "SCARR"
+    assert r.json()["candidates"][0]["name"] == "SCARRSet"
 
 
 @pytest.mark.usefixtures("two_services")
@@ -483,7 +543,7 @@ async def test_an_admin_draws_a_link_and_removes_it(client, ina_query, generic_s
     await rebuild()
     query = await node("oncall", "query", "2CZC_ONCALL")
     order = await node("sales-orders", "entity", "A_SalesOrder")
-    view = await node("agent-data", "entity", "ZC_ONCALL")
+    view = await node("agent-data", "entity", "ZC_ONCALLSet")
     [imported] = await edge_between(query, view)
     before = len(await edges())
     r = await client.post(f"{API}/edges",
@@ -606,7 +666,7 @@ async def test_a_drawn_link_is_named_in_the_relations_like_an_imported_one(
             db, "standby hours", allowed_sources=allowed, tier="basic")
         narrow = await search.find_sources(
             db, "standby hours", allowed_sources={("ina", "oncall")}, tier="basic")
-    assert by_query[0]["name"] == "2CZC_ONCALL"
+    assert by_query[0]["name"] == "oncall"
     assert {"kind": "aggregates", "to": {"source_name": "sales-orders", "name": "A_SalesOrder",
                                          "label": order.label}} in by_query[0]["relations"]
     assert narrow[0]["relations"] == []  # the other end is outside that scope
@@ -632,7 +692,7 @@ async def test_hints_on_query_dimension_and_measure_nodes(client, ina_query):
         by_crew = await search.find_sources(
             db, "crew", allowed_sources={("ina", "oncall")}, tier="basic")
     assert found == []  # a measure that is not readable boosts nothing
-    assert by_crew[0]["name"] == "2CZC_ONCALL"
+    assert by_crew[0]["name"] == "oncall"
     # Back up to what the description allows: an InA member is readable.
     r = await client.put(f"{API}/nodes/{hours.id}/hints", json={"readable": True})
     assert r.status_code == 200 and r.json()["readable"] is True

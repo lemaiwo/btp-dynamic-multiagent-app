@@ -17,10 +17,11 @@ nothing writable (InA only reads). A query not described yet is the source
 and the query alone. Variables are no nodes.
 
 ``same_object`` edges join nodes of different sources by NAME, never by
-data (``_link_same_objects``): entity sets that share an entity type name,
-and across kinds the names SAP gives one repository object (an InA query
-``2C<view>``, a ``generic`` table or view ``<view>``, an ``odata`` entity
-type ``<view>`` / ``<view>Type``).
+data: entity sets that share an entity type name, and across kinds the names
+SAP gives one repository object (an InA query ``2C<view>``, a ``generic``
+entity whose type names the table or view ``<view>``, an ``odata`` entity
+type ``<view>`` / ``<view>Type``). That pass is ``agents.data_catalog.links``
+(`link_same_objects`), run by every import.
 
 Edges an admin drew (``curated_at`` set) are never deleted by an import, and
 an import does not add a ``same_object`` edge beside a drawn ``same_object``
@@ -62,9 +63,23 @@ from pydantic import ValidationError
 from sqlalchemy import delete, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-# The kind constants live with the tables; imported here too, where the
-# admin routes read them (`importer.ODATA`).
-from agents.data_catalog.models import (
+# The link pass of an import (`_replace_imported_edges`); its names are
+# re-exported for the callers that read them here.
+from agents.data_catalog.links import (  # noqa: F401
+    LINKED_KINDS,
+    _cds_view_of,
+    _curated_pairs,
+    _join_names,
+    _same_by_name,
+    _upper_type_local,
+    link_same_objects,
+)
+
+# The kind constants and `batched` live with the tables; imported here too,
+# where the admin routes, the search and the embeddings read them
+# (`importer.ODATA`, `importer.batched`).
+from agents.data_catalog.models import (  # noqa: F401
+    BATCH,
     CATALOGUE_KINDS,
     GENERIC,
     INA,
@@ -77,27 +92,17 @@ from agents.data_catalog.models import (
     DataCatalogEdge,
     DataCatalogNode,
     DataCatalogVector,
+    batched,
+    cut,
     utcnow,
 )
 from agents.data_catalog.scope import listed_names
 
 logger = logging.getLogger(__name__)
 
-# Node kinds an import links with ``navigation`` / ``same_object`` edges.
-_LINKED_KINDS = ("entity", "query")
 _IMPORTED_EDGE_KINDS = ("navigation", "same_object")
-# The InA prefix of a query generated from a CDS view: ``2C<view>``.
-_CDS_QUERY_PREFIX = "2C"
-# Statement parameter lists are cut into batches of this size: SQLite allows
-# 999 bound parameters per statement, and very long IN lists are slow
-# everywhere.
-BATCH = 500
 _WRITE_OPS = ("create", "update", "delete")
 _HINT_FIELDS = ("label", "purpose", "not_for", "synonyms_json", "examples_json")
-
-
-def batched(values: list[Any], size: int = BATCH) -> list[list[Any]]:
-    return [values[i : i + size] for i in range(0, len(values), size)]
 
 
 @dataclass
@@ -110,15 +115,6 @@ class _Planned:
     @property
     def key(self) -> tuple[str, tuple[str, str] | None, str]:
         return (self.kind, self.parent, self.name)
-
-
-def _cut(value: Any, limit: int) -> str:
-    return " ".join(str(value or "").split())[:limit]
-
-
-def _type_local_name(entity_type: str) -> str:
-    """``API_X.A_PurchaseOrderType`` -> ``A_PurchaseOrderType``."""
-    return entity_type.rsplit(".", 1)[-1] if entity_type else ""
 
 
 def service_kind(row: Any) -> str:
@@ -145,9 +141,9 @@ def plan_service(service: Any) -> tuple[list[_Planned], list[tuple[str, str, str
         service.name,
         None,
         {
-            "label": _cut(service.title, LABEL_MAX),
-            "purpose": _cut(service.purpose, PURPOSE_MAX),
-            "not_for": _cut(service.not_for, NOT_FOR_MAX),
+            "label": cut(service.title, LABEL_MAX),
+            "purpose": cut(service.purpose, PURPOSE_MAX),
+            "not_for": cut(service.not_for, NOT_FOR_MAX),
             "readable": int(
                 bool(readable_sets) or any(not o.is_write(kind) for o in enabled_ops)
             ),
@@ -163,20 +159,20 @@ def plan_service(service: Any) -> tuple[list[_Planned], list[tuple[str, str, str
     source_ref = ("source", service.name)
     for es in definition.entity_sets:
         can_write_fields = bool({"create", "update"} & set(es.operations))
-        examples = [_cut(ex.description, 200) for ex in es.examples][:20]
+        examples = [cut(ex.description, 200) for ex in es.examples][:20]
         planned.append(
             _Planned(
                 "entity",
                 es.name,
                 source_ref,
                 {
-                    "label": _cut(es.title, LABEL_MAX),
-                    "purpose": _cut(es.description, PURPOSE_MAX),
+                    "label": cut(es.title, LABEL_MAX),
+                    "purpose": cut(es.description, PURPOSE_MAX),
                     "not_for": "",
                     "readable": int(bool({"list", "get"} & set(es.operations))),
                     "writable": int(any(op in _WRITE_OPS for op in es.operations)),
                     "is_key": 0,
-                    "type_name": _cut(es.entity_type, 200) or None,
+                    "type_name": cut(es.entity_type, 200) or None,
                     "synonyms_json": None,
                     "examples_json": json.dumps(examples) if examples else None,
                 },
@@ -190,20 +186,20 @@ def plan_service(service: Any) -> tuple[list[_Planned], list[tuple[str, str, str
                     fd.name,
                     ("entity", es.name),
                     {
-                        "label": _cut(fd.label, LABEL_MAX),
-                        "purpose": _cut(fd.hint, PURPOSE_MAX),
+                        "label": cut(fd.label, LABEL_MAX),
+                        "purpose": cut(fd.hint, PURPOSE_MAX),
                         "not_for": "",
                         "readable": int(fd.selectable),
                         "writable": int(fd.writable and can_write_fields),
                         "is_key": int(fd.name in keys),
-                        "type_name": _cut(fd.type, 200) or None,
+                        "type_name": cut(fd.type, 200) or None,
                         "synonyms_json": None,
                         "examples_json": None,
                     },
                 )
             )
         for nav in es.navigations:
-            navigations.append((es.name, nav.target, _cut(nav.description or nav.name, LABEL_MAX)))
+            navigations.append((es.name, nav.target, cut(nav.description or nav.name, LABEL_MAX)))
     for op in enabled_ops:
         planned.append(
             _Planned(
@@ -211,8 +207,8 @@ def plan_service(service: Any) -> tuple[list[_Planned], list[tuple[str, str, str
                 op.name,
                 source_ref,
                 {
-                    "label": _cut(op.title, LABEL_MAX),
-                    "purpose": _cut(op.description, PURPOSE_MAX),
+                    "label": cut(op.title, LABEL_MAX),
+                    "purpose": cut(op.description, PURPOSE_MAX),
                     "not_for": "",
                     "readable": int(not op.is_write(kind)),
                     "writable": int(op.is_write(kind)),
@@ -233,14 +229,14 @@ def _ina_attrs(
 ) -> dict[str, Any]:
     """The columns of an InA node: readable, never writable (InA only reads)."""
     return {
-        "label": _cut(label, LABEL_MAX),
-        "purpose": _cut(purpose, PURPOSE_MAX),
-        "not_for": _cut(not_for, NOT_FOR_MAX),
+        "label": cut(label, LABEL_MAX),
+        "purpose": cut(purpose, PURPOSE_MAX),
+        "not_for": cut(not_for, NOT_FOR_MAX),
         "readable": 1,
         "writable": 0,
         "is_key": 0,
-        "type_name": _cut(type_name, 200) or None,
-        "unit": _cut(unit, UNIT_MAX) or None,
+        "type_name": cut(type_name, 200) or None,
+        "unit": cut(unit, UNIT_MAX) or None,
         "synonyms_json": None,
         "examples_json": None,
     }
@@ -444,7 +440,7 @@ async def _replace_imported_edges(
     """Drop the imported ``navigation`` and ``same_object`` edges of the
     source's entities and queries and make them again; a curated edge stays
     (``curated_at`` set: an admin drew it)."""
-    linked = [n for (kind, _), n in kept.items() if kind in _LINKED_KINDS]
+    linked = [n for (kind, _), n in kept.items() if kind in LINKED_KINDS]
     ids = [n.id for n in linked]
     for chunk in batched(ids):
         await db.execute(
@@ -458,150 +454,7 @@ async def _replace_imported_edges(
         a, b = kept.get(("entity", src)), kept.get(("entity", target))
         if a is not None and b is not None:
             db.add(DataCatalogEdge(from_id=a.id, to_id=b.id, kind="navigation", label=label))
-    await _link_same_objects(db, source, linked, await _curated_pairs(db, ids))
-
-
-async def _curated_pairs(db: AsyncSession, ids: list[int]) -> set[frozenset[int]]:
-    """The node pairs an admin linked as ``same_object``, of the edges that
-    touch ``ids``: one link per kind per pair, so a drawn ``aggregates`` does
-    not keep the import's ``same_object`` out."""
-    pairs: set[frozenset[int]] = set()
-    for chunk in batched(ids):
-        rows = await db.execute(
-            select(DataCatalogEdge.from_id, DataCatalogEdge.to_id).where(
-                DataCatalogEdge.curated_at.is_not(None),
-                DataCatalogEdge.kind == "same_object",
-                or_(DataCatalogEdge.from_id.in_(chunk), DataCatalogEdge.to_id.in_(chunk)),
-            )
-        )
-        pairs.update(frozenset(row) for row in rows.all())
-    return pairs
-
-
-def _cds_view_of(node: DataCatalogNode) -> str:
-    """``2CZC_ONCALL`` -> ``ZC_ONCALL`` for an InA query generated from a CDS
-    view; ``""`` for any other node."""
-    name = node.name.upper() if node.source_kind == INA and node.kind == "query" else ""
-    if name.startswith(_CDS_QUERY_PREFIX) and len(name) > len(_CDS_QUERY_PREFIX):
-        return name[len(_CDS_QUERY_PREFIX) :]
-    return ""
-
-
-def _upper_type_local(node: DataCatalogNode) -> str:
-    return _type_local_name(node.type_name or "").upper()
-
-
-def _join_names(node: DataCatalogNode) -> set[str]:
-    """The upper-cased names a node may share with a node of another kind
-    (the index of the cross-kind pass; `_same_by_name` decides)."""
-    if node.kind == "query":
-        view = _cds_view_of(node)
-        return {view} if view else set()
-    if node.kind != "entity":
-        return set()
-    if node.source_kind == GENERIC:
-        return {node.name.upper()}
-    if node.source_kind == ODATA:
-        local = _upper_type_local(node)
-        if not local:
-            return set()
-        if local.endswith("TYPE") and len(local) > len("TYPE"):
-            return {local, local[: -len("TYPE")]}
-        return {local}
-    return set()
-
-
-def _same_by_name(a: DataCatalogNode, b: DataCatalogNode) -> str:
-    """The name under which ``a`` and ``b``, of two different source kinds,
-    are one SAP object, or ``""`` (addendum (k), "Cross-kind links" 1):
-
-    * an InA query ``2C<view>`` and a ``generic`` entity ``<view>`` (a CDS
-      view on SAP's allow-list);
-    * an InA query ``2C<view>`` and an ``odata`` entity whose entity type's
-      local name is ``<view>`` or ``<view>Type``;
-    * a ``generic`` entity (a table or view name) and an ``odata`` entity
-      whose entity type's local name is exactly that name.
-
-    The two InA rules compare upper-cased: InA names a CDS query in upper
-    case, while the OData type of a CDS entity keeps its camel case
-    (``ZC_OnCallType``). The generic-to-OData rule compares exactly, as the
-    entity type pass does: a table ``PRODUCT`` says nothing about a type
-    ``Product`` of another service, and an imported edge is not one an admin
-    can remove."""
-    ends = {a.source_kind: a, b.source_kind: b}
-    if len(ends) != 2:
-        return ""
-    query, generic, odata = ends.get(INA), ends.get(GENERIC), ends.get(ODATA)
-    view = _cds_view_of(query) if query is not None else ""
-    if generic is not None and generic.kind != "entity":
-        return ""
-    if odata is not None and odata.kind != "entity":
-        return ""
-    if view and generic is not None:
-        return view if generic.name.upper() == view else ""
-    if view and odata is not None:
-        return view if _upper_type_local(odata) in (view, view + "TYPE") else ""
-    if generic is not None and odata is not None:
-        local = _type_local_name(odata.type_name or "")
-        return generic.name if generic.name and local == generic.name else ""
-    return ""
-
-
-async def _link_same_objects(
-    db: AsyncSession,
-    source: tuple[str, str],
-    mine: list[DataCatalogNode],
-    taken: set[frozenset[int]],
-) -> None:
-    """``same_object`` edges from this source's entities and queries to the
-    nodes of OTHER sources that are the same object: entities with the same
-    entity type name (local part, exactly), then the cross-kind names of
-    `_same_by_name`. One ``same_object`` per pair: a pair in ``taken`` (an
-    admin's ``same_object``, or one this pass made) gets none."""
-    by_type: dict[str, list[DataCatalogNode]] = {}
-    by_name: dict[str, list[DataCatalogNode]] = {}
-    for node in mine:
-        local = _type_local_name(node.type_name or "") if node.kind == "entity" else ""
-        if local:
-            by_type.setdefault(local, []).append(node)
-        for name in _join_names(node):
-            by_name.setdefault(name, []).append(node)
-    if not by_type and not by_name:
-        return
-    others = await db.execute(
-        select(DataCatalogNode)
-        .where(
-            DataCatalogNode.kind.in_(_LINKED_KINDS),
-            or_(
-                DataCatalogNode.source_kind != source[0],
-                DataCatalogNode.source_name != source[1],
-            ),
-        )
-        .order_by(DataCatalogNode.id)
-    )
-    for other in others.scalars():
-        found: list[tuple[DataCatalogNode, str]] = []
-        if other.kind == "entity":
-            local = _type_local_name(other.type_name or "")
-            found.extend((node, node.type_name or "") for node in by_type.get(local, []))
-        for name in _join_names(other):
-            for node in by_name.get(name, []):
-                shared = _same_by_name(node, other)
-                if shared:
-                    found.append((node, shared))
-        for node, label in found:
-            pair = frozenset((node.id, other.id))
-            if pair in taken:
-                continue
-            taken.add(pair)
-            db.add(
-                DataCatalogEdge(
-                    from_id=node.id,
-                    to_id=other.id,
-                    kind="same_object",
-                    label=_cut(label, LABEL_MAX),
-                )
-            )
+    await link_same_objects(db, source, linked, await _curated_pairs(db, ids))
 
 
 async def _names_enabled_agents_attach(

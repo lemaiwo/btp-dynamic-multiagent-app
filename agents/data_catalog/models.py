@@ -57,10 +57,24 @@ PURPOSE_MAX = 1000
 NOT_FOR_MAX = 500
 NAME_MAX = 128
 UNIT_MAX = 32
+# Statement parameter lists are cut into batches of this size: SQLite allows
+# 999 bound parameters per statement, and very long IN lists are slow
+# everywhere.
+BATCH = 500
 
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def batched(values: list[Any], size: int = BATCH) -> list[list[Any]]:
+    return [values[i : i + size] for i in range(0, len(values), size)]
+
+
+def cut(value: Any, limit: int) -> str:
+    """``value`` as one line of at most ``limit`` characters: how a text
+    column of the graph is filled."""
+    return " ".join(str(value or "").split())[:limit]
 
 
 def _json_list(raw: str | None) -> list[str]:
