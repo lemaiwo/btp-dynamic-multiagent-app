@@ -11,6 +11,8 @@ import oauthConfig from "../model/oauthConfig";
 import odataEntry from "../model/odataEntry";
 import bitbucketEntry from "../model/bitbucketEntry";
 import gitEntry from "../model/gitEntry";
+import inaEntry from "../model/inaEntry";
+import InaEntryPart from "./agent/InaEntryPart";
 import type { ODataEntryGiven, ODataEntryOpens, ODataEntryRow } from "../model/odataEntry";
 import { AUTH_MODE_TEXT_KEYS, BUILTINS, authModesFor, findBuiltin } from "../model/builtins";
 import formatter from "../model/formatter";
@@ -94,6 +96,8 @@ export default class AgentDetail extends BaseController {
     /** True from a Save press until its request is answered or its question
      *  is cancelled: one press, one question, one request. */
     private saving = false;
+    // --- ina --- The dialog's "Analytical queries (InA)" entry.
+    private ina!: InaEntryPart;
 
     public onInit(): void {
         this.setModel(new JSONModel({
@@ -115,6 +119,14 @@ export default class AgentDetail extends BaseController {
             runsCount: runsCountLabel(0)
         }), "agent");
         this.setModel(new JSONModel({}), "server");
+        this.ina = new InaEntryPart({
+            serverModel: () => this.getModel("server") as JSONModel,
+            agentModel: () => this.getModel("agent") as JSONModel,
+            service: () => this.getAdminService(),
+            text: (key, args) => this.text(key, args),
+            box: () => this.byId("inaEntryQueries") as unknown as { setSelectedKeys(keys: string[]): void } | undefined,
+            editingIndex: () => this.editingServerIndex
+        });
 
         this.getRouter().getRoute("agentDetail")?.attachPatternMatched((event: Route$PatternMatchedEvent) => {
             const id = (event.getParameter("arguments") as { agentId: string }).agentId;
@@ -330,6 +342,9 @@ export default class AgentDetail extends BaseController {
         this.odataCatalogue = null;
         this.odataDefinitions = {};
         const loadError = isOData ? await this.loadODataCatalogue() : "";
+        // --- ina --- Its own state, read first for a stored entry as above.
+        const isIna = inaEntry.isInaUrl(server.url);
+        const ina = await this.ina.begin(server);
         if (opening !== this.odataOpening) {
             return;
         }
@@ -338,14 +353,15 @@ export default class AgentDetail extends BaseController {
             // exactly `builtin:odata`: an entry stored in another spelling
             // (`Builtin:OData`) is held in that one, or OK would write back
             // an `allow_write` the admin never saw.
-            url: isOData ? odataEntry.ODATA_URL : isBitbucket ? bitbucketEntry.BITBUCKET_URL
+            url: isOData ? odataEntry.ODATA_URL : isIna ? inaEntry.INA_URL : isBitbucket ? bitbucketEntry.BITBUCKET_URL
                 : isGit ? gitEntry.GIT_URL : server.url,
             auth_mode: server.auth_mode,
             odata: {
                 services: stored.services, allowWrite: stored.allow_write, loaded: isOData, loadError,
                 options: [], rows: [], noData: "", duplicate: "", missing: "", disabled: "", warning: "", writeText: ""
             },
-            oauth: isOData || !server.oauth ? blankOAuth
+            ina,
+            oauth: isOData || isIna || !server.oauth ? blankOAuth
                 : isBitbucket ? { ...blankOAuth, destination: typeof pins.destination === "string" ? pins.destination : "" }
                     : isGit ? { ...blankOAuth, destination: typeof git.destination === "string" ? git.destination : "" }
                         : server.oauth,
@@ -392,6 +408,8 @@ export default class AgentDetail extends BaseController {
         this.syncServerKind();
         this.showODataOptions();
         this.showODataEntry();
+        this.ina.showOptions();
+        this.ina.show();
 
         if (!this.serverDialog) {
             this.serverDialog = await Fragment.load({
@@ -414,6 +432,8 @@ export default class AgentDetail extends BaseController {
             serverModel.setProperty("/auth_mode", builtin.defaultAuthMode);
             if (odataEntry.isODataUrl(builtin.url)) {
                 void this.enterODataEntry();
+            } else if (inaEntry.isInaUrl(builtin.url)) {
+                void this.ina.enter();
             }
         } else if (findBuiltin(serverModel.getProperty("/url") as string)) {
             // Back to a remote server: the built-in's pseudo-url is no
@@ -438,7 +458,15 @@ export default class AgentDetail extends BaseController {
             serverModel.setProperty("/url", bitbucketEntry.BITBUCKET_URL);
         } else if (gitEntry.isGitUrl(url)) {
             serverModel.setProperty("/url", gitEntry.GIT_URL);
+        } else if (inaEntry.isInaUrl(url)) {
+            serverModel.setProperty("/url", inaEntry.INA_URL);
+            void this.ina.enter();
         }
+    }
+
+    /** --- ina --- A tick, a selection or a removed token in the query box. */
+    public onInaEntryChange(event: Event): void {
+        this.ina.onChange(event);
     }
 
     /**
@@ -847,6 +875,14 @@ export default class AgentDetail extends BaseController {
             oauthRaw.services = this.odataSelection();
             oauthRaw.allow_write = serverModel.getProperty("/odata/allowWrite") === true;
         }
+        if (inaEntry.isInaUrl(url)) {
+            // --- ina --- Only the entry's one value reaches cleanOAuth.
+            if (!this.ina.confirm(() => this.onConfirmServer())) {
+                return;
+            }
+            Object.keys(oauthRaw).forEach((key) => { delete oauthRaw[key]; });
+            oauthRaw.queries = this.ina.block().queries;
+        }
         if (oauthConfig.supportsMailTheme(url)) {
             const parsedTheme = oauthConfig.parseMailTheme(serverModel.getProperty("/themeJson") as string);
             if (parsedTheme.error) {
@@ -1059,8 +1095,11 @@ export default class AgentDetail extends BaseController {
         try {
             // --- odata --- The entry is sent as exactly { services,
             // allow_write: <boolean> }, also when its dialog was never opened
-            // and the form still holds the form the server answered with.
-            const sent = { ...data, mcp_servers: odataEntry.explicit(data.mcp_servers) } as AgentInput & ReloadOutcome;
+            // and the form still holds the form the server answered with;
+            // --- ina --- likewise exactly { queries }.
+            const sent = {
+                ...data, mcp_servers: inaEntry.explicit(odataEntry.explicit(data.mcp_servers))
+            } as AgentInput & ReloadOutcome;
             // What a save answers about the reload is no field of an agent;
             // it never goes back in a body, whatever the form was filled from.
             delete sent.reloaded;

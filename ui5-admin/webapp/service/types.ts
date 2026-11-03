@@ -226,6 +226,14 @@ export type OAuthClient =
            * only when it is `true`.
            */
           allow_write?: boolean;
+          // --- ina ---
+          /**
+           * `builtin:ina` only. The registered analytical queries (their
+           * slugs, 1-50 distinct) this agent may run. As for `services`, the
+           * entry carries no `destination` and no `user_context`: both belong
+           * to each registered query. See model/inaEntry.ts.
+           */
+          queries?: string[];
       };
 
 export interface McpServer {

@@ -5,6 +5,7 @@ import { isRemoteUrl } from "./remoteUrl";
 import odataEntry from "./odataEntry";
 import bitbucketEntry from "./bitbucketEntry";
 import gitEntry from "./gitEntry";
+import inaEntry from "./inaEntry";
 
 /**
  * Turns the server dialog's flat form model into the config block the API
@@ -280,6 +281,11 @@ export default {
             // as a real boolean (true only for exactly `true`); no
             // destination, no user_context, nothing left from another type.
             return odataEntry.clean(raw) as McpServer["oauth"];
+        }
+        if (key === inaEntry.INA_URL) {
+            // --- ina --- As for OData, first and whatever the mode: exactly
+            // the queries; no destination, no user_context.
+            return inaEntry.clean(raw) as McpServer["oauth"];
         }
         if (key === SHAREPOINT_URL) {
             // --- sharepoint --- Before the generic branches: an app-only

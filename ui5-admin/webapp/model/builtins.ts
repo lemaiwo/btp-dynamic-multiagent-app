@@ -80,6 +80,15 @@ export const BUILTINS: BuiltinToolset[] = [
         url: "builtin:odata", titleKey: "builtinOData", descriptionKey: "builtinODataDesc",
         defaultAuthMode: "destination", authModes: ["destination"]
     },
+    // --- ina --- ina_toolset builds with nothing else either: the entry
+    // names the registered analytical queries and holds no destination, no
+    // identity and no credential (each query names its destination) -- see
+    // agents/ina/tools.py, `_validate_ina_entry` in agents/admin.py and
+    // model/inaEntry.ts.
+    {
+        url: "builtin:ina", titleKey: "builtinIna", descriptionKey: "builtinInaDesc",
+        defaultAuthMode: "destination", authModes: ["destination"]
+    },
     // sharepoint_toolset reads one pinned workbook as the application: a
     // destination's credential or client credentials, never a signed-in
     // user -- see agents/sharepoint_tools.py and `_validate_sharepoint`

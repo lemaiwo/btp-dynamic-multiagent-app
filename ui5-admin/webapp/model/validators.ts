@@ -4,6 +4,7 @@ import { isRemoteUrl } from "./remoteUrl";
 import odataEntry from "./odataEntry";
 import bitbucketEntry from "./bitbucketEntry";
 import gitEntry from "./gitEntry";
+import inaEntry, { INA_TEXTS } from "./inaEntry";
 
 // --- odata ---
 /** `SERVICE_NAME_RE` in agents/odata/models.py: the slug of a catalogue service. */
@@ -348,6 +349,11 @@ export default {
             // --- git --- Its own rules and none of the Jira ones below.
             return gitEntry.validate(oauth, authMode);
         }
+        if (inaEntry.isInaUrl(url)) {
+            // --- ina --- Its own rules and none of the destination ones
+            // below: this entry names no destination.
+            return inaEntry.validate(oauth, authMode);
+        }
         if (this.isTeams(url)) {
             const teamsError = this.validateTeams(oauth, authMode);
             if (teamsError) {
@@ -548,6 +554,8 @@ export default {
                     errors[index] = "An agent has one Bitbucket entry; change the existing one.";
                 } else if (key === gitEntry.GIT_URL) {
                     errors[index] = "An agent has one Git entry; add the repositories to the existing one.";
+                } else if (key === inaEntry.INA_URL) {
+                    errors[index] = INA_TEXTS.secondEntry;
                 } else {
                     errors[index] = "This is a duplicate URL; each server may appear once.";
                 }
