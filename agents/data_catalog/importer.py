@@ -58,36 +58,35 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from pydantic import ValidationError
-from sqlalchemy import delete, or_, select
+from sqlalchemy import delete, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+# The kind constants live with the tables; imported here too, where the
+# admin routes read them (`importer.ODATA`).
 from agents.data_catalog.models import (
+    CATALOGUE_KINDS,
+    GENERIC,
+    INA,
     LABEL_MAX,
     NAME_MAX,
     NOT_FOR_MAX,
+    ODATA,
     PURPOSE_MAX,
+    UNIT_MAX,
     DataCatalogEdge,
     DataCatalogNode,
     DataCatalogVector,
     utcnow,
 )
+from agents.data_catalog.scope import listed_names
 
 logger = logging.getLogger(__name__)
 
-ODATA = "odata"
-GENERIC = "generic"
-INA = "ina"
-# The kinds whose sources are ``odata_services`` rows. A service name is
-# unique in that table whatever the kind, so ``("odata", name)`` -- what the
-# catalogue routes and the registry say -- and ``("generic", name)`` name the
-# same row; its nodes are stored under the row's kind (`service_kind`).
-CATALOGUE_KINDS = (ODATA, GENERIC)
 # Node kinds an import links with ``navigation`` / ``same_object`` edges.
 _LINKED_KINDS = ("entity", "query")
 _IMPORTED_EDGE_KINDS = ("navigation", "same_object")
 # The InA prefix of a query generated from a CDS view: ``2C<view>``.
 _CDS_QUERY_PREFIX = "2C"
-_UNIT_MAX = 32
 # Statement parameter lists are cut into batches of this size: SQLite allows
 # 999 bound parameters per statement, and very long IN lists are slow
 # everywhere.
@@ -240,7 +239,7 @@ def _ina_attrs(
         "writable": 0,
         "is_key": 0,
         "type_name": _cut(type_name, 200) or None,
-        "unit": _cut(unit, _UNIT_MAX) or None,
+        "unit": _cut(unit, UNIT_MAX) or None,
         "synonyms_json": None,
         "examples_json": None,
     }
@@ -254,6 +253,11 @@ def plan_ina_query(row: Any) -> list[_Planned]:
     its purpose and "not for" stay empty, so the search shows the source's
     (one place for the admin to write them). A stored description that does
     not validate raises (``ValueError`` / ``ValidationError``).
+
+    A dimension's ``key_field`` is not read: in InA it names the member's
+    key attribute (how a member is identified on an axis), not the identity
+    of a result row, so no InA node is ``is_key`` and a query's search
+    candidate answers no ``keys``.
     """
     from agents.ina.models import InaDefinition
 
@@ -514,9 +518,12 @@ def _same_by_name(a: DataCatalogNode, b: DataCatalogNode) -> str:
     * a ``generic`` entity (a table or view name) and an ``odata`` entity
       whose entity type's local name is exactly that name.
 
-    Compared upper-cased: names in SAP's repository are case-insensitive
-    (DDIC keeps them upper case, while the OData type of a CDS entity keeps
-    its camel case, ``ZC_OnCallType``)."""
+    The two InA rules compare upper-cased: InA names a CDS query in upper
+    case, while the OData type of a CDS entity keeps its camel case
+    (``ZC_OnCallType``). The generic-to-OData rule compares exactly, as the
+    entity type pass does: a table ``PRODUCT`` says nothing about a type
+    ``Product`` of another service, and an imported edge is not one an admin
+    can remove."""
     ends = {a.source_kind: a, b.source_kind: b}
     if len(ends) != 2:
         return ""
@@ -531,8 +538,8 @@ def _same_by_name(a: DataCatalogNode, b: DataCatalogNode) -> str:
     if view and odata is not None:
         return view if _upper_type_local(odata) in (view, view + "TYPE") else ""
     if generic is not None and odata is not None:
-        name = generic.name.upper()
-        return name if name and _upper_type_local(odata) == name else ""
+        local = _type_local_name(odata.type_name or "")
+        return generic.name if generic.name and local == generic.name else ""
     return ""
 
 
@@ -597,17 +604,13 @@ async def _names_enabled_agents_attach(
     db: AsyncSession, entries: Callable[[list[dict[str, Any]]], list[dict[str, Any]]], key: str
 ) -> set[str]:
     """The names listed under ``key`` in the ``entries`` blocks of every
-    ENABLED agent (a name that is not a string is ignored)."""
+    ENABLED agent (`listed_names`, the scope's own reading)."""
     from agents.db import list_agents
 
     names: set[str] = set()
     for agent in await list_agents(db):
-        if not agent.enabled:
-            continue
-        for block in entries(agent.mcp_servers):
-            listed = block.get(key)
-            if isinstance(listed, list):
-                names.update(n for n in listed if isinstance(n, str))
+        if agent.enabled:
+            names |= listed_names(entries(agent.mcp_servers), key)
     return names
 
 
@@ -641,6 +644,43 @@ async def wanted_ina_queries(db: AsyncSession) -> dict[str, Any]:
     }
 
 
+async def _has_nodes(db: AsyncSession, source_kind: str, source_name: str) -> bool:
+    row = await db.execute(
+        select(DataCatalogNode.id)
+        .where(
+            DataCatalogNode.source_kind == source_kind,
+            DataCatalogNode.source_name == source_name,
+        )
+        .limit(1)
+    )
+    return row.first() is not None
+
+
+async def _follow_kind(db: AsyncSession, service_row: Any) -> int:
+    """Move the nodes of a catalogue service stored under the OTHER catalogue
+    kind to the service's kind, in place (one conditional ``UPDATE`` of
+    ``source_kind``): a kind change of the registration is no reason to
+    lose what an admin wrote. Ids stay, so hints, a narrowed ``readable``,
+    vectors and curated edges stay; the import that follows brings the rest
+    up to date. Should both kinds hold nodes of that name, the service's own
+    kind is kept and the other dropped. Answers the nodes dropped."""
+    kind = service_kind(service_row)
+    name = service_row.name
+    removed = 0
+    for other in CATALOGUE_KINDS:
+        if other == kind or not await _has_nodes(db, other, name):
+            continue
+        if await _has_nodes(db, kind, name):
+            removed += await remove_source(db, other, name)
+            continue
+        await db.execute(
+            update(DataCatalogNode)
+            .where(DataCatalogNode.source_kind == other, DataCatalogNode.source_name == name)
+            .values(source_kind=kind)
+        )
+    return removed
+
+
 async def stored_sources(db: AsyncSession) -> set[tuple[str, str]]:
     rows = await db.execute(
         select(DataCatalogNode.source_kind, DataCatalogNode.source_name)
@@ -658,9 +698,10 @@ async def rebuild(
 
     A catalogue source is named ``("odata", name)`` or ``("generic", name)``
     alike (`CATALOGUE_KINDS`): the row's own kind decides, and nodes of that
-    name under the other kind (a service whose kind changed) are dropped.
-    What goes is dropped before anything is imported, so a stale node is
-    never linked.
+    name stored under the other kind (a service whose kind changed) are
+    moved to it in place first (`_follow_kind`), so the import that follows
+    keeps their ids, the admin's hints, vectors and curated edges. What goes
+    is dropped before anything is imported, so a stale node is never linked.
     """
     from agents.data_catalog.embeddings import refresh_vectors
 
@@ -669,6 +710,8 @@ async def rebuild(
     if source is None:
         services = await wanted_odata_services(db)
         queries = await wanted_ina_queries(db)
+        for name in sorted(services):
+            total.removed += await _follow_kind(db, services[name])
         for kind, name in sorted(await stored_sources(db)):
             if kind in CATALOGUE_KINDS:
                 stale = name not in services or service_kind(services[name]) != kind
@@ -682,10 +725,11 @@ async def rebuild(
             total.add(await import_ina_query(db, queries[name]))
     elif source[0] in CATALOGUE_KINDS:
         row = (await wanted_odata_services(db)).get(source[1])
-        for kind in CATALOGUE_KINDS:
-            if row is None or service_kind(row) != kind:
+        if row is None:
+            for kind in CATALOGUE_KINDS:
                 total.removed += await remove_source(db, kind, source[1])
-        if row is not None:
+        else:
+            total.removed += await _follow_kind(db, row)
             total.add(await import_odata_service(db, row))
             scope = (service_kind(row), row.name)
     elif source[0] == INA:

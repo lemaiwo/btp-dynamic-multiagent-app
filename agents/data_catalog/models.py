@@ -3,18 +3,22 @@
 
 Three tables, portable across SQLite, Postgres and HANA:
 
-* ``data_catalog_nodes``: one row per source, entity, field, function (and,
-  later, InA query, dimension and measure). ``source_kind`` / ``source_name``
-  name the record the node came from (an ``odata_services.name`` today).
+* ``data_catalog_nodes``: one row per source, entity, field and function of
+  a catalogue service, and per source, query, dimension and measure of an
+  InA query. ``source_kind`` / ``source_name`` name the record the node came
+  from: ``odata`` or ``generic`` and an ``odata_services.name`` (the row's
+  kind), or ``ina`` and an ``ina_queries.name``.
   ``label``, ``purpose``, ``not_for``, ``synonyms_json`` and
   ``examples_json`` are the hints; once an admin edits them (``curated_at``
   set) an import never overwrites them. ``type_name`` is an entity's
-  entity type (the join of ``same_object`` edges) or a field's EDM type.
+  entity type (the join of ``same_object`` edges), a field's EDM type or an
+  InA query's object name; ``unit`` is a measure's unit.
   ``is_key`` marks a key field: the
   search answers an entity's keys without reading the (possibly megabytes
   large) service definition.
 * ``data_catalog_edges``: ``navigation``, ``association``, ``foreign_key``,
-  ``same_object``, ``aggregates`` between two nodes.
+  ``same_object``, ``aggregates`` between two nodes; ``curated_at`` set when
+  an admin drew the edge (an import never deletes such an edge).
 * ``data_catalog_vectors``: one embedding per node and model, float32 bytes
   (cosine is computed in Python over the small scoped candidate set; no HANA
   ``REAL_VECTOR`` in v1). ``text_hash`` is the SHA-256 of the text that was
@@ -37,13 +41,22 @@ from sqlalchemy.orm import Mapped, mapped_column
 from agents.db import Base
 
 NODE_KINDS = ("source", "entity", "field", "query", "dimension", "measure", "function")
-SOURCE_KINDS = ("odata", "ina", "generic")
+ODATA = "odata"
+INA = "ina"
+GENERIC = "generic"
+SOURCE_KINDS = (ODATA, INA, GENERIC)
+# The kinds whose sources are ``odata_services`` rows. A service name is
+# unique in that table whatever the kind, so ``("odata", name)`` -- what the
+# catalogue routes and the registry say -- and ``("generic", name)`` name the
+# same row; its nodes are stored under the row's kind.
+CATALOGUE_KINDS = (ODATA, GENERIC)
 EDGE_KINDS = ("navigation", "association", "foreign_key", "same_object", "aggregates")
 
 LABEL_MAX = 200
 PURPOSE_MAX = 1000
 NOT_FOR_MAX = 500
 NAME_MAX = 128
+UNIT_MAX = 32
 
 
 def utcnow() -> datetime:
@@ -81,7 +94,7 @@ class DataCatalogNode(Base):
     )
     synonyms_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     examples_json: Mapped[str | None] = mapped_column(Text, nullable=True)
-    unit: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    unit: Mapped[str | None] = mapped_column(String(UNIT_MAX), nullable=True)
     # The entity type of an entity (``same_object`` edges join on its local
     # name across sources), the EDM type of a field.
     type_name: Mapped[str | None] = mapped_column(String(200), nullable=True)

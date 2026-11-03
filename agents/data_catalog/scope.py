@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from agents.data_catalog.importer import CATALOGUE_KINDS, INA, ODATA
+from agents.data_catalog.models import CATALOGUE_KINDS, INA, ODATA
 from agents.db import ina_entries, odata_entries
 
 Source = tuple[str, str]
@@ -33,7 +33,11 @@ def _servers_of(agent: Any) -> list[Any]:
     return servers if isinstance(servers, list) else []
 
 
-def _names(blocks: list[dict[str, Any]], key: str) -> set[str]:
+def listed_names(blocks: list[dict[str, Any]], key: str) -> set[str]:
+    """The names listed under ``key`` in entry blocks (``services`` of a
+    ``builtin:odata`` block, ``queries`` of a ``builtin:ina`` one); a name
+    that is not a non-empty string is ignored. The importer reads the
+    enabled agents' entries through it too."""
     names: set[str] = set()
     for block in blocks:
         listed = block.get(key)
@@ -46,8 +50,8 @@ def allowed_sources_of(agent: Any) -> set[Source]:
     """The sources of an agent row (``AgentConfig``), of one server entry
     (``{"url": "builtin:odata", "oauth": {...}}``) or of a list of them."""
     servers = _servers_of(agent)
-    return {(ODATA, n) for n in _names(odata_entries(servers), "services")} | {
-        (INA, n) for n in _names(ina_entries(servers), "queries")
+    return {(ODATA, n) for n in listed_names(odata_entries(servers), "services")} | {
+        (INA, n) for n in listed_names(ina_entries(servers), "queries")
     }
 
 
