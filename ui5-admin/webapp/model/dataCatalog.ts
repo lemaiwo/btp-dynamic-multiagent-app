@@ -286,8 +286,9 @@ export interface GraphModel {
         kind: DataNodeKind; source_kind: DataSourceKind; source_name: string;
     }[];
     /** `title` is the edge's kind, `description` its label; the control
-     *  shows both in the line's popover, it draws no text on a line. */
-    lines: { from: string; to: string; title: string; description: string }[];
+     *  shows both in the line's popover, it draws no text on a line.
+     *  `curated`: an admin drew it, drawn dashed in both views. */
+    lines: { from: string; to: string; title: string; description: string; curated: boolean }[];
     /** The API answered as many nodes as it may: some may be missing. */
     capped: boolean;
 }
@@ -326,7 +327,8 @@ export function graphModel(answer: DataGraph, kinds: readonly string[] = []): Gr
     const lines = (answer.edges ?? [])
         .filter((edge) => shown[String(edge.from)] && shown[String(edge.to)])
         .map((edge) => ({
-            from: String(edge.from), to: String(edge.to), title: edge.kind, description: edge.label ?? ""
+            from: String(edge.from), to: String(edge.to), title: edge.kind, description: edge.label ?? "",
+            curated: edge.curated === true
         }));
     return { groups, nodes: mapped, lines, capped: answer.truncated === true || allNodes.length >= GRAPH_NODE_CAP };
 }

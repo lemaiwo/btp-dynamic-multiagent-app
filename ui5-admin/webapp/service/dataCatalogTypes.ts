@@ -58,6 +58,8 @@ export interface DataEdge {
     to: number | string;
     kind: string;
     label: string;
+    /** An admin drew the link (it survives a re-import); absent or false for an imported edge. */
+    curated?: boolean;
     /** The two ends as nodes, in the detail answer only. */
     from_node?: DataNode | null;
     to_node?: DataNode | null;

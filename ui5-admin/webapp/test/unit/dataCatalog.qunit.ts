@@ -193,10 +193,23 @@ QUnit.test("one group per source, coloured by its kind, and only lines between s
     assert.strictEqual(model.nodes[0].shape, "Box");
     assert.strictEqual(model.nodes[2].shape, "Circle");
     assert.deepEqual(model.lines, [
-        { from: "1", to: "2", title: "aggregates", description: "" },
-        { from: "2", to: "3", title: "aggregates", description: "has" }
+        { from: "1", to: "2", title: "aggregates", description: "", curated: false },
+        { from: "2", to: "3", title: "aggregates", description: "has", curated: false }
     ], "the kind is the title, the label the description; a line to a node that is not there is dropped");
     assert.notOk(model.capped);
+});
+
+QUnit.test("a line knows whether an admin drew it", function (assert) {
+    const model = graphModel({
+        nodes: [graphNode(1, "entity", "pr"), graphNode(2, "entity", "bp"), graphNode(3, "query", "sales", "ina")],
+        edges: [
+            { from: 1, to: 2, kind: "same_object", label: "", curated: true },
+            { from: 1, to: 3, kind: "aggregates", label: "", curated: false },
+            { from: 2, to: 3, kind: "aggregates", label: "" }
+        ]
+    });
+    assert.deepEqual(model.lines.map((l) => l.curated), [true, false, false],
+        "curated only for the boolean true; an answer without the flag is an imported edge");
 });
 
 QUnit.test("picked kinds filter the nodes and their lines", function (assert) {
