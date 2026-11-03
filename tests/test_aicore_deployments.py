@@ -1,6 +1,7 @@
 """``agents/aicore_deployments.py``: the AI Core calls behind the embeddings
-panel (design addendum l, point 3), against a MockTransport. No network, no
-AI Core, no database.
+panel (design addendum l, point 3), against the scripted AI Core of
+``tests/aicore_helpers.py`` on a MockTransport. No network, no AI Core, no
+database.
 """
 
 from __future__ import annotations
@@ -15,13 +16,20 @@ import httpx
 import pytest
 
 from agents import aicore_deployments as aid
-from agents.aicore_deployments import AICoreCredentials, AICoreDeployments, AICoreError
+from agents.aicore_deployments import AICoreDeployments, AICoreError
+from tests.aicore_helpers import (
+    API,
+    AUTH,
+    BODY_MARKER,
+    CLIENT_ID,
+    SECRET,
+    FakeAICore,
+    client_for,
+    deployment_entry,
+    fake_creds,
+    model_entry,
+)
 
-API = "https://api.example.test"
-AUTH = "https://auth.example.test"
-CLIENT_ID = "client-id-for-tests"
-SECRET = "not-a-real-secret-123"
-BODY_MARKER = "BODY-MARKER-must-not-be-logged"
 ENV_NAMES = ("AICORE_CLIENT_ID", "AICORE_CLIENT_SECRET", "AICORE_AUTH_URL",
              "AICORE_BASE_URL", "AICORE_RESOURCE_GROUP", "AICORE_SERVICE_KEY",
              "VCAP_SERVICES")
@@ -37,124 +45,6 @@ def _clean_environment(monkeypatch):
     aid.reset()
     yield
     aid.reset()
-
-
-def _creds() -> AICoreCredentials:
-    return AICoreCredentials(
-        client_id=CLIENT_ID, client_secret=SECRET,
-        auth_url=f"{AUTH}/oauth/token", base_url=f"{API}/v2", source="test")
-
-
-def _model(name, versions=("1",), executable="azure-openai"):
-    return {"model": name, "executableId": executable,
-            "versions": [{"name": v, "isLatest": i == 0, "deprecated": False}
-                         for i, v in enumerate(versions)]}
-
-
-def _deployment(model, status="RUNNING", did="d0000000001", *, style="backend"):
-    details = ({"resources": {"backend_details": {"model": {"name": model, "version": "1"}}}}
-               if style == "backend" else {"modelName": model})
-    return {"id": did, "status": status, "details": details, "configurationId": "c1",
-            "configurationName": "something-else"}
-
-
-class FakeAICore:
-    """Scripted token endpoint and AI API. ``fail`` maps ``"METHOD /path"``
-    (or ``"token"``) to a status, a callable or an exception to raise."""
-
-    def __init__(self):
-        self.models = [
-            _model("gpt-4o", ("2024-08-06",)),
-            _model("text-embedding-3-large", ("1", "2")),
-            _model("text-embedding-ada-002", ("2",)),
-            _model("anthropic--claude-4.6-opus", executable="aws-bedrock"),
-        ]
-        self.executables = [
-            {"id": "azure-openai", "parameters": [
-                {"name": "modelName", "type": "string"},
-                {"name": "modelVersion", "type": "string", "default": "latest"}]},
-            {"id": "aws-bedrock", "parameters": [{"name": "modelName", "type": "string"}]},
-        ]
-        self.deployments: list[dict] = []
-        self.configurations: list[dict] = []
-        self.requests: list[httpx.Request] = []
-        self.posted: list[tuple[str, dict]] = []
-        self.fail: dict[str, object] = {}
-        self.token_calls = 0
-        self.expires_in: object = 3600
-        self.token_seq = 0
-
-    def _fail(self, key, request):
-        rule = self.fail.get(key)
-        if rule is None:
-            return None
-        if isinstance(rule, BaseException):
-            raise rule
-        if callable(rule):
-            return rule(request)
-        return httpx.Response(rule, text=f"error {BODY_MARKER} {SECRET}")
-
-    async def handler(self, request: httpx.Request) -> httpx.Response:
-        # A real request suspends; without this two concurrent calls on a
-        # MockTransport would never interleave.
-        await asyncio.sleep(0)
-        self.requests.append(request)
-        if request.url.host == "auth.example.test":
-            self.token_calls += 1
-            failed = self._fail("token", request)
-            if failed is not None:
-                return failed
-            self.token_seq += 1
-            return httpx.Response(200, json={
-                "access_token": f"token-{self.token_seq}", "token_type": "bearer",
-                "expires_in": self.expires_in})
-        path = request.url.path
-        key = f"{request.method} {path}"
-        failed = self._fail(key, request)
-        if failed is not None:
-            return failed
-        if key == "GET /v2/lm/scenarios/foundation-models/models":
-            return httpx.Response(200, json={"count": len(self.models), "resources": self.models})
-        if key == "GET /v2/lm/scenarios/foundation-models/executables":
-            return httpx.Response(200, json={"resources": self.executables})
-        if key == "GET /v2/lm/deployments":
-            return self.page(self.deployments, request)
-        if key == "GET /v2/lm/configurations":
-            return self.page(self.configurations, request)
-        if key == "POST /v2/lm/configurations":
-            body = json.loads(request.content)
-            self.posted.append((path, body))
-            self.configurations.append({**body, "id": f"cfg-{len(self.configurations) + 1}"})
-            return httpx.Response(201, json={"id": self.configurations[-1]["id"],
-                                             "message": "ok"})
-        if key == "POST /v2/lm/deployments":
-            body = json.loads(request.content)
-            self.posted.append((path, body))
-            return httpx.Response(202, json={**self.add_deployment(body), "message": "ok"})
-        return httpx.Response(404, text=BODY_MARKER)
-
-    def add_deployment(self, body: dict) -> dict:
-        """What a create makes: a PENDING deployment whose details name no
-        model yet, only its configuration."""
-        config = next(c for c in self.configurations if c["id"] == body["configurationId"])
-        did = f"dnew{len(self.posted):08d}"
-        self.deployments.append({"id": did, "status": "PENDING", "configurationId": config["id"],
-                                 "configurationName": config["name"]})
-        return {"id": did, "status": "UNKNOWN"}
-
-    @staticmethod
-    def page(items: list, request: httpx.Request) -> httpx.Response:
-        top = int(request.url.params.get("$top", 10_000))
-        skip = int(request.url.params.get("$skip", 0))
-        return httpx.Response(200, json={"count": len(items), "resources": items[skip:skip + top]})
-
-    def api_requests(self):
-        return [r for r in self.requests if r.url.host == "api.example.test"]
-
-
-def _client(server: FakeAICore, **kw) -> AICoreDeployments:
-    kw.setdefault("credentials", _creds())
-    return AICoreDeployments(transport=httpx.MockTransport(server.handler), **kw)
 
 
 async def _refused(coro) -> AICoreError:
@@ -277,7 +167,7 @@ def test_a_loopback_http_url_is_accepted_for_local_work(monkeypatch):
 
 
 def test_credentials_repr_masks_everything_but_the_source():
-    text = repr(_creds()) + str(_creds())
+    text = repr(fake_creds()) + str(fake_creds())
     assert "test" in text
     _assert_clean(text)
     assert "example.test" not in text
@@ -306,7 +196,7 @@ def test_error_codes_are_a_closed_list_with_fixed_texts():
 async def test_token_is_fetched_with_client_credentials_and_cached_until_expiry():
     server = FakeAICore()
     now = [1000.0]
-    client = _client(server, clock=lambda: now[0])
+    client = client_for(server, clock=lambda: now[0])
     await client.list_models()
     await client.list_deployments()
     assert server.token_calls == 1
@@ -326,7 +216,7 @@ async def test_token_is_fetched_with_client_credentials_and_cached_until_expiry(
 
 async def test_concurrent_calls_on_a_fresh_client_fetch_one_token():
     server = FakeAICore()
-    client = _client(server)
+    client = client_for(server)
     await asyncio.gather(client.list_models(), client.list_deployments(), client.list_models())
     assert server.token_calls == 1
 
@@ -334,7 +224,7 @@ async def test_concurrent_calls_on_a_fresh_client_fetch_one_token():
 async def test_a_token_without_a_lifetime_is_used_once_and_not_cached():
     server = FakeAICore()
     server.expires_in = "soon"
-    client = _client(server)
+    client = client_for(server)
     await client.list_models()
     await client.list_models()
     assert server.token_calls == 2
@@ -343,8 +233,8 @@ async def test_a_token_without_a_lifetime_is_used_once_and_not_cached():
 async def test_the_resource_group_header_follows_the_client_or_the_environment(monkeypatch):
     monkeypatch.setenv("AICORE_RESOURCE_GROUP", "embed-rg")
     server = FakeAICore()
-    await _client(server).list_models()
-    await _client(server, group="pinned").list_models()
+    await client_for(server).list_models()
+    await client_for(server, group="pinned").list_models()
     groups = [r.headers["AI-Resource-Group"] for r in server.api_requests()]
     assert groups == ["embed-rg", "pinned"]
 
@@ -360,7 +250,7 @@ async def test_token_failure_is_token_failed_and_nothing_else_is_sent(caplog, fa
     server = FakeAICore()
     server.fail["token"] = failure
     with caplog.at_level(logging.DEBUG, logger=aid.__name__):
-        err = await _refused(_client(server).list_models())
+        err = await _refused(client_for(server).list_models())
     assert err.code == "token_failed"
     assert server.api_requests() == []
     _assert_clean(_own_log(caplog) + str(err))
@@ -375,10 +265,10 @@ async def test_a_401_from_ai_core_fetches_a_new_token_once():
         if len(seen) == 1:
             return httpx.Response(401, text=BODY_MARKER)
         return httpx.Response(200, json={"count": 1,
-                                         "resources": [_deployment("text-embedding-3-large")]})
+                                         "resources": [deployment_entry("text-embedding-3-large")]})
 
     server.fail["GET /v2/lm/deployments"] = once
-    out = await _client(server).list_deployments()
+    out = await client_for(server).list_deployments()
     assert seen == ["Bearer token-1", "Bearer token-2"]
     assert [d["model"] for d in out] == ["text-embedding-3-large"]
 
@@ -387,7 +277,7 @@ async def test_a_second_401_is_aicore_unavailable(caplog):
     server = FakeAICore()
     server.fail["GET /v2/lm/deployments"] = 401
     with caplog.at_level(logging.DEBUG, logger=aid.__name__):
-        err = await _refused(_client(server).list_deployments())
+        err = await _refused(client_for(server).list_deployments())
     assert err.code == "aicore_unavailable"
     assert server.token_calls == 2
     assert "401" in _own_log(caplog)
@@ -405,7 +295,7 @@ async def test_list_models_keeps_embedding_models_with_their_versions():
         {"model": "bad\nembedding-name", "versions": []},
         {"model": "text-embedding-3-small", "versions": "not a list"},
     ]
-    out = await _client(server).list_models()
+    out = await client_for(server).list_models()
     assert out == [
         {"model": "Gemini-Embedding-001", "versions": ["001"]},
         {"model": "text-embedding-3-large", "versions": ["1", "2"]},
@@ -419,10 +309,11 @@ async def test_list_models_keeps_embedding_models_with_their_versions():
 async def test_a_model_whose_name_says_embed_is_an_embedding_model():
     # Bedrock's and NVIDIA's names say "embed", not "embedding"
     server = FakeAICore()
-    server.models = [_model("gpt-4o"), _model("amazon--titan-embed-text", ("2",), "aws-bedrock")]
-    server.deployments = [_deployment("gpt-4o", "RUNNING", "d00000000g1"),
-                          _deployment("amazon--titan-embed-text", "RUNNING", "d00000000t1")]
-    client = _client(server)
+    server.models = [model_entry("gpt-4o"),
+                     model_entry("amazon--titan-embed-text", ("2",), "aws-bedrock")]
+    server.deployments = [deployment_entry("gpt-4o", "RUNNING", "d00000000g1"),
+                          deployment_entry("amazon--titan-embed-text", "RUNNING", "d00000000t1")]
+    client = client_for(server)
     assert await client.list_models() == [
         {"model": "amazon--titan-embed-text", "versions": ["2"]}]
     assert await client.list_deployments() == [
@@ -442,7 +333,7 @@ async def test_list_models_failure_is_aicore_unavailable_without_the_body(caplog
     server = FakeAICore()
     server.fail["GET /v2/lm/scenarios/foundation-models/models"] = failure
     with caplog.at_level(logging.DEBUG, logger=aid.__name__):
-        err = await _refused(_client(server).list_models())
+        err = await _refused(client_for(server).list_models())
     assert err.code == "aicore_unavailable"
     log = _own_log(caplog)
     assert log  # the failure is logged, by status or class
@@ -452,16 +343,16 @@ async def test_list_models_failure_is_aicore_unavailable_without_the_body(caplog
 async def test_an_answer_over_the_cap_is_refused(monkeypatch, caplog):
     monkeypatch.setattr(aid, "MAX_RESPONSE_BYTES", 1000)
     server = FakeAICore()
-    server.models = [_model(f"text-embedding-{i}") for i in range(50)]
+    server.models = [model_entry(f"text-embedding-{i}") for i in range(50)]
     with caplog.at_level(logging.DEBUG, logger=aid.__name__):
-        err = await _refused(_client(server).list_models())
+        err = await _refused(client_for(server).list_models())
     assert err.code == "aicore_unavailable"
     assert "large" in _own_log(caplog)
 
 
 async def test_requests_use_30_second_timeouts():
     server = FakeAICore()
-    await _client(server).list_models()
+    await client_for(server).list_models()
     assert aid.REQUEST_TIMEOUT_SECONDS == 30.0
     for request in server.requests:
         assert request.extensions["timeout"] == {
@@ -485,7 +376,7 @@ async def test_a_request_over_the_total_deadline_is_aicore_unavailable(monkeypat
             return await slow(request)
         return await inner(request)
 
-    client = AICoreDeployments(credentials=_creds(), transport=httpx.MockTransport(handler))
+    client = AICoreDeployments(credentials=fake_creds(), transport=httpx.MockTransport(handler))
     with caplog.at_level(logging.DEBUG, logger=aid.__name__):
         err = await _refused(client.list_models())
     assert err.code == "aicore_unavailable"
@@ -497,16 +388,16 @@ async def test_a_request_over_the_total_deadline_is_aicore_unavailable(monkeypat
 async def test_list_deployments_answers_embedding_deployments_only():
     server = FakeAICore()
     server.deployments = [
-        _deployment("gpt-4o", "RUNNING", "d00000000a1"),
-        _deployment("text-embedding-3-large", "RUNNING", "d00000000b2"),
-        _deployment("text-embedding-ada-002", "PENDING", "d00000000c3", style="modelName"),
-        _deployment("text-embedding-3-large", "STOPPED", "d00000000a0"),
-        _deployment("text-embedding-3-small", 7, "d00000000d4"),
+        deployment_entry("gpt-4o", "RUNNING", "d00000000a1"),
+        deployment_entry("text-embedding-3-large", "RUNNING", "d00000000b2"),
+        deployment_entry("text-embedding-ada-002", "PENDING", "d00000000c3", style="modelName"),
+        deployment_entry("text-embedding-3-large", "STOPPED", "d00000000a0"),
+        deployment_entry("text-embedding-3-small", 7, "d00000000d4"),
         {"id": "d00000000e5", "status": "RUNNING", "details": None},
         {"status": "RUNNING", "details": {"modelName": "text-embedding-3-large"}},
-        _deployment("text-embedding-3-large", "RUNNING", "bad id\n"),
+        deployment_entry("text-embedding-3-large", "RUNNING", "bad id\n"),
     ]
-    out = await _client(server).list_deployments()
+    out = await client_for(server).list_deployments()
     assert out == [
         {"model": "text-embedding-3-large", "status": "STOPPED", "deployment_id": "d00000000a0"},
         {"model": "text-embedding-3-large", "status": "RUNNING", "deployment_id": "d00000000b2"},
@@ -529,10 +420,10 @@ async def test_a_fresh_deployment_without_details_counts_under_its_configuration
         {"id": "d000000other", "status": "PENDING", "configurationName": "gpt-4o-embeddings"},
         {"id": "d000000plain", "status": "PENDING", "configurationName": "my-config"},
         # a model the details name wins over the configuration's name
-        {**_deployment("gpt-4o", "RUNNING", "d00000000gpt"),
+        {**deployment_entry("gpt-4o", "RUNNING", "d00000000gpt"),
          "configurationName": "text-embedding-3-large-embeddings"},
     ]
-    client = _client(server)
+    client = client_for(server)
     assert await client.list_deployments() == [
         {"model": "text-embedding-3-large", "status": "PENDING", "deployment_id": "d000000fresh"}]
     out = await client.deploy("text-embedding-3-large")
@@ -540,29 +431,70 @@ async def test_a_fresh_deployment_without_details_counts_under_its_configuration
     assert server.posted == []
 
 
-async def test_deployments_are_read_page_by_page_until_the_count():
-    # STOPPED and DEAD deployments pile up; the RUNNING one is on page two
+COUNT_MODES = ["total", "page", "absent"]
+
+
+def _stopped(ids):
+    return [deployment_entry("text-embedding-ada-002", "STOPPED", f"d{i:011d}") for i in ids]
+
+
+def _list_pages(server):
+    return [(r.url.params["$top"], r.url.params.get("$skip")) for r in server.api_requests()
+            if r.method == "GET" and r.url.path == "/v2/lm/deployments"]
+
+
+@pytest.mark.parametrize("count_mode", COUNT_MODES)
+async def test_deployments_are_read_page_by_page_until_a_short_page(count_mode):
+    # STOPPED and DEAD deployments pile up; the RUNNING one is on page two.
+    # With ``count`` as the page length, page one says 100 of 100: the list
+    # is read on all the same
     server = FakeAICore()
-    server.deployments = [_deployment("text-embedding-ada-002", "STOPPED", f"d{i:011d}")
-                          for i in range(130)]
-    server.deployments.append(_deployment("text-embedding-3-large", "RUNNING", "d0000running"))
-    client = _client(server)
+    server.count_mode = count_mode
+    server.deployments = _stopped(range(130))
+    server.deployments.append(deployment_entry("text-embedding-3-large", "RUNNING", "d0000running"))
+    client = client_for(server)
     assert len(await client.list_deployments()) == 131
     out = await client.deploy("text-embedding-3-large")
     assert out == {"deployment_id": "d0000running", "status": "RUNNING", "created": False}
     assert server.posted == []
-    pages = [r.url.params for r in server.api_requests() if r.url.path == "/v2/lm/deployments"]
-    assert [(p["$top"], p.get("$skip")) for p in pages] == [("100", None), ("100", "100")] * 2
-    assert all(p["scenarioId"] == "foundation-models" for p in pages)
+    assert _list_pages(server) == [("100", None), ("100", "100")] * 2
+    assert all(r.url.params["scenarioId"] == "foundation-models" for r in server.api_requests()
+               if r.url.path == "/v2/lm/deployments")
+
+
+@pytest.mark.parametrize("count_mode", COUNT_MODES)
+async def test_a_full_last_page_is_followed_by_one_more_read(count_mode):
+    # 200 entries are two full pages: only the empty third page ends the list
+    server = FakeAICore()
+    server.count_mode = count_mode
+    server.deployments = _stopped(range(199))
+    server.deployments.append(deployment_entry("text-embedding-3-large", "RUNNING", "d0000running"))
+    out = await client_for(server).deploy("text-embedding-3-large")
+    assert out == {"deployment_id": "d0000running", "status": "RUNNING", "created": False}
+    assert server.posted == []
+    assert _list_pages(server) == [("100", None), ("100", "100"), ("100", "200")]
+
+
+@pytest.mark.parametrize("count_mode", COUNT_MODES)
+async def test_an_empty_list_is_one_read_and_deploys(count_mode):
+    server = FakeAICore()
+    server.count_mode = count_mode
+    out = await client_for(server).deploy("text-embedding-3-large")
+    assert out["created"] is True
+    assert _list_pages(server) == [("100", None)]
 
 
 def _answer(count, resources):
     return httpx.Response(200, json={"count": count, "resources": resources})
 
 
-def _pages_ignoring_skip(request):
-    return _answer(150, [_deployment("text-embedding-ada-002", "STOPPED", f"d{i:011d}")
-                         for i in range(100)])
+def _answering(count, resources):
+    return lambda request: _answer(count, resources)
+
+
+def _pages_ignoring_skip():
+    # every read answers page one: page two repeats it
+    return _answering(150, _stopped(range(100)))
 
 
 def _pages_that_overlap():
@@ -572,43 +504,52 @@ def _pages_that_overlap():
 
     def answer(request):
         calls.append(1)
-        ids = range(100) if len(calls) == 1 else range(50, 100)
-        return _answer(150, [_deployment("text-embedding-ada-002", "STOPPED", f"d{i:011d}")
-                             for i in ids])
+        return _answer(150, _stopped(range(100) if len(calls) == 1 else range(50, 100)))
     return answer
 
 
 def _count_that_moves():
     # a deployment created between the two reads: page two states 151 while
-    # the two pages hold 150, so one entry on them is not the list's
+    # the two pages hold 150, so one entry of the list was not read
     calls = []
 
     def answer(request):
         calls.append(1)
-        ids = range(100) if len(calls) == 1 else range(100, 150)
-        return _answer(150 if len(calls) == 1 else 151,
-                       [_deployment("text-embedding-ada-002", "STOPPED", f"d{i:011d}")
-                        for i in ids])
+        if len(calls) == 1:
+            return _answer(150, _stopped(range(100)))
+        return _answer(151, _stopped(range(100, 150)))
     return answer
 
 
-@pytest.mark.parametrize("answer", [
+def _pages_short_of_the_count():
+    # a server whose pages are shorter than $top: the short first page ends
+    # the read, and only a total ``count`` tells that 80 entries are missing
+    def answer(request):
+        skip = int(request.url.params.get("$skip", 0))
+        return _answer(130, _stopped(range(skip, skip + 50)))
+    return answer
+
+
+# Factories: a stateful answer is built inside the test, never at collection.
+@pytest.mark.parametrize("make_answer", [
     _pages_ignoring_skip,
-    _pages_that_overlap(),
-    _count_that_moves(),
-    lambda request: httpx.Response(200, json={"resources": []}),
-    lambda request: _answer("3", []),
-    lambda request: _answer(True, []),
-    lambda request: _answer(5, []),  # an empty page before the count is reached
-    lambda request: _answer(0, [_deployment("text-embedding-3-large")]),
-], ids=["skip-ignored", "overlap", "count-moves", "no-count", "count-text", "count-bool",
-        "short", "more-than-count"])
-async def test_pages_that_do_not_add_up_are_aicore_unavailable_and_nothing_is_made(answer,
+    _pages_that_overlap,
+    _count_that_moves,
+    _pages_short_of_the_count,
+    lambda: _answering("3", []),
+    lambda: _answering(True, []),
+    lambda: _answering(-1, []),
+    lambda: _answering(5, []),  # an empty page before the count is reached
+    lambda: _answering(0, [deployment_entry("text-embedding-3-large")]),
+    lambda: lambda request: httpx.Response(200, json={"count": 1, "resources": "x"}),
+], ids=["skip-ignored", "overlap", "count-moves", "short-of-count", "count-text", "count-bool",
+        "count-negative", "empty-before-count", "more-than-count", "no-list"])
+async def test_pages_that_do_not_add_up_are_aicore_unavailable_and_nothing_is_made(make_answer,
                                                                                 caplog):
     server = FakeAICore()
-    server.fail["GET /v2/lm/deployments"] = answer
+    server.fail["GET /v2/lm/deployments"] = make_answer()
     with caplog.at_level(logging.DEBUG, logger=aid.__name__):
-        err = await _refused(_client(server).deploy("text-embedding-3-large"))
+        err = await _refused(client_for(server).deploy("text-embedding-3-large"))
     assert err.code == "aicore_unavailable"
     assert server.posted == []
     assert "deployment list failed" in _own_log(caplog)
@@ -619,9 +560,9 @@ async def test_more_pages_than_the_limit_are_refused(monkeypatch):
     monkeypatch.setattr(aid, "PAGE_SIZE", 2)
     monkeypatch.setattr(aid, "MAX_PAGES", 3)
     server = FakeAICore()
-    server.deployments = [_deployment("text-embedding-ada-002", "STOPPED", f"d{i:011d}")
+    server.deployments = [deployment_entry("text-embedding-ada-002", "STOPPED", f"d{i:011d}")
                           for i in range(7)]
-    err = await _refused(_client(server).list_deployments())
+    err = await _refused(client_for(server).list_deployments())
     assert err.code == "aicore_unavailable"
 
 
@@ -629,7 +570,7 @@ async def test_list_deployments_failure_is_aicore_unavailable(caplog):
     server = FakeAICore()
     server.fail["GET /v2/lm/deployments"] = 503
     with caplog.at_level(logging.DEBUG, logger=aid.__name__):
-        err = await _refused(_client(server).list_deployments())
+        err = await _refused(client_for(server).list_deployments())
     assert err.code == "aicore_unavailable"
     assert "503" in _own_log(caplog)
     _assert_clean(_own_log(caplog))
@@ -640,8 +581,8 @@ async def test_list_deployments_failure_is_aicore_unavailable(caplog):
 @pytest.mark.parametrize("status", ["RUNNING", "PENDING", "UNKNOWN"])
 async def test_deploy_answers_a_live_deployment_and_creates_nothing(status):
     server = FakeAICore()
-    server.deployments = [_deployment("text-embedding-3-large", status, "d000000live")]
-    out = await _client(server).deploy("text-embedding-3-large")
+    server.deployments = [deployment_entry("text-embedding-3-large", status, "d000000live")]
+    out = await client_for(server).deploy("text-embedding-3-large")
     assert out == {"deployment_id": "d000000live", "status": status, "created": False}
     assert server.posted == []
     assert all(r.method == "GET" for r in server.api_requests())
@@ -650,18 +591,18 @@ async def test_deploy_answers_a_live_deployment_and_creates_nothing(status):
 async def test_deploy_prefers_a_running_deployment_over_a_pending_one():
     server = FakeAICore()
     server.deployments = [
-        _deployment("text-embedding-3-large", "PENDING", "d00000pending"),
-        _deployment("text-embedding-3-large", "RUNNING", "d00000running"),
+        deployment_entry("text-embedding-3-large", "PENDING", "d00000pending"),
+        deployment_entry("text-embedding-3-large", "RUNNING", "d00000running"),
     ]
-    out = await _client(server).deploy("text-embedding-3-large")
+    out = await client_for(server).deploy("text-embedding-3-large")
     assert out["deployment_id"] == "d00000running"
 
 
 async def test_deploy_creates_the_configuration_and_the_deployment(caplog):
     server = FakeAICore()
-    server.deployments = [_deployment("text-embedding-3-large", "STOPPED", "d0000stopped")]
+    server.deployments = [deployment_entry("text-embedding-3-large", "STOPPED", "d0000stopped")]
     with caplog.at_level(logging.DEBUG, logger=aid.__name__):
-        out = await _client(server).deploy("text-embedding-3-large")
+        out = await client_for(server).deploy("text-embedding-3-large")
     assert out == {"deployment_id": "dnew00000002", "status": "UNKNOWN", "created": True}
     (cfg_path, cfg), (dep_path, dep) = server.posted
     assert cfg_path == "/v2/lm/configurations"
@@ -679,8 +620,8 @@ async def test_deploy_creates_the_configuration_and_the_deployment(caplog):
 
 async def test_deploy_binds_no_model_version_when_the_executable_declares_none():
     server = FakeAICore()
-    server.models.append(_model("amazon--titan-embedding-v2", executable="aws-bedrock"))
-    await _client(server).deploy("amazon--titan-embedding-v2")
+    server.models.append(model_entry("amazon--titan-embedding-v2", executable="aws-bedrock"))
+    await client_for(server).deploy("amazon--titan-embedding-v2")
     cfg = server.posted[0][1]
     assert cfg["executableId"] == "aws-bedrock"
     assert cfg["parameterBindings"] == [{"key": "modelName", "value": "amazon--titan-embedding-v2"}]
@@ -689,18 +630,18 @@ async def test_deploy_binds_no_model_version_when_the_executable_declares_none()
 async def test_deploy_takes_the_executable_whose_model_name_enum_lists_the_model():
     # the lookup of scripts/deploy_claude.py (find_executable_for_model) first
     server = FakeAICore()
-    server.models.append(_model("text-embedding-x", executable="azure-openai"))
+    server.models.append(model_entry("text-embedding-x", executable="azure-openai"))
     server.executables.append({"id": "special-exec", "parameters": [
         {"name": "modelName", "constraints": {"enum": ["text-embedding-x"]}}]})
-    await _client(server).deploy("text-embedding-x")
+    await client_for(server).deploy("text-embedding-x")
     assert server.posted[0][1]["executableId"] == "special-exec"
 
 
 async def test_deploy_without_an_executable_is_deploy_failed_and_creates_nothing(caplog):
     server = FakeAICore()
-    server.models.append(_model("text-embedding-orphan", executable="gone-exec"))
+    server.models.append(model_entry("text-embedding-orphan", executable="gone-exec"))
     with caplog.at_level(logging.DEBUG, logger=aid.__name__):
-        err = await _refused(_client(server).deploy("text-embedding-orphan"))
+        err = await _refused(client_for(server).deploy("text-embedding-orphan"))
     assert err.code == "deploy_failed"
     assert server.posted == []
     assert "executable" in _own_log(caplog)
@@ -710,14 +651,14 @@ async def test_deploy_without_an_executable_is_deploy_failed_and_creates_nothing
                                    "text-embedding-3-large\nINJECTED"])
 async def test_deploy_of_a_model_the_scenario_does_not_offer_is_model_unknown(model):
     server = FakeAICore()
-    err = await _refused(_client(server).deploy(model))
+    err = await _refused(client_for(server).deploy(model))
     assert err.code == "model_unknown"
     assert server.posted == []
 
 
 async def test_deploy_refuses_a_non_string_before_anything_is_sent():
     server = FakeAICore()
-    await _refused(_client(server).deploy(["text-embedding-3-large"]))
+    await _refused(client_for(server).deploy(["text-embedding-3-large"]))
     assert server.requests == []
 
 
@@ -725,7 +666,7 @@ async def test_a_refused_configuration_is_deploy_failed_and_no_deployment_is_mad
     server = FakeAICore()
     server.fail["POST /v2/lm/configurations"] = 400
     with caplog.at_level(logging.DEBUG, logger=aid.__name__):
-        err = await _refused(_client(server).deploy("text-embedding-3-large"))
+        err = await _refused(client_for(server).deploy("text-embedding-3-large"))
     assert err.code == "deploy_failed"
     assert not any(r.method == "POST" and r.url.path == "/v2/lm/deployments"
                    for r in server.requests)
@@ -739,7 +680,7 @@ async def test_a_failed_deployment_create_is_deploy_failed_and_never_repeated(ca
     server = FakeAICore()
     server.fail["POST /v2/lm/deployments"] = failure
     with caplog.at_level(logging.DEBUG, logger=aid.__name__):
-        err = await _refused(_client(server).deploy("text-embedding-3-large"))
+        err = await _refused(client_for(server).deploy("text-embedding-3-large"))
     assert err.code == "deploy_failed"
     creates = [r for r in server.requests
                if r.method == "POST" and r.url.path == "/v2/lm/deployments"]
@@ -750,7 +691,7 @@ async def test_a_failed_deployment_create_is_deploy_failed_and_never_repeated(ca
 async def test_a_retry_after_a_failed_deployment_create_reuses_the_configuration():
     server = FakeAICore()
     server.fail["POST /v2/lm/deployments"] = 500
-    client = _client(server)
+    client = client_for(server)
     assert (await _refused(client.deploy("text-embedding-3-large"))).code == "deploy_failed"
     del server.fail["POST /v2/lm/deployments"]
     out = await client.deploy("text-embedding-3-large")
@@ -764,6 +705,33 @@ async def test_a_retry_after_a_failed_deployment_create_reuses_the_configuration
                            if r.url.path == "/v2/lm/configurations" and r.method == "GET"]
     assert configuration_lists[0].url.params["scenarioId"] == "foundation-models"
     assert configuration_lists[0].url.params["$top"] == "100"
+
+
+@pytest.mark.parametrize("failure", [
+    503, lambda request: _answer(1, [{"id": "cfg-x"}, {"id": "cfg-x"}])])
+async def test_an_unreadable_configuration_list_makes_a_new_configuration(failure, caplog):
+    # a second configuration costs nothing; the deployment list, read in
+    # full before, is what keeps a model from being deployed (and billed) twice
+    server = FakeAICore()
+    server.fail["GET /v2/lm/configurations"] = failure
+    with caplog.at_level(logging.DEBUG, logger=aid.__name__):
+        out = await client_for(server).deploy("text-embedding-3-large")
+    assert out["created"] is True
+    assert [p for p, _ in server.posted] == ["/v2/lm/configurations", "/v2/lm/deployments"]
+    assert server.posted[1][1] == {"configurationId": "cfg-1"}
+    log = _own_log(caplog)
+    assert "configuration list failed" in log
+    assert "configuration list not read (aicore_unavailable)" in log
+    _assert_clean(log)
+
+
+async def test_a_failed_deployment_list_still_stops_the_deploy_before_any_configuration():
+    server = FakeAICore()
+    server.fail["GET /v2/lm/deployments"] = 503
+    err = await _refused(client_for(server).deploy("text-embedding-3-large"))
+    assert err.code == "aicore_unavailable"
+    assert server.posted == []
+    assert not any(r.url.path == "/v2/lm/configurations" for r in server.requests)
 
 
 @pytest.mark.parametrize("change", [
@@ -783,7 +751,7 @@ async def test_a_configuration_that_differs_is_not_reused(change):
         "parameterBindings": [{"key": "modelVersion", "value": "latest"},
                               {"key": "modelName", "value": "text-embedding-3-large"}],
         "inputArtifactBindings": [], **change}]
-    await _client(server).deploy("text-embedding-3-large")
+    await client_for(server).deploy("text-embedding-3-large")
     assert [p for p, _ in server.posted] == ["/v2/lm/configurations", "/v2/lm/deployments"]
     assert server.posted[1][1] == {"configurationId": "cfg-2"}
 
@@ -796,7 +764,7 @@ async def test_an_equal_configuration_is_reused_whatever_the_order_of_its_bindin
         "parameterBindings": [{"key": "modelVersion", "value": "latest"},
                               {"key": "modelName", "value": "text-embedding-3-large"}],
         "inputArtifactBindings": []}]
-    out = await _client(server).deploy("text-embedding-3-large")
+    out = await client_for(server).deploy("text-embedding-3-large")
     assert out["created"] is True
     assert server.posted == [("/v2/lm/deployments", {"configurationId": "cfg-old"})]
 
@@ -815,7 +783,7 @@ async def test_an_unconfirmed_create_that_was_made_is_answered_from_the_list(los
 
     server.fail["POST /v2/lm/deployments"] = made_but_lost
     with caplog.at_level(logging.DEBUG, logger=aid.__name__):
-        out = await _client(server).deploy("text-embedding-3-large")
+        out = await client_for(server).deploy("text-embedding-3-large")
     assert out["created"] is True and out["status"] == "PENDING"
     assert out["deployment_id"] == server.deployments[-1]["id"]
     creates = [r for r in server.requests
@@ -833,11 +801,11 @@ async def test_an_unconfirmed_create_whose_list_fails_is_deploy_failed():
         calls.append(1)
         if len(calls) > 1:
             return httpx.Response(503)
-        return FakeAICore.page(server.deployments, request)
+        return server.page(server.deployments, request)
 
     server.fail["GET /v2/lm/deployments"] = listing
     server.fail["POST /v2/lm/deployments"] = 500
-    err = await _refused(_client(server).deploy("text-embedding-3-large"))
+    err = await _refused(client_for(server).deploy("text-embedding-3-large"))
     assert err.code == "deploy_failed"
 
 
@@ -852,7 +820,7 @@ async def test_a_401_on_the_deployment_create_is_repeated_once_with_a_new_token(
         return httpx.Response(202, json=server.add_deployment(json.loads(request.content)))
 
     server.fail["POST /v2/lm/deployments"] = refused_once
-    out = await _client(server).deploy("text-embedding-3-large")
+    out = await client_for(server).deploy("text-embedding-3-large")
     assert out["created"] is True
     assert tokens == ["Bearer token-1", "Bearer token-2"]
 
@@ -861,7 +829,7 @@ async def test_a_second_401_on_the_deployment_create_is_deploy_failed(caplog):
     server = FakeAICore()
     server.fail["POST /v2/lm/deployments"] = 401
     with caplog.at_level(logging.DEBUG, logger=aid.__name__):
-        err = await _refused(_client(server).deploy("text-embedding-3-large"))
+        err = await _refused(client_for(server).deploy("text-embedding-3-large"))
     assert err.code == "deploy_failed"
     creates = [r for r in server.requests
                if r.method == "POST" and r.url.path == "/v2/lm/deployments"]
@@ -886,7 +854,7 @@ async def test_a_deployment_create_over_the_total_deadline_is_deploy_failed_and_
             return await slow(request)
         return await inner(request)
 
-    client = AICoreDeployments(credentials=_creds(), transport=httpx.MockTransport(handler))
+    client = AICoreDeployments(credentials=fake_creds(), transport=httpx.MockTransport(handler))
     with caplog.at_level(logging.DEBUG, logger=aid.__name__):
         err = await _refused(client.deploy("text-embedding-3-large"))
     assert err.code == "deploy_failed"
@@ -899,7 +867,7 @@ async def test_a_deployment_create_over_the_total_deadline_is_deploy_failed_and_
 async def test_a_listing_failure_during_deploy_is_aicore_unavailable_and_creates_nothing():
     server = FakeAICore()
     server.fail["GET /v2/lm/deployments"] = 500
-    err = await _refused(_client(server).deploy("text-embedding-3-large"))
+    err = await _refused(client_for(server).deploy("text-embedding-3-large"))
     assert err.code == "aicore_unavailable"
     assert server.posted == []
 
@@ -907,13 +875,13 @@ async def test_a_listing_failure_during_deploy_is_aicore_unavailable_and_creates
 async def test_a_token_failure_during_deploy_is_token_failed():
     server = FakeAICore()
     server.fail["token"] = 401
-    err = await _refused(_client(server).deploy("text-embedding-3-large"))
+    err = await _refused(client_for(server).deploy("text-embedding-3-large"))
     assert err.code == "token_failed"
 
 
 async def test_two_deploys_at_once_in_one_process_create_one_deployment():
     server = FakeAICore()
-    client = _client(server)
+    client = client_for(server)
     first, second = await asyncio.gather(client.deploy("text-embedding-3-large"),
                                          client.deploy("text-embedding-3-large"))
     assert sorted([first["created"], second["created"]]) == [False, True]
@@ -925,7 +893,7 @@ async def test_two_deploys_at_once_in_one_process_create_one_deployment():
 
 async def test_module_functions_use_one_default_client(monkeypatch):
     server = FakeAICore()
-    monkeypatch.setattr(aid, "_default", _client(server))
+    monkeypatch.setattr(aid, "_default", client_for(server))
     assert [m["model"] for m in await aid.list_models()][0] == "text-embedding-3-large"
     assert await aid.list_deployments() == []
     out = await aid.deploy("text-embedding-ada-002")

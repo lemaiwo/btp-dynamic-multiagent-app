@@ -32,16 +32,21 @@ RUNNING, PENDING or UNKNOWN deployment of the model is answered instead
 (``created: False``); a status that cannot be read counts as UNKNOWN, and a
 fresh deployment whose details do not name its model yet counts under the
 model its configuration is named after (``<model>-embeddings``, the name
-this module writes). The deployment list is read page by page and must add
-up to the ``count`` AI Core states, or nothing is created: a RUNNING
-deployment on a page that was not read would be deployed a second time. A
-create is sent once: the only repeat is after a 401, which AI Core answers
-before it processes anything. When a deployment create fails or its answer
-is lost, the list is read once more: a deployment of the model that has
-appeared is the one this call made and is answered (``created: True``);
-otherwise ``deploy_failed``. The configuration of such a failed create is
-not made again by the next call: a configuration of the same name,
-executable and bindings is reused.
+this module writes). The deployment list is read page by page to its end,
+or nothing is created: a RUNNING deployment on a page that was not read
+would be deployed a second time. The paging parameter names ``$top``/``$skip``
+and the meaning of ``count`` are unverified against a live AI Core; the loop
+therefore ends on an empty page (or one shorter than ``$top``), never on
+``count``. A create is sent once: the only repeat is after a 401, which AI
+Core answers before it processes anything. When a deployment create fails
+or its answer is lost, the list is read once more: a deployment of the
+model that has appeared is the one this call made and is answered
+(``created: True``); otherwise ``deploy_failed``. The configuration of such
+a failed create is not made again by the next call: a configuration of the
+same name, executable and bindings is reused. A configuration list that
+cannot be read does not stop the deploy (a second configuration costs
+nothing; the deployment list is the barrier against billing twice): a new
+one is made.
 
 Standard library and httpx only: no ``agents.*`` import, no database. The
 module functions share one :class:`AICoreDeployments` per process
@@ -485,16 +490,20 @@ class AICoreDeployments:
                         step: str, params: dict[str, str]) -> list[dict]:
         """Every entry of an AI API list, read in pages of ``PAGE_SIZE``.
 
-        Fails closed (``aicore_unavailable``): ``count``, a required field of
-        the list answer, must be the same on every page, the pages must add
-        up to it and no id may come twice. Otherwise the list moved while it
-        was read, or the server ignored ``$skip``, and an entry may be
-        missing: for the deployment list that is a RUNNING deployment that
-        ``deploy`` would create a second time.
+        The read ends on a page shorter than ``$top`` (an empty one
+        included), never on ``count``: if ``count`` is the length of the
+        page rather than of the list, page one says "100 of 100" and a
+        RUNNING deployment on page two would stay unseen (and be deployed,
+        and billed, a second time). ``count`` is a consistency check only,
+        valid in both meanings: when it is there it must be a number, at
+        least the entries of its page, and at most the entries read in all.
+        Fails closed (``aicore_unavailable``) when it is not, when an id
+        comes twice (the server ignored ``$skip``, or the list moved while
+        it was read) and after ``MAX_PAGES`` pages.
         """
         entries: list[dict] = []
         seen: set[str] = set()
-        total: int | None = None
+        stated = 0  # the largest count a page gave
         received = 0
         for _ in range(MAX_PAGES):
             page_params: dict[str, Any] = {**params, "$top": PAGE_SIZE}
@@ -503,13 +512,14 @@ class AICoreDeployments:
             data = await self._call(http, creds, "GET", path, step=step,
                                     code="aicore_unavailable", params=page_params)
             count, resources = data.get("count"), data.get("resources")
-            if (not isinstance(count, int) or isinstance(count, bool) or count < 0
-                    or not isinstance(resources, list)):
-                raise _incomplete(step, "no count or no resources list in the answer")
-            if total is None:
-                total = count
-            elif count != total:
-                raise _incomplete(step, "the list changed while it was read")
+            if not isinstance(resources, list):
+                raise _incomplete(step, "no resources list in the answer")
+            if count is not None:
+                if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+                    raise _incomplete(step, "the count is not a number")
+                if count < len(resources):
+                    raise _incomplete(step, "more entries than the count")
+                stated = max(stated, count)
             received += len(resources)
             for entry in resources:
                 if not isinstance(entry, dict):
@@ -520,12 +530,10 @@ class AICoreDeployments:
                         raise _incomplete(step, "an entry came on two pages")
                     seen.add(key)
                 entries.append(entry)
-            if received > total:
-                raise _incomplete(step, "more entries than the count")
-            if received == total:
+            if len(resources) < PAGE_SIZE:
+                if received < stated:
+                    raise _incomplete(step, "fewer entries than the count")
                 return entries
-            if not resources:
-                raise _incomplete(step, "the pages do not add up to the count")
         raise _incomplete(step, f"more than {MAX_PAGES} pages")
 
     async def _deployments(self, http: httpx.AsyncClient,
@@ -563,11 +571,20 @@ class AICoreDeployments:
     async def _configuration_id(self, http: httpx.AsyncClient, creds: AICoreCredentials,
                                 model: str, executable: dict) -> str:
         """The id of the configuration to deploy: one of the same name,
-        executable and bindings that a failed deploy left, else a new one."""
+        executable and bindings that a failed deploy left, else a new one.
+        A list that cannot be read means a new one: a second configuration
+        costs nothing, and the deployment list (read in full before this) is
+        what keeps a model from being deployed twice."""
         wanted = _configuration(model, executable)
-        for entry in await self._list_all(http, creds, "/lm/configurations",
-                                          step="configuration list",
-                                          params={"scenarioId": SCENARIO_ID}):
+        try:
+            existing = await self._list_all(http, creds, "/lm/configurations",
+                                            step="configuration list",
+                                            params={"scenarioId": SCENARIO_ID})
+        except AICoreError as failed:
+            logger.warning("AI Core: configuration list not read (%s); a new configuration "
+                           "is made", failed.code)
+            existing = []
+        for entry in existing:
             if _same_configuration(entry, wanted):
                 logger.info("AI Core: configuration %s of %s reused", entry["id"], model)
                 return entry["id"]
