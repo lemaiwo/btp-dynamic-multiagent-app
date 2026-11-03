@@ -1388,11 +1388,65 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   OData or InA entry (`_reload_for_changed_entry`), after a bundle import, and in the
   background at startup (`app.py`; a full rebuild first drops sources no enabled agent
   names, `wanted_ina_queries` for InA); failures are logged, never a 500 of the
-  save. `embeddings.py`: `AICORE_EMBEDDING_MODEL`, else `text-embedding-3-large` when
-  deployed, else the first deployed model named `*embedding*`, else none (lexical
-  ranking); through `gen_ai_hub`'s `AsyncOpenAI(proxy_client=...).embeddings`; only
-  names, labels, purpose, synonyms and examples are embedded, never data;
-  `DATA_CATALOG_EMBEDDINGS=0` switches it off (the test suite sets it). `search.py`
+  save. `embeddings.py` (design addendum l): **the setting** is two columns of the
+  orchestrator row, `orchestrator_config.embeddings_enabled` (`Integer`, NOT NULL,
+  `server_default "1"`; only a stored 0 is off) and `embedding_model` (`String(128)`,
+  nullable, `NULL` = automatic; `EMBEDDING_MODEL_RE`), HANA schema generation 10, read
+  and written by `get_embedding_setting` / `set_embedding_setting` in `agents/db.py`
+  (the last gate: `enabled` a real `bool`, `model` `None` or a model name; a refusal
+  names the field, never the value; the caches are reset after the commit).
+  **Resolution order** (`resolve_model_detail()` -> `(model, source)`, `source`
+  setting|env|discovery|none; `resolve_model()` is its first half):
+  `DATA_CATALOG_EMBEDDINGS=0` -> none (the test suite sets it; the emergency switch);
+  the setting unreadable (logged by class, not cached: fail closed) or switched off ->
+  none; an admin model -> that model while gen_ai_hub discovery lists a RUNNING
+  deployment of it, else `(None, "setting")`, no fallback and nothing embedded; else
+  `AICORE_EMBEDDING_MODEL` (no deployment check); else discovery
+  (`text-embedding-3-large`, else the first deployed name holding `embed`,
+  case-insensitive); else none (lexical ranking). Two caches per process, the setting
+  row and the discovered deployments, 10 minutes each (an empty or failed discovery
+  60 s, `EMPTY_CACHE_SECONDS`), reset by a save (`reset_caches`; an epoch keeps a read
+  that a save overtook out of the cache); another app instance sees a save after its
+  own 10 minutes, and a deploy resets neither, so Automatic takes up a new RUNNING
+  deployment after at most 10 minutes or at the next save. Embedding goes through
+  `gen_ai_hub`'s `AsyncOpenAI(proxy_client=...).embeddings`; only names, labels,
+  purpose, synonyms and examples of `EMBEDDED_KINDS` (source, entity, function, query)
+  are embedded, never data and never fields. `refresh_vectors(db, scope=, model=,
+  on_progress=, strict=)` embeds what is stale (`_changed`: no vector of the model or
+  an old text hash) in batches of 64 and writes in one transaction at the end (a run
+  that fails at batch n keeps nothing of it); a refresh of ALL nodes that did not
+  fail also deletes the vectors of every other model (the startup rebuild too).
+  **`embedding_routes.py`** (`/admin/api/data-catalog/embeddings`, included by
+  `agents/admin.py` after the catalogue router, every route `require_admin`, raw JSON
+  <= 4 KB through `routes._json_body`, registered on the bare prefix: no trailing
+  slash): `GET` the status (`setting`, `effective_model`, `source`, `env_override`,
+  `deployed` (embedding deployments in any status, from `agents/aicore_deployments.py`,
+  while `effective_model` comes from gen_ai_hub discovery: two views, two caches),
+  `available` (offered models without a RUNNING, PENDING or UNKNOWN deployment),
+  `nodes`, `vectors` (of the effective model), `stale`, `running`, `progress`,
+  `last_run`, plus `resource_group` and `aicore_error` (a code: AI Core unreadable
+  still answers 200 with both lists empty); the two AI Core lists are cached 10 s, and
+  only an answer of both); `PUT` `{enabled, model}` (both required, `enabled` strictly
+  boolean, `model` 1..128 characters or `null`; a model must be in `list_deployments()`,
+  read fresh, any status, else 422 `model: not a deployed embedding model`; AI Core
+  unreachable with a model: 502) answers the status; `POST /run` (no body or `{}`) 202
+  `{running: true}`, 409 while a run is in flight or when no model is in effect;
+  `POST /deploy` `{model}`: the name is checked (`EMBEDDING_MODEL_RE`) and must be
+  offered by `list_models()` (else 422 `model: not an embedding model AI Core offers`,
+  nothing logged), then ONE WARNING `AI Core deployment of <model> requested by
+  <principal> in resource group <rg>` (it bills), then `deploy(model)` in its own task,
+  awaited through `asyncio.shield` for at most 150 s (`DEPLOY_WAIT_SECONDS`; a client
+  that goes away does not cancel it); 202 `{deployment_id, status, created}`,
+  idempotent (a live deployment of the model is answered, nothing created);
+  `model_unknown` is a 422, every other failure a 502 with a fixed text and the code
+  (`aicore_unavailable`, `token_failed`, `deploy_failed`) in `X-Embeddings-Error`; the
+  lists cache is dropped after every deploy. No undeploy route (an ops step in AI
+  Core). **`embedding_run.py`**: one run per process (`start` is a synchronous
+  check-and-set; the task is created in the request context), `progress` `{done,
+  total}` per batch and `last_run` `{started_at, finished_at, model, embedded,
+  error_class}` in memory (gone at a restart, not shared between instances), cancelled
+  at shutdown (`cancel_all` in the lifespan: `finished_at` null, `error_class`
+  `CancelledError`). `search.py`
   `find_sources(question, allowed_sources, tier, scope_tier, k=5)` filters to the
   allowed sources BEFORE scoring (no leak of unattached sources through ranking or
   empty results; an edge to a node outside the scope is dropped; `CANDIDATE_KINDS`
@@ -1427,7 +1481,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   (label, purpose, not_for, synonyms ≤ 50, examples ≤ 20, readable; `_planned` reads
   the registration of any kind, so a narrowed node is widened back at most to what it
   allows, and refused once the registration is gone), `POST /search` ({question,
-  agent?} → candidates, `scope` agent|all), `GET /graph?agent=&kind=&q=` (`kind` one
+  agent?} → candidates, `scope` agent|all, `mode` vector|lexical: `find_sources_detail`
+  answers `(candidates, mode)`, `vector` when the question was embedded and at least
+  one candidate had a vector of the effective model; the agents' tool keeps
+  `find_sources`), `GET /graph?agent=&kind=&q=` (`kind` one
   node kind or several comma-separated, applied before the cap; ≤ 2,000 nodes,
   `contains` edges, `truncated`; every edge `curated: bool`), `POST /rebuild`
   ({source?} → counts; 503 on failure), **`POST /edges`** (201; `{from_id, to_id,
@@ -1444,12 +1501,71 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   admin area "Data catalogue" (list with a kind filter, detail per kind with inline
   hints, the Links panel and test search, graph on
   `sap.suite.ui.commons.networkgraph` with a 2D/3D toggle, opening with every node kind
-  but `field`: `DEFAULT_GRAPH_KINDS` in `model/dataCatalog.ts`; see `ui5-admin/`).
+  but `field`: `DEFAULT_GRAPH_KINDS` in `model/dataCatalog.ts`; the embeddings panel
+  on the Settings page; see `ui5-admin/`).
   `tests/test_data_catalog.py`, `tests/test_data_catalog_kinds.py` (generic and InA
   import, the routes per kind, the edge routes), `tests/test_data_catalog_links.py`
   (kind flip, look-alike names, SAP's generic naming for rules (a) and (b) against the
-  recorded `$metadata`, cross-kind scope, curated edges against re-imports).
-  Embeddings never run against a real AI Core yet
+  recorded `$metadata`, cross-kind scope, curated edges against re-imports),
+  `tests/test_data_catalog_embeddings.py` (the setting, the resolution order, the
+  caches), `tests/test_data_catalog_embedding_routes.py` (the four routes, the run,
+  the deploy, `mode`). Embeddings and the panel's AI Core calls have never run
+  against a real AI Core yet
+- `agents/aicore_deployments.py` — the SAP AI Core deployments client of the
+  embeddings panel (design addendum l), standard library plus httpx only, no
+  `agents.*` import (pinned by a test): `list_models()` (`GET
+  /lm/scenarios/foundation-models/models`: `[{model, versions}]`, names holding
+  `embed`, case-insensitive), `list_deployments()` (`GET /lm/deployments?scenarioId=`:
+  `[{model, status, deployment_id}]` of the resource group in any status; the model
+  from `details.resources.backend_details.model.name` or `modelName`, else from a
+  `configurationName` of `<model>-embeddings` (`CONFIGURATION_SUFFIX`: a deployment
+  just created names no model yet; a model the details do name wins); a status that
+  cannot be read is `UNKNOWN`) and `deploy(model)` (it bills). Resource group
+  `AICORE_RESOURCE_GROUP` (blank = `default`). **Credentials from ONE source, in
+  gen_ai_hub's order**: `AICORE_CLIENT_ID` / `_CLIENT_SECRET` / `_AUTH_URL` /
+  `_BASE_URL` when any of the four is set (then all four; the log names the missing
+  variable names), else the `aicore` binding of `VCAP_SERVICES` (by label:
+  `clientid`, `clientsecret`, `url`, `serviceurls.AI_API_URL`); never mixed, https
+  only (http on loopback), no userinfo, query or fragment; a set
+  `AICORE_SERVICE_KEY` is refused (`aicore_unavailable`, the log names the
+  variable); an x509 binding and the SDK's config-file profiles are not read. On CF
+  only the binding is there (`mta.yaml` sets no `AICORE_*` credential). Token by
+  client credentials, cached until `expires_in` minus 60 s, fetched once at a time; a
+  token AI Core answered 401 to is not handed out again. **Lists are paged and fail
+  closed**: `/lm/deployments` and `/lm/configurations` are read in pages of
+  `$top=100` / `$skip=n`, at most `MAX_PAGES` (100); a `count` that is missing or no
+  integer, a `count` that moves, an id twice, more entries than the count, an empty
+  page before it or too many pages is `aicore_unavailable`, and nothing is created.
+  **Unverified**: the names of the paging parameters (`ai_api_client_sdk` sends
+  `top` / `skip` for these endpoints, `ai_core_sdk` `$top` / `$skip`; an AI Core that
+  ignores ours answers its default page, read as complete only when it holds `count`
+  entries, refused otherwise; check on the first landscape with more than 100
+  deployments); `$count=true` is not sent. **`deploy` is idempotent**, under a
+  per-process lock (two deploys take turns; ONE app instance assumed): a RUNNING,
+  PENDING or UNKNOWN deployment of the model is answered (`created: false`, RUNNING
+  preferred); a model that is not offered is `model_unknown` before anything is
+  created; the executable is the one whose `modelName` enum lists the model (the rule
+  of `scripts/deploy_claude.py`), else the model list's `executableId`, else
+  `deploy_failed`; a configuration of the same name (`<model>-embeddings`),
+  executable and scenario, with equal parameter bindings (any order) and no input
+  artifacts, is reused, otherwise one is posted (`modelVersion: latest` is bound only
+  when the executable declares that parameter: unverified); then `POST
+  /lm/deployments`. Every POST is sent once (only a 401 is repeated, with a new
+  token); a deployment create whose outcome is unknown (5xx, timeout, no id, a second
+  401) re-reads the list once under the lock and answers a live deployment found
+  there as `created: true`, with one WARNING. 30 s per request (httpx plus an
+  `asyncio.timeout`; `expired()` tells ours from the callee's), no redirect followed,
+  the body of an error status never read, answers streamed up to 8 MB, values from AI
+  Core kept only in identifier form (the UI and the route's WARNING show them).
+  `AICoreError(code)` with a fixed `.message`; the codes: `aicore_unavailable` (no or
+  unusable credentials, any failed or odd read), `token_failed`, `model_unknown`,
+  `deploy_failed`. A log line names the step and the status or exception class,
+  never a body, a URL, a token or a credential (httpx's own INFO request line, which
+  names the AI API host, is held back by `app.py` raising the `httpx` logger to
+  WARNING). `default_client()` is the per-process client that holds the token (a
+  FastAPI `Depends`), `reset()` is for tests. Never run against a real AI Core
+  (`tests/test_aicore_deployments.py`, on `httpx.MockTransport`). 676 lines: the
+  credential resolution is the split candidate (`agents/aicore_credentials.py`)
 - `agents/jira_tools.py` — in-process Jira tools over REST v2
   (`builtin:jira`), reached through a destination. JQL is built server-side
   from pinned `project`/`status` and a `lookback` ceiling; issues this
@@ -2692,7 +2808,33 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     node, the draw list; QUnit on a recording fake 2D context) and the
     controller only sizes the canvas and wires drag (rotate), wheel (zoom),
     hover and click (opens the source's detail), with a slow auto-rotation
-    until the first drag
+    until the first drag. The detail's Test search shows the answer's `mode`
+    ("Ranked by vectors" / "Ranked by words")
+  - Data catalogue embeddings (design addendum l): a panel on the Settings page
+    after "LLM model" (`embeddingsPanel` in `view/Settings.view.xml`, its logic
+    in `controller/settings/Embeddings.ts` over the pure
+    `model/embeddingsSettings.ts`, types in `service/dataCatalogTypes.ts`,
+    `AdminService.getEmbeddings` / `setEmbeddings` / `runEmbeddings` /
+    `deployEmbeddingModel` on the bare `data-catalog/embeddings`): status lines
+    (Effective model and where it comes from, Vectors n of m nodes, Stale, Last
+    run), a strip when `AICORE_EMBEDDING_MODEL` is set ("in effect" only when the
+    source is `env`; a model chosen here wins over it), a Switch "Use
+    embeddings", a Select "Model" (Automatic under the key `__automatic__`, as a
+    `Select` reads "" as no selection; each deployed embedding model once with
+    its status; a saved model no longer deployed stays, marked "(not
+    deployed)"), Save (a GET first: a setting changed elsewhere meanwhile is
+    shown and not overwritten; then the PUT with both keys; a 422 at `model`
+    marks the Select), "Compute embeddings now" (202, then the status polled
+    every 2 s ONLY while `running` and the page is shown, 10 s after a failed
+    poll; leaving the page stops it, coming back reads the status and resumes;
+    a toast with the count or the error class when the run ends) and "Deploy an
+    embedding model…" (`fragment/EmbeddingsDeployDialog`: the `available`
+    models, then a confirmation with Cancel focused that names the model, the
+    resource group and that AI Core bills for it as long as it runs; after the
+    202 the status shows the PENDING deployment). No undeploy (an ops step in
+    AI Core). `test/unit/embeddingsSettings.qunit.ts`,
+    `test/integration/FakeEmbeddings.ts` (a scripted run and deploy),
+    `EmbeddingsJourney.ts`
   - OPA convention: a `Select` is driven by `setSelectedKey` plus
     `fireChange` on the control (a `MultiComboBox` by `setSelectedKeys`),
     never by opening its picker: a picker opened by one journey was destroyed
@@ -2819,7 +2961,18 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   variable or role; the 3D overview of the catalogue graph. Unverified on a landscape: the
   InA data read (recorded and synthetic shapes only, no SIA query was named for this
   release) and the generic kind (run locally only, against the recorded `$metadata` of
-  A4H's `ZAGENT_DATA_SRV`: A4H is not reachable from BTP)
+  A4H's `ZAGENT_DATA_SRV`: A4H is not reachable from BTP); 2.36.0 lets an admin switch
+  the catalogue's embeddings on, compute the vectors and deploy an embedding model in
+  AI Core from the UI5 admin's Settings page (design addendum l:
+  `agents/data_catalog/embedding_routes.py`, `embedding_run.py`,
+  `agents/aicore_deployments.py`): `orchestrator_config.embeddings_enabled` /
+  `embedding_model`, HANA schema generation 10 (two columns added to the table in
+  place by the HDI deploy, nothing undeployed, no `HANA_HDI_ALLOW_DROP`); no new
+  resource, environment variable or role (the AI Core calls use the app's `aicore`
+  binding and `AICORE_RESOURCE_GROUP`); a deployment requested from the UI bills and
+  is logged as one WARNING naming the principal and the resource group; no undeploy
+  from the UI. Unverified on a landscape: every AI Core call of the panel (the lists,
+  the names of the paging parameters, the deploy) and the embedding itself
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets
