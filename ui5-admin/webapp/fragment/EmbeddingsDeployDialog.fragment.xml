@@ -11,7 +11,7 @@
                 id="embDeployList"
                 mode="SingleSelectMaster"
                 items="{ path: 'emb>/deploy/options', templateShareable: false }"
-                noDataText="{i18n>embDeployNoOffers}"
+                noDataText="{emb>/deploy/noData}"
                 ariaLabelledBy="embDeployHintText"
                 selectionChange=".onDeployPick"
                 class="sapUiSmallMarginTop">

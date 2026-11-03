@@ -11,6 +11,11 @@ export const MODEL_NOT_OFFERED = "model: not an embedding model AI Core offers";
 export const RUN_IN_FLIGHT = "An embedding run is already in progress";
 export const NO_MODEL = "No embedding model is in effect";
 const NOT_AN_OBJECT = "body: expected a JSON object";
+/** `ERROR_MESSAGES["aicore_unavailable"]` of agents/aicore_deployments.py: the route's 502 when AI Core cannot be read. */
+export const AICORE_UNAVAILABLE = "SAP AI Core could not be reached or did not answer as expected.";
+const ERROR_HEADER = "X-Embeddings-Error";
+/** `LIVE_STATUSES` of agents/aicore_deployments.py: a model with one of these is not offered again. */
+const LIVE_STATUSES = ["RUNNING", "PENDING", "UNKNOWN"];
 
 /** `LOC_FIELD_RE` of agents/loc_fields.py: a key that may be repeated in a refusal. */
 const LOC_FIELD_RE = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
@@ -30,12 +35,16 @@ function isObject(value: unknown): value is Body {
  * with it, one finished run. AI Core offers `text-embedding-3-large` and
  * `text-embedding-ada-002` as well.
  *
- * Scripted: a run answers `running` to the next two `GET`s (progress a
- * third, then two thirds) and is done at the third, with every node
+ * Scripted: a run answers `running` to the next two `GET`s (progress
+ * `{0, 0}` as the real run before it has counted, then half) and is done
+ * at the third, with every node
  * embedded by the model in effect (the vectors of another model are
  * dropped); `runFails` makes it end with that error class instead and
- * keeps the vectors. A deploy answers `PENDING` and stays so until
- * `startDeployments()`.
+ * keeps the vectors. A deploy answers `PENDING` (`created: true`) and stays
+ * so until `startDeployments()`. `aicoreError` answers the status as the
+ * route does when AI Core cannot be read: `deployed` and `available`
+ * empty, the code in `aicore_error`; a check against AI Core (the PUT of a
+ * model, a deploy) is then a 502.
  */
 export default class FakeEmbeddings {
 
@@ -54,7 +63,11 @@ export default class FakeEmbeddings {
     public resourceGroup = "rg-agents";
     /** An error class: the next run ends failed with it. */
     public runFails: string | null = null;
-    private run: { model: string; total: number; done: number; pollsLeft: number; startedAt: string } | null = null;
+    /** A code (`aicore_unavailable`, ...): AI Core cannot be read. */
+    public aicoreError: string | null = null;
+    private run: {
+        model: string; total: number; done: number; counted: number; pollsLeft: number; startedAt: string;
+    } | null = null;
     private stamp = 0;
     private nextId = 2;
 
@@ -78,6 +91,7 @@ export default class FakeEmbeddings {
         };
         this.resourceGroup = "rg-agents";
         this.runFails = null;
+        this.aicoreError = null;
         this.run = null;
     }
 
@@ -95,8 +109,13 @@ export default class FakeEmbeddings {
         return new Date(this.stamp).toISOString().replace(".000Z", "+00:00");
     }
 
+    /** What AI Core lists; nothing while it cannot be read. */
+    private listed(): EmbeddingDeployment[] {
+        return this.aicoreError ? [] : this.deployments;
+    }
+
     private isRunning(model: string): boolean {
-        return this.deployments.some((deployment) => deployment.model === model && deployment.status === "RUNNING");
+        return this.listed().some((deployment) => deployment.model === model && deployment.status === "RUNNING");
     }
 
     /** `resolve_model`: the landscape switch, the setting's switch, the
@@ -112,7 +131,7 @@ export default class FakeEmbeddings {
             return { model: this.envModel, source: "env" };
         }
         const found = this.isRunning("text-embedding-3-large") ? "text-embedding-3-large"
-            : this.deployments.filter((d) => d.status === "RUNNING" && d.model.indexOf("embedding") !== -1)
+            : this.listed().filter((d) => d.status === "RUNNING" && d.model.indexOf("embedding") !== -1)
                 .map((d) => d.model)[0];
         return found ? { model: found, source: "discovery" } : { model: null, source: "none" };
     }
@@ -120,15 +139,16 @@ export default class FakeEmbeddings {
     private status(): EmbeddingsStatus {
         const { model, source } = this.resolve();
         const vectors = model && this.vectors && this.vectors.model === model ? this.vectors.count : 0;
-        const deployed = this.deployments.map((d) => d.model);
+        const live = this.listed().filter((d) => LIVE_STATUSES.indexOf(d.status) !== -1).map((d) => d.model);
         return {
             setting: { ...this.setting }, effective_model: model, source, env_override: this.envModel !== null,
-            deployed: this.deployments.map((d) => ({ ...d })),
-            available: this.offers.filter((offer) => deployed.indexOf(offer.model) === -1)
+            deployed: this.listed().map((d) => ({ ...d })),
+            available: this.aicoreError ? [] : this.offers.filter((offer) => live.indexOf(offer.model) === -1)
                 .map((offer) => ({ model: offer.model, versions: offer.versions.slice() })),
             nodes: this.nodes, vectors, stale: this.nodes - vectors, running: this.run !== null,
-            progress: this.run ? { done: this.run.done, total: this.run.total } : null,
-            last_run: this.lastRun ? { ...this.lastRun } : null, resource_group: this.resourceGroup
+            progress: this.run ? { done: this.run.done, total: this.run.counted } : null,
+            last_run: this.lastRun ? { ...this.lastRun } : null, resource_group: this.resourceGroup,
+            aicore_error: this.aicoreError
         };
     }
 
@@ -140,7 +160,9 @@ export default class FakeEmbeddings {
         }
         if (run.pollsLeft > 0) {
             run.pollsLeft -= 1;
-            run.done = Math.floor(run.total * (2 - run.pollsLeft) / 3);
+            // The first answer: not counted yet; the second: half way.
+            run.counted = run.pollsLeft === 1 ? 0 : run.total;
+            run.done = run.pollsLeft === 1 ? 0 : Math.floor(run.total / 2);
             return;
         }
         this.run = null;
@@ -183,6 +205,11 @@ export default class FakeEmbeddings {
             : json({ detail: "Not Found" }, 404);
     }
 
+    /** The route's answer when AI Core cannot be read for a check. */
+    private unavailable(json: Json): Promise<Response> {
+        return json({ detail: AICORE_UNAVAILABLE }, 502, { [ERROR_HEADER]: this.aicoreError ?? "aicore_unavailable" });
+    }
+
     private static loc(key: string): string {
         return LOC_FIELD_RE.test(key) ? key : "<unknown field>";
     }
@@ -213,6 +240,9 @@ export default class FakeEmbeddings {
             return json({ detail: problems.join("; ") }, 422);
         }
         const model = body.model as string | null;
+        if (model !== null && this.aicoreError) {
+            return this.unavailable(json);
+        }
         if (model !== null && !this.deployments.some((deployment) => deployment.model === model)) {
             return json({ detail: MODEL_NOT_DEPLOYED }, 422);
         }
@@ -226,14 +256,16 @@ export default class FakeEmbeddings {
         }
         const { model } = this.resolve();
         if (!model) {
-            return json({ detail: NO_MODEL }, 409);
+            return json({ detail: NO_MODEL }, 409, { [ERROR_HEADER]: "no_model" });
         }
         const vectors = this.vectors && this.vectors.model === model ? this.vectors.count : 0;
-        this.run = { model, total: this.nodes - vectors, done: 0, pollsLeft: 2, startedAt: this.nextStamp() };
+        this.run = {
+            model, total: this.nodes - vectors, done: 0, counted: 0, pollsLeft: 2, startedAt: this.nextStamp()
+        };
         return json({ running: true }, 202);
     }
 
-    /** Idempotent: a RUNNING or PENDING deployment of the model is answered and nothing is made. */
+    /** Idempotent: a live (RUNNING, PENDING, UNKNOWN) deployment of the model is answered and nothing is made. */
     private deploy(body: unknown, json: Json): Promise<Response> {
         if (!isObject(body)) {
             return json({ detail: NOT_AN_OBJECT }, 422);
@@ -245,16 +277,19 @@ export default class FakeEmbeddings {
             return json({ detail: problems.join("; ") }, 422);
         }
         const model = body.model as string;
+        if (this.aicoreError) {
+            return this.unavailable(json);
+        }
         const existing = this.deployments.filter((deployment) => deployment.model === model
-            && (deployment.status === "RUNNING" || deployment.status === "PENDING"))[0];
+            && LIVE_STATUSES.indexOf(deployment.status) !== -1)[0];
         if (existing) {
-            return json({ deployment_id: existing.deployment_id, status: existing.status }, 202);
+            return json({ deployment_id: existing.deployment_id, status: existing.status, created: false }, 202);
         }
         if (!this.offers.some((offer) => offer.model === model)) {
             return json({ detail: MODEL_NOT_OFFERED }, 422);
         }
         const created: EmbeddingDeployment = { model, status: "PENDING", deployment_id: `d-emb-${this.nextId++}` };
         this.deployments.push(created);
-        return json({ deployment_id: created.deployment_id, status: created.status }, 202);
+        return json({ deployment_id: created.deployment_id, status: created.status, created: true }, 202);
     }
 }

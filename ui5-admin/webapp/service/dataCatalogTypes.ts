@@ -238,10 +238,13 @@ export interface EmbeddingsStatus {
     running: boolean;
     progress: { done: number; total: number } | null;
     last_run: EmbeddingRun | null;
-    /** The AI Core resource group a deployment is made in. Not in the
-     *  status shape of the design's point 2, which the deploy confirmation
-     *  needs; read when the server sends it. */
-    resource_group?: string;
+    /** The AI Core resource group a deployment is made in (the deploy
+     *  confirmation names it). */
+    resource_group: string;
+    /** The code when AI Core could not be read (`aicore_unavailable`,
+     *  `token_failed`, ...): the rest is answered all the same, with
+     *  `deployed` and `available` empty, so the deployment state is unknown. */
+    aicore_error?: string | null;
 }
 
 /** `POST data-catalog/embeddings/run`: 202, or 409 while a run is in flight. */
@@ -254,4 +257,6 @@ export interface EmbeddingsRunStarted {
 export interface EmbeddingDeployResult {
     deployment_id: string;
     status: string;
+    /** false: a live deployment of the model was answered, nothing was made. */
+    created: boolean;
 }

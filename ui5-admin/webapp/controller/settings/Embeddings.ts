@@ -3,6 +3,7 @@ import MessageBox from "sap/m/MessageBox";
 import MessageToast from "sap/m/MessageToast";
 import Fragment from "sap/ui/core/Fragment";
 import type Dialog from "sap/m/Dialog";
+import type List from "sap/m/List";
 import type View from "sap/ui/core/mvc/View";
 import type { ListBase$SelectionChangeEvent } from "sap/m/ListBase";
 import Poller, { type PollOutcome } from "../../model/autoRefresh";
@@ -52,8 +53,8 @@ export default class Embeddings {
         return {
             loaded: false, loading: false, loadError: "", busy: false,
             lines: {}, options: [], form: { enabled: false, modelKey: "" }, modelState: "None", modelStateText: "",
-            envStrip: "", canRun: false, running: false,
-            deploy: { options: [], selected: "", resourceGroup: "" }
+            envStrip: "", aicoreStrip: "", canRun: false, canDeploy: false, running: false,
+            deploy: { options: [], selected: "", resourceGroup: "", noData: "" }
         };
     }
 
@@ -65,6 +66,11 @@ export default class Embeddings {
     public show(): Promise<void> {
         this.shown = true;
         return this.load();
+    }
+
+    /** "Try again" of a status that could not be read. */
+    public retry(): Promise<void> {
+        return this.shown ? this.load() : Promise.resolve();
     }
 
     /** The page is no longer shown: nothing polls behind it. */
@@ -106,8 +112,8 @@ export default class Embeddings {
         embeddings.statusLines(status).forEach((line) => {
             lines[line.label] = { text: this.say(line.text), state: line.state };
         });
-        model.setProperty("/lines", lines);
-        model.setProperty("/options", embeddings.modelOptions(status).map((option) => (
+        this.setIfChanged("/lines", lines);
+        this.setIfChanged("/options", embeddings.modelOptions(status).map((option) => (
             { key: option.key, text: this.say(option.text) })));
         if (withForm) {
             const form = embeddings.formOf(status);
@@ -117,11 +123,15 @@ export default class Embeddings {
         }
         const strip = embeddings.envStripText(status);
         model.setProperty("/envStrip", strip ? this.say(strip) : "");
+        const unread = embeddings.aicoreStripText(status);
+        model.setProperty("/aicoreStrip", unread ? this.say(unread) : "");
         model.setProperty("/canRun", embeddings.canRun(status));
+        model.setProperty("/canDeploy", embeddings.canDeploy(status));
         model.setProperty("/running", status.running === true);
-        model.setProperty("/deploy/options", embeddings.deployOptions(status).map((offer) => ({
+        this.setIfChanged("/deploy/options", embeddings.deployOptions(status).map((offer) => ({
             model: offer.model, versions: offer.versions ? this.host.text("embDeployVersions", [offer.versions]) : ""
         })));
+        model.setProperty("/deploy/noData", this.host.text(unread ? "embDeployUnavailable" : "embDeployNoOffers"));
         model.setProperty("/deploy/resourceGroup", typeof status.resource_group === "string" ? status.resource_group : "");
         model.setProperty("/loaded", true);
 
@@ -136,6 +146,14 @@ export default class Embeddings {
             }
         } else {
             this.poller.stop();
+        }
+    }
+
+    /** Sets a list or a group of lines only when it changed: a poll every
+     *  2 s must not rebuild an open dropdown or the dialog's list. */
+    private setIfChanged(path: string, value: unknown): void {
+        if (JSON.stringify(this.model.getProperty(path)) !== JSON.stringify(value)) {
+            this.model.setProperty(path, value);
         }
     }
 
@@ -251,6 +269,13 @@ export default class Embeddings {
             this.apply(await this.host.service().getEmbeddings(), false);
         } catch (error) {
             ErrorHandler.handle(error, this.host.text("embLoadFailedPlain"));
+            // A run that was started is polled all the same: the panel must
+            // not stay on "Running" because one read failed.
+            const kind = ErrorHandler.classify(error);
+            if (this.model.getProperty("/running") === true && this.shown && !this.poller.isActive()
+                && kind !== "session" && kind !== "forbidden") {
+                this.poller.start();
+            }
         }
     }
 
@@ -267,6 +292,7 @@ export default class Embeddings {
             view.addDependent(this.dialog);
         }
         this.model.setProperty("/deploy/selected", "");
+        (this.host.view().byId("embDeployList") as List | undefined)?.removeSelections(true);
         this.dialog.open();
     }
 
@@ -317,7 +343,7 @@ export default class Embeddings {
             return;
         }
         this.dialog?.close();
-        MessageToast.show(this.host.text("embDeployRequested", [model, String(result.status ?? "")]));
+        MessageToast.show(this.say(embeddings.deployOutcome(model, result)));
         await this.refresh();
     }
 }

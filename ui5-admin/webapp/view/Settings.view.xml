@@ -40,6 +40,17 @@
                     showIcon="true"
                     visible="{= !!${emb>/loadError} }"
                     text="{emb>/loadError}"
+                    class="sapUiTinyMarginTopBottom">
+                    <link>
+                        <Link id="embRetry" text="{i18n>embRetry}" press=".onRetryEmbeddings" />
+                    </link>
+                </MessageStrip>
+                <MessageStrip
+                    id="embAicoreStrip"
+                    type="Warning"
+                    showIcon="true"
+                    visible="{= !!${emb>/aicoreStrip} }"
+                    text="{emb>/aicoreStrip}"
                     class="sapUiTinyMarginTopBottom" />
                 <MessageStrip
                     id="embEnvStrip"
@@ -86,7 +97,7 @@
                         <Button
                             id="embDeployButton"
                             text="{i18n>embDeployOpen}"
-                            enabled="{= !${emb>/busy} }"
+                            enabled="{= ${emb>/canDeploy} &amp;&amp; !${emb>/busy} }"
                             press=".onOpenEmbeddingsDeploy"
                             class="sapUiTinyMarginBegin" />
                     </HBox>

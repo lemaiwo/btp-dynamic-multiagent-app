@@ -1,5 +1,7 @@
 import { ValueState } from "sap/ui/core/library";
-import type { EmbeddingDeployment, EmbeddingSetting, EmbeddingsStatus } from "../service/dataCatalogTypes";
+import type {
+    EmbeddingDeployResult, EmbeddingDeployment, EmbeddingSetting, EmbeddingsStatus
+} from "../service/dataCatalogTypes";
 import formatter from "./formatter";
 
 /**
@@ -64,6 +66,11 @@ function nameOf(value: unknown): string {
     return typeof value === "string" ? value : "";
 }
 
+/** AI Core could not be read: the deployments and offers are unknown, not empty. */
+function aicoreUnread(status: EmbeddingsStatus | null | undefined): boolean {
+    return !!status && typeof status.aicore_error === "string" && status.aicore_error !== "";
+}
+
 function settingOf(status: EmbeddingsStatus): { enabled: boolean; model: string } {
     const setting = status.setting as Partial<EmbeddingSetting> | undefined;
     return { enabled: setting?.enabled === true, model: nameOf(setting?.model) };
@@ -83,11 +90,15 @@ function modelLine(status: EmbeddingsStatus): StatusLine {
     if (!setting.enabled) {
         return line({ key: "embModelOff" });
     }
+    const unread = aicoreUnread(status);
     if (status.source === "setting" && setting.model) {
-        // A model chosen here without a RUNNING deployment: nothing is embedded.
-        return line({ key: "embModelNotRunning", args: [setting.model] }, ValueState.Warning);
+        // A model chosen here without a RUNNING deployment (or none AI Core
+        // could confirm): nothing is embedded.
+        return unread
+            ? line({ key: "embModelUnknownState", args: [setting.model] }, ValueState.Warning)
+            : line({ key: "embModelNotRunning", args: [setting.model] }, ValueState.Warning);
     }
-    return line({ key: "embModelNone" });
+    return unread ? line({ key: "embModelNoneUnknown" }, ValueState.Warning) : line({ key: "embModelNone" });
 }
 
 /** The last run, or the one in flight. */
@@ -96,7 +107,8 @@ function runLine(status: EmbeddingsStatus): StatusLine {
         { label: "embLineLastRun", text, state });
     if (status.running === true) {
         const progress = status.progress;
-        return progress && typeof progress.total === "number"
+        // Before the run has counted its nodes the server says `{0, 0}`.
+        return progress && typeof progress.total === "number" && progress.total > 0
             ? line({ key: "embRunRunningProgress", args: [count(progress.done), count(progress.total)] }, ValueState.Information)
             : line({ key: "embRunRunning" }, ValueState.Information);
     }
@@ -162,7 +174,9 @@ export function modelOptions(status: EmbeddingsStatus | null | undefined): Model
     order.forEach((model) => options.push({ key: model, text: { key: "embModelOption", args: [model, byModel[model]] } }));
     const saved = status ? settingOf(status).model : "";
     if (saved && saved !== AUTOMATIC_KEY && !(saved in byModel)) {
-        options.push({ key: saved, text: { key: "embModelOptionNotDeployed", args: [saved] } });
+        options.push({ key: saved, text: {
+            key: aicoreUnread(status) ? "embModelOptionUnknown" : "embModelOptionNotDeployed", args: [saved]
+        } });
     }
     return options;
 }
@@ -179,10 +193,10 @@ export function settingBody(form: EmbeddingsForm): EmbeddingSetting {
     return { enabled: form.enabled === true, model: key && key !== AUTOMATIC_KEY ? key : null };
 }
 
-/** The field a refusal of the save names (`<field>: <rule>`); "" for any other. */
-export function refusedField(detail: string | null | undefined): "enabled" | "model" | "" {
-    const match = /^(enabled|model):/.exec(nameOf(detail));
-    return match ? match[1] as "enabled" | "model" : "";
+/** "model" when a refusal of the save names the model (`model: <rule>`),
+ *  else "": the switch is a boolean the panel always sends as one. */
+export function refusedField(detail: string | null | undefined): "model" | "" {
+    return /^model:/.test(nameOf(detail)) ? "model" : "";
 }
 
 /** "Compute embeddings now": embeddings on, a model in effect, no run in flight. */
@@ -215,6 +229,26 @@ export function envStripText(status: EmbeddingsStatus | null | undefined): Embed
     return status.source === "env" && effective ? { key: "embEnvInEffect", args: [effective] } : { key: "embEnvSet" };
 }
 
+/** The strip when AI Core could not be read: the deployment state is
+ *  unknown (the lists are empty for that reason, not because nothing is
+ *  deployed or offered). A fixed text: the code is not shown. */
+export function aicoreStripText(status: EmbeddingsStatus | null | undefined): EmbeddingsText | null {
+    return aicoreUnread(status) ? { key: "embAicoreUnreadable" } : null;
+}
+
+/** "Deploy an embedding model…": not while the live state of the deployments is unknown. */
+export function canDeploy(status: EmbeddingsStatus | null | undefined): boolean {
+    return !!status && !aicoreUnread(status);
+}
+
+/** The toast after a deploy: requested, or a live deployment that was already there. */
+export function deployOutcome(model: string, result: EmbeddingDeployResult): EmbeddingsText {
+    const state = nameOf(result?.status);
+    return result?.created === false
+        ? { key: "embDeployExisting", args: [model, state] }
+        : { key: "embDeployRequested", args: [model, state] };
+}
+
 /**
  * The question before a deployment: it names the model, the resource group
  * and that AI Core bills for it. Without the group (a server that does not
@@ -239,5 +273,5 @@ export function deployOptions(status: EmbeddingsStatus | null | undefined): Depl
 
 export default {
     statusLines, modelOptions, formOf, settingBody, refusedField, canRun, runOutcome, envStripText, deployConfirmText,
-    deployOptions
+    deployOptions, aicoreStripText, canDeploy, deployOutcome
 };

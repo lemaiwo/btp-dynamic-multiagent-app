@@ -1,15 +1,15 @@
 import ResourceBundle from "sap/base/i18n/ResourceBundle";
 import { ValueState } from "sap/ui/core/library";
 import embeddingsSettings, {
-    AUTOMATIC_KEY, POLL_INTERVAL_MS, canRun, deployConfirmText, deployOptions, envStripText, formOf, modelOptions,
-    refusedField, runOutcome, settingBody, statusLines
+    AUTOMATIC_KEY, POLL_INTERVAL_MS, aicoreStripText, canDeploy, canRun, deployConfirmText, deployOptions,
+    deployOutcome, envStripText, formOf, modelOptions, refusedField, runOutcome, settingBody, statusLines
 } from "com/agent/admin/model/embeddingsSettings";
 import type { EmbeddingsText } from "com/agent/admin/model/embeddingsSettings";
 import formatter from "com/agent/admin/model/formatter";
 import AdminService, { AdminError } from "com/agent/admin/service/AdminService";
 import type { EmbeddingRun, EmbeddingsStatus } from "com/agent/admin/service/dataCatalogTypes";
 import FakeBackend from "com/agent/admin/test/integration/FakeBackend";
-import { MODEL_NOT_DEPLOYED, MODEL_NOT_OFFERED, RUN_IN_FLIGHT } from "com/agent/admin/test/integration/FakeEmbeddings";
+import { MODEL_NOT_DEPLOYED, MODEL_NOT_OFFERED, NO_MODEL, RUN_IN_FLIGHT } from "com/agent/admin/test/integration/FakeEmbeddings";
 
 // The logic of the "Data catalogue embeddings" panel of the Settings page
 // (design addendum (l), point 4), the four calls of AdminService, and the
@@ -27,7 +27,7 @@ function status(extra: Partial<EmbeddingsStatus> = {}): EmbeddingsStatus {
         deployed: [{ model: "text-embedding-3-small", status: "RUNNING", deployment_id: "d1" }],
         available: [{ model: "text-embedding-3-large", versions: ["1"] }],
         nodes: 24, vectors: 20, stale: 4, running: false, progress: null, last_run: DONE_RUN,
-        resource_group: "rg-agents", ...extra
+        resource_group: "rg-agents", aicore_error: null, ...extra
     };
 }
 
@@ -87,6 +87,8 @@ QUnit.test("stale: none is no warning; without a model nothing is a warning", fu
 QUnit.test("the last run: running, never, failed, unfinished", function (assert) {
     const running = lineOf(status({ running: true, progress: { done: 8, total: 24 } }), "embLineLastRun");
     assert.deepEqual(running.text, { key: "embRunRunningProgress", args: ["8", "24"] });
+    assert.deepEqual(lineOf(status({ running: true, progress: { done: 0, total: 0 } }), "embLineLastRun").text,
+        { key: "embRunRunning" }, "a run that has not counted its nodes yet says no 0 of 0");
     assert.strictEqual(running.state, ValueState.Information);
     assert.deepEqual(lineOf(status({ running: true, progress: null }), "embLineLastRun").text, { key: "embRunRunning" },
         "the run has not counted its nodes yet");
@@ -154,7 +156,8 @@ QUnit.test("the form and the body of the save", function (assert) {
 
 QUnit.test("a refusal names its field", function (assert) {
     assert.strictEqual(refusedField("model: not a deployed embedding model"), "model");
-    assert.strictEqual(refusedField("enabled: Input should be a valid boolean"), "enabled");
+    assert.strictEqual(refusedField("enabled: Input should be a valid boolean"), "",
+        "the switch is a boolean: only the model is marked");
     assert.strictEqual(refusedField("body: expected a JSON object"), "");
     assert.strictEqual(refusedField(""), "");
 });
@@ -206,6 +209,52 @@ QUnit.test("the env strip: the landscape's variable, in effect or not", function
         effective_model: null, source: "none" })), { key: "embEnvSet" });
 });
 
+QUnit.module("embeddingsSettings: AI Core could not be read");
+
+// The status is answered all the same, with `deployed: []`, `available: []`
+// and `aicore_error` (agents/data_catalog/embedding_routes.py): nothing may
+// read as "not deployed" or "nothing offered", and nothing is offered to deploy.
+const UNREAD: Partial<EmbeddingsStatus> = { deployed: [], available: [], aicore_error: "aicore_unavailable" };
+
+QUnit.test("a strip says the deployment state is unknown, and only then", function (assert) {
+    assert.deepEqual(aicoreStripText(status(UNREAD)), { key: "embAicoreUnreadable" });
+    assert.strictEqual(aicoreStripText(status()), null);
+    assert.strictEqual(aicoreStripText(status({ aicore_error: "" })), null);
+    assert.strictEqual(aicoreStripText(status({ aicore_error: undefined })), null, "a server before the key");
+    assert.strictEqual(aicoreStripText(null), null);
+});
+
+QUnit.test("the model line does not claim there is no deployment", function (assert) {
+    const chosen = lineOf(status({ ...UNREAD, setting: { enabled: true, model: "text-embedding-3-large" },
+        effective_model: null, source: "setting" }), "embLineModel");
+    assert.deepEqual(chosen.text, { key: "embModelUnknownState", args: ["text-embedding-3-large"] });
+    assert.strictEqual(chosen.state, ValueState.Warning);
+    const automatic = lineOf(status({ ...UNREAD, effective_model: null, source: "none" }), "embLineModel");
+    assert.deepEqual(automatic.text, { key: "embModelNoneUnknown" });
+    assert.strictEqual(automatic.state, ValueState.Warning);
+    assert.deepEqual(lineOf(status({ ...UNREAD, setting: { enabled: false, model: null }, effective_model: null,
+        source: "none" }), "embLineModel").text, { key: "embModelOff" }, "switched off stays switched off");
+    assert.deepEqual(lineOf(status({ ...UNREAD, effective_model: "e", source: "env" }), "embLineModel").text,
+        { key: "embModelFromEnv", args: ["e"] }, "a model in effect is said as ever");
+});
+
+QUnit.test("the saved model is not called not deployed, and nothing is offered to deploy", function (assert) {
+    assert.deepEqual(modelOptions(status({ ...UNREAD, setting: { enabled: true, model: "text-embedding-3-small" } })), [
+        { key: AUTOMATIC_KEY, text: { key: "embModelAutomatic" } },
+        { key: "text-embedding-3-small", text: { key: "embModelOptionUnknown", args: ["text-embedding-3-small"] } }
+    ]);
+    assert.notOk(canDeploy(status(UNREAD)), "no deploy while the live state is unknown");
+    assert.ok(canDeploy(status()));
+    assert.notOk(canDeploy(null));
+});
+
+QUnit.test("the deploy toast says whether something was requested", function (assert) {
+    assert.deepEqual(deployOutcome("m", { deployment_id: "d", status: "PENDING", created: true }),
+        { key: "embDeployRequested", args: ["m", "PENDING"] });
+    assert.deepEqual(deployOutcome("m", { deployment_id: "d", status: "RUNNING", created: false }),
+        { key: "embDeployExisting", args: ["m", "RUNNING"] });
+});
+
 QUnit.test("every text the panel can show is in the i18n bundle", async function (assert) {
     const bundle = await ResourceBundle.create({
         url: sap.ui.require.toUrl("com/agent/admin/i18n/i18n.properties"), async: true
@@ -219,15 +268,21 @@ QUnit.test("every text the panel can show is in the i18n bundle", async function
         status({ running: true, progress: { done: 1, total: 2 } }), status({ running: true }), status({ last_run: null }),
         status({ last_run: { ...DONE_RUN, error_class: "E" } }), status({ last_run: { ...DONE_RUN, finished_at: null } }),
         status({ last_run: { ...DONE_RUN, model: null } }), status({ env_override: true, source: "env", effective_model: "e" }),
-        status({ env_override: true })
+        status({ env_override: true }),
+        status({ setting: { enabled: true, model: "x" }, effective_model: null, source: "setting", deployed: [],
+            available: [], aicore_error: "aicore_unavailable" }),
+        status({ effective_model: null, source: "none", deployed: [], available: [], aicore_error: "token_failed" })
     ];
     statuses.forEach((value) => {
         statusLines(value).forEach((line) => { keys.add(line.label); keys.add(line.text.key); });
         modelOptions(value).forEach((option) => keys.add(option.text.key));
         const outcome = runOutcome(value);
         const strip = envStripText(value);
-        [outcome, strip].forEach((text) => text && keys.add(text.key));
+        const aicore = aicoreStripText(value);
+        [outcome, strip, aicore].forEach((text) => text && keys.add(text.key));
     });
+    keys.add(deployOutcome("m", { deployment_id: "d", status: "PENDING", created: true }).key);
+    keys.add(deployOutcome("m", { deployment_id: "d", status: "RUNNING", created: false }).key);
     keys.add(deployConfirmText("m", "rg").key);
     keys.add(deployConfirmText("m", "").key);
     keys.forEach((key) => assert.ok(bundle.hasText(key), key));
@@ -298,7 +353,7 @@ QUnit.test("a run answers running for two polls, then done with the vectors", as
     assert.deepEqual(await service.runEmbeddings(), { running: true });
     const first = await service.getEmbeddings();
     assert.ok(first.running);
-    assert.deepEqual(first.progress, { done: 1, total: 4 });
+    assert.deepEqual(first.progress, { done: 0, total: 0 }, "as the real run: nothing counted yet");
     assert.notOk(canRun(first));
     const again = await refusal(() => service.runEmbeddings());
     assert.strictEqual(again.status, 409, "one run at a time");
@@ -334,7 +389,8 @@ QUnit.test("the save: refusals at the field, the setting in effect", async funct
     assert.strictEqual(notDeployed.detail, MODEL_NOT_DEPLOYED);
     assert.strictEqual(refusedField(notDeployed.detail), "model");
     const loose = await refusal(() => service.setEmbeddings({ enabled: "yes", model: null } as never));
-    assert.strictEqual(refusedField(loose.detail), "enabled");
+    assert.strictEqual(loose.status, 422);
+    assert.strictEqual(refusedField(loose.detail), "");
 
     const chosen = await service.setEmbeddings({ enabled: true, model: "text-embedding-3-small" });
     assert.deepEqual(chosen.setting, { enabled: true, model: "text-embedding-3-small" });
@@ -353,8 +409,9 @@ QUnit.test("a deploy answers PENDING once, and the model stays not running until
     const service = new AdminService();
     const deployed = await service.deployEmbeddingModel("text-embedding-3-large");
     assert.strictEqual(deployed.status, "PENDING");
+    assert.strictEqual(deployed.created, true);
     const repeat = await service.deployEmbeddingModel("text-embedding-3-large");
-    assert.deepEqual(repeat, deployed, "idempotent: the PENDING deployment is answered, nothing created");
+    assert.deepEqual(repeat, { ...deployed, created: false }, "idempotent: the PENDING deployment is answered, nothing created");
     const unknown = await refusal(() => service.deployEmbeddingModel("gpt-4o"));
     assert.strictEqual(unknown.status, 422);
     assert.strictEqual(unknown.detail, MODEL_NOT_OFFERED);
@@ -383,4 +440,32 @@ QUnit.test("the landscape's variable decides when Model is Automatic", async fun
     assert.strictEqual(value.effective_model, "text-embedding-ada-002");
     assert.deepEqual(envStripText(value), { key: "embEnvInEffect", args: ["text-embedding-ada-002"] });
     assert.strictEqual(value.resource_group, "rg-agents");
+});
+
+QUnit.test("the fake answers as the built routes: no-model code, live deployments, AI Core unread", async function (this: { backend: FakeBackend }, assert) {
+    const fake = this.backend.embeddings;
+    const service = new AdminService();
+
+    fake.setting = { enabled: true, model: "text-embedding-ada-002" };
+    const noModel = await fetch("backend/data-catalog/embeddings/run", { method: "POST", body: "{}" });
+    assert.strictEqual(noModel.status, 409);
+    assert.strictEqual(noModel.headers.get("X-Embeddings-Error"), "no_model");
+    assert.strictEqual(((await noModel.json()) as { detail: string }).detail, NO_MODEL);
+
+    fake.deployments.push({ model: "text-embedding-ada-002", status: "STOPPED", deployment_id: "d-stopped" });
+    const stopped = await service.getEmbeddings();
+    assert.ok(stopped.deployed.some((d) => d.model === "text-embedding-ada-002"), "a STOPPED deployment is listed");
+    assert.ok(stopped.available.some((a) => a.model === "text-embedding-ada-002"), "and its model is offered again");
+    assert.notOk(stopped.available.some((a) => a.model === "text-embedding-3-small"), "a RUNNING one is not");
+
+    fake.aicoreError = "aicore_unavailable";
+    const unread = await service.getEmbeddings();
+    assert.deepEqual([unread.deployed, unread.available, unread.aicore_error], [[], [], "aicore_unavailable"]);
+    assert.strictEqual(unread.effective_model, null, "a chosen model cannot be confirmed RUNNING");
+    assert.strictEqual(unread.source, "setting");
+    const put = await refusal(() => service.setEmbeddings({ enabled: true, model: "text-embedding-3-small" }));
+    assert.strictEqual(put.status, 502, "the PUT's check of the model reads AI Core");
+    const deploy = await refusal(() => service.deployEmbeddingModel("text-embedding-3-large"));
+    assert.strictEqual(deploy.status, 502);
+    assert.ok((await service.setEmbeddings({ enabled: true, model: null })).setting.enabled, "Automatic needs no AI Core");
 });

@@ -29,7 +29,9 @@ export const ID = {
     run: "embRunButton",
     deploy: "embDeployButton",
     envStrip: "embEnvStrip",
+    aicoreStrip: "embAicoreStrip",
     loadError: "embLoadError",
+    retry: "embRetry",
     dialog: "embDeployDialog",
     offers: "embDeployList",
     dialogDeploy: "embDeployContinue",
@@ -49,7 +51,10 @@ export interface PanelTexts {
     options: string[];
     /** The strip's text when it is visible, else "". */
     envStrip: string;
+    /** The AI Core strip's text when it is visible, else "". */
+    aicoreStrip: string;
     canRun: boolean;
+    canDeploy: boolean;
 }
 
 /** The panel of the view that holds `control`. */
@@ -57,7 +62,10 @@ export function panelOf(control: UI5Element): PanelTexts {
     const view = viewOf(control);
     const status = (id: string) => view.byId(id) as ObjectStatus;
     const select = view.byId(ID.select) as Select;
-    const strip = view.byId(ID.envStrip) as MessageStrip;
+    const strip = (id: string) => {
+        const control = view.byId(id) as MessageStrip;
+        return control.getVisible() ? control.getText() : "";
+    };
     return {
         model: status(ID.model).getText(),
         modelState: String(status(ID.model).getState()),
@@ -67,8 +75,10 @@ export function panelOf(control: UI5Element): PanelTexts {
         enabled: (view.byId(ID.enabled) as Switch).getState(),
         modelKey: select.getSelectedKey(),
         options: select.getItems().map((item) => item.getText()),
-        envStrip: strip.getVisible() ? strip.getText() : "",
-        canRun: (view.byId(ID.run) as Button).getEnabled()
+        envStrip: strip(ID.envStrip),
+        aicoreStrip: strip(ID.aicoreStrip),
+        canRun: (view.byId(ID.run) as Button).getEnabled(),
+        canDeploy: (view.byId(ID.deploy) as Button).getEnabled()
     };
 }
 

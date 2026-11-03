@@ -7,6 +7,8 @@ import type Dialog from "sap/m/Dialog";
 import type Select from "sap/m/Select";
 import type Button from "sap/m/Button";
 import type MessageStrip from "sap/m/MessageStrip";
+import type List from "sap/m/List";
+import type Control from "sap/ui/core/Control";
 import type UI5Element from "sap/ui/core/Element";
 import Common, { backend } from "./pages/Common";
 import { choose } from "./pages/DataCatalog";
@@ -103,7 +105,9 @@ opaTest("the panel shows the status, the switch and the deployed models", functi
         Opa5.assert.strictEqual(shown.modelKey, "__automatic__", "Model is Automatic");
         Opa5.assert.deepEqual(shown.options, ["Automatic", "text-embedding-3-small (RUNNING)"]);
         Opa5.assert.strictEqual(shown.envStrip, "", "no strip: the landscape sets no model");
+        Opa5.assert.strictEqual(shown.aicoreStrip, "", "no strip: AI Core answered");
         Opa5.assert.strictEqual(shown.canRun, true, "Compute embeddings now can run");
+        Opa5.assert.strictEqual(shown.canDeploy, true, "a model can be deployed");
         Opa5.assert.strictEqual(backend.countRequests(STATUS), 1, "the status was read once");
     });
 
@@ -322,6 +326,31 @@ opaTest("Deploy asks with the model, the resource group and the billing, then th
         success: () => Opa5.assert.strictEqual(backend.countRequests(DEPLOY), 0, "Cancel deploys nothing")
     });
 
+    // Closed and opened again, the dialog starts without a pick.
+    When.waitFor({ id: ID.dialogCancel, viewName: VIEW, searchOpenDialogs: true, actions: new Press() });
+    When.waitFor({ id: ID.deploy, viewName: VIEW, actions: new Press() });
+    Then.waitFor({
+        id: ID.offers,
+        viewName: VIEW,
+        searchOpenDialogs: true,
+        success: (list: UI5Element) => {
+            Opa5.assert.strictEqual((list as List).getSelectedItems().length, 0, "no model is picked");
+        }
+    });
+    Then.waitFor({
+        id: ID.dialogDeploy,
+        viewName: VIEW,
+        searchOpenDialogs: true,
+        autoWait: false,
+        success: (button: UI5Element) => Opa5.assert.strictEqual((button as Button).getEnabled(), false,
+            "nothing to deploy again before a pick")
+    });
+    When.waitFor({
+        controlType: "sap.m.StandardListItem",
+        searchOpenDialogs: true,
+        matchers: (item: UI5Element) => (item as unknown as { getTitle(): string }).getTitle() === "text-embedding-3-large",
+        actions: new Press()
+    });
     When.waitFor({ id: ID.dialogDeploy, viewName: VIEW, searchOpenDialogs: true, actions: new Press() });
     iAnswer(When, "Deploy");
 
@@ -378,6 +407,66 @@ opaTest("a status that cannot be read is said in the panel, not in a box", funct
         },
         errorMessage: "The failure is not shown in the panel"
     });
+    When.waitFor({ id: ID.retry, viewName: VIEW, actions: new Press() });
+    iSeeThePanel(Then, "read again", () => {
+        Opa5.assert.strictEqual(backend.countRequests(STATUS), 2, "Try again reads the status");
+    }, (panel) => panelOf(panel).vectors === "20 of 24 nodes");
+    Then.waitFor({
+        id: ID.loadError,
+        viewName: VIEW,
+        visible: false,
+        success: (strip: UI5Element) => Opa5.assert.notOk((strip as MessageStrip).getVisible(), "the strip is gone")
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("AI Core that cannot be read: the state is unknown, nothing reads as not deployed, no deploy", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("agents");
+    Then.waitFor({
+        id: "agentsPage",
+        viewName: "Agents",
+        success: () => {
+            // The route answers 200 with `deployed: []`, `available: []` and the code.
+            backend.embeddings.setting = { enabled: true, model: "text-embedding-3-small" };
+            backend.embeddings.aicoreError = "aicore_unavailable";
+            HashChanger.getInstance().setHash("settings");
+        }
+    });
+
+    iSeeThePanel(Then, "the unknown deployment state", (panel) => {
+        const shown = panelOf(panel);
+        Opa5.assert.strictEqual(shown.aicoreStrip, "AI Core could not be read; the deployment state is unknown. "
+            + "The model list may be incomplete and no model can be deployed until AI Core answers.");
+        Opa5.assert.strictEqual(shown.model, "None for now: AI Core could not be read, so whether "
+            + "text-embedding-3-small runs is unknown. Agents rank data sources by their words.");
+        Opa5.assert.deepEqual(shown.options, ["Automatic", "text-embedding-3-small (state unknown)"],
+            "the saved model is not called not deployed");
+        Opa5.assert.strictEqual(shown.canDeploy, false, "no deploy while AI Core cannot be read");
+        Opa5.assert.strictEqual(shown.canRun, false, "no model in effect");
+    }, (panel) => panelOf(panel).aicoreStrip !== "");
+
+    Then.iStopTheApp();
+});
+
+opaTest("a failed read right after the start still polls the run to its end", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("settings");
+    iSeeThePanel(Then, "loaded", () => undefined);
+
+    When.waitFor({
+        id: ID.run,
+        viewName: VIEW,
+        actions: (button: UI5Element | null) => {
+            backend.failNext = { path: "data-catalog/embeddings", method: "GET", status: 500, body: { detail: "busy" } };
+            new Press().executeOn(button as Control);
+        }
+    });
+    iSeeAMessage(Then, "the failed read", (dialog) => Opa5.assert.strictEqual(messageOf(dialog), "busy"));
+    iAnswer(When, "Close");
+    iSeeAToast(Then, "Embeddings computed: 4 nodes embedded.");
+    iSeeThePanel(Then, "the finished run", (panel) => {
+        Opa5.assert.strictEqual(panelOf(panel).vectors, "24 of 24 nodes");
+    }, (panel) => panelOf(panel).vectors === "24 of 24 nodes");
 
     Then.iStopTheApp();
 });

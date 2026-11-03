@@ -129,6 +129,10 @@ export default class Settings extends BaseController {
         this.embeddings.clearModelError();
     }
 
+    public onRetryEmbeddings(): void {
+        void this.embeddings.retry();
+    }
+
     public async onSaveOrchestrator(): Promise<void> {
         const instructions = (this.getModel("settings") as JSONModel)
             .getProperty("/orchestrator/instructions") as string;
