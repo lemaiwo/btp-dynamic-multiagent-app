@@ -165,6 +165,8 @@ async def test_export_carries_the_full_service_payloads(client):
         "agents",
         "workflows",
         "odata_services",
+        # The InA queries travel the same way (tests/test_ina_bundles.py).
+        "ina_queries",
     }
 
 

@@ -4019,6 +4019,17 @@ def ina_query_columns(payload: InaQueryPayload) -> dict[str, Any]:
     }
 
 
+def _ina_written_columns(payload: InaQueryPayload) -> dict[str, Any]:
+    """What an update of an existing query writes: `ina_query_columns`
+    without the description pair when the payload has no ``definition``
+    key (an edit form, which never holds what ``Describe`` read)."""
+    columns = ina_query_columns(payload)
+    if "definition" not in payload.model_fields_set:
+        for column in _INA_DESCRIBED:
+            del columns[column]
+    return columns
+
+
 async def list_ina_queries(session: AsyncSession, *, lock: bool = False) -> list[InaQuery]:
     """Every registered query, in name order; ``lock`` as in `list_odata_services`."""
     query = select(InaQuery).order_by(InaQuery.name)
@@ -4105,6 +4116,7 @@ async def update_ina_query(
     *,
     expected_updated_at: datetime | None = None,
     commit: bool = True,
+    write_locked: bool = False,
 ) -> InaQuery | None:
     """Replace everything but the name of query ``name`` with ``data``.
 
@@ -4129,9 +4141,16 @@ async def update_ina_query(
     whatever stamp it sends; ``definition: null`` clears both. ``updated_at``
     moves forward on every call (`_next_odata_stamp`), also when no field
     changed.
+
+    ``write_locked``: the caller's transaction already serialises this write
+    and holds the row, so no `begin_exclusive_write` is asked for -- which
+    in an open transaction would take no lock and log a WARNING per call. A
+    bundle import, which read every query with ``list_ina_queries(lock=True)``
+    and writes without ``expected_updated_at``.
     """
     payload = _ina_payload(data)
-    await begin_exclusive_write(session)
+    if not write_locked:
+        await begin_exclusive_write(session)
     row = (await session.execute(_locked_ina_query(name))).scalar_one_or_none()
     if row is None:
         return None
@@ -4139,11 +4158,7 @@ async def update_ina_query(
         raise ValueError(INA_NAME_FIXED)
     if stamp_moved(row.updated_at, expected_updated_at):
         raise StaleRow()
-    columns = ina_query_columns(payload)
-    if "definition" not in payload.model_fields_set:
-        for column in _INA_DESCRIBED:
-            del columns[column]
-    for column, value in columns.items():
+    for column, value in _ina_written_columns(payload).items():
         setattr(row, column, value)
     row.updated_at = _next_odata_stamp(row.updated_at)
     if commit:
@@ -4152,6 +4167,41 @@ async def update_ina_query(
         await session.flush()
     await session.refresh(row)
     return row
+
+
+async def upsert_ina_query(
+    session: AsyncSession,
+    data: InaQueryPayload | dict[str, Any],
+    *,
+    existing: InaQuery | None = None,
+    commit: bool = True,
+    write_locked: bool = False,
+) -> str:
+    """Store ``data`` by name: ``"created"``, ``"updated"`` or ``"unchanged"``.
+
+    For the bulk writers that carry a whole record (the bundle import,
+    ``scripts/import_bundle.py``). ``existing`` is the stored row when the
+    caller has read it already (the import, under its lock), else it is
+    looked up. A record that would change nothing is not written and so not
+    restamped: ``updated_at`` is what an open admin tab hands back as
+    ``expected_updated_at``, and a query the import left as it was must not
+    answer that tab's save with 409 (`odata_service_unchanged`, which
+    compares stored form with stored form for any row). Without the
+    ``definition`` key the stored description and its stamp are kept and
+    not compared, as `update_ina_query` keeps them. The replace is
+    unconditional (no ``expected_updated_at``); ``write_locked`` as there.
+    """
+    payload = _ina_payload(data)
+    row = existing if existing is not None else await get_ina_query(session, payload.name)
+    if row is None:
+        await create_ina_query(session, payload, commit=commit)
+        return "created"
+    if odata_service_unchanged(row, _ina_written_columns(payload)):  # type: ignore[arg-type]
+        return "unchanged"
+    await update_ina_query(
+        session, payload.name, payload, commit=commit, write_locked=write_locked
+    )
+    return "updated"
 
 
 async def delete_ina_query(

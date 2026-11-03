@@ -22,6 +22,12 @@ refused (one transaction, all-or-nothing). ``expose_invoke`` (and
 reads the string "true" as true, so the script refuses any other value rather
 than silently storing "off".
 
+The bundle's InA queries (``ina_queries``) are written before the agents, one
+by one in the same way, so an agent may name a query its bundle brings; a
+refused query is ``FAIL   ina query <name>: <rule>`` (by its position when
+the entry has no usable name), and an entry must say ``enabled``, as for the
+HTTP import. Nothing is removed: this script has no ``replace``.
+
 Secrets come from --secrets (a Google client_secret_*.json, or a flat
 {"<url>": {"client_secret": "..."}} map). Without it, the repo root is searched
 for a client_secret_*.json, which covers builtin:gmail.
@@ -75,6 +81,7 @@ def fill_secrets(bundle: dict, secrets_file: Path | None) -> list[str]:
     return missing
 
 
+ENABLED_REQUIRED = "enabled: Field required"
 EXPOSE_INVOKE_NOT_BOOLEAN = "expose_invoke: must be a JSON boolean (true or false)"
 SHARE_TOOLS_NOT_BOOLEAN = "share_tools: must be a JSON boolean (true or false)"
 
@@ -106,6 +113,7 @@ async def import_bundle(bundle: dict) -> list[str]:
                 content=skill["content"],
             )
             print(f"  skill  {skill['name']}")
+        failed.extend(await _import_queries(session, bundle.get("ina_queries") or []))
         for agent in bundle.get("agents") or []:
             if "expose_invoke" in agent and not isinstance(agent["expose_invoke"], bool):
                 failed.append(agent["name"])
@@ -152,6 +160,38 @@ async def import_bundle(bundle: dict) -> list[str]:
                 continue
             print(f"  agent  {agent['name']}")
         await session.commit()
+    return failed
+
+
+async def _import_queries(session, queries: list) -> list[str]:
+    """Write each InA query by name in its own commit; answers the refused
+    ones (their name, or ``#<position>`` for an entry without a usable name).
+
+    The storage gate (``validate_ina_query``, through ``upsert_ina_query``)
+    names the field and the rule, never the value. An unchanged query is not
+    rewritten, so an open admin tab's ``updated_at`` stays valid.
+    """
+    import re  # noqa: PLC0415
+
+    from agents.db import upsert_ina_query  # noqa: PLC0415 - after sys.path setup
+    from agents.ina.models import QUERY_NAME_RE  # noqa: PLC0415
+
+    failed: list[str] = []
+    for position, entry in enumerate(queries, start=1):
+        name = entry.get("name") if isinstance(entry, dict) else None
+        label = name if isinstance(name, str) and re.fullmatch(QUERY_NAME_RE, name) else (
+            f"#{position}"
+        )
+        try:
+            if isinstance(entry, dict) and "enabled" not in entry:
+                raise ValueError(ENABLED_REQUIRED)
+            outcome = await upsert_ina_query(session, entry)
+        except ValueError as e:
+            await session.rollback()
+            failed.append(label)
+            print(f"  FAIL   ina query {label}: {e}")
+            continue
+        print(f"  ina    {label}  ({outcome})")
     return failed
 
 

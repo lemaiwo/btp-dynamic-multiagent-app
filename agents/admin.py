@@ -88,8 +88,10 @@ from agents.db import (
     check_delegation_name_collision,
     check_ina_queries,
     check_odata_services,
+    create_ina_query,
     create_odata_service,
     delete_agent,
+    delete_ina_query,
     delete_odata_service,
     delete_skill,
     delete_workflow,
@@ -105,7 +107,9 @@ from agents.db import (
     get_workflow_parts,
     get_workflow_run,
     ina_entries,
+    ina_query_referrers,
     list_agents,
+    list_ina_queries,
     list_item_runs,
     list_odata_services,
     list_skills,
@@ -125,6 +129,7 @@ from agents.db import (
     set_orchestrator_instructions,
     update_odata_service,
     upsert_agent,
+    upsert_ina_query,
     upsert_skill,
     upsert_workflow,
     validate_api_slug,
@@ -137,7 +142,7 @@ from agents.git_config import BUILTIN_GIT_URL
 from agents.git_config import check_entry as check_git_entry
 from agents.git_config import clean_entry as clean_git_entry
 from agents.ina import BUILTIN_INA_URL
-from agents.ina.models import check_query_names
+from agents.ina.models import QUERY_NAME_RE, check_query_names, validate_ina_query
 from agents.invoke_config import check_result_schema, clean_limits
 from agents.jira_tools import BUILTIN_JIRA_URL
 from agents.mail_render import MailTheme
@@ -1410,7 +1415,11 @@ class ImportPayload(BaseModel):
     # validates every entry and reports field names and rules only.
     # None / absent / [] all mean "this bundle carries no catalogue".
     odata_services: Any = None
-    # if true, delete agents/skills/workflows/OData services not in the import
+    # The InA queries, one `InaQuery.to_export()` each; untyped for the same
+    # reason (`_import_ina_queries`). None / absent / [] carry none.
+    ina_queries: Any = None
+    # if true, delete agents/skills/workflows/OData services/InA queries not
+    # in the import
     replace: bool = False
 
 
@@ -2511,6 +2520,9 @@ async def api_export() -> dict[str, Any]:
         # `metadata_fetched_at` in UTC with a `Z`, which is also what an
         # import stores, so export -> import -> export is byte-stable.
         services = await list_odata_services(session)
+        # The InA queries likewise: a destination NAME and an identity flag,
+        # the described names, no credential (`InaQuery.to_export`).
+        queries = await list_ina_queries(session)
         return {
             "version": 1,
             "orchestrator_instructions": orch,
@@ -2518,6 +2530,7 @@ async def api_export() -> dict[str, Any]:
             "agents": [r.to_export() for r in rows],
             "workflows": workflows,
             "odata_services": [s.to_export() for s in services],
+            "ina_queries": [q.to_export() for q in queries],
         }
 
 
@@ -2563,31 +2576,72 @@ MAX_IMPORT_ODATA_SERVICES = 200
 # off the event loop one entry at a time. The count alone would allow
 # 200 x 2 MB = 400 MB, i.e. the better part of a minute.
 MAX_IMPORT_ODATA_CHARS = 4 * MAX_DEFINITION_BYTES
-# What decides whose identity a call carries and which system it reaches.
+# What decides whose identity a call carries and which system it reaches
+# (a catalogue service's and an InA query's alike).
 _ODATA_SERVICE_IDENTITY_FIELDS = ("destination", "user_context")
+# The InA queries of one bundle: as many as catalogue services. A query is
+# small (at most 250 described members), so the section's ceiling in
+# characters is the catalogue's, which no real section comes near.
+MAX_IMPORT_INA_QUERIES = 200
+MAX_IMPORT_INA_CHARS = MAX_IMPORT_ODATA_CHARS
 
 
-class _ODataImport:
-    """What `_import_odata_services` did, for the replace step and the answer."""
+class _CatalogueImport:
+    """What `_import_odata_services` or `_import_ina_queries` did, for the
+    replace step (`_finish_catalogue_import`) and the answer."""
 
     def __init__(self) -> None:
-        self.carried = False  # the bundle has a non-empty catalogue section
+        self.carried = False  # the bundle has a non-empty section
         self.names: set[str] = set()  # stored by this import
-        # Every service the bundle names, stored or refused: a refused entry
+        # Every record the bundle names, stored or refused: a refused entry
         # is not an absent one, so replace must not want to remove it.
         self.named: set[str] = set()
         self.existing: dict[str, Any] = {}  # name -> row, as before the import
         self.created = 0
         self.updated = 0
-        # The services this import created or changed (not the unchanged).
+        # The records this import created or changed (not the unchanged).
         self.changed: set[str] = set()
         # name -> the identity fields an update changed
         self.identity: dict[str, list[str]] = {}
 
 
+def _bounded_section(
+    section: Any, *, key: str, items: str, max_count: int, max_chars: int, errors: list[str]
+) -> list[Any] | None:
+    """A bundle's catalogue section (``odata_services``, ``ina_queries``)
+    when it carries entries, else None.
+
+    Absent, ``null`` and ``[]`` all mean "no section". A section that is not
+    a list, holds more than ``max_count`` entries or more than ``max_chars``
+    characters of JSON is one fixed error line (``key`` and the rule, never
+    a value), checked before any entry is validated.
+    """
+    if section is None:
+        return None
+    if not isinstance(section, list):
+        errors.append(f"{key}: expected a list of {items}")
+        return None
+    if len(section) > max_count:
+        errors.append(f"{key}: more than {max_count} {items} in one bundle")
+        return None
+    if not section:
+        return None
+    try:
+        size = 0
+        for entry in section:
+            size += len(json.dumps(entry, ensure_ascii=False))
+            if size > max_chars:
+                errors.append(f"{key}: the section is too large for one import")
+                return None
+    except (TypeError, ValueError, RecursionError):
+        errors.append(f"{key}: expected a list of {items}")
+        return None
+    return section
+
+
 async def _import_odata_services(
     session: Any, section: Any, errors: list[str]
-) -> _ODataImport:
+) -> _CatalogueImport:
     """Upsert a bundle's catalogue services by name, without committing.
 
     Runs before the agents of the same bundle: `upsert_agent` refuses a
@@ -2614,28 +2668,16 @@ async def _import_odata_services(
     is validated, and each entry is validated once, in a worker thread,
     together with the column values its row gets (`_checked_odata_entry`).
     """
-    result = _ODataImport()
+    result = _CatalogueImport()
+    section = _bounded_section(
+        section,
+        key="odata_services",
+        items="services",
+        max_count=MAX_IMPORT_ODATA_SERVICES,
+        max_chars=MAX_IMPORT_ODATA_CHARS,
+        errors=errors,
+    )
     if section is None:
-        return result
-    if not isinstance(section, list):
-        errors.append("odata_services: expected a list of services")
-        return result
-    if len(section) > MAX_IMPORT_ODATA_SERVICES:
-        errors.append(
-            f"odata_services: more than {MAX_IMPORT_ODATA_SERVICES} services in one bundle"
-        )
-        return result
-    if not section:
-        return result
-    try:
-        size = 0
-        for entry in section:
-            size += len(json.dumps(entry, ensure_ascii=False))
-            if size > MAX_IMPORT_ODATA_CHARS:
-                errors.append("odata_services: the section is too large for one import")
-                return result
-    except (TypeError, ValueError, RecursionError):
-        errors.append("odata_services: expected a list of services")
         return result
     result.carried = True
     result.existing = {r.name: r for r in await list_odata_services(session, lock=True)}
@@ -2687,6 +2729,147 @@ async def _import_odata_services(
     return result
 
 
+async def _import_ina_queries(
+    session: Any, section: Any, errors: list[str]
+) -> _CatalogueImport:
+    """Upsert a bundle's InA queries by name, without committing.
+
+    `_import_odata_services` for ``ina_queries``, with its reasons: before
+    the agents of the bundle (`upsert_agent` refuses a query name nobody
+    registered, and reads this session), each entry validated whole by
+    `validate_ina_query` in a worker thread, a refusal one line naming the
+    query (or its position) and the field, never a value; ``enabled`` must
+    be present; a name listed twice is refused; a query the bundle carries
+    unchanged is not written and keeps its ``updated_at``
+    (`agents.db.upsert_ina_query`). An entry without the ``definition`` key
+    keeps the stored description.
+
+    Every query row is locked first, after the catalogue's (the same order
+    in every import), so a write in this transaction needs no write lock of
+    its own (``write_locked``).
+    """
+    result = _CatalogueImport()
+    section = _bounded_section(
+        section,
+        key="ina_queries",
+        items="queries",
+        max_count=MAX_IMPORT_INA_QUERIES,
+        max_chars=MAX_IMPORT_INA_CHARS,
+        errors=errors,
+    )
+    if section is None:
+        return result
+    result.carried = True
+    result.existing = {r.name: r for r in await list_ina_queries(session, lock=True)}
+    for position, entry in enumerate(section, start=1):
+        name = entry.get("name") if isinstance(entry, dict) else None
+        if isinstance(name, str) and re.fullmatch(QUERY_NAME_RE, name):
+            label = f"InA query '{name}'"
+            result.named.add(name)
+        else:
+            label = f"InA query #{position}"
+        try:
+            payload = await asyncio.to_thread(validate_ina_query, entry)
+        except ValueError as e:
+            errors.append(f"{label}: {e}")
+            continue
+        if "enabled" not in entry:
+            errors.append(f"{label}: enabled: Field required")
+            continue
+        if payload.name in result.names:
+            errors.append(f"{label}: listed more than once")
+            continue
+        result.names.add(payload.name)
+        row = result.existing.get(payload.name)
+        if row is None:
+            try:
+                await create_ina_query(session, payload, commit=False)
+            except ValueError as e:  # created by someone else since the read
+                errors.append(f"{label}: {e}")
+                continue
+            result.created += 1
+            result.changed.add(payload.name)
+            continue
+        # Read before the write: the update re-reads the same row object.
+        before = {"destination": row.destination, "user_context": bool(row.user_context)}
+        changed = [f for f in _ODATA_SERVICE_IDENTITY_FIELDS if before[f] != getattr(payload, f)]
+        outcome = await upsert_ina_query(
+            session, payload, existing=row, commit=False, write_locked=True
+        )
+        if outcome == "unchanged":
+            continue
+        result.updated += 1
+        result.changed.add(payload.name)
+        if changed:
+            result.identity[payload.name] = changed
+    return result
+
+
+async def _finish_catalogue_import(
+    session: Any,
+    result: _CatalogueImport,
+    *,
+    replace: bool,
+    doomed: set[str],
+    referrers: Any,
+    delete: Any,
+    noun: str,
+    key: str,
+    errors: list[str],
+    warnings: list[str],
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """The replace step and the identity report of one imported section:
+    ``(removed names, identity changes)``.
+
+    ``referrers`` is the section's ``*_referrers`` and ``delete`` its delete
+    function; ``noun`` names a record in a message (``OData service``,
+    ``InA query``) and ``key`` in an identity change (``service``,
+    ``query``). Who names what is read once this import is in: the agents it
+    wrote count, the ones it removes (``doomed``) do not.
+
+    Replace applies only when the bundle carries the section, like skills.
+    Unlike a skill, a record is not detached from its agents: one that lost
+    its only service or query could not run, so a record still in use is an
+    error. An identity change (another destination, or the other identity)
+    of a record in use is allowed, as an admin's own act, but never unseen:
+    field and agent names only.
+    """
+    removed: list[str] = []
+    identity_changes: list[dict[str, Any]] = []
+    if not (result.carried and (replace or result.identity)):
+        return removed, identity_changes
+    await session.flush()
+    used_by = {
+        name: [r["agent"] for r in users if r["agent"] not in doomed]
+        for name, users in (await referrers(session)).items()
+    }
+    if replace:
+        for name, row in sorted(result.existing.items()):
+            if name in result.named:
+                continue
+            if used_by.get(name):
+                agents = ", ".join(f"'{a}'" for a in used_by[name])
+                errors.append(
+                    f"{noun} '{name}' cannot be removed by replace: it is used by "
+                    f"agent(s) {agents}"
+                )
+                continue
+            await delete(session, row, commit=False)
+            removed.append(name)
+        if removed:
+            # A curated record has no undo; say which went.
+            names = ", ".join(f"'{n}'" for n in removed)
+            warnings.append(f"{noun}(s) removed by replace: {names}")
+    for name in sorted(result.identity):
+        if not used_by.get(name):
+            continue
+        changed = result.identity[name]
+        identity_changes.append({key: name, "changed": changed, "agents": used_by[name]})
+        agents = ", ".join(f"'{a}'" for a in used_by[name])
+        warnings.append(f"{noun} '{name}': {', '.join(changed)} changed; used by agent(s) {agents}")
+    return removed, identity_changes
+
+
 def _checked_odata_entry(entry: Any) -> tuple[dict[str, Any], dict[str, Any]]:
     """One bundle entry as ``(validated data, column values)``, or the
     ``ValueError`` of `validate_odata_service`. Pure and CPU-bound (up to a
@@ -2724,12 +2907,21 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
     not written and keeps its ``updated_at`` (`odata_service_unchanged`): it
     is in ``imported_odata_services`` but in neither ``created_`` nor
     ``updated_odata_services``.
+
+    ``ina_queries`` (the InA analytical queries) is taken the same way, right
+    after the catalogue (`_import_ina_queries`), with the same replace rule
+    and the ``imported_/created_/updated_/removed_ina_queries``,
+    ``removed_ina_query_names`` and ``ina_identity_changes`` keys; a changed
+    or removed query in use rebuilds the running agents too
+    (`agents.ina.admin_routes.reload_if_in_use`).
     """
     errors: list[str] = []
     warnings: list[str] = []
     removed = removed_skills = removed_workflows = 0
     removed_services: list[str] = []
     identity_changes: list[dict[str, Any]] = []
+    removed_queries: list[str] = []
+    ina_identity_changes: list[dict[str, Any]] = []
     async with SessionLocal() as session:
         try:
             existing_agents = {r.name: r for r in await list_agents(session)}
@@ -2757,10 +2949,12 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
                 )
                 imported_skill_names.add(skill.name)
 
-            # The catalogue before the agents, for the same reason.
+            # The catalogue and the InA queries before the agents, for the
+            # same reason; always in this order, which is the lock order.
             odata = await _import_odata_services(
                 session, payload.odata_services, errors
             )
+            ina = await _import_ina_queries(session, payload.ina_queries, errors)
 
             # Agents this bundle still writes: their stored peer lists are
             # about to be replaced, so they do not decide whether an agent
@@ -2879,50 +3073,30 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
                             await session.delete(srow)
                             removed_skills += 1
 
-            if odata.carried and (payload.replace or odata.identity):
-                # Who attaches what once this import is in: the agents it
-                # wrote count, the ones it removes do not.
-                await session.flush()
-                used_by = {
-                    name: [r["agent"] for r in users if r["agent"] not in doomed]
-                    for name, users in (await odata_service_referrers(session)).items()
-                }
-                # Replace applies to the catalogue only when the bundle
-                # carries one, like skills. Unlike a skill, a service is not
-                # detached from its agents: one that lost its only service
-                # could not run, so a service still in use is an error.
-                if payload.replace:
-                    for name, srow in sorted(odata.existing.items()):
-                        if name in odata.named:
-                            continue
-                        if used_by.get(name):
-                            agents = ", ".join(f"'{a}'" for a in used_by[name])
-                            errors.append(
-                                f"OData service '{name}' cannot be removed by replace: "
-                                f"it is used by agent(s) {agents}"
-                            )
-                            continue
-                        await delete_odata_service(session, srow, commit=False)
-                        removed_services.append(name)
-                    if removed_services:
-                        # A curated definition has no undo; say which went.
-                        names = ", ".join(f"'{n}'" for n in removed_services)
-                        warnings.append(f"OData service(s) removed by replace: {names}")
-                # Allowed, as an admin's own act, but never unseen: an agent
-                # whose service now runs as another identity or reaches
-                # another system. Field and agent names only.
-                for name in sorted(odata.identity):
-                    if not used_by.get(name):
-                        continue
-                    changed = odata.identity[name]
-                    identity_changes.append(
-                        {"service": name, "changed": changed, "agents": used_by[name]}
-                    )
-                    agents = ", ".join(f"'{a}'" for a in used_by[name])
-                    warnings.append(
-                        f"OData service '{name}': {', '.join(changed)} changed; "
-                        f"used by agent(s) {agents}"
-                    )
+            removed_services, identity_changes = await _finish_catalogue_import(
+                session,
+                odata,
+                replace=payload.replace,
+                doomed=doomed,
+                referrers=odata_service_referrers,
+                delete=delete_odata_service,
+                noun="OData service",
+                key="service",
+                errors=errors,
+                warnings=warnings,
+            )
+            removed_queries, ina_identity_changes = await _finish_catalogue_import(
+                session,
+                ina,
+                replace=payload.replace,
+                doomed=doomed,
+                referrers=ina_query_referrers,
+                delete=delete_ina_query,
+                noun="InA query",
+                key="query",
+                errors=errors,
+                warnings=warnings,
+            )
 
             if errors:
                 await session.rollback()
@@ -2941,6 +3115,14 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
             referrers = await odata_service_referrers(session)
         reload_outcome = await reload_after_catalogue_change(
             touched, referrers, f"import changed {len(touched)} service(s)"
+        )
+    touched_queries = sorted(ina.changed | set(removed_queries))
+    if touched_queries and not (reload_outcome["reloaded"] or reload_outcome["reload_failed"]):
+        # The same rule for an InA query in use; one rebuild at most.
+        async with SessionLocal() as session:
+            ina_referrers = await ina_query_referrers(session)
+        reload_outcome = await reload_ina_if_in_use(
+            touched_queries, ina_referrers, f"import changed {len(touched_queries)} InA query(s)"
         )
     if not (reload_outcome["reloaded"] or reload_outcome["reload_failed"]):
         # The other way an import closes access: an agent's own
@@ -2980,6 +3162,13 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
         # Catalogue services in use whose destination or identity
         # (`user_context`) this import changed: [{service, changed, agents}].
         "odata_identity_changes": identity_changes,
+        # The InA queries alike; an identity change is [{query, changed, agents}].
+        "imported_ina_queries": len(ina.names),
+        "created_ina_queries": ina.created,
+        "updated_ina_queries": ina.updated,
+        "removed_ina_queries": len(removed_queries),
+        "removed_ina_query_names": removed_queries,
+        "ina_identity_changes": ina_identity_changes,
         # Model overrides this landscape cannot currently serve are imported
         # rather than rejected, so the operator is told about them here; so
         # is every entry of `odata_identity_changes`, as a line of text.
@@ -3437,7 +3626,9 @@ async def _destination_health() -> list[dict[str, Any]]:
     entry per attached service, with that service's destination and identity
     from the catalogue (``service`` and ``service_enabled`` are the extra
     keys). A name the catalogue does not have is a ``missing`` entry with
-    ``service_enabled`` false; see `_odata_destination_health`.
+    ``service_enabled`` false; see `_odata_destination_health`. A
+    ``builtin:ina`` entry likewise, one entry per query it names (``query``
+    and ``query_enabled``; `_ina_destination_health`).
     """
     from agents.destination import (
         MISSING_BINDING_MESSAGE,
@@ -3455,6 +3646,9 @@ async def _destination_health() -> list[dict[str, Any]]:
         if any(r.enabled and odata_entries(r.mcp_servers) for r in rows):
             # One read for every entry of every agent.
             catalogue = {s.name: s for s in await list_odata_services(session)}
+        queries: dict[str, Any] = {}
+        if any(r.enabled and ina_entries(r.mcp_servers) for r in rows):
+            queries = {q.name: q for q in await list_ina_queries(session)}
     config = config_from_environment(os.environ)
     resolvers: dict[str, DestinationResolver] = {}
     out: list[dict[str, Any]] = []
@@ -3474,8 +3668,10 @@ async def _destination_health() -> list[dict[str, Any]]:
                 continue
             if _server_key(srv.get("url")) == BUILTIN_INA_URL:
                 # Its entry names no destination either; each registered query
-                # does, and is checked from its own page (Describe, Test).
-                # Reported here, it would read as "no destination name".
+                # does, and is reported like a catalogue service.
+                out.extend(
+                    await _ina_destination_health(row.name, oauth, queries, config, resolvers)
+                )
                 continue
             name = str(oauth.get("destination") or "").strip()
             user_context = oauth.get("user_context") is True
@@ -3545,6 +3741,22 @@ async def _destination_health() -> list[dict[str, Any]]:
     return out
 
 
+class _HealthKind:
+    """What tells a catalogue service's health entry from an InA query's:
+    the server key, the entry's key for the record (``service`` / ``query``,
+    with ``<key>_enabled``), the name rule and the noun of a message."""
+
+    def __init__(self, server_key: str, key: str, name_re: str, noun: str) -> None:
+        self.server_key = server_key
+        self.key = key
+        self.name_re = name_re
+        self.noun = noun
+
+
+_ODATA_HEALTH = _HealthKind(BUILTIN_ODATA_URL, "service", SERVICE_NAME_RE, "OData service")
+_INA_HEALTH = _HealthKind(BUILTIN_INA_URL, "query", QUERY_NAME_RE, "InA query")
+
+
 async def _odata_destination_health(
     agent: str,
     oauth: dict[str, Any],
@@ -3553,7 +3765,38 @@ async def _odata_destination_health(
     resolvers: dict[str, Any],
 ) -> list[dict[str, Any]]:
     """The `_destination_health` entries of one ``builtin:odata`` entry: one
-    per service it lists.
+    per service it lists (`_record_destination_health`)."""
+    return await _record_destination_health(
+        agent, oauth.get("services"), catalogue, config, resolvers, _ODATA_HEALTH
+    )
+
+
+async def _ina_destination_health(
+    agent: str,
+    oauth: dict[str, Any],
+    queries: dict[str, Any],
+    config: Any,
+    resolvers: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """The `_destination_health` entries of one ``builtin:ina`` entry: one
+    per query it names, each with that query's destination and identity
+    (``query``, ``query_enabled``; `_record_destination_health`)."""
+    return await _record_destination_health(
+        agent, oauth.get("queries"), queries, config, resolvers, _INA_HEALTH
+    )
+
+
+async def _record_destination_health(
+    agent: str,
+    names: Any,
+    records: dict[str, Any],
+    config: Any,
+    resolvers: dict[str, Any],
+    kind: _HealthKind,
+) -> list[dict[str, Any]]:
+    """One health entry per name an entry lists, checked through the
+    destination of the record of that name (a catalogue service, an InA
+    query; ``records`` by name). Written for the catalogue, in its words:
 
     ``{agent, server_key, service, service_enabled, destination,
     user_context, state, auth_type, error}`` plus ``warning`` on an identity
@@ -3588,14 +3831,14 @@ async def _odata_destination_health(
     from agents.odata.destinations import destination_failure
     from agents.odata.preview import plain
 
-    services = oauth.get("services")
+    enabled_key = f"{kind.key}_enabled"
     out: list[dict[str, Any]] = []
-    for name in services if isinstance(services, list) else []:
+    for name in names if isinstance(names, list) else []:
         entry: dict[str, Any] = {
             "agent": agent,
-            "server_key": BUILTIN_ODATA_URL,
-            "service": "",
-            "service_enabled": False,
+            "server_key": kind.server_key,
+            kind.key: "",
+            enabled_key: False,
             "destination": "",
             "user_context": False,
             "state": "error",
@@ -3603,19 +3846,19 @@ async def _odata_destination_health(
             "error": None,
         }
         out.append(entry)
-        if not isinstance(name, str) or not re.fullmatch(SERVICE_NAME_RE, name):
+        if not isinstance(name, str) or not re.fullmatch(kind.name_re, name):
             # A row written around the save gate; the value is not repeated.
-            entry["error"] = "invalid service name"
+            entry["error"] = f"invalid {kind.key} name"
             continue
-        entry["service"] = name
-        service = catalogue.get(name)
-        if service is None:
+        entry[kind.key] = name
+        record = records.get(name)
+        if record is None:
             entry["state"] = "missing"
-            entry["error"] = "unknown OData service"
+            entry["error"] = f"unknown {kind.noun}"
             continue
-        entry["service_enabled"] = bool(service.enabled)
-        destination = str(service.destination or "").strip()
-        user_context = bool(service.user_context)
+        entry[enabled_key] = bool(record.enabled)
+        destination = str(record.destination or "").strip()
+        user_context = bool(record.user_context)
         entry["destination"] = destination
         entry["user_context"] = user_context
         if not destination:
@@ -3649,8 +3892,9 @@ async def _odata_destination_health(
             # logged with URLs masked.
             code, entry["error"] = destination_failure(str(e))
             logger.warning(
-                "credential health: destination '%s' of OData service '%s' failed (%s): %s",
+                "credential health: destination '%s' of %s '%s' failed (%s): %s",
                 destination,
+                kind.noun,
                 name,
                 code,
                 plain(str(e), 400),
@@ -3658,15 +3902,16 @@ async def _odata_destination_health(
         except Exception as e:  # noqa: BLE001 - a health check must not 500
             entry["error"] = f"the destination could not be checked ({type(e).__name__})"
             logger.warning(
-                "credential health: destination '%s' of OData service '%s' failed (%s)",
+                "credential health: destination '%s' of %s '%s' failed (%s)",
                 destination,
+                kind.noun,
                 name,
                 type(e).__name__,
             )
         auth_type = str(entry["auth_type"] or "")
         if user_context and auth_type and auth_type not in USER_PROPAGATING_AUTH_TYPES:
             entry["warning"] = (
-                f"the service runs as the signed-in user, but the destination's "
+                f"the {kind.key} runs as the signed-in user, but the destination's "
                 f"Authentication is {auth_type}, an app-level type; every user "
                 f"would share one credential. Use PrincipalPropagation (on-premise), "
                 f"OAuth2UserTokenExchange, OAuth2JWTBearer or OAuth2SAMLBearerAssertion"
@@ -3698,3 +3943,9 @@ router.include_router(_notifications_router)
 from agents.data_catalog.routes import router as _data_catalog_router  # noqa: E402
 
 router.include_router(_data_catalog_router)
+
+# The InA analytical queries (/admin/api/ina), included the same way.
+from agents.ina.admin_routes import reload_if_in_use as reload_ina_if_in_use  # noqa: E402
+from agents.ina.admin_routes import router as _ina_router  # noqa: E402
+
+router.include_router(_ina_router)

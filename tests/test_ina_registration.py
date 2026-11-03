@@ -361,12 +361,17 @@ async def test_saving_stores_the_entry_and_an_unknown_query_is_422(client):
     assert stored.mcp_servers[0]["oauth"] == {"queries": [SALES]}
 
 
-async def test_credential_health_reports_no_entry_for_ina(client):
+async def test_credential_health_reports_the_query_not_the_entry(client):
+    """The entry names no destination: each query it names is reported with
+    its own (``tests/test_ina_admin.py`` has the shape), never as an entry
+    without a destination name."""
     await add_query(SALES)
     await add_agent("analyst", ina_server(SALES))
     r = await client.get("/admin/api/credential-health")
     assert r.status_code == 200, r.text
-    assert URL not in json.dumps(r.json())
+    entries = [e for e in r.json()["destinations"] if e["server_key"] == URL]
+    assert [(e["query"], e["destination"]) for e in entries] == [(SALES, "SIA_INA")]
+    assert "no destination name configured" not in json.dumps(r.json())
 
 
 # --- the reload of a changed entry --------------------------------------------

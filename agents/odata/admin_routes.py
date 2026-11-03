@@ -254,13 +254,14 @@ def _stale_write(name: str) -> str:
     return f"Service '{name}' was changed since it was loaded; reload it and save again"
 
 
-def _expected_updated_at(value: Any) -> datetime | None:
+def _expected_updated_at(value: Any, rule: str = _EXPECTED_RULE) -> datetime | None:
     """A given ``expected_updated_at`` as an aware UTC instant, or a 422.
 
     ``None`` (the field missing, or JSON ``null``) means the client asks for
     no check. Otherwise only a string in the format the API emits
     ``updated_at`` in; the refusal names the field and the rule, never the
-    value.
+    value. ``rule`` is the text of a malformed value, for a caller whose
+    records are not services (the InA queries' routes).
 
     A value without an offset is UTC, as the stored timestamps are (SQLite
     hands them back naive, and the API emits them that way).
@@ -270,14 +271,14 @@ def _expected_updated_at(value: Any) -> datetime | None:
     if not isinstance(value, str):
         raise _refuse(_EXPECTED_NO_STRING)
     if not _EXPECTED_RE.fullmatch(value):
-        raise _refuse(_EXPECTED_RULE)
+        raise _refuse(rule)
     try:
         moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
         if moment.tzinfo is None:
             moment = moment.replace(tzinfo=timezone.utc)
         return moment.astimezone(timezone.utc)
     except (ValueError, OverflowError):  # month 13, offset +99:00, year 1 minus an offset
-        raise _refuse(_EXPECTED_RULE) from None
+        raise _refuse(rule) from None
 
 
 def _is_stale(row: ODataService, expected: datetime | None) -> bool:
