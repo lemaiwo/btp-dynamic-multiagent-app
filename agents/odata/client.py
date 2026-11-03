@@ -96,7 +96,8 @@ property (``__metadata`` dropped). SAP's allow-list owner decides what a
 listed module exposes, and the app has no field catalogue for a complex type
 to cut by; what is not positively complex data (an entity, a navigation) is
 still withheld, and such an answer over the size cap is refused, never cut
-(``clip_result``).
+(``clip_result``), as is one that SAP paged (``__next``: the first page is not
+the whole table).
 """
 
 from __future__ import annotations
@@ -179,6 +180,14 @@ _STRUCTURED_STARTS = ("{", "[", "<")
 # (a value in a structure in a table in a structure ...) to be passed on
 # whole (`_is_structure`); a deeper one is withheld, not walked further.
 MAX_STRUCTURE_DEPTH = 10
+# What `ODataClient.call` passes on whole (a generic service's complex answer,
+# `_returned`): one structure, or a collection of them. Over the cap it is
+# refused, never cut (`clip_result`).
+WHOLE_RETURNS = ("structure", "collection")
+# The hints of the two refusals of such an answer: no page to continue from,
+# so the model can only ask for less or say so.
+_WHOLE_TOO_LARGE_HINT = "narrow the call, or tell the user the module's answer is too large"
+_WHOLE_PAGED_HINT = "SAP paged the answer; narrow the call"
 
 
 def _outcome_hint(operation: str) -> str:
@@ -560,6 +569,26 @@ def _value(value: Any) -> Any:
     return value
 
 
+def _is_edm_name(name: str) -> bool:
+    return re.fullmatch(EDM_NAME_RE, name) is not None
+
+
+def _is_property_key(name: object) -> bool:
+    """Whether a key of a complex answer is a name and nothing but a name.
+
+    A property name reaches the model as SAP wrote it, so it must have the
+    form of an EDM name (``EDM_NAME_RE``: ASCII, at most 128 characters), never
+    of a sentence. An annotation (``Property@term`` or ``@term``) is dropped
+    by ``_value``; it passes only when each of its parts is such a name too.
+    """
+    if not isinstance(name, str):
+        return False
+    prop, at, term = name.partition("@")
+    if at:
+        return (prop == "" or _is_edm_name(prop)) and _is_edm_name(term)
+    return _is_edm_name(prop)
+
+
 def _is_structure(value: Any, entity_types: frozenset[str], depth: int = 0) -> bool:
     """Whether ``value`` is positively complex-type data, nothing of an entity.
 
@@ -568,9 +597,10 @@ def _is_structure(value: Any, entity_types: frozenset[str], depth: int = 0) -> b
     value carries at most ``__metadata.type``. So an object passes only when
     its ``__metadata``, if any, holds nothing but a ``type`` that is a text
     and not the entity type of a catalogue entity set (that set's field
-    allowlist decides about such data), it has no other ``__`` key, and
-    every value passes in turn; a list when every item does; a scalar
-    always. A value nested deeper than ``MAX_STRUCTURE_DEPTH`` does not.
+    allowlist decides about such data), it has no other ``__`` key, every
+    other key has the form of a name (``_is_property_key``), and every value
+    passes in turn; a list when every item does; a scalar always. A value
+    nested deeper than ``MAX_STRUCTURE_DEPTH`` does not.
     """
     if depth > MAX_STRUCTURE_DEPTH:
         return False
@@ -584,7 +614,7 @@ def _is_structure(value: Any, entity_types: frozenset[str], depth: int = 0) -> b
         return all(
             name == "__metadata"
             or (
-                isinstance(name, str)
+                _is_property_key(name)
                 and not name.startswith("__")
                 and _is_structure(item, entity_types, depth + 1)
             )
@@ -593,6 +623,19 @@ def _is_structure(value: Any, entity_types: frozenset[str], depth: int = 0) -> b
     if isinstance(value, list):
         return all(_is_structure(item, entity_types, depth + 1) for item in value)
     return True
+
+
+def _server_paged(payload: Any, name: str) -> bool:
+    """Whether a V2 call answer says SAP holds more of it (``__next``).
+
+    Read where ``V2Dialect.parse_call`` takes a collection from: ``d``, or the
+    ``d.<name>`` wrapper Gateway puts around a function import's result. The
+    key alone counts, whatever its value: the rows that came are then a page.
+    """
+    d = payload.get("d") if isinstance(payload, dict) else None
+    if isinstance(d, dict) and set(d) == {name} and isinstance(d[name], dict):
+        d = d[name]
+    return isinstance(d, dict) and "__next" in d
 
 
 class ODataClient:
@@ -2103,10 +2146,15 @@ class ODataClient:
         Except, for a plan that says ``whole`` (a reading function import of
         a ``generic`` service that names no entity set it returns): one
         object, or a list of objects, that is positively complex-type data
-        (``_is_structure``) is ``structure`` / ``collection`` with every
-        property, the bookkeeping dropped as for a read (``_value``: no
-        ``__metadata``, no annotation). What fails that test falls to the
-        rule above, which withholds it.
+        (``_is_structure``) is ``structure`` / ``collection``
+        (``WHOLE_RETURNS``) with every property, the bookkeeping dropped as
+        for a read (``_value``: no ``__metadata``, no annotation). What fails
+        that test falls to the rule above, which withholds it (or, for rows
+        of the set the import is bound to, cuts them to that set's fields).
+        Such a collection that SAP paged (``__next``, ``_server_paged``) is
+        the refusal ``result_too_large``: the first page is not the table,
+        and there is no page to continue from. A ``whole`` plan only reads,
+        so the refusal never follows a change.
 
         A single JSON scalar is passed on for a call that only reads (it is
         the whole point of such a function): a number or a boolean as it
@@ -2132,7 +2180,7 @@ class ODataClient:
                 ):
                     return "withheld", None
             return "value", value
-        if plan.whole and shape in ("entity", "collection"):
+        if plan.whole and shape in ("entity", "structure", "collection"):
             rows = value if shape == "collection" else [value]
             entity_types = frozenset(
                 e.entity_type for e in self._definition.entity_sets if e.entity_type
@@ -2140,8 +2188,16 @@ class ODataClient:
             if isinstance(rows, list) and all(
                 isinstance(row, dict) and _is_structure(row, entity_types) for row in rows
             ):
+                structure, collection = WHOLE_RETURNS
+                if shape == "collection" and _server_paged(payload, plan.name):
+                    raise ODataError(
+                        "result_too_large",
+                        "SAP sent only the first part of this operation's answer; "
+                        "nothing of it was returned",
+                        hint=_WHOLE_PAGED_HINT,
+                    )
                 whole = [_value(row) for row in rows]
-                return ("collection", whole) if shape == "collection" else ("structure", whole[0])
+                return (collection, whole) if shape == "collection" else (structure, whole[0])
         target = plan.result_set
         if shape not in ("entity", "collection") or target is None or not target.entity_type:
             return "withheld", None
@@ -2206,10 +2262,6 @@ class ODataClient:
 
 
 # -- the size cap ---------------------------------------------------------------
-
-# What `ODataClient.call` passes on whole (a generic service's complex answer):
-# over the cap it is refused, never cut.
-WHOLE_RETURNS = ("structure", "collection")
 
 
 def _size(result: dict) -> int:
@@ -2290,7 +2342,7 @@ def clip_result(result: dict, max_chars: int, *, skip: int | None = None) -> dic
                 "result_too_large",
                 "the answer of this operation is larger than a tool result may be; "
                 "nothing of it was returned",
-                hint="call it with parameters that select less",
+                hint=_WHOLE_TOO_LARGE_HINT,
             ).to_dict()
         }
     out["truncated"] = True

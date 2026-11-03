@@ -28,7 +28,7 @@ MAX_KEY_VALUE_CHARS = common.MAX_KEY_VALUE_CHARS
 # query string, and a URL is not the place for a document.
 MAX_PARAM_VALUE_CHARS = 1000
 # What a function import answered, as `V2Dialect.parse_call` names it.
-CALL_SHAPES = ("none", "value", "entity", "collection", "other")
+CALL_SHAPES = ("none", "value", "entity", "structure", "collection", "other")
 
 # Used with `fullmatch` only, and with `[0-9]`: `$` also matches before a
 # trailing newline, and `\d` matches every Unicode decimal digit.
@@ -281,12 +281,18 @@ class V2Dialect:
           Gateway returns a primitive) or ``{"d": scalar}``;
         * ``entity``: one object with ``__metadata``, directly under ``d`` or
           under ``d.<name>``;
+        * ``structure``: one object with neither ``__metadata`` nor
+          ``results``, directly under ``d`` or under ``d.<name>`` (a complex
+          value as Gateway may write it, without its type);
         * ``collection``: a list, as ``d.results``, ``d`` or ``d.<name>``
           (with or without ``results``);
-        * ``other``: anything else under ``d`` (a complex type, say). The
-          value is ``None``: the caller has nothing it could check.
+        * ``other``: anything else under ``d`` (``results`` that is no
+          list, say). The value is ``None``: the caller has nothing it could
+          check.
 
-        Whether an entity or a collection may be shown is not decided here.
+        Whether an entity, a structure or a collection may be shown is not
+        decided here (``ODataClient._returned``: on an ``odata`` service a
+        structure is withheld).
         An answer without ``d``, or with an ``error``, is not the answer of
         a function import (``sap_error``).
         """
@@ -308,6 +314,8 @@ class V2Dialect:
                 return "entity", d
             if isinstance(d.get("results"), list):
                 return "collection", d["results"]
+            if "results" not in d:
+                return "structure", d
         return "other", None
 
     # -- request bodies -----------------------------------------------------
