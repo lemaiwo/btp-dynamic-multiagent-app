@@ -75,7 +75,6 @@ from agents.db import (
     INA_ENTRY_KEYS,
     INA_SINGLE_ENTRY_MESSAGE,
     KEEP,
-    MAX_INA_ENTRY_QUERIES,
     MAX_ODATA_ENTRY_SERVICES,
     OAUTH_CONFIG_MODES,
     ODATA_ENTRY_KEYS,
@@ -138,7 +137,7 @@ from agents.git_config import BUILTIN_GIT_URL
 from agents.git_config import check_entry as check_git_entry
 from agents.git_config import clean_entry as clean_git_entry
 from agents.ina import BUILTIN_INA_URL
-from agents.ina.models import QUERY_NAME_RE
+from agents.ina.models import check_query_names
 from agents.invoke_config import check_result_schema, clean_limits
 from agents.jira_tools import BUILTIN_JIRA_URL
 from agents.mail_render import MailTheme
@@ -3371,26 +3370,9 @@ def _validate_ina_entry(cfg: dict[str, Any]) -> None:
         known = sorted(stray & _OAUTH_FIELD_NAMES)
         named = f"oauth.{', oauth.'.join(known)}" if known else "the unknown keys"
         raise ValueError(f"a {BUILTIN_INA_URL} entry holds only oauth.queries; remove {named}")
-    queries = cfg.get("queries")
-    if queries is None or queries == []:
-        raise ValueError(
-            f"{BUILTIN_INA_URL} requires oauth.queries: the names of the registered "
-            "queries this agent may run (at least one)"
-        )
-    if not isinstance(queries, list):
-        raise ValueError("oauth.queries must be a list of registered query names")
-    if len(queries) > MAX_INA_ENTRY_QUERIES:
-        raise ValueError(f"oauth.queries lists more than {MAX_INA_ENTRY_QUERIES} queries")
-    seen: set[str] = set()
-    for name in queries:
-        if not isinstance(name, str) or not re.fullmatch(QUERY_NAME_RE, name):
-            raise ValueError(
-                "oauth.queries: invalid query name (lower-case letters, digits "
-                "and '-', at most 64 characters)"
-            )
-        if name in seen:
-            raise ValueError(f"oauth.queries: duplicate query '{name}'")
-        seen.add(name)
+    # The entry's one slug-list rule; a repeat is refused here, so the admin
+    # learns of it, where storage drops it.
+    check_query_names(cfg.get("queries"), distinct=True)
 
 
 # Built-ins that originate mail through agents/mail_render and so read a

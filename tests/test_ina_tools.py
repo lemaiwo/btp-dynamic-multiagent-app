@@ -329,14 +329,16 @@ async def test_an_unknown_name_is_refused_before_anything_is_sent(patch, where):
     assert error["code"] == "invalid_filter"
     assert error["message"].startswith(f"{where}:")
     assert PROBE not in json.dumps(answer)
-    assert w.sap.requests == []
+    # Refused on the stored description alone: no destination resolved, no
+    # client built, nothing sent.
+    assert w.sap.requests == [] and w.resolved == [] and w.toolset.http_clients == []
 
 
 async def test_a_missing_mandatory_variable_is_refused_before_anything_is_sent():
     w = world()
     answer = await w.tool("run_query")(SALES, ["0AMOUNT"], ["0CALMONTH"])
     assert error_of(answer)["code"] == "variable_required"
-    assert w.sap.requests == []
+    assert w.sap.requests == [] and w.resolved == []
 
 
 @pytest.mark.parametrize("top", [0, -1, 2001])
@@ -344,7 +346,7 @@ async def test_top_outside_its_bounds_is_refused(top):
     w = world()
     code = error_of(await w.tool("run_query")(SALES, **RUN, top=top))["code"]
     assert code == ("result_too_large" if top > 2000 else "invalid_filter")
-    assert w.sap.requests == []
+    assert w.sap.requests == [] and w.resolved == []
 
 
 async def test_a_refusal_of_sap_is_an_error_object_not_an_exception():

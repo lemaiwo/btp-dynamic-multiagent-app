@@ -63,7 +63,7 @@ from . import BUILTIN_INA_URL
 from .client import DEFAULT_TOP, MAX_TOP, InaClient, InaSessionStore
 from .errors import InaError
 from .models import InaDefinition
-from .protocol import fits_name
+from .protocol import fits_name, plan_run
 
 logger = logging.getLogger(__name__)
 
@@ -205,7 +205,7 @@ def _attached(
             continue
         known = isinstance(snapshot.get(name), dict)
         logger.warning(
-            "%s of %s names the InA query '%s', which is %s",
+            "%s of %s names the InA query %r, which is %s",
             server_key,
             who,
             name,
@@ -424,6 +424,18 @@ def ina_toolset(
             return _not_described()
         name = entry.raw["name"]
         try:
+            # Every argument is checked against the stored description first:
+            # a refusal needs no destination, client or session (the client
+            # checks again before it sends).
+            plan_run(
+                definition,
+                measures=measures,
+                group_by=group_by,
+                filters=filters,
+                top=top,
+                order=order,
+                variables=variables,
+            )
             result = await _client(entry, definition).run(
                 measures, group_by, filters, top, order, variables
             )

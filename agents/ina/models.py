@@ -28,6 +28,7 @@ OData page. Never imports ``agents.db``.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
@@ -54,6 +55,8 @@ QUERY_NAME_RE = r"^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$"
 MAX_DIMENSIONS = 100
 MAX_MEASURES = 100
 MAX_VARIABLES = 50
+# How many queries one agent's ``builtin:ina`` entry may name.
+MAX_ENTRY_QUERIES = 50
 
 
 # A technical name SAP uses (the query's object name, a dimension, measure,
@@ -161,3 +164,45 @@ def validate_ina_query(data: Any) -> InaQueryPayload:
     except ValidationError as exc:
         # `from None`: the ValidationError carries the input in its repr.
         raise ValueError(refusal_text(exc, "ina_query")) from None
+
+
+def check_query_names(
+    names: Any, *, field: str = "oauth.queries", distinct: bool = False
+) -> list[str]:
+    """The query names of a ``builtin:ina`` entry, distinct and in order.
+
+    The one slug-list rule of the entry, for the admin gate
+    (``agents.admin._validate_ina_entry``), storage
+    (``agents.db._clean_ina_entry``) and the existence check
+    (``agents.db.check_ina_queries``): a non-empty list of names in the form
+    of ``QUERY_NAME_RE``, at most ``MAX_ENTRY_QUERIES`` of them. Anything
+    else is refused rather than skipped: an entry whose list was silently
+    shortened would be an agent with less than its admin configured.
+
+    A repeated name is dropped (first occurrence wins), or refused with
+    ``distinct`` (the gate, which tells the admin). Each ``ValueError``
+    names ``field`` and the rule; a name is repeated only when it has the
+    slug form, never a value that does not.
+    """
+    if names is None or names == []:
+        raise ValueError(
+            f"{field}: the names of the registered queries this agent may run "
+            "(at least one)"
+        )
+    if not isinstance(names, list):
+        raise ValueError(f"{field}: must be a list of registered query names")
+    kept: list[str] = []
+    for name in names:
+        if not isinstance(name, str) or not re.fullmatch(QUERY_NAME_RE, name):
+            raise ValueError(
+                f"{field}: invalid query name (lower-case letters, digits and '-', "
+                "at most 64 characters)"
+            )
+        if name in kept:
+            if distinct:
+                raise ValueError(f"{field}: duplicate query '{name}'")
+            continue
+        kept.append(name)
+    if len(kept) > MAX_ENTRY_QUERIES:
+        raise ValueError(f"{field}: more than {MAX_ENTRY_QUERIES} queries")
+    return kept

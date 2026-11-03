@@ -39,10 +39,10 @@ from agents.bitbucket_config import BUILTIN_BITBUCKET_URL, asks_to_approve
 from agents.bitbucket_tools import activity_summary as bitbucket_activity_summary
 from agents.git_config import BUILTIN_GIT_URL
 from agents.git_tools import activity_summary as git_activity_summary
+from agents.builtins import build_builtin_toolset, is_builtin_url
 from agents.ina import BUILTIN_INA_URL
 from agents.ina.tools import NoUsableQueryError, attached_queries
 from agents.ina.tools import activity_summary as ina_activity_summary
-from agents.builtins import build_builtin_toolset, is_builtin_url
 from agents.odata import BUILTIN_ODATA_URL
 from agents.odata.tools import NoUsableServiceError, attached_services
 from agents.shared import (
@@ -932,7 +932,7 @@ async def build_orchestrator() -> BuildResult:
         # What a retired build closes. A prefixed built-in is a wrapper
         # without the toolset's `http_client`, so the toolset itself is kept.
         closable: list = []
-        odata_blocks: list[str] = []
+        index_blocks: list[str] = []
         # The catalogue sources this specialist can reach (data catalogue
         # scope), and the tool prefix of its first OData entry.
         catalog_sources: set[tuple[str, str]] = set()
@@ -980,10 +980,23 @@ async def build_orchestrator() -> BuildResult:
                 "the agent is built without the Git tools",
                 row.name,
             )
+        # And for builtin:ina: the gate and storage refuse a second entry, so
+        # a row with two passed neither, and which of them somebody reviewed
+        # cannot be told. None is built, and none of their queries enters
+        # the agent's catalogue scope.
+        no_ina = sum(_server_key_of(s) == BUILTIN_INA_URL for s in specs) > 1
+        if no_ina:
+            logger.warning(
+                "Agent '%s': its row holds more than one builtin:ina entry; "
+                "the agent is built without the InA tools",
+                row.name,
+            )
         for idx, (spec, prefix) in enumerate(zip(specs, prefixes)):
             if no_bitbucket and _is_bitbucket_entry(spec):
                 continue
             if no_git and _server_key_of(spec) == BUILTIN_GIT_URL:
+                continue
+            if no_ina and _server_key_of(spec) == BUILTIN_INA_URL:
                 continue
             server_name = row.name if idx == 0 else f"{row.name}-{idx}"
             try:
@@ -1009,7 +1022,7 @@ async def build_orchestrator() -> BuildResult:
                         attached = attached_services(oauth, odata_by_name)
                         catalog_sources.update(("odata", svc["name"]) for svc in attached)
                         odata_prefix.append(prefix)
-                        odata_blocks.append(
+                        index_blocks.append(
                             _odata_instructions(
                                 attached,
                                 # `is True`, as the toolset reads it.
@@ -1023,7 +1036,7 @@ async def build_orchestrator() -> BuildResult:
                         attached_ina = attached_queries(spec.get("oauth"), ina_by_name)
                         catalog_sources.update(("ina", q["name"]) for q in attached_ina)
                         ina_prefix.append(prefix)
-                        odata_blocks.append(_ina_instructions(attached_ina, prefix=prefix))
+                        index_blocks.append(_ina_instructions(attached_ina, prefix=prefix))
                     continue
                 _warn_technical_ide_target(row.name, server_name, spec, ide_destinations)
                 server = create_mcp_server(
@@ -1095,10 +1108,10 @@ async def build_orchestrator() -> BuildResult:
         if len(catalog_sources) > DATA_CATALOG_INDEX_MAX:
             # Above this many sources the index would grow with the catalogue;
             # the agent finds its source through the tool instead.
-            odata_blocks = [
+            index_blocks = [
                 _data_catalog_instructions(len(catalog_sources), odata_prefix, ina_prefix)
             ]
-        specialist_instructions += "".join(odata_blocks)
+        specialist_instructions += "".join(index_blocks)
 
         specialist_model = _model_for(
             row, default_model=model, default_name=model_name, cache=model_cache

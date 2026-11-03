@@ -398,12 +398,12 @@ async def describe(conv: ChatConversation, principal: str,
             # (attached_services, attached_queries).
             catalogue_sources = allowed_sources_of(row)
             usable = False
-            for model, kind in ((ODataService, "odata"), (InaQuery, "ina")):
+            for table, kind in ((ODataService, "odata"), (InaQuery, "ina")):
                 names = sorted(n for k, n in catalogue_sources if k == kind)
                 if not usable and names:
                     usable = (await db.execute(
-                        select(model.name)
-                        .where(model.name.in_(names), model.enabled == 1)
+                        select(table.name)
+                        .where(table.name.in_(names), table.enabled == 1)
                         .limit(1)
                     )).first() is not None
             if usable:

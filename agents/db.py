@@ -54,8 +54,8 @@ from sqlalchemy.types import TypeDecorator
 
 from agents import hana_hdi
 from agents.ina import BUILTIN_INA_URL
-from agents.ina.models import QUERY_NAME_RE as _INA_QUERY_NAME_RE
-from agents.ina.models import InaQueryPayload, validate_ina_query
+from agents.ina.models import MAX_ENTRY_QUERIES as _INA_MAX_ENTRY_QUERIES
+from agents.ina.models import InaQueryPayload, check_query_names, validate_ina_query
 from agents.odata import BUILTIN_ODATA_URL
 
 # The catalogue's save-time gate lives with its models; re-exported because
@@ -3639,15 +3639,12 @@ async def check_ina_queries(session: AsyncSession, servers: list[dict[str, Any]]
     query exists and may be attached; the run time leaves it out.
 
     ``ValueError("unknown InA query 'x'")`` names every missing name in the
-    order listed; a name without the slug form is "invalid query name",
-    without the value.
+    order listed; a list that breaks the entry's rule is refused by
+    `check_query_names`, which never repeats a value that is no query name.
     """
     names: list[str] = []
     for block in ina_entries(servers):
-        queries = block.get("queries")
-        for name in queries if isinstance(queries, list) else []:
-            if not isinstance(name, str) or not re.fullmatch(_INA_QUERY_NAME_RE, name):
-                raise ValueError("invalid query name")
+        for name in check_query_names(block.get("queries")):
             if name not in names:
                 names.append(name)
     if not names:
@@ -5217,7 +5214,7 @@ MAX_ODATA_ENTRY_SERVICES = 50
 # (`InaQuery`) names its own destination and identity, and the entry only
 # which queries the agent may run. Public for the admin gate, as above.
 INA_ENTRY_KEYS = ("queries",)
-MAX_INA_ENTRY_QUERIES = 50
+MAX_INA_ENTRY_QUERIES = _INA_MAX_ENTRY_QUERIES
 def bitbucket_approves(servers: Any) -> bool:
     """Whether a server list holds a ``builtin:bitbucket`` entry (any
     spelling of the URL) that asks for approving
@@ -5441,26 +5438,12 @@ def _clean_ina_entry(src: dict[str, Any]) -> dict[str, Any]:
     Exactly ``{"queries": [...]}``; every other key is dropped,
     ``destination`` and ``user_context`` included (identity belongs to each
     registered query). As `_clean_odata_entry`, the last gate before the
-    row: ``queries`` must be a non-empty list of query names (the slug form
-    of ``agents.ina.models.QUERY_NAME_RE``), anything else is refused rather
-    than skipped, duplicates are dropped (first occurrence wins) and at most
-    ``MAX_INA_ENTRY_QUERIES`` remain. Whether the names are registered is
+    row: the list is held to the entry's one rule (`check_query_names`:
+    refused rather than skipped, duplicates dropped, at most
+    ``MAX_INA_ENTRY_QUERIES``). Whether the names are registered is
     `check_ina_queries`' question. The message never repeats a value.
     """
-    raw = src.get("queries")
-    if not isinstance(raw, list) or not raw:
-        raise ValueError("builtin:ina requires at least one query")
-    queries: list[str] = []
-    for name in raw:
-        if not isinstance(name, str) or not re.fullmatch(_INA_QUERY_NAME_RE, name):
-            raise ValueError("builtin:ina queries: invalid query name")
-        if name not in queries:
-            queries.append(name)
-    if len(queries) > MAX_INA_ENTRY_QUERIES:
-        raise ValueError(
-            f"builtin:ina allows at most {MAX_INA_ENTRY_QUERIES} queries per entry"
-        )
-    return {"queries": queries}
+    return {"queries": check_query_names(src.get("queries"))}
 
 
 # The data catalogue tables (agents/data_catalog/models.py) live in their own

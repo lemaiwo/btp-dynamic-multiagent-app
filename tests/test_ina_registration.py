@@ -79,6 +79,7 @@ from agents.db import (  # noqa: E402
 )
 from agents.deep import DeepState, WorkspaceScope, current_workspace  # noqa: E402
 from agents.ide.readonly import POLICIES, REFUSED_PREFIX, ReadOnlyGuard, policy_name  # noqa: E402
+from agents.ina.models import check_query_names  # noqa: E402
 from agents.odata import admin_routes  # noqa: E402
 from tests.test_ina_client import definition  # noqa: E402
 
@@ -219,7 +220,7 @@ def test_storage_keeps_exactly_the_queries():
 def test_storage_refuses_what_is_no_list_of_query_names(block):
     with pytest.raises(ValueError) as info:
         _clean_destination(block, url=URL)
-    assert SECRET not in str(info.value) and "builtin:ina" in str(info.value)
+    assert SECRET not in str(info.value) and str(info.value).startswith("oauth.queries: ")
 
 
 def test_storage_stores_the_url_canonical_and_refuses_a_second_entry_or_another_mode():
@@ -256,7 +257,8 @@ async def test_the_check_refuses_a_name_that_is_no_query_name():
     async with SessionLocal() as s:
         with pytest.raises(ValueError) as info:
             await check_ina_queries(s, [{"url": URL, "oauth": {"queries": [SECRET]}}])
-    assert str(info.value) == "invalid query name"
+    assert str(info.value).startswith("oauth.queries: invalid query name")
+    assert SECRET not in str(info.value)
     async with SessionLocal() as s:
         await check_ina_queries(s, [NOTES])  # nothing to check, nothing read
 
@@ -268,6 +270,17 @@ def test_the_existence_check_locks_the_rows():
     assert "FOR SHARE" in sql
     assert "FOR" not in str(_existing_ina_names_query([SALES], lock=False).compile(
         dialect=postgresql.dialect()))
+
+
+def test_the_one_slug_list_rule_drops_or_refuses_a_repeat():
+    assert check_query_names([STOCK, SALES, STOCK]) == [STOCK, SALES]
+    with pytest.raises(ValueError, match=f"^oauth.queries: duplicate query '{STOCK}'$"):
+        check_query_names([STOCK, SALES, STOCK], distinct=True)
+    # 51 entries that are 50 distinct names fit storage, not the gate.
+    names = [f"q-{i}" for i in range(50)]
+    assert check_query_names([*names, names[0]]) == names
+    with pytest.raises(ValueError, match="^queries: invalid query name"):
+        check_query_names([SECRET], field="queries")
 
 
 # --- the admin gate -----------------------------------------------------------
@@ -297,13 +310,13 @@ def test_the_gate_refuses_an_identity_on_the_entry(extra, field):
     ({"queries": [SALES], "allow_write": True},
      "holds only oauth.queries; remove oauth.allow_write"),
     ({"queries": [SALES], SECRET: 1}, "holds only oauth.queries; remove the unknown keys"),
-    ({}, "requires oauth.queries"),
-    ({"queries": []}, "requires oauth.queries"),
-    ({"queries": SALES}, "oauth.queries must be a list"),
+    ({}, "oauth.queries: the names of the registered queries"),
+    ({"queries": []}, "oauth.queries: the names of the registered queries"),
+    ({"queries": SALES}, "oauth.queries: must be a list"),
     ({"queries": [SECRET]}, "oauth.queries: invalid query name"),
     ({"queries": [7]}, "oauth.queries: invalid query name"),
     ({"queries": [SALES, SALES]}, f"oauth.queries: duplicate query '{SALES}'"),
-    ({"queries": [f"q-{i}" for i in range(51)]}, "more than 50 queries"),
+    ({"queries": [f"q-{i}" for i in range(51)]}, "oauth.queries: more than 50 queries"),
 ])
 def test_bad_entries_are_refused_naming_the_field_not_the_value(oauth, message):
     with pytest.raises(ValidationError) as info:
@@ -449,6 +462,44 @@ async def test_an_agent_whose_queries_are_all_disabled_gets_neither(caplog):
     assert "## Analytical queries" not in instructions
     assert "only-ina" not in build.specialists
     assert "names no usable InA query" in caplog.text and "Traceback" not in caplog.text
+
+
+async def test_a_row_with_two_ina_entries_gets_no_ina_tools(monkeypatch, caplog):
+    """The gate and storage refuse a second entry; a row written by hand has
+    two, and which one somebody reviewed cannot be told: neither is built
+    and neither's queries are in the catalogue scope. The agent keeps its
+    other servers and its OData source."""
+    from agents.data_catalog import tool as dc_tool
+    from agents.db import create_odata_service, validate_odata_service
+    from tests.test_odata_registry import SERVICE
+
+    scopes: list[frozenset] = []
+    real = dc_tool.data_catalog_toolset
+
+    def spy(*, sources, scope_tier):
+        scopes.append(frozenset(sources))
+        return real(sources=sources, scope_tier=scope_tier)
+
+    monkeypatch.setattr(dc_tool, "data_catalog_toolset", spy)
+    await add_query(SALES)
+    await add_query(STOCK)
+    async with SessionLocal() as s:
+        await create_odata_service(s, validate_odata_service(json.loads(json.dumps(SERVICE))))
+        await s.commit()
+    odata = {"url": "builtin:odata", "auth_mode": "destination",
+             "oauth": {"services": [SERVICE["name"]]}}
+    await add_agent("analyst", NOTES, odata, ina_server(SALES), ina_server(STOCK))
+    caplog.set_level(logging.WARNING, logger="agents.registry")
+    build = await registry_module.build_orchestrator()
+    tools, instructions = await seen_by_model(build.specialists["analyst"])
+    assert not any(t.endswith(("list_queries", "describe_query", "run_query")) for t in tools)
+    assert any(t.startswith("sapnotes_") for t in tools)
+    assert {"odata_search_operations", "find_data_source"} <= tools
+    assert "## Analytical queries" not in instructions
+    assert scopes == [frozenset({("odata", SERVICE["name"])})]
+    lines = [r.getMessage() for r in caplog.records if "builtin:ina" in r.getMessage()]
+    assert lines == ["Agent 'analyst': its row holds more than one builtin:ina entry; "
+                     "the agent is built without the InA tools"]
 
 
 async def test_the_tools_are_prefixed_beside_a_second_server():
