@@ -877,9 +877,9 @@ async def test_every_route_requires_the_admin_scope(monkeypatch):
         bare = FastAPI()
         bare.include_router(dc_routes.router, prefix="/admin")
         calls = [(m, route.path.replace("{kind}", "odata").replace("{name}", "x")
-                  .replace("{node_id}", "1"))
+                  .replace("{node_id}", "1").replace("{edge_id}", "1"))
                  for route in dc_routes.router.routes for m in route.methods - {"HEAD"}]
-        assert len(calls) == 6
+        assert len(calls) == 8
         async with AsyncClient(transport=ASGITransport(app=bare), base_url="http://t") as c:
             for method, path in calls:
                 kwargs = {} if method == "GET" else {"json": {"question": "x"}}
@@ -898,4 +898,5 @@ def test_the_app_serves_the_routes_under_admin_api_data_catalog():
     served = {p for p in paths if "/data-catalog/" in p}
     assert served == {
         f"{API}/sources", f"{API}/sources/{{kind}}/{{name}}",
-        f"{API}/nodes/{{node_id}}/hints", f"{API}/search", f"{API}/graph", f"{API}/rebuild"}
+        f"{API}/nodes/{{node_id}}/hints", f"{API}/search", f"{API}/graph", f"{API}/rebuild",
+        f"{API}/edges", f"{API}/edges/{{edge_id}}"}

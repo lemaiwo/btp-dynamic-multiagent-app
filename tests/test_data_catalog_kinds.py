@@ -5,7 +5,9 @@ one ``query`` node with its ``dimension`` and ``measure`` nodes, the
 cross-kind ``same_object`` links by name, curated edges kept across
 re-imports, the scope of a ``builtin:ina`` entry, an ``("odata", name)``
 scope that reaches a generic service, and the search boost and keys over
-dimensions and measures. The helpers and fixtures are those of
+dimensions and measures; the admin routes for every kind (the sources list
+and the detail per kind, the links an admin draws and removes, hints on
+query, dimension and measure nodes). The helpers and fixtures are those of
 ``tests/test_data_catalog.py``: ``_clean`` (autouse) and ``two_services``
 are imported so that pytest finds them here by name.
 """
@@ -19,11 +21,13 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from httpx import ASGITransport, AsyncClient
 from sqlalchemy import delete
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+import app as app_module  # noqa: E402
 from agents.data_catalog import search  # noqa: E402
 from agents.data_catalog.models import DataCatalogEdge, DataCatalogNode, utcnow  # noqa: E402
 from agents.data_catalog.scope import allowed_sources_of  # noqa: E402
@@ -36,7 +40,9 @@ from agents.db import (  # noqa: E402
     update_ina_query,
 )
 from tests.test_data_catalog import (  # noqa: E402
+    API,
     BILLING,
+    SECRET,
     _clean,  # noqa: F401
     add_agent,
     add_service,
@@ -138,6 +144,13 @@ async def add_query(data: dict[str, Any]) -> None:
 async def ina_query():
     await add_query(ONCALL_QUERY)
     await add_agent("standby", ina_server("oncall"))
+
+
+@pytest.fixture
+async def client():
+    async with AsyncClient(transport=ASGITransport(app=app_module.app),
+                           base_url="http://test") as c:
+        yield c
 
 
 @pytest.fixture
@@ -368,3 +381,274 @@ async def test_the_keys_of_a_candidate_come_from_any_child_kind(ina_query):
         found = await search.find_sources(
             db, "team", allowed_sources={("ina", "oncall")}, tier="basic")
     assert found[0]["keys"] == ["ZTEAM"]
+
+
+# --- admin routes: sources of every kind, detail per kind, links ---------------------
+
+
+@pytest.mark.usefixtures("two_services")
+async def test_sources_lists_every_kind(client, ina_query, generic_service):
+    spare = svc(ONCALL_QUERY, name="spare", title="Spare query", query="2CZC_SPARE")
+    del spare["definition"]
+    await add_query(spare)  # registered, attached by nobody: never imported
+    await rebuild()
+    r = await client.get(f"{API}/sources")
+    assert r.status_code == 200
+    by_key = {(s["kind"], s["name"]): s for s in r.json()["sources"]}
+    assert set(by_key) == {("odata", "sales-orders"), ("odata", "billing"),
+                           ("generic", "agent-data"), ("ina", "oncall"), ("ina", "spare")}
+    generic = by_key[("generic", "agent-data")]
+    assert generic["nodes"] == len(await nodes_of("agent-data")) == 6
+    assert generic["last_import"] and generic["used_by"] == ["data"]
+    oncall = by_key[("ina", "oncall")]
+    assert {k: oncall[k] for k in ("title", "destination", "user_context", "enabled",
+                                   "used_by", "nodes", "hint_completeness")} == {
+        "title": "On-call analysis", "destination": "SIA_INA", "user_context": True,
+        "enabled": True, "used_by": ["standby"], "nodes": 6, "hint_completeness": 0}
+    assert oncall["last_import"]
+    assert (by_key[("ina", "spare")]["nodes"], by_key[("ina", "spare")]["last_import"],
+            by_key[("ina", "spare")]["used_by"]) == (0, None, [])
+
+    async def completeness() -> float:
+        listed = (await client.get(f"{API}/sources")).json()["sources"]
+        return {(s["kind"], s["name"]): s for s in listed}[("ina", "oncall")][
+            "hint_completeness"]
+
+    measure = await node("oncall", "measure", "ZSTANDBY_H")
+    r = await client.put(f"{API}/nodes/{measure.id}/hints", json={"synonyms": ["standby"]})
+    assert r.status_code == 200, r.text
+    assert await completeness() == 0, "a dimension or a measure adds nothing"
+    query = await node("oncall", "query", "2CZC_ONCALL")
+    r = await client.put(f"{API}/nodes/{query.id}/hints", json={"purpose": "Duty per team"})
+    assert r.status_code == 200, r.text
+    assert await completeness() == 0.5  # the source and the query count
+
+
+async def test_the_detail_of_an_ina_source(client, ina_query, generic_service):
+    await rebuild()
+    r = await client.get(f"{API}/sources/ina/oncall")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert set(body) == {"source", "query", "edges", "used_by"}
+    assert body["source"]["name"] == "oncall" and body["source"]["source_kind"] == "ina"
+    assert body["used_by"] == ["standby"]
+    assert body["query"]["node"]["name"] == "2CZC_ONCALL"
+    assert [d["name"] for d in body["query"]["dimensions"]] == ["0CALMONTH", "ZTEAM"]
+    assert [(m["name"], m["unit"]) for m in body["query"]["measures"]] == [
+        ("ZSTANDBY_H", "H"), ("ZCALLOUTS", None)]
+    [edge] = body["edges"]  # the imported link to the generic view
+    assert (edge["kind"], edge["curated"]) == ("same_object", False) and edge["id"]
+    assert {edge["from_node"]["name"], edge["to_node"]["name"]} == {"2CZC_ONCALL",
+                                                                    "ZC_ONCALL"}
+    assert {edge["from_node"]["source_kind"], edge["to_node"]["source_kind"]} == {
+        "ina", "generic"}
+
+    bare = svc(ONCALL_QUERY, name="bare", query="2CZC_BARE")
+    del bare["definition"]
+    await add_query(bare)
+    r = await client.get(f"{API}/sources/ina/bare")  # registered, never imported
+    assert r.status_code == 200 and r.json() == {
+        "source": None, "query": None, "edges": [], "used_by": []}
+    for path in ("sources/ina/nothing", "sources/ina/a%20b"):
+        assert (await client.get(f"{API}/{path}")).status_code == 404, path
+
+
+async def test_the_detail_of_a_generic_source_has_the_odata_shape(client, generic_service):
+    await rebuild()
+    r = await client.get(f"{API}/sources/generic/agent-data")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert set(body) == {"source", "entities", "functions", "edges", "used_by"}
+    assert body["source"]["source_kind"] == "generic" and body["used_by"] == ["data"]
+    assert [e["node"]["name"] for e in body["entities"]] == ["ZC_ONCALL", "SCARR"]
+    assert [f["name"] for f in body["entities"][1]["fields"]] == ["CARRID"]
+    assert [f["name"] for f in body["functions"]] == ["MONTH_NAMES_GET"]
+    # The catalogue's own handle names the same row, as the rebuild route does.
+    again = (await client.get(f"{API}/sources/odata/agent-data")).json()
+    assert again["source"]["id"] == body["source"]["id"]
+
+
+async def test_an_agent_scope_reaches_its_generic_service(client, generic_service):
+    await rebuild()
+    r = await client.get(f"{API}/graph", params={"agent": "data"})
+    assert r.status_code == 200
+    assert {n["group"] for n in r.json()["nodes"]} == {"generic:agent-data"}
+    r = await client.post(f"{API}/search", json={"question": "airline", "agent": "data"})
+    assert r.json()["scope"] == "agent"
+    assert r.json()["candidates"][0]["name"] == "SCARR"
+
+
+@pytest.mark.usefixtures("two_services")
+async def test_an_admin_draws_a_link_and_removes_it(client, ina_query, generic_service):
+    await rebuild()
+    query = await node("oncall", "query", "2CZC_ONCALL")
+    order = await node("sales-orders", "entity", "A_SalesOrder")
+    view = await node("agent-data", "entity", "ZC_ONCALL")
+    [imported] = await edge_between(query, view)
+    before = len(await edges())
+    r = await client.post(f"{API}/edges",
+                          json={"from_id": query.id, "to_id": order.id, "kind": "aggregates"})
+    assert r.status_code == 201, r.text
+    drawn = r.json()
+    assert {k: drawn[k] for k in ("from", "to", "kind", "label", "curated")} == {
+        "from": query.id, "to": order.id, "kind": "aggregates", "label": "", "curated": True}
+    assert drawn["from_node"]["name"] == "2CZC_ONCALL"
+    assert drawn["to_node"]["source_name"] == "sales-orders"
+    [stored] = await edge_between(query, order)
+    assert stored.id == drawn["id"] and stored.curated_at is not None
+
+    detail = (await client.get(f"{API}/sources/ina/oncall")).json()
+    assert {(e["kind"], e["curated"]) for e in detail["edges"]} == {
+        ("same_object", False), ("aggregates", True)}
+    graph = (await client.get(f"{API}/graph")).json()
+    assert all(isinstance(e["curated"], bool) for e in graph["edges"])
+    assert [e["curated"] for e in graph["edges"]
+            if (e["from"], e["to"]) == (query.id, order.id)] == [True]
+    assert [e["curated"] for e in graph["edges"]
+            if {e["from"], e["to"]} == {query.id, view.id}] == [False]
+    assert not any(e["curated"] for e in graph["edges"] if e["kind"] == "contains")
+
+    # A pair is linked once, in either direction and whatever the kind.
+    for body in ({"from_id": order.id, "to_id": query.id, "kind": "aggregates"},
+                 {"from_id": query.id, "to_id": order.id, "kind": "same_object"},
+                 {"from_id": view.id, "to_id": query.id, "kind": "aggregates"}):
+        r = await client.post(f"{API}/edges", json=body)
+        assert r.status_code == 409, body
+    assert len(await edges()) == before + 1
+
+    r = await client.delete(f"{API}/edges/{imported.id}")
+    assert r.status_code == 409 and await edge_between(query, view)
+    r = await client.delete(f"{API}/edges/{drawn['id']}")
+    assert r.status_code == 204 and await edge_between(query, order) == []
+    assert (await client.delete(f"{API}/edges/{drawn['id']}")).status_code == 404
+    for eid in ("abc", "99999999999", "-1", "0x1"):
+        assert (await client.delete(f"{API}/edges/{eid}")).status_code == 404, eid
+
+
+@pytest.mark.usefixtures("two_services")
+async def test_a_function_can_be_linked(client, generic_service):
+    await rebuild()
+    month = await node("agent-data", "function", "MONTH_NAMES_GET")
+    release = await node("sales-orders", "function", "ReleaseOrder")
+    r = await client.post(f"{API}/edges",
+                          json={"from_id": month.id, "to_id": release.id, "kind": "same_object"})
+    assert r.status_code == 201, r.text
+
+
+@pytest.mark.usefixtures("two_services")
+async def test_link_refusals_name_the_field_never_the_value(client, ina_query):
+    await rebuild()
+    query = await node("oncall", "query", "2CZC_ONCALL")
+    order = await node("sales-orders", "entity", "A_SalesOrder")
+    item = await node("sales-orders", "entity", "A_SalesOrderItem")
+    field = await node("sales-orders", "field", "SoldToParty")
+    source = await node("billing", "source", "billing")
+    dimension = await node("oncall", "dimension", "ZTEAM")
+    cases = [
+        ({"from_id": order.id, "to_id": item.id, "kind": "aggregates"}, 422,
+         "to_id: same source as from_id"),
+        ({"from_id": order.id, "to_id": order.id, "kind": "aggregates"}, 422,
+         "to_id: same source as from_id"),
+        ({"from_id": field.id, "to_id": query.id, "kind": "aggregates"}, 422,
+         "from_id: not an entity, query or function"),
+        ({"from_id": query.id, "to_id": source.id, "kind": "aggregates"}, 422,
+         "to_id: not an entity, query or function"),
+        ({"from_id": dimension.id, "to_id": order.id, "kind": "aggregates"}, 422,
+         "from_id: not an entity, query or function"),
+        ({"from_id": 999999, "to_id": order.id, "kind": "aggregates"}, 422,
+         "from_id: not a node of the catalogue"),
+        ({"from_id": query.id, "to_id": 999999, "kind": "aggregates"}, 422,
+         "to_id: not a node of the catalogue"),
+        ({"from_id": query.id, "to_id": order.id, "kind": "navigation"}, 422, "kind:"),
+        ({"from_id": query.id, "to_id": order.id, "kind": SECRET}, 422, "kind:"),
+        ({"from_id": query.id, "to_id": order.id, "kind": 1}, 422, "kind:"),
+        ({"from_id": str(query.id), "to_id": order.id, "kind": "aggregates"}, 422, "from_id:"),
+        ({"from_id": True, "to_id": order.id, "kind": "aggregates"}, 422, "from_id:"),
+        ({"from_id": 0, "to_id": order.id, "kind": "aggregates"}, 422, "from_id:"),
+        ({"from_id": query.id, "kind": "aggregates"}, 422, "to_id:"),
+        ({"from_id": query.id, "to_id": order.id, "kind": "aggregates", "label": SECRET},
+         422, "label:"),
+    ]
+    for body, status, detail in cases:
+        r = await client.post(f"{API}/edges", json=body)
+        assert r.status_code == status, (body, r.text)
+        assert r.json()["detail"].startswith(detail), (body, r.text)
+        assert SECRET not in r.text and "999999" not in r.text
+    for raw in (b"[1]", b"not json", b'"x"'):
+        r = await client.post(f"{API}/edges", content=raw,
+                              headers={"content-type": "application/json"})
+        assert r.status_code == 422 and r.json()["detail"] == "body: expected a JSON object"
+    assert all(e.curated_at is None for e in await edges())
+
+
+@pytest.mark.usefixtures("two_services")
+async def test_a_drawn_link_is_named_in_the_relations_like_an_imported_one(
+    client, ina_query
+):
+    await rebuild()
+    query = await node("oncall", "query", "2CZC_ONCALL")
+    order = await node("sales-orders", "entity", "A_SalesOrder")
+    r = await client.post(f"{API}/edges",
+                          json={"from_id": query.id, "to_id": order.id, "kind": "aggregates"})
+    assert r.status_code == 201, r.text
+    allowed = {("ina", "oncall"), ("odata", "sales-orders")}
+    async with SessionLocal() as db:
+        by_query = await search.find_sources(
+            db, "standby hours", allowed_sources=allowed, tier="basic")
+        narrow = await search.find_sources(
+            db, "standby hours", allowed_sources={("ina", "oncall")}, tier="basic")
+    assert by_query[0]["name"] == "2CZC_ONCALL"
+    assert {"kind": "aggregates", "to": {"source_name": "sales-orders", "name": "A_SalesOrder",
+                                         "label": order.label}} in by_query[0]["relations"]
+    assert narrow[0]["relations"] == []  # the other end is outside that scope
+
+
+async def test_hints_on_query_dimension_and_measure_nodes(client, ina_query):
+    await rebuild()
+    query = await node("oncall", "query", "2CZC_ONCALL")
+    team = await node("oncall", "dimension", "ZTEAM")
+    hours = await node("oncall", "measure", "ZSTANDBY_H")
+    r = await client.put(f"{API}/nodes/{query.id}/hints", json={"label": "On-call duty"})
+    assert r.status_code == 200 and r.json()["label"] == "On-call duty"
+    r = await client.put(f"{API}/nodes/{team.id}/hints", json={"synonyms": ["crew"]})
+    assert r.status_code == 200 and r.json()["synonyms"] == ["crew"]
+    r = await client.put(f"{API}/nodes/{hours.id}/hints", json={"readable": False})
+    assert r.status_code == 200 and r.json()["readable"] is False
+    await rebuild()
+    assert (await node("oncall", "measure", "ZSTANDBY_H")).readable == 0  # narrowed, kept
+    assert (await node("oncall", "query", "2CZC_ONCALL")).label == "On-call duty"
+    async with SessionLocal() as db:
+        found = await search.find_sources(
+            db, "standby hours", allowed_sources={("ina", "oncall")}, tier="basic")
+        by_crew = await search.find_sources(
+            db, "crew", allowed_sources={("ina", "oncall")}, tier="basic")
+    assert found == []  # a measure that is not readable boosts nothing
+    assert by_crew[0]["name"] == "2CZC_ONCALL"
+    # Back up to what the description allows: an InA member is readable.
+    r = await client.put(f"{API}/nodes/{hours.id}/hints", json={"readable": True})
+    assert r.status_code == 200 and r.json()["readable"] is True
+    r = await client.put(f"{API}/nodes/{team.id}/hints", json={"readable": False})
+    assert r.status_code == 200
+    async with SessionLocal() as s:  # the registration is gone, its nodes not yet
+        await s.execute(delete(InaQuery))
+        await s.commit()
+    r = await client.put(f"{API}/nodes/{team.id}/hints", json={"readable": True})
+    assert r.status_code == 422 and r.json()["detail"].startswith("readable:")
+
+
+async def test_a_generic_node_is_widened_back_up_to_the_definition_only(client):
+    hidden = svc(GENERIC_DATA)
+    hidden["definition"]["entity_sets"][1]["fields"].append(
+        {"name": "INTERNAL", "label": "Internal", "selectable": False})
+    await add_service(hidden)
+    await add_agent("data", odata_server("agent-data"))
+    await rebuild()
+    carrid = await node("agent-data", "field", "CARRID")
+    internal = await node("agent-data", "field", "INTERNAL")
+    assert carrid.source_kind == "generic" and internal.readable == 0
+    r = await client.put(f"{API}/nodes/{carrid.id}/hints", json={"readable": False})
+    assert r.status_code == 200
+    r = await client.put(f"{API}/nodes/{carrid.id}/hints", json={"readable": True})
+    assert r.status_code == 200 and r.json()["readable"] is True
+    r = await client.put(f"{API}/nodes/{internal.id}/hints", json={"readable": True})
+    assert r.status_code == 422 and r.json()["detail"].startswith("readable:")
