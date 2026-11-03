@@ -185,10 +185,10 @@ async def test_to_dict_shape_and_stored_types():
         row = await create_odata_service(s, validate_odata_service(GOOD))
         d = row.to_dict()
         assert set(d) == {
-            "id", "name", "title", "purpose", "not_for", "destination", "user_context",
-            "odata_version", "service_path", "enabled", "definition", "metadata_fetched_at",
-            "created_at", "updated_at", "counts", "has_write", "used_by",
-            "uncallable_operations",
+            "id", "name", "kind", "title", "purpose", "not_for", "destination",
+            "user_context", "odata_version", "service_path", "enabled", "definition",
+            "metadata_fetched_at", "created_at", "updated_at", "counts", "has_write",
+            "used_by", "uncallable_operations",
         }
         assert d["uncallable_operations"] == []  # the one operation is not enabled
         assert d["user_context"] is True and d["enabled"] is True
@@ -238,6 +238,62 @@ async def test_metadata_fetched_at_round_trips_through_export():
         assert datetime.fromisoformat(stamp) == datetime.fromisoformat(
             exported["metadata_fetched_at"].replace("Z", "+00:00")
         )
+
+
+async def test_kind_defaults_to_odata_and_generic_is_stored():
+    """``kind`` (addendum (k), part 3): a service saved without it is a plain
+    OData service; ``generic`` is the ZAGENT_DATA registration."""
+    async with SessionLocal() as s:
+        plain = await create_odata_service(s, validate_odata_service(GOOD))
+        generic = await create_odata_service(
+            s, validate_odata_service(good(name="zagent-data", kind="generic"))
+        )
+        # Written past the gate (an older row, a direct insert): the column's default.
+        s.add(ODataService(
+            name="raw-row", title="t", purpose="p", destination="S4_ODATA_TECH",
+            odata_version="v2", service_path="/x", definition_json="{}",
+        ))
+        await s.commit()
+    async with SessionLocal() as s:
+        rows = {r.name: r for r in await list_odata_services(s)}
+    assert (plain.kind, rows["purchase-requisitions"].kind) == ("odata", "odata")
+    assert rows["zagent-data"].kind == "generic" and generic.kind == "generic"
+    assert rows["raw-row"].kind == "odata"
+    assert rows["zagent-data"].to_export()["kind"] == "generic"
+    assert rows["zagent-data"].to_dict()["kind"] == "generic"
+    assert rows["purchase-requisitions"].to_summary()["kind"] == "odata"
+    # The export goes back through the gate unchanged, kind included.
+    exported = rows["zagent-data"].to_export()
+    assert validate_odata_service(exported) == exported
+
+
+async def test_an_update_replaces_the_kind():
+    async with SessionLocal() as s:
+        row = await create_odata_service(s, validate_odata_service(GOOD))
+        await update_odata_service(s, row, validate_odata_service(good(kind="generic")))
+    async with SessionLocal() as s:
+        assert (await get_odata_service(s, "purchase-requisitions")).kind == "generic"
+
+
+@pytest.mark.skipif(engine.dialect.name != "sqlite", reason="drops a column on SQLite")
+async def test_init_db_adds_kind_to_an_older_table_and_its_rows_read_odata():
+    """A database of 2.34 has no ``kind``: the migration adds it NOT NULL
+    with the default, so the rows already there read back ``odata``."""
+    import sqlite3
+
+    if sqlite3.sqlite_version_info < (3, 35):
+        pytest.skip("SQLite before 3.35 cannot drop a column")
+    async with SessionLocal() as s:
+        await create_odata_service(s, validate_odata_service(GOOD))
+    async with engine.begin() as c:
+        await c.exec_driver_sql("ALTER TABLE odata_services DROP COLUMN kind")
+    await agents_db._create_and_migrate()
+    async with engine.connect() as c:
+        columns = await c.run_sync(lambda s: inspect(s).get_columns("odata_services"))
+    kind = next(col for col in columns if col["name"] == "kind")
+    assert kind["nullable"] is False
+    async with SessionLocal() as s:
+        assert (await get_odata_service(s, "purchase-requisitions")).kind == "odata"
 
 
 async def test_duplicate_name_is_a_value_error():
@@ -467,6 +523,8 @@ def test_column_widths_fit_what_validation_accepts():
     assert cols.purpose.type.length >= 200 and cols.not_for.type.length >= 200
     assert cols.destination.type.length >= 200
     assert cols.service_path.type.length >= 512
+    assert cols.kind.type.length >= max(len("odata"), len("generic"))
+    assert cols.kind.nullable is False and cols.kind.server_default is not None
     audit = ODataAuditLog.__table__.c
     assert audit.service.type.length >= 64 and audit.target.type.length >= 128
     assert audit.agent.type.length >= AgentConfig.__table__.c.name.type.length

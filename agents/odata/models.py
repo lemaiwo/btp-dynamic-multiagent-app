@@ -75,7 +75,7 @@ def _first_duplicate(names: list[str]) -> str | None:
     return None
 
 
-def _one_line(value: str, info: ValidationInfo) -> str:
+def one_line(value: str, info: ValidationInfo) -> str:
     """Refuse a control character or a line separator in a one-line text.
 
     These texts are printed as one line each -- the service's ``purpose`` in
@@ -87,6 +87,11 @@ def _one_line(value: str, info: ValidationInfo) -> str:
     if any(unicodedata.category(ch) in ("Cc", "Zl", "Zp") for ch in value):
         raise ValueError(f"{info.field_name} must be one line of text without control characters")
     return value
+
+
+# The earlier, private name; `one_line` is public because the InA gate
+# (agents/ina/models.py) applies the same rule.
+_one_line = one_line
 
 
 class _Model(BaseModel):
@@ -104,7 +109,7 @@ class ValueMeaning(_Model):
     value: str = Field(min_length=1, max_length=64)
     meaning: str = Field(min_length=1, max_length=200)
 
-    _one_line = field_validator("value", "meaning")(_one_line)
+    _one_line = field_validator("value", "meaning")(one_line)
 
 
 class FieldDef(_Model):
@@ -124,7 +129,7 @@ class FieldDef(_Model):
     values: list[ValueMeaning] = Field(default_factory=list)
     personal_data: StrictBool = False
 
-    _one_line = field_validator("label")(_one_line)
+    _one_line = field_validator("label")(one_line)
 
     @model_validator(mode="after")
     def _filterable_is_selectable(self) -> FieldDef:
@@ -167,7 +172,7 @@ class EntitySetDef(_Model):
     navigations: list[NavigationDef] = Field(default_factory=list)
     examples: list[ExampleQuery] = Field(default_factory=list)
 
-    _one_line = field_validator("title")(_one_line)
+    _one_line = field_validator("title")(one_line)
 
     @field_validator("path")
     @classmethod
@@ -279,7 +284,7 @@ class OperationDef(_Model):
     # None = not known: a result is then tied to `bound_to`, or withheld.
     returns: ReturnDef | None = None
 
-    _one_line = field_validator("title")(_one_line)
+    _one_line = field_validator("title")(one_line)
 
     def is_write(self) -> bool:
         """Whether a call of this operation is a write (``operation_is_write``)."""
@@ -355,6 +360,9 @@ class ODataServicePayload(_Model):
     """One catalogue service, as the admin API takes it and export writes it."""
 
     name: Annotated[str, StringConstraints(pattern=SERVICE_NAME_RE)]
+    # `generic` is the ZAGENT_DATA registration of addendum (k), part 3 (the
+    # rules that differ for it are applied where the kind is read).
+    kind: Literal["odata", "generic"] = "odata"
     # Stripped before the length check, so a blank title or purpose is
     # refused: the model picks a service by these two lines.
     title: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=120)]
@@ -371,7 +379,7 @@ class ODataServicePayload(_Model):
     metadata_fetched_at: datetime | None = None
 
     # Runs after the strip above, so surrounding whitespace is still dropped.
-    _one_line = field_validator("title", "purpose", "not_for")(_one_line)
+    _one_line = field_validator("title", "purpose", "not_for")(one_line)
 
     @field_validator("service_path")
     @classmethod

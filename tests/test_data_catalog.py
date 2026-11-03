@@ -281,6 +281,20 @@ async def test_navigation_and_same_object_edges(two_services):
     assert len([e for e in await edges() if e.kind == "same_object"]) == 1
 
 
+async def test_an_edge_is_not_curated_unless_an_admin_drew_it(two_services):
+    """``curated_at`` (generation 9) marks a link an admin drew; the edges an
+    import makes, and a row written without it, leave it NULL."""
+    assert DataCatalogEdge.__table__.c.curated_at.nullable is True
+    await rebuild()
+    assert [e.curated_at for e in await edges()] == [None, None]
+    order = await node("sales-orders", "entity", "A_SalesOrder")
+    invoice = await node("billing", "entity", "A_BillingDocument")
+    async with SessionLocal() as db:
+        db.add(DataCatalogEdge(from_id=order.id, to_id=invoice.id, kind="aggregates"))
+        await db.commit()
+    assert {e.kind: e.curated_at for e in await edges()}["aggregates"] is None
+
+
 async def test_only_sources_of_enabled_agents_and_enabled_services_are_imported():
     await add_service(ORDERS)
     await add_service(BILLING)

@@ -53,6 +53,8 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import TypeDecorator
 
 from agents import hana_hdi
+from agents.ina import BUILTIN_INA_URL
+from agents.ina.models import InaQueryPayload, validate_ina_query
 from agents.odata import BUILTIN_ODATA_URL
 
 # The catalogue's save-time gate lives with its models; re-exported because
@@ -927,6 +929,12 @@ class ODataService(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+    # `odata` or `generic` (the ZAGENT_DATA registration, addendum (k) part
+    # 3; HANA schema generation 9). Last, so HDI adds it to the table in
+    # place; the server default fills the rows that are already there.
+    kind: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="odata", server_default="odata"
+    )
 
     def _stored_definition(self) -> dict[str, Any] | None:
         """The stored definition, or None when it is not a JSON object."""
@@ -973,6 +981,7 @@ class ODataService(Base):
         timestamp except when the metadata was read."""
         return {
             "name": self.name,
+            "kind": self.kind or "odata",
             "title": self.title,
             "purpose": self.purpose,
             "not_for": self.not_for or "",
@@ -1123,6 +1132,105 @@ class ODataAuditLog(Base):
             "run_principal": self.run_principal,
             "token_digest": self.token_digest,
         }
+
+
+class InaQuery(Base):
+    """One registered analytical query of ``builtin:ina``.
+
+    The InA sibling of ``ODataService`` (addendum (k), part 2): the
+    destination a call goes through and whose identity it carries
+    (``user_context``), the query's InA ``DataSource.ObjectName``
+    (``query``) and ``PackageName`` (``package``), and what ``Describe``
+    read from SAP (``definition_json``, an ``agents.ina.models.InaDefinition``;
+    NULL until the first describe). Agents name a query in their
+    ``builtin:ina`` entry, so the name is the stable handle and is never
+    changed after creation. HANA schema generation 9.
+    """
+
+    __tablename__ = "ina_queries"
+    __table_args__ = (UniqueConstraint("name", name="uq_ina_queries_name"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # Widths follow the limits in agents/ina/models.py, which Postgres and
+    # HANA enforce and SQLite does not; tests/test_ina_db.py holds the two
+    # together.
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    title: Mapped[str] = mapped_column(String(120), nullable=False)
+    purpose: Mapped[str] = mapped_column(String(200), nullable=False)
+    not_for: Mapped[str] = mapped_column(
+        String(200), nullable=False, default="", server_default=""
+    )
+    destination: Mapped[str] = mapped_column(String(200), nullable=False)
+    # 1 = as the signed-in user (principal propagation), 0 = as the
+    # destination's technical user; Integer 0/1 as on ODataService.
+    user_context: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    query: Mapped[str] = mapped_column(String(128), nullable=False)
+    package: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="", server_default=""
+    )
+    definition_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    metadata_fetched_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    enabled: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    # The version `update_ina_query` compares with ``expected_updated_at``;
+    # no ``onupdate``, for the reason given at ``ODataService.updated_at``.
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    def _stored_definition(self) -> dict[str, Any] | None:
+        """The stored description; None when there is none yet, and when the
+        stored text is not a JSON object (logged by name, so a broken row
+        still lists and can be described again)."""
+        if self.definition_json is None:
+            return None
+        try:
+            value = json.loads(self.definition_json)
+        except (TypeError, ValueError):
+            value = None
+        if not isinstance(value, dict):
+            logger.warning("Malformed definition_json on InA query %s", self.name)
+            return None
+        return value
+
+    def to_export(self) -> dict[str, Any]:
+        """Exactly an ``InaQueryPayload`` dump (``model_dump(mode="json")``):
+        portable, no ids, no row timestamps, so an export goes back through
+        `validate_ina_query` unchanged."""
+        return {
+            "name": self.name,
+            "title": self.title,
+            "purpose": self.purpose,
+            "not_for": self.not_for or "",
+            "destination": self.destination,
+            "user_context": bool(self.user_context),
+            "query": self.query,
+            "package": self.package or "",
+            "definition": self._stored_definition(),
+            "metadata_fetched_at": _odata_stamp(self.metadata_fetched_at),
+            "enabled": bool(self.enabled),
+        }
+
+    def to_dict(self, used_by: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        """``to_export`` plus the row's id and timestamps (``updated_at`` is
+        what a client sends back as ``expected_updated_at``) and the agents
+        that name the query (`ina_query_referrers`)."""
+        data = self.to_export()
+        data.update(
+            id=self.id,
+            created_at=self.created_at.isoformat() if self.created_at else None,
+            updated_at=self.updated_at.isoformat() if self.updated_at else None,
+            used_by=list(used_by or []),
+        )
+        return data
 
 
 class Workflow(Base):
@@ -1942,6 +2050,12 @@ async def _create_and_migrate() -> None:
             conn, "agent_configs", "share_tools", "INTEGER NOT NULL DEFAULT 0"
         )
         await _ensure_column(conn, "chat_user_agents", "tools_json", "TEXT")
+        # The catalogue for every kind (addendum (k)): a service's kind and
+        # the links an admin draws. ina_queries is a new table (create_all).
+        await _ensure_column(
+            conn, "odata_services", "kind", "VARCHAR(16) NOT NULL DEFAULT 'odata'"
+        )
+        await _ensure_column(conn, "data_catalog_edges", "curated_at", tstz)
         await _backfill_ide_revisions(conn)
         await _resync_ide_revisions(conn)
         # create_all only creates indexes together with a new table; an
@@ -3365,6 +3479,7 @@ def odata_service_columns(data: dict[str, Any]) -> dict[str, Any]:
     """
     definition = _ODataServiceDefinition.model_validate(data.get("definition") or {})
     return {
+        "kind": data.get("kind") or "odata",
         "title": data["title"],
         "purpose": data["purpose"],
         "not_for": data.get("not_for") or "",
@@ -3773,6 +3888,233 @@ async def odata_service_referrers(
                 })
                 entry["allow_write"] = entry["allow_write"] or allow_write
     return {service: list(by_agent.values()) for service, by_agent in found.items()}
+
+
+# --- InA queries (builtin:ina) ---
+# The refusals of the CRUD: the field and the rule, never a value.
+INA_NAME_TAKEN = "name: already exists"
+INA_NAME_FIXED = "name: cannot be changed; register the query under the new name instead"
+# The payload fields a ``Describe`` writes rather than an admin types, and
+# their columns: an update that leaves such a key out keeps the stored value.
+_INA_DESCRIBED = {"definition": "definition_json", "metadata_fetched_at": "metadata_fetched_at"}
+
+
+class StaleRow(Exception):
+    """A compare-and-set on ``updated_at`` lost: the row moved on since the
+    client loaded it, and nothing was written. A route answers 409.
+
+    The message is fixed: it names neither the row nor anything of the
+    payload, so it can be answered and logged as it is.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("changed since it was loaded; reload it and save again")
+
+
+def _ina_payload(data: InaQueryPayload | dict[str, Any]) -> InaQueryPayload:
+    """``data`` as the gate's model. Anything but a payload goes through
+    `validate_ina_query` here, so a caller without the admin route (an import
+    script, a test) cannot store what the gate refuses."""
+    return data if isinstance(data, InaQueryPayload) else validate_ina_query(data)
+
+
+def ina_query_columns(payload: InaQueryPayload) -> dict[str, Any]:
+    """Column values for a query from the validated payload (all but the name).
+
+    The definition is stored as the model's own ``model_dump_json()``, so
+    `InaQuery.to_export` reads back exactly what the gate produced; no
+    description yet is NULL.
+    """
+    return {
+        "title": payload.title,
+        "purpose": payload.purpose,
+        "not_for": payload.not_for,
+        "destination": payload.destination,
+        "user_context": 1 if payload.user_context is True else 0,
+        "query": payload.query,
+        "package": payload.package,
+        "definition_json": (
+            None if payload.definition is None else payload.definition.model_dump_json()
+        ),
+        "metadata_fetched_at": _odata_utc(payload.metadata_fetched_at),
+        "enabled": 1 if payload.enabled is True else 0,
+    }
+
+
+async def list_ina_queries(session: AsyncSession, *, lock: bool = False) -> list[InaQuery]:
+    """Every registered query, in name order; ``lock`` as in `list_odata_services`."""
+    query = select(InaQuery).order_by(InaQuery.name)
+    if lock:
+        query = query.with_for_update()
+    return list((await session.execute(query)).scalars().all())
+
+
+async def get_ina_query(session: AsyncSession, name: str) -> InaQuery | None:
+    result = await session.execute(select(InaQuery).where(InaQuery.name == name))
+    return result.scalar_one_or_none()
+
+
+async def create_ina_query(
+    session: AsyncSession,
+    data: InaQueryPayload | dict[str, Any],
+    *,
+    commit: bool = True,
+) -> InaQuery:
+    """Store a new query; ``data`` is `validate_ina_query` output (a dict is
+    validated first).
+
+    A taken name is ``ValueError(INA_NAME_TAKEN)``. As in
+    `create_odata_service`: the lookup gives the answer, the unique
+    constraint closes the check-then-write race, and the insert runs in a
+    SAVEPOINT so a caller with ``commit=False`` (an import) loses only this
+    row when it loses that race.
+    """
+    payload = _ina_payload(data)
+    if await get_ina_query(session, payload.name) is not None:
+        raise ValueError(INA_NAME_TAKEN)
+    row = InaQuery(name=payload.name, **ina_query_columns(payload))
+    await _begin_before_savepoint(session)
+    try:
+        async with session.begin_nested():
+            session.add(row)
+            await session.flush()
+    except IntegrityError:
+        # `from None`: the IntegrityError carries the statement and its values.
+        raise ValueError(INA_NAME_TAKEN) from None
+    if commit:
+        await session.commit()
+    await session.refresh(row)
+    return row
+
+
+def _stamp_moved(stored: datetime | None, expected: datetime | None) -> bool:
+    """Whether the row's ``updated_at`` is no longer ``expected``.
+
+    Instants are compared, not texts (SQLite hands the column back naive,
+    Postgres aware; a client may send either). ``expected`` None asks for no
+    check; a row without a stamp is always moved.
+    """
+    if expected is None:
+        return False
+    stored_utc = _odata_utc(stored)
+    return stored_utc is None or stored_utc != _odata_utc(expected)
+
+
+def _locked_ina_query(name: str) -> Any:
+    """The query row with an exclusive row lock (Postgres, HANA; SQLAlchemy
+    leaves ``FOR UPDATE`` out on SQLite)."""
+    return select(InaQuery).where(InaQuery.name == name).with_for_update()
+
+
+async def update_ina_query(
+    session: AsyncSession,
+    name: str,
+    data: InaQueryPayload | dict[str, Any],
+    *,
+    expected_updated_at: datetime | None = None,
+    commit: bool = True,
+) -> InaQuery | None:
+    """Replace everything but the name of query ``name`` with ``data``.
+
+    Lock, compare, write in the caller's transaction, as the OData update
+    route does: the row is read ``FOR UPDATE``, and with
+    ``expected_updated_at`` it is replaced only while its ``updated_at`` is
+    still that instant, else `StaleRow` and nothing changes. Of two saves
+    that loaded the same stamp the second waits at the locked read and then
+    compares against the first one's new stamp. SQLite has no row locks: on
+    a session that has not started yet the transaction is made a writer
+    first (`begin_exclusive_write`); a caller whose transaction is already
+    open there takes that lock itself, before its first statement. Without
+    ``expected_updated_at`` the replace is unconditional (scripts, imports).
+
+    Answers None for an unknown name; a different name in ``data`` is
+    ``ValueError(INA_NAME_FIXED)``: agents name a query, so a rename would
+    detach them silently. ``definition`` and ``metadata_fetched_at`` are
+    what ``Describe`` read from SAP: a payload that leaves such a key out
+    (an edit form) keeps the stored value, an explicit ``null`` clears it.
+    ``updated_at`` moves forward on every call (`_next_odata_stamp`), also
+    when no field changed.
+    """
+    payload = _ina_payload(data)
+    if not session.in_transaction():
+        await begin_exclusive_write(session)
+    row = (await session.execute(_locked_ina_query(name))).scalar_one_or_none()
+    if row is None:
+        return None
+    if payload.name != row.name:
+        raise ValueError(INA_NAME_FIXED)
+    if _stamp_moved(row.updated_at, expected_updated_at):
+        raise StaleRow()
+    columns = ina_query_columns(payload)
+    for field_name, column in _INA_DESCRIBED.items():
+        if field_name not in payload.model_fields_set:
+            del columns[column]
+    for column, value in columns.items():
+        setattr(row, column, value)
+    row.updated_at = _next_odata_stamp(row.updated_at)
+    if commit:
+        await session.commit()
+    else:
+        await session.flush()
+    await session.refresh(row)
+    return row
+
+
+async def delete_ina_query(
+    session: AsyncSession, row: InaQuery, *, commit: bool = True
+) -> bool:
+    """Delete the query. Whether agents still name it is the caller's
+    question (`ina_query_referrers`); nothing is detached here."""
+    await session.delete(row)
+    if commit:
+        await session.commit()
+    else:
+        await session.flush()
+    return True
+
+
+def ina_entries(servers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The ``builtin:ina`` config blocks of a server list, in order (the
+    `odata_entries` rule: a block that is not an object is left out)."""
+    blocks: list[dict[str, Any]] = []
+    for server in servers or []:
+        if not isinstance(server, dict):
+            continue
+        url = str(server.get("url") or "").strip().rstrip("/").lower()
+        if url == BUILTIN_INA_URL and isinstance(server.get("oauth"), dict):
+            blocks.append(server["oauth"])
+    return blocks
+
+
+async def ina_query_referrers(
+    session: AsyncSession, name: str | None = None
+) -> dict[str, list[dict[str, Any]]]:
+    """Which agents name which query in a ``builtin:ina`` entry.
+
+    ``{query name: [{agent_id, agent, enabled, expose_api, api_slug}]}``,
+    agents in name order, enabled and disabled alike (a disabled agent
+    breaks when its query is deleted and it is turned back on). One pass
+    over the agents; ``name`` narrows the answer to one query (absent when
+    nobody names it). An agent naming a query twice appears once; a name
+    that is not a string is ignored.
+    """
+    found: dict[str, dict[int, dict[str, Any]]] = {}
+    for agent in await list_agents(session):
+        for block in ina_entries(agent.mcp_servers):
+            queries = block.get("queries")
+            if not isinstance(queries, (list, tuple)):
+                continue
+            for query in queries:
+                if not isinstance(query, str) or (name is not None and query != name):
+                    continue
+                found.setdefault(query, {}).setdefault(agent.id, {
+                    "agent_id": agent.id,
+                    "agent": agent.name,
+                    "enabled": bool(agent.enabled),
+                    "expose_api": bool(agent.expose_api),
+                    "api_slug": agent.api_slug,
+                })
+    return {query: list(by_agent.values()) for query, by_agent in found.items()}
 
 
 # The longest retention the purge computes with (100 years): a larger

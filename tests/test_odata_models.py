@@ -129,6 +129,7 @@ def test_payload_has_exactly_the_contract_fields():
         "definition",
         "destination",
         "enabled",
+        "kind",
         "metadata_fetched_at",
         "name",
         "not_for",
@@ -146,6 +147,7 @@ def test_defaults():
     data["definition"] = {}
     p = ODataServicePayload.model_validate(data)
     assert p.enabled is True and p.user_context is False and p.not_for == ""
+    assert p.kind == "odata"
     assert p.definition == ServiceDefinition() and p.metadata_fetched_at is None
     field = ODataServicePayload.model_validate(GOOD).definition.entity_sets[0].fields[1]
     assert (field.type, field.filterable, field.writable, field.personal_data) == (
@@ -154,6 +156,23 @@ def test_defaults():
         False,
         False,
     )
+
+
+def test_kind_is_odata_or_generic_and_a_refusal_names_the_field():
+    """``kind`` (addendum (k), part 3, schema generation 9): the column the
+    export carries, so an export goes back through this gate unchanged."""
+    assert validate_odata_service({**good(), "kind": "generic"})["kind"] == "generic"
+    assert validate_odata_service(good())["kind"] == "odata"
+    with pytest.raises(ValueError) as refused:
+        validate_odata_service({**good(), "kind": "zagent-secret"})
+    assert str(refused.value).startswith("kind:")
+    assert "zagent-secret" not in str(refused.value)
+
+
+def test_one_line_is_public_and_the_private_name_still_works():
+    from agents.odata import models
+
+    assert models._one_line is models.one_line
 
 
 def test_title_and_purpose_are_stripped():

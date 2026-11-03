@@ -1,4 +1,5 @@
-"""The tables of the data catalogue graph (HANA schema generation 8).
+"""The tables of the data catalogue graph (HANA schema generation 8; 9 adds
+``data_catalog_edges.curated_at``).
 
 Three tables, portable across SQLite, Postgres and HANA:
 
@@ -144,6 +145,11 @@ class DataCatalogEdge(Base):
     kind: Mapped[str] = mapped_column(String(16), nullable=False)
     label: Mapped[str] = mapped_column(
         String(LABEL_MAX), nullable=False, default="", server_default=""
+    )
+    # Set when an admin drew the link (addendum (k), schema generation 9);
+    # NULL for every edge an import made.
+    curated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
 
 

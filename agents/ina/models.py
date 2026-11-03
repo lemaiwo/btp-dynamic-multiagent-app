@@ -38,8 +38,8 @@ from pydantic import (
     field_validator,
 )
 
-# `_one_line` is imported rather than restated: one rule for both pages.
-from agents.odata.models import DESTINATION_NAME_RE, _one_line, loc_path
+# `one_line` is imported rather than restated: one rule for both pages.
+from agents.odata.models import DESTINATION_NAME_RE, loc_path, one_line
 
 QUERY_NAME_RE = r"^[a-z0-9][a-z0-9-]{0,63}$"  # the slug agents and server entries use
 
@@ -55,10 +55,10 @@ _MAX_REPORTED_ERRORS = 20
 # are not EDM identifiers (`0CALMONTH`, `[ZREGION].[KEY]`, `!V0001`); only
 # what would break a line is refused.
 InaName = Annotated[
-    StrictStr, StringConstraints(min_length=1, max_length=128), AfterValidator(_one_line)
+    StrictStr, StringConstraints(min_length=1, max_length=128), AfterValidator(one_line)
 ]
-Label = Annotated[StrictStr, StringConstraints(max_length=120), AfterValidator(_one_line)]
-Unit = Annotated[StrictStr, StringConstraints(max_length=32), AfterValidator(_one_line)]
+Label = Annotated[StrictStr, StringConstraints(max_length=120), AfterValidator(one_line)]
+Unit = Annotated[StrictStr, StringConstraints(max_length=32), AfterValidator(one_line)]
 
 
 def _first_repeat(names: list[str]) -> int | None:
@@ -138,7 +138,7 @@ class InaQueryPayload(_Model):
     enabled: StrictBool = True
 
     # Runs after the strip above, so surrounding whitespace is still dropped.
-    _one_line = field_validator("title", "purpose", "not_for", "package")(_one_line)
+    _one_line = field_validator("title", "purpose", "not_for", "package")(one_line)
 
 
 def validate_ina_query(data: Any) -> InaQueryPayload:

@@ -6,3 +6,7 @@ registers each query (``models.py``) and a ``Describe`` reads its dimensions,
 measures and variables from SAP once, so a query that is not registered does
 not exist for the model.
 """
+
+BUILTIN_INA_URL = "builtin:ina"
+
+__all__ = ["BUILTIN_INA_URL"]
