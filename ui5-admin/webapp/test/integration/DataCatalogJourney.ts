@@ -71,10 +71,11 @@ opaTest("the list shows each source with its completeness", function (Given: Com
     Then.waitFor({
         id: "dcSourcesTable",
         viewName: LIST_VIEW,
-        check: (table: UI5Element) => rowsOf(table).length === 3,
+        check: (table: UI5Element) => rowsOf(table).length === 5,
         success: function (table: UI5Element) {
-            Opa5.assert.deepEqual(rowsOf(table).map(nameOf), ["purchase-requisitions", "business-partners", "sales-orders"],
-                "every catalogue service is listed, the one never imported included");
+            Opa5.assert.deepEqual(rowsOf(table).map(nameOf),
+                ["purchase-requisitions", "business-partners", "sales-orders", "agent-data", "flight-revenue"],
+                "every source is listed: the catalogue services (the one never imported included), then the InA query");
             const completeness = (name: string) => rowNamed(table, name)!.getCells()[8] as ProgressIndicator;
             Opa5.assert.strictEqual(completeness("purchase-requisitions").getDisplayValue(), "72%");
             Opa5.assert.strictEqual(completeness("purchase-requisitions").getState(), "Success");
@@ -86,7 +87,7 @@ opaTest("the list shows each source with its completeness", function (Given: Com
             Opa5.assert.strictEqual(lastImport.getText(), "Not imported yet");
             Opa5.assert.ok(backend.requests.indexOf("GET data-catalog/sources") !== -1, "the list was read");
         },
-        errorMessage: "The data catalogue list does not show the three sources"
+        errorMessage: "The data catalogue list does not show the five sources"
     });
 
     Then.iStopTheApp();
@@ -98,7 +99,7 @@ opaTest("rebuild of the selected source sends that source", function (Given: Com
     When.waitFor({
         id: "dcSourcesTable",
         viewName: LIST_VIEW,
-        check: (table: UI5Element) => rowsOf(table).length === 3,
+        check: (table: UI5Element) => rowsOf(table).length === 5,
         success: function (table: UI5Element) {
             const row = rowNamed(table, "business-partners")!;
             (table as Table).setSelectedItem(row, true);
@@ -308,14 +309,14 @@ opaTest("the graph opens with every kind but fields and the agent filter reduces
     Then.waitFor({
         id: "dcGraph",
         viewName: GRAPH_VIEW,
-        check: (graph: UI5Element) => (graph as Graph).getNodes().length === 7,
+        check: (graph: UI5Element) => (graph as Graph).getNodes().length === 15,
         success: function (graph: UI5Element) {
-            Opa5.assert.strictEqual((graph as Graph).getNodes().length, 7,
-                "2 sources, 4 entities and a function: the 10 fields are left out");
+            Opa5.assert.strictEqual((graph as Graph).getNodes().length, 15,
+                "4 sources, 5 entities, 2 functions and a query with its 3 members: the 12 fields are left out");
             Opa5.assert.strictEqual(nodesOfKind(graph, "field").length, 0, "no field node by default");
-            Opa5.assert.strictEqual((graph as Graph).getGroups().length, 2, "one group per source");
+            Opa5.assert.strictEqual((graph as Graph).getGroups().length, 4, "one group per source");
         },
-        errorMessage: "The graph does not open with the 7 nodes that are not fields"
+        errorMessage: "The graph does not open with the 15 nodes that are not fields"
     });
 
     When.waitFor({
@@ -350,7 +351,7 @@ opaTest("fields are drawn once the admin picks Field", function (Given: Common, 
     Then.waitFor({
         id: "dcGraph",
         viewName: GRAPH_VIEW,
-        check: (graph: UI5Element) => (graph as Graph).getNodes().length === 7,
+        check: (graph: UI5Element) => (graph as Graph).getNodes().length === 15,
         success: function (graph: UI5Element) {
             Opa5.assert.strictEqual(nodesOfKind(graph, "field").length, 0, "no field before the pick");
         },
@@ -369,10 +370,10 @@ opaTest("fields are drawn once the admin picks Field", function (Given: Common, 
     Then.waitFor({
         id: "dcGraph",
         viewName: GRAPH_VIEW,
-        check: (graph: UI5Element) => (graph as Graph).getNodes().length === 17,
+        check: (graph: UI5Element) => (graph as Graph).getNodes().length === 27,
         success: function (graph: UI5Element) {
-            Opa5.assert.strictEqual((graph as Graph).getNodes().length, 17, "17 nodes of two sources");
-            Opa5.assert.strictEqual(nodesOfKind(graph, "field").length, 10, "the 10 fields are drawn");
+            Opa5.assert.strictEqual((graph as Graph).getNodes().length, 27, "27 nodes of four sources");
+            Opa5.assert.strictEqual(nodesOfKind(graph, "field").length, 12, "the 12 fields are drawn");
         },
         errorMessage: "Picking Field did not draw the fields"
     });
@@ -386,9 +387,9 @@ opaTest("fields are drawn once the admin picks Field", function (Given: Common, 
     Then.waitFor({
         id: "dcGraph",
         viewName: GRAPH_VIEW,
-        check: (graph: UI5Element) => (graph as Graph).getNodes().length === 10,
+        check: (graph: UI5Element) => (graph as Graph).getNodes().length === 12,
         success: function (graph: UI5Element) {
-            Opa5.assert.strictEqual(nodesOfKind(graph, "field").length, 10, "Field alone: only fields");
+            Opa5.assert.strictEqual(nodesOfKind(graph, "field").length, 12, "Field alone: only fields");
         },
         errorMessage: "Field alone did not leave only the fields"
     });
@@ -559,7 +560,7 @@ opaTest("a graph node opens its source", function (Given: Common, When: Common, 
     When.waitFor({
         id: "dcGraph",
         viewName: GRAPH_VIEW,
-        check: (graph: UI5Element) => (graph as Graph).getNodes().length === 7,
+        check: (graph: UI5Element) => (graph as Graph).getNodes().length === 15,
         success: function (graph: UI5Element) {
             const node = (graph as Graph).getNodes().filter((one: Node) => one.getTitle() === "Business partners")[0];
             node.firePress();

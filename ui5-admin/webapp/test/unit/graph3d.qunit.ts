@@ -3,7 +3,7 @@ import graph3d, {
 } from "com/agent/admin/model/graph3d";
 import type { Canvas2d, Colours3d, DrawItem, Layout, Placed, Projected, View3d } from "com/agent/admin/model/graph3d";
 import { graphModel } from "com/agent/admin/model/dataCatalog";
-import type { DataEdge, DataGraphNode, DataNodeKind, DataSourceKind } from "com/agent/admin/service/dataCatalogTypes";
+import type { DataGraphEdge, DataGraphNode, DataNodeKind, DataSourceKind } from "com/agent/admin/service/dataCatalogTypes";
 
 /** The real 2D context fits the module's interface (checked by tsc, not at run time). */
 type ContextFits = CanvasRenderingContext2D extends Canvas2d ? true : false;
@@ -13,7 +13,7 @@ function graphNode(id: number, kind: DataNodeKind, sourceName: string, sourceKin
     return { id, kind, source_kind: sourceKind, source_name: sourceName, name: `N${id}`, label: "", group: "" };
 }
 
-function contains(from: number, to: number): DataEdge {
+function contains(from: number, to: number): DataGraphEdge {
     return { from, to, kind: "contains", label: "" };
 }
 

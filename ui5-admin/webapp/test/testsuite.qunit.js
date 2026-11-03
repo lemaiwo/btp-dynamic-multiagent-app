@@ -10,6 +10,7 @@ sap.ui.define(function () {
         },
         tests: {
             "unit/AdminService": { title: "Unit: AdminService" },
+            "unit/AdminServiceDataAccess": { title: "Unit: AdminService, InA queries and catalogue links" },
             "unit/BaseController": { title: "Unit: BaseController" },
             "unit/ErrorHandler": { title: "Unit: ErrorHandler" },
             "unit/formatter": { title: "Unit: formatter" },
@@ -22,6 +23,7 @@ sap.ui.define(function () {
             "unit/oauthConfig": { title: "Unit: oauthConfig" },
             "unit/dataCatalog": { title: "Unit: dataCatalog, the data catalogue pages" },
             "unit/graph3d": { title: "Unit: graph3d, the 3D overview of the data catalogue graph" },
+            "unit/inaQueries": { title: "Unit: inaQueries, the analytical queries pages" },
             "unit/odataEntry": { title: "Unit: odataEntry, the agent's OData services entry" },
             "unit/bitbucketEntry": { title: "Unit: bitbucketEntry" },
             "unit/gitEntry": { title: "Unit: gitEntry" },

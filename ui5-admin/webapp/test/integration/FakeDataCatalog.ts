@@ -1,5 +1,6 @@
 import type {
-    DataEdge, DataGraphNode, DataNode, DataNodeKind, DataSearchCandidate, DataSourceKind, DataSourceSummary
+    DataEdge, DataEdgeEnd, DataGraphEdge, DataGraphNode, DataNode, DataNodeKind, DataSearchCandidate, DataSourceKind,
+    DataSourceSummary
 } from "com/agent/admin/service/dataCatalogTypes";
 
 type Json = (body: unknown, status?: number) => Promise<Response>;
@@ -10,11 +11,28 @@ const HINT_KEYS = ["label", "purpose", "not_for", "synonyms", "examples", "reada
 /** The answer to `readable: true` on a node the OData catalogue hides. */
 export const NOT_READABLE = "readable: the catalogue does not let agents read this node";
 
+/** What an admin may link, and by which kinds (`LINKABLE_KINDS`, `CURATED_EDGE_KINDS`). */
+const LINKABLE_KINDS = ["entity", "query", "function"];
+const LINK_KINDS = ["same_object", "aggregates"];
+const MAX_ID = 2147483647;
+/** The catalogue services' two kinds: one name is one row of `odata_services`. */
+const CATALOGUE_KINDS = ["odata", "generic"];
+/** `LOC_FIELD_RE` of agents/loc_fields.py: a key that may be repeated in a refusal. */
+const LOC_FIELD_RE = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
+
+/** The fixed texts of the edge routes (agents/data_catalog/routes.py). */
+export const LINK_NOT_FOUND = "Link not found";
+export const LINK_IMPORTED = "Only a link an admin drew can be removed; an import made this one";
+export const ALREADY_LINKED = "The two nodes are already linked";
+
 /**
  * The `/admin/api/data-catalog/...` routes of the fake backend, apart from
- * `FakeBackend` so neither file grows past its size. Two OData sources: a
+ * `FakeBackend` so neither file grows past its size. Three OData sources: a
  * requisition service with three entities and relations between them, used
- * by btp-agent, and a small business-partner service used by gmail-agent.
+ * by btp-agent, a small business-partner service used by gmail-agent and one
+ * never imported. A generic source (ZAGENT_DATA: the demo airlines and a
+ * function) and an InA source (a query with two dimensions and a measure,
+ * used by gmail-agent), joined by a link an admin drew.
  */
 export default class FakeDataCatalog {
 
@@ -23,6 +41,7 @@ export default class FakeDataCatalog {
     public edges: DataEdge[] = [];
     /** Nodes the OData catalogue does not let agents read: `readable: true` is refused. */
     public catalogueHidden: (number | string)[] = [];
+    private nextEdgeId = 1;
 
     public reset(): void {
         this.sources = [
@@ -41,6 +60,16 @@ export default class FakeDataCatalog {
                 kind: "odata", name: "sales-orders", title: "Sales orders",
                 destination: "S4_ODATA_USER", user_context: true, enabled: true, used_by: [],
                 nodes: 0, last_import: null, hint_completeness: 0
+            },
+            {
+                kind: "generic", name: "agent-data", title: "Agent data (ZAGENT_DATA)",
+                destination: "S4_ODATA_TECH", user_context: false, enabled: true, used_by: [],
+                nodes: 5, last_import: "2026-11-03T09:00:00+00:00", hint_completeness: 0
+            },
+            {
+                kind: "ina", name: "flight-revenue", title: "Flight revenue",
+                destination: "S4_ODATA_USER", user_context: true, enabled: true, used_by: ["gmail-agent"],
+                nodes: 5, last_import: "2026-11-03T09:00:00+00:00", hint_completeness: 0
             }
         ];
         this.catalogueHidden = [32];
@@ -48,6 +77,10 @@ export default class FakeDataCatalog {
             FakeDataCatalog.node(id, kind, "odata", "purchase-requisitions", name, parent, hints);
         const bp = (id: number, kind: DataNodeKind, name: string, parent: number | null, hints: Partial<DataNode> = {}) =>
             FakeDataCatalog.node(id, kind, "odata", "business-partners", name, parent, hints);
+        const ad = (id: number, kind: DataNodeKind, name: string, parent: number | null, hints: Partial<DataNode> = {}) =>
+            FakeDataCatalog.node(id, kind, "generic", "agent-data", name, parent, hints);
+        const fr = (id: number, kind: DataNodeKind, name: string, parent: number | null, hints: Partial<DataNode> = {}) =>
+            FakeDataCatalog.node(id, kind, "ina", "flight-revenue", name, parent, hints);
         this.nodes = [
             pr(1, "source", "purchase-requisitions", null, {
                 label: "Purchase requisitions", purpose: "Requests to buy goods or services, before an order",
@@ -77,13 +110,43 @@ export default class FakeDataCatalog {
             bp(100, "source", "business-partners", null, { label: "Business partners", purpose: "Customers and suppliers as partners" }),
             bp(110, "entity", "A_BusinessPartner", 100, { label: "" }),
             bp(111, "field", "BusinessPartner", 110, { label: "" }),
-            bp(112, "field", "BusinessPartnerFullName", 110, { label: "Name" })
+            bp(112, "field", "BusinessPartnerFullName", 110, { label: "Name" }),
+            ad(200, "source", "agent-data", null, { label: "Agent data", purpose: "Demo data of the generic service" }),
+            ad(210, "entity", "SCARRSet", 200, { label: "Demo airlines", type_name: "ZAGENT_DATA_SRV.SCARR" }),
+            ad(211, "field", "CARRID", 210, { label: "Airline", is_key: true, type_name: "Edm.String" }),
+            ad(212, "field", "CARRNAME", 210, { label: "Airline name", type_name: "Edm.String" }),
+            ad(220, "function", "MONTH_NAMES_GET", 200, { label: "Month names", purpose: "The names of the months" }),
+            fr(300, "source", "flight-revenue", null, { label: "Flight revenue", purpose: "Revenue per airline and month" }),
+            fr(310, "query", "ZFLIGHT_REV_Q001", 300, { label: "Flight revenue by month" }),
+            fr(311, "dimension", "0CALMONTH", 310, { label: "Calendar month" }),
+            fr(312, "dimension", "ZCARRID", 310, { label: "Airline" }),
+            fr(313, "measure", "ZREVENUE", 310, { label: "Revenue", unit: "EUR" })
         ];
+        this.nextEdgeId = 1;
         this.edges = [
-            { from: 10, to: 20, kind: "navigation", label: "to_PurchaseReqnItem" },
-            { from: 20, to: 30, kind: "association", label: "to_Supplier" },
-            { from: 24, to: 31, kind: "foreign_key", label: "Supplier" }
+            this.edge(10, 20, "navigation", "to_PurchaseReqnItem"),
+            this.edge(20, 30, "association", "to_Supplier"),
+            this.edge(24, 31, "foreign_key", "Supplier"),
+            { ...this.edge(310, 210, "aggregates", ""), curated: true }
         ];
+    }
+
+    /** An imported edge; the detail adds its two ends. */
+    private edge(from: number, to: number, kind: string, label: string): DataEdge {
+        return { id: this.nextEdgeId++, from, to, kind, label, curated: false };
+    }
+
+    private nodeOf(id: number | string): DataNode | undefined {
+        return this.nodes.filter((node) => String(node.id) === String(id))[0];
+    }
+
+    /** An edge's end as the detail answers it: the node in brief. */
+    private endOf(id: number | string): DataEdgeEnd | null {
+        const node = this.nodeOf(id);
+        return node ? {
+            id: node.id, kind: node.kind, source_kind: node.source_kind, source_name: node.source_name,
+            name: node.name, label: node.label || node.name
+        } : null;
     }
 
     private static node(
@@ -142,6 +205,13 @@ export default class FakeDataCatalog {
         if (sub === "graph" && method === "GET") {
             return this.graph(query, json);
         }
+        if (sub === "edges" && method === "POST") {
+            return this.createEdge(body, json);
+        }
+        const edge = /^edges\/([^/]+)$/.exec(sub);
+        if (edge && method === "DELETE") {
+            return this.deleteEdge(decodeURIComponent(edge[1]), json);
+        }
         if (sub === "rebuild" && method === "POST") {
             const source = body?.source as { kind: string; name: string } | undefined;
             const count = source ? this.sourceNodes(source.kind, source.name).length : this.nodes.length;
@@ -157,19 +227,107 @@ export default class FakeDataCatalog {
         }
         const nodes = this.sourceNodes(kind, name);
         const source = nodes.filter((node) => node.kind === "source")[0];
+        const shape = (parts: Record<string, unknown>) =>
+            json({ source: source ?? null, ...parts, edges: source ? this.edgesOf(nodes) : [], used_by: summary.used_by });
+        if (kind === "ina") {
+            // One query with its members; `null` before the first import.
+            const query = nodes.filter((node) => node.kind === "query")[0];
+            const members = (memberKind: DataNodeKind) =>
+                nodes.filter((node) => node.kind === memberKind && query && node.parent_id === query.id);
+            return shape({
+                query: source && query ? { node: query, dimensions: members("dimension"), measures: members("measure") } : null
+            });
+        }
         if (!source) {
-            return json({ source: null, entities: [], functions: [], edges: [], used_by: summary.used_by });
+            return shape({ entities: [], functions: [] });
         }
         const children = nodes.filter((node) => node.parent_id === source.id);
         const entities = children.filter((node) => node.kind === "entity").map((entity) => ({
             node: entity, fields: nodes.filter((node) => node.parent_id === entity.id)
         }));
         const functions = children.filter((node) => node.kind === "function");
+        return shape({ entities, functions });
+    }
+
+    /** Every edge that starts or ends in `nodes`, in id order, with both ends. */
+    private edgesOf(nodes: DataNode[]): DataEdge[] {
         const ids = nodes.map((node) => String(node.id));
-        const byId = (id: number | string) => this.nodes.filter((other) => String(other.id) === String(id))[0] ?? null;
-        const edges = this.edges.filter((edge) => ids.indexOf(String(edge.from)) !== -1)
-            .map((edge) => ({ ...edge, from_node: byId(edge.from), to_node: byId(edge.to) }));
-        return json({ source, entities, functions, edges, used_by: summary.used_by });
+        return this.edges
+            .filter((edge) => ids.indexOf(String(edge.from)) !== -1 || ids.indexOf(String(edge.to)) !== -1)
+            .sort((a, b) => a.id - b.id)
+            .map((edge) => ({ ...edge, from_node: this.endOf(edge.from), to_node: this.endOf(edge.to) }));
+    }
+
+    /** `POST edges`: the body's own gate, then the two nodes, then the pair. */
+    private createEdge(body: unknown, json: Json): Promise<Response> {
+        if (typeof body !== "object" || body === null || Array.isArray(body)) {
+            return json({ detail: "body: expected a JSON object" }, 422);
+        }
+        const given = body as Record<string, unknown>;
+        const problems: string[] = [];
+        ["from_id", "to_id"].forEach((key) => {
+            const value = given[key];
+            if (!(key in given)) {
+                problems.push(`${key}: Field required`);
+            } else if (typeof value !== "number" || !Number.isInteger(value)) {
+                problems.push(`${key}: Input should be a valid integer`);
+            } else if (value < 1) {
+                problems.push(`${key}: Input should be greater than or equal to 1`);
+            } else if (value > MAX_ID) {
+                problems.push(`${key}: Input should be less than or equal to ${MAX_ID}`);
+            }
+        });
+        if (!("kind" in given)) {
+            problems.push("kind: Field required");
+        } else if (typeof given.kind !== "string") {
+            problems.push("kind: Input should be a valid string");
+        } else if (LINK_KINDS.indexOf(given.kind) === -1) {
+            problems.push("kind: Value error, must be same_object or aggregates");
+        }
+        Object.keys(given).filter((key) => ["from_id", "to_id", "kind"].indexOf(key) === -1).forEach((key) =>
+            problems.push(`${LOC_FIELD_RE.test(key) ? key : "<unknown field>"}: Extra inputs are not permitted`));
+        if (problems.length) {
+            return json({ detail: problems.join("; ") }, 422);
+        }
+        const ends: DataNode[] = [];
+        for (const key of ["from_id", "to_id"]) {
+            const node = this.nodeOf(given[key] as number);
+            if (!node) {
+                return json({ detail: `${key}: not a node of the catalogue` }, 422);
+            }
+            if (LINKABLE_KINDS.indexOf(node.kind) === -1) {
+                return json({ detail: `${key}: not an entity, query or function` }, 422);
+            }
+            ends.push(node);
+        }
+        const [start, end] = ends;
+        const sameSource = start.source_name === end.source_name && (start.source_kind === end.source_kind
+            || (CATALOGUE_KINDS.indexOf(start.source_kind) !== -1 && CATALOGUE_KINDS.indexOf(end.source_kind) !== -1));
+        if (sameSource) {
+            return json({ detail: "to_id: same source as from_id" }, 422);
+        }
+        const linked = this.edges.some((edge) =>
+            (String(edge.from) === String(start.id) && String(edge.to) === String(end.id))
+            || (String(edge.from) === String(end.id) && String(edge.to) === String(start.id)));
+        if (linked) {
+            return json({ detail: ALREADY_LINKED }, 409);
+        }
+        const created: DataEdge = { ...this.edge(start.id as number, end.id as number, given.kind as string, ""), curated: true };
+        this.edges.push(created);
+        return json({ ...created, from_node: this.endOf(start.id), to_node: this.endOf(end.id) }, 201);
+    }
+
+    /** `DELETE edges/{id}`: only a link an admin drew. */
+    private deleteEdge(raw: string, json: Json): Promise<Response> {
+        const found = /^\d{1,10}$/.test(raw) ? this.edges.filter((edge) => edge.id === Number(raw))[0] : undefined;
+        if (!found) {
+            return json({ detail: LINK_NOT_FOUND }, 404);
+        }
+        if (!found.curated) {
+            return json({ detail: LINK_IMPORTED }, 409);
+        }
+        this.edges.splice(this.edges.indexOf(found), 1);
+        return Promise.resolve(new Response(null, { status: 204 }));
     }
 
     private updateHints(id: string, body: Record<string, unknown>, json: Json): Promise<Response> {
@@ -257,12 +415,14 @@ export default class FakeDataCatalog {
                 name: node.name, label: node.label, group: `${node.source_kind}:${node.source_name}`
             }));
         const shown = nodes.map((node) => String(node.id));
-        const parentEdges: DataEdge[] = this.nodes
+        const parentEdges: DataGraphEdge[] = this.nodes
             .filter((node) => node.parent_id !== null && shown.indexOf(String(node.id)) !== -1
                 && shown.indexOf(String(node.parent_id)) !== -1)
-            .map((node) => ({ from: node.parent_id as number, to: node.id, kind: "contains", label: "" }));
-        const edges = this.edges
+            .map((node) => ({ from: node.parent_id as number, to: node.id, kind: "contains", label: "", curated: false }));
+        // As the route answers them: no id, the origin as `curated`.
+        const edges: DataGraphEdge[] = this.edges
             .filter((edge) => shown.indexOf(String(edge.from)) !== -1 && shown.indexOf(String(edge.to)) !== -1)
+            .map((edge): DataGraphEdge => ({ from: edge.from, to: edge.to, kind: edge.kind, label: edge.label, curated: edge.curated }))
             .concat(parentEdges);
         return json({ nodes: nodes.slice(0, 2000), edges, truncated: nodes.length > 2000 });
     }

@@ -30,8 +30,8 @@ const DETAIL: DataSourceDetail = {
         }
     ],
     edges: [
-        { from: 10, to: 20, kind: "navigation", label: "to_Item" },
-        { from: 22, to: 999, kind: "foreign_key", label: "" }
+        { id: 1, from: 10, to: 20, kind: "navigation", label: "to_Item", curated: false },
+        { id: 2, from: 22, to: 999, kind: "foreign_key", label: "", curated: false }
     ],
     used_by: ["btp-agent"]
 };
@@ -90,7 +90,7 @@ QUnit.test("an end in another source is named from the node the edge carries", f
     const other = node(900, "entity", "A_Supplier", { label: "Supplier", source_name: "business-partners" });
     const rows = relationRows({
         source: DETAIL.source, entities: DETAIL.entities, functions: [],
-        edges: [{ from: 22, to: 900, kind: "same_object", label: "", from_node: null, to_node: other }]
+        edges: [{ id: 3, from: 22, to: 900, kind: "same_object", label: "", curated: false, from_node: null, to_node: other }]
     });
     assert.deepEqual(rows, [{ kind: "same_object", label: "", from: "A_Item.Supplier", to: "Supplier (business-partners)" }]);
     assert.deepEqual(relationRows({ source: null, entities: [], edges: [] }), [], "a source never imported has none");

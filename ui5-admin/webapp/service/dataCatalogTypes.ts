@@ -53,25 +53,67 @@ export interface DataNode {
     curated_at: string | null;
 }
 
-export interface DataEdge {
+/** An edge of `GET data-catalog/graph`: the parent-to-child `contains`
+ *  lines and the links between nodes. It carries no id. */
+export interface DataGraphEdge {
     from: number | string;
     to: number | string;
     kind: string;
     label: string;
-    /** An admin drew the link (it survives a re-import); absent or false for an imported edge. */
+    /** An admin drew the link (it survives a re-import); false for an
+     *  imported edge and for `contains`. Read as `=== true`. */
     curated?: boolean;
-    /** The two ends as nodes, in the detail answer only. */
-    from_node?: DataNode | null;
-    to_node?: DataNode | null;
+}
+
+/** One end of an edge in the detail answer: the node in brief. */
+export interface DataEdgeEnd {
+    id: number | string;
+    kind: DataNodeKind;
+    source_kind: DataSourceKind;
+    source_name: string;
+    name: string;
+    /** The label, else the name. */
+    label: string;
+}
+
+/** An edge of the detail answer and of `POST data-catalog/edges`. */
+export interface DataEdge extends DataGraphEdge {
+    /** What `DELETE data-catalog/edges/{id}` takes. */
+    id: number;
+    curated: boolean;
+    /** The two ends; null for an end that is no longer in the catalogue. */
+    from_node?: DataEdgeEnd | null;
+    to_node?: DataEdgeEnd | null;
+}
+
+/** The two kinds of link an admin may draw (`CURATED_EDGE_KINDS`). */
+export type DataLinkKind = "same_object" | "aggregates";
+
+/** The body of `POST data-catalog/edges`: two entities, InA queries or
+ *  functions of different sources that are not linked yet. */
+export interface DataEdgeInput {
+    from_id: number;
+    to_id: number;
+    kind: DataLinkKind;
+}
+
+/** An InA source's one query with its members. */
+export interface DataQueryDetail {
+    node: DataNode;
+    dimensions: DataNode[];
+    measures: DataNode[];
 }
 
 /** `GET data-catalog/sources/{kind}/{name}`. */
 export interface DataSourceDetail {
-    /** `null`: the service is in the catalogue but was never imported. */
+    /** `null`: the source is registered but was never imported. */
     source: DataNode | null;
-    entities: { node: DataNode; fields: DataNode[] }[];
-    /** Function imports / operations of the source. */
+    /** Kinds `odata` and `generic` only. */
+    entities?: { node: DataNode; fields: DataNode[] }[];
+    /** Function imports / operations of the source (`odata`, `generic`). */
     functions?: DataNode[];
+    /** Kind `ina` only; `null` before the first import. */
+    query?: DataQueryDetail | null;
     edges: DataEdge[];
     used_by: string[];
 }
@@ -120,7 +162,7 @@ export interface DataGraphNode {
 export interface DataGraph {
     nodes: DataGraphNode[];
     /** Parent-to-child links are edges of kind `contains`. */
-    edges: DataEdge[];
+    edges: DataGraphEdge[];
     /** More nodes matched than the 2,000 the route answers. */
     truncated?: boolean;
 }

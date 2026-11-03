@@ -5,6 +5,7 @@ import type {
 } from "com/agent/admin/service/types";
 import { DEEP_DEFAULTS } from "com/agent/admin/service/types";
 import FakeDataCatalog from "./FakeDataCatalog";
+import FakeIna from "./FakeIna";
 
 /** What `FakeBackend#failNext` accepts: the next call to `path` answers with `body`/`status` instead. */
 export interface FailNext {
@@ -43,6 +44,8 @@ export default class FakeBackend {
     public odataServices: ODataService[] = [];
     /** The data catalogue routes (`data-catalog/...`), in a file of their own. */
     public dataCatalog = new FakeDataCatalog();
+    /** The `ina/...` routes: the analytical queries of `builtin:ina`. */
+    public ina = new FakeIna();
     /** What POST odata/metadata answers, whatever the request names. */
     public metadataPreview!: ODataMetadataPreview;
     /** What POST odata/services/{name}/test answers. */
@@ -145,6 +148,7 @@ export default class FakeBackend {
         // already assumes btp-agent is id 100.
         this.nextId = 100;
         this.dataCatalog.reset();
+        this.ina.reset();
         this.requests = [];
         this.bodies = {};
         this.runNowCalls = [];
@@ -1654,6 +1658,10 @@ export default class FakeBackend {
             this.agents.map((agent) => agent.name));
         if (catalogue) {
             return catalogue;
+        }
+        const ina = this.ina.handle(path, method, body, (b, s, h) => this.json(b, s, h), this.reloadKeys());
+        if (ina) {
+            return ina;
         }
         if (path === "whoami") {
             return this.json({ principal: "uuid-1234", label: "tester@example.com" });

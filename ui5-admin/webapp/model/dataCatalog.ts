@@ -1,6 +1,6 @@
 import odataCatalog from "./odataCatalog";
 import type {
-    DataEdge, DataGraph, DataHintsUpdate, DataNode, DataNodeKind, DataSearchCandidate, DataSourceDetail,
+    DataEdge, DataEdgeEnd, DataGraph, DataHintsUpdate, DataNode, DataNodeKind, DataSearchCandidate, DataSourceDetail,
     DataSourceKind
 } from "../service/dataCatalogTypes";
 
@@ -132,7 +132,7 @@ export function relationRows(
     });
     (detail.functions ?? []).forEach((fn) => note(fn));
     const own = detail.source ? detail.source.source_name : "";
-    const end = (id: number | string, carried: DataNode | null | undefined): string => {
+    const end = (id: number | string, carried: DataEdgeEnd | null | undefined): string => {
         if (names[String(id)] !== undefined) {
             return names[String(id)];
         }
