@@ -399,7 +399,7 @@ export default class FakeDataCatalog {
             .sort((a, b) => b.score - a.score)
             .slice(0, 5)
             .map(({ node, score }) => this.candidate(node, score));
-        return json({ candidates, scope: agent ? "agent" : "all" });
+        return json({ candidates, scope: agent ? "agent" : "all", mode: "lexical" });
     }
 
     private candidate(node: DataNode, score: number): DataSearchCandidate {

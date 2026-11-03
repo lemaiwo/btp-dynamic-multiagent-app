@@ -380,6 +380,13 @@ opaTest("a test search lists the candidates for the chosen agent", function (Giv
                 "Limited to the sources the chosen agent attaches.");
         }
     });
+    Then.waitFor({
+        id: "dcSearchMode",
+        viewName: DETAIL_VIEW,
+        success: (text: UI5Element) => {
+            Opa5.assert.strictEqual((text as Text).getText(false), "Ranked by words", "the mode of the answer is shown");
+        }
+    });
 
     Then.iStopTheApp();
 });

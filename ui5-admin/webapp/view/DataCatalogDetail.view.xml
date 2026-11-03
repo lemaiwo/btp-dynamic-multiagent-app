@@ -348,6 +348,12 @@
                     showIcon="true"
                     class="sapUiTinyMarginTopBottom"
                     text="{= ${search>/scope} === 'agent' ? ${i18n>dcSearchScopeAgent} : ${i18n>dcSearchScopeAll} }" />
+                <!-- How the answer was ranked (design addendum (l)); absent from a server before 2.36.0. -->
+                <Text
+                    id="dcSearchMode"
+                    visible="{= ${search>/ran} &amp;&amp; !!${search>/mode} }"
+                    class="sapUiTinyMarginBottom"
+                    text="{= ${search>/mode} === 'vector' ? ${i18n>dcSearchModeVector} : ${i18n>dcSearchModeLexical} }" />
                 <List
                     id="dcSearchResults"
                     items="{search>/candidates}"

@@ -28,6 +28,7 @@ import "./DataCatalogGraph3dJourney";
 import "./RunReportJourney";
 import "./RunAutoRefreshJourney";
 import "./ReloadJourney";
+import "./EmbeddingsJourney";
 import "./ImportJourney";
 import "./SessionExpiredJourney";
 import "./WorkflowJourney";

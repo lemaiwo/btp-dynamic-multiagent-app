@@ -43,7 +43,7 @@ export default class DataCatalogDetail extends BaseController {
     public onInit(): void {
         this.setModel(new JSONModel(DataCatalogDetail.emptyState()), "src");
         this.setModel(new JSONModel({
-            question: "", agent: "", agents: [], candidates: [], scope: "all", ran: false, running: false
+            question: "", agent: "", agents: [], candidates: [], scope: "all", mode: "", ran: false, running: false
         }), "search");
         this.getRouter().getRoute("dataCatalogDetail")?.attachPatternMatched((event: Route$PatternMatchedEvent) => {
             const args = event.getParameter("arguments") as { kind: string; name: string };
@@ -442,6 +442,7 @@ export default class DataCatalogDetail extends BaseController {
             }
             this.search().setProperty("/candidates", dataCatalog.candidateRows(result.candidates));
             this.search().setProperty("/scope", result.scope);
+            this.search().setProperty("/mode", result.mode === "vector" || result.mode === "lexical" ? result.mode : "");
             this.search().setProperty("/ran", true);
             return true;
         } finally {
