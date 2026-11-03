@@ -391,20 +391,26 @@ async def lifespan(app: FastAPI):
     await ide_runner.cancel_all()
     await webchat_run.cancel_all_chat_runs()
     await embedding_run.cancel_all()
-    await drain_embedding_deploys()
+
     # An approved trace whose ARC-1 call is in flight runs in its own task,
     # not in a run: let it record its outcome (armed / failed) rather than
     # leave the approval `approved` with nothing behind it. Each call is
     # bounded by ARM_TIMEOUT_S, so this wait is too.
-    try:
-        await asyncio.wait_for(
-            ide_approvals.drain(), ide_approvals.ARM_TIMEOUT_S + 5
-        )
-    except TimeoutError:
-        logger.warning(
-            "IDE approval call(s) still running at shutdown; the next start "
-            "closes them as interrupted"
-        )
+    async def drain_ide_approvals() -> None:
+        try:
+            await asyncio.wait_for(
+                ide_approvals.drain(), ide_approvals.ARM_TIMEOUT_S + 5
+            )
+        except TimeoutError:
+            logger.warning(
+                "IDE approval call(s) still running at shutdown; the next start "
+                "closes them as interrupted"
+            )
+
+    # Side by side, not one after the other: Cloud Foundry kills the app 10 s
+    # after SIGTERM. An AI Core deploy in flight is waited for, never
+    # cancelled (drain_embedding_deploys, bounded, never raises).
+    await asyncio.gather(drain_embedding_deploys(), drain_ide_approvals())
     # A write whose run was cancelled above still has its result to store
     # (its own shielded task). Bounded: `drain` gives up after its timeout
     # and never raises; a row left `intent` is explained in agents.odata.audit.

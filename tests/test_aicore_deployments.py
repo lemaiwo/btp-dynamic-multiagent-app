@@ -707,9 +707,15 @@ async def test_a_retry_after_a_failed_deployment_create_reuses_the_configuration
     assert configuration_lists[0].url.params["$top"] == "100"
 
 
-@pytest.mark.parametrize("failure", [
-    503, lambda request: _answer(1, [{"id": "cfg-x"}, {"id": "cfg-x"}])])
-async def test_an_unreadable_configuration_list_makes_a_new_configuration(failure, caplog):
+@pytest.mark.parametrize(("failure", "detail"), [
+    (503, "configuration list failed"),
+    # count 2: two entries that the count allows, one id twice
+    (lambda request: _answer(2, [{"id": "cfg-x"}, {"id": "cfg-x"}]),
+     "configuration list failed (an entry came on two pages)"),
+], ids=["status", "duplicate id"])
+async def test_an_unreadable_configuration_list_makes_a_new_configuration(
+    failure, detail, caplog
+):
     # a second configuration costs nothing; the deployment list, read in
     # full before, is what keeps a model from being deployed (and billed) twice
     server = FakeAICore()
@@ -720,7 +726,7 @@ async def test_an_unreadable_configuration_list_makes_a_new_configuration(failur
     assert [p for p, _ in server.posted] == ["/v2/lm/configurations", "/v2/lm/deployments"]
     assert server.posted[1][1] == {"configurationId": "cfg-1"}
     log = _own_log(caplog)
-    assert "configuration list failed" in log
+    assert detail in log
     assert "configuration list not read (aicore_unavailable)" in log
     _assert_clean(log)
 

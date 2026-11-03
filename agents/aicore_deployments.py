@@ -50,7 +50,7 @@ one is made.
 
 Standard library and httpx only: no ``agents.*`` import, no database. The
 module functions share one :class:`AICoreDeployments` per process
-(``default_client``, a FastAPI dependency as it is), which holds the token.
+(``default_client``, built at the first call), which holds the token.
 """
 
 from __future__ import annotations
