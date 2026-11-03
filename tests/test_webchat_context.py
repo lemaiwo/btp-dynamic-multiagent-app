@@ -53,6 +53,7 @@ from agents.db import (  # noqa: E402
     ChatMessage,
     ChatUserAgent,
     ChatUserSkill,
+    InaQuery,
     ODataService,
     SessionLocal,
     SkillConfig,
@@ -127,7 +128,7 @@ async def client():
 async def wipe() -> None:
     async with SessionLocal() as s:
         for model in (ChatFile, ChatMessage, ChatConversation, ChatUserAgent, ChatUserSkill,
-                      AgentConfig, SkillConfig, ODataService):
+                      AgentConfig, SkillConfig, ODataService, InaQuery):
             await s.execute(delete(model))
         await s.commit()
 
@@ -453,6 +454,37 @@ async def test_an_admin_agent_lists_its_connectors_and_the_data_catalogue(client
     # The orchestrator lists no connector of its own.
     orch = await conversation(client)
     assert of(await get_context(client, orch), "connector") == []
+
+
+async def test_an_admin_agent_with_an_ina_query_lists_the_data_catalogue(client):
+    # The registry scopes the catalogue tools to `builtin:ina` queries too
+    # (`allowed_sources_of`), so an InA-only agent lists them once one of its
+    # queries is registered and enabled.
+    ina = {"url": "builtin:ina", "auth_mode": "destination",
+           "oauth": {"queries": ["sales-by-month"]}}
+    async with SessionLocal() as s:
+        s.add(AgentConfig(name="analyst", description="d", instructions="x",
+                          mcp_url=ina["url"], auth_mode="destination",
+                          oauth_json=json.dumps(ina["oauth"]), enabled=1, expose_chat=1))
+        s.add(InaQuery(name="sales-by-month", title="Sales", purpose="p",
+                       destination="SIA_INA_SECRET_DEST", user_context=0,
+                       query="ZQ_SALES_01", enabled=1))
+        await s.commit()
+    cid = await conversation(client, agent_ref="admin:analyst")
+
+    def of(out, kind):
+        return [t for t in out["tools"] if t["kind"] == kind]
+
+    out = await get_context(client, cid)
+    assert of(out, "connector") == [
+        {"kind": "connector", "name": "builtin:ina", "agent": "analyst"}]
+    assert [t["name"] for t in of(out, "data_catalog")] == [
+        "find_data_source", "list_data_sources"]
+    assert "SIA_INA_SECRET_DEST" not in json.dumps(out["tools"])
+    async with SessionLocal() as s:
+        await s.execute(update(InaQuery).values(enabled=0))
+        await s.commit()
+    assert of(await get_context(client, cid), "data_catalog") == []
 
 
 async def test_a_deep_personal_agent_lists_its_deep_tools_and_consults(client):

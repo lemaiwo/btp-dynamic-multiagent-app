@@ -69,6 +69,7 @@ from agents.db import (
     ChatFile,
     ChatMessage,
     ChatUserSkill,
+    InaQuery,
     ODataService,
     SessionLocal,
     SkillConfig,
@@ -393,13 +394,19 @@ async def describe(conv: ChatConversation, principal: str,
             tools += [{"kind": "connector", "name": label, "agent": row.name}
                       for label in user_agents.connector_labels(row)]
             # The registry attaches the data catalogue's tools when one of the
-            # agent's OData services exists and is enabled (attached_services).
-            services = sorted(n for k, n in allowed_sources_of(row) if k == "odata")
-            if services and (await db.execute(
-                select(ODataService.name)
-                .where(ODataService.name.in_(services), ODataService.enabled == 1)
-                .limit(1)
-            )).first() is not None:
+            # agent's OData services or InA queries exists and is enabled
+            # (attached_services, attached_queries).
+            catalogue_sources = allowed_sources_of(row)
+            usable = False
+            for model, kind in ((ODataService, "odata"), (InaQuery, "ina")):
+                names = sorted(n for k, n in catalogue_sources if k == kind)
+                if not usable and names:
+                    usable = (await db.execute(
+                        select(model.name)
+                        .where(model.name.in_(names), model.enabled == 1)
+                        .limit(1)
+                    )).first() is not None
+            if usable:
                 tools += [{"kind": "data_catalog", "name": n, "agent": row.name}
                           for n in DATA_CATALOG_TOOL_NAMES]
         else:

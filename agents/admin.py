@@ -72,7 +72,10 @@ from agents.db import (
     BITBUCKET_SINGLE_ENTRY_MESSAGE,
     BUILTIN_PUBLIC_KEYS,
     GIT_SINGLE_ENTRY_MESSAGE,
+    INA_ENTRY_KEYS,
+    INA_SINGLE_ENTRY_MESSAGE,
     KEEP,
+    MAX_INA_ENTRY_QUERIES,
     MAX_ODATA_ENTRY_SERVICES,
     OAUTH_CONFIG_MODES,
     ODATA_ENTRY_KEYS,
@@ -84,6 +87,7 @@ from agents.db import (
     bitbucket_approves,
     check_bitbucket_approver_reach,
     check_delegation_name_collision,
+    check_ina_queries,
     check_odata_services,
     create_odata_service,
     delete_agent,
@@ -101,6 +105,7 @@ from agents.db import (
     get_workflow_by_name,
     get_workflow_parts,
     get_workflow_run,
+    ina_entries,
     list_agents,
     list_item_runs,
     list_odata_services,
@@ -132,6 +137,8 @@ from agents.deep import DeepConfig, dump_deep_config
 from agents.git_config import BUILTIN_GIT_URL
 from agents.git_config import check_entry as check_git_entry
 from agents.git_config import clean_entry as clean_git_entry
+from agents.ina import BUILTIN_INA_URL
+from agents.ina.models import QUERY_NAME_RE
 from agents.invoke_config import check_result_schema, clean_limits
 from agents.jira_tools import BUILTIN_JIRA_URL
 from agents.mail_render import MailTheme
@@ -335,6 +342,9 @@ class OAuthClientPayload(BaseModel):
     # and so open writes. See `_validate_odata_entry`.
     services: list[str] = Field(default_factory=list)
     allow_write: StrictBool = False
+    # builtin:ina only, and all its entry holds: the registered analytical
+    # queries the agent may run. See `_validate_ina_entry`.
+    queries: list[str] = Field(default_factory=list)
     # builtin:sharepoint only. The one workbook the toolset may read (`site`
     # is <tenant>.sharepoint.com:/sites/<site>) and the views of it an agent
     # may name. Pinned here, never tool arguments. agents/sharepoint_views.py
@@ -534,6 +544,8 @@ class OAuthClientPayload(BaseModel):
             config["services"] = list(self.services)
         if self.allow_write:
             config["allow_write"] = True
+        if self.queries:
+            config["queries"] = list(self.queries)
         if self.repositories is not None:
             config["repositories"] = list(self.repositories)
         if self.allow_approve:
@@ -681,6 +693,25 @@ class McpServerPayload(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
+    def _validate_raw_ina_entry(cls, data: Any) -> Any:
+        """The ``builtin:ina`` block as the client sent it, for the reason
+        ``_validate_raw_odata_entry`` gives: afterwards a stray key, or
+        ``user_context: false``, can no longer be told from a correct entry.
+        The mode first, so a block of another mode is not judged by this
+        entry's keys."""
+        if isinstance(data, dict) and _server_key(data.get("url")) == BUILTIN_INA_URL:
+            mode = str(data.get("auth_mode") or "").strip().lower()
+            if mode != AUTH_MODE_DESTINATION:
+                raise ValueError(_INA_MODE_TEXT)
+            oauth = data.get("oauth")
+            if isinstance(oauth, OAuthClientPayload):
+                oauth = {k: getattr(oauth, k) for k in oauth.model_fields_set}
+            if isinstance(oauth, dict):
+                _validate_ina_entry(oauth)
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
     def _validate_raw_bitbucket_entry(cls, data: Any) -> Any:
         """The ``builtin:bitbucket`` block as the client sent it.
 
@@ -741,6 +772,17 @@ class McpServerPayload(BaseModel):
             raise ValueError(
                 f"oauth.services and oauth.allow_write belong to a {BUILTIN_ODATA_URL} "
                 "entry only; no other server reads them"
+            )
+        if _server_key(self.url) == BUILTIN_INA_URL:
+            # Its own rules, as builtin:odata above: no destination here.
+            if self.auth_mode != AUTH_MODE_DESTINATION:
+                raise ValueError(_INA_MODE_TEXT)
+            _validate_ina_entry(self.oauth.to_config() if self.oauth else {})
+            return self
+        if self.oauth is not None and self.oauth.queries:
+            raise ValueError(
+                f"oauth.queries belongs to a {BUILTIN_INA_URL} entry only; no other "
+                "server reads it"
             )
         if self.oauth is not None and self.oauth.theme:
             _validate_mail_theme(self.url, self.oauth.theme)
@@ -1188,6 +1230,8 @@ class AgentPayload(BaseModel):
         # that says what to do instead.
         if sum(1 for u in urls if _server_key(u) == BUILTIN_ODATA_URL) > 1:
             raise ValueError(ODATA_SINGLE_ENTRY_MESSAGE)
+        if sum(1 for u in urls if _server_key(u) == BUILTIN_INA_URL) > 1:
+            raise ValueError(INA_SINGLE_ENTRY_MESSAGE)
         # By server key, not by the string sent: the duplicate rule below
         # compares spellings, and storage stores every spelling of this URL
         # as the one entry (`prepare_servers`, which refuses this as well).
@@ -1488,12 +1532,14 @@ async def api_create_agent(payload: AgentPayload) -> dict[str, Any]:
 
 
 def _entry_signature(servers: Any, enabled: Any = True) -> list[Any]:
-    """What an agent's ``builtin:odata``, ``builtin:bitbucket`` and
-    ``builtin:git`` entries let it do: the part of an agent row whose change must reach the running
-    build at once. ``[]`` for an agent with neither entry.
+    """What an agent's ``builtin:odata``, ``builtin:ina``, ``builtin:bitbucket``
+    and ``builtin:git`` entries let it do: the part of an agent row whose
+    change must reach the running build at once. ``[]`` for an agent with
+    none of these entries.
 
     Per OData entry the attached services (sorted) and whether it may write;
-    order-free, so a save that only reorders is no change. Per Bitbucket
+    order-free, so a save that only reorders is no change; per InA entry its
+    queries (sorted) the same way, under ``builtin:ina``. Per Bitbucket
     entry the block as it is stored (`agents.bitbucket_config.clean_entry`:
     destination, workspace, repositories, branch and the three switches), so
     a block that only says its defaults out loud is no change either. A
@@ -1546,7 +1592,16 @@ def _entry_signature(servers: Any, enabled: Any = True) -> list[Any]:
         except ValueError:
             stored = {"refused": [server.get("auth_mode"), block]}
         git.append((BUILTIN_GIT_URL, json.dumps(stored, sort_keys=True, default=str)))
-    return sorted(odata) + sorted(bitbucket) + sorted(git)
+    # The queries an agent may run are read from the build as well: one taken
+    # out of the entry must not stay runnable until a manual reload.
+    ina = []
+    for block in ina_entries(servers):
+        queries = block.get("queries")
+        names = sorted({n for n in queries if isinstance(n, str)}) if isinstance(
+            queries, list
+        ) else []
+        ina.append((BUILTIN_INA_URL, tuple(names)))
+    return sorted(odata) + sorted(bitbucket) + sorted(git) + sorted(ina)
 
 
 async def _reload_for_changed_entry(before: Any, after: Any, what: str) -> dict[str, bool]:
@@ -1570,22 +1625,30 @@ async def _reload_for_changed_entry(before: Any, after: Any, what: str) -> dict[
     """
     if before == after:
         return dict(NOT_RELOADED)
-    outcome = await reload_running_agents(f"{what} with a changed OData or Bitbucket entry")
+    outcome = await reload_running_agents(f"{what} with a changed data or review entry")
     await _rebuild_data_catalog(before, after, what)
     return outcome
 
 
 async def _rebuild_data_catalog(before: Any, after: Any, what: str) -> None:
     """Bring the data catalogue graph up to date when an agent's
-    ``builtin:odata`` services changed (``agents.data_catalog``): the graph
-    holds only sources an enabled agent attaches. Never raises."""
-    odata_before = [s for s in before if s and isinstance(s[0], tuple)]
-    odata_after = [s for s in after if s and isinstance(s[0], tuple)]
-    if odata_before == odata_after:
+    ``builtin:odata`` services or ``builtin:ina`` queries changed
+    (``agents.data_catalog``): the graph holds only sources an enabled agent
+    attaches. Never raises."""
+    if _catalogue_part(before) == _catalogue_part(after):
         return
     from agents.data_catalog.importer import rebuild_safely
 
     await rebuild_safely(None, what=what)
+
+
+def _catalogue_part(signature: Any) -> list[Any]:
+    """The items of an `_entry_signature` that name data catalogue sources:
+    the OData ones (a tuple of services first) and the InA ones."""
+    return [
+        s for s in signature
+        if s and (isinstance(s[0], tuple) or s[0] == BUILTIN_INA_URL)
+    ]
 
 
 def _entry_signatures(rows: Any) -> dict[str, Any]:
@@ -1639,9 +1702,9 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
             # writes the row itself. Same session as the commit below, and
             # on the prepared entries: the ones the row is given further
             # down, not a second reading of the payload.
-            await check_odata_services(
-                session, prepared_server_list(primary, extras, primary_oauth_json)
-            )
+            prepared = prepared_server_list(primary, extras, primary_oauth_json)
+            await check_odata_services(session, prepared)
+            await check_ina_queries(session, prepared)
             # As `upsert_agent` does. The other agents' peer lists still hold
             # the old name here: the rename below rewrites them.
             await check_bitbucket_approver_reach(
@@ -3266,6 +3329,70 @@ def _validate_odata_entry(cfg: dict[str, Any]) -> None:
         seen.add(name)
 
 
+_INA_MODE_TEXT = (
+    f"{BUILTIN_INA_URL} requires auth_mode=destination: every registered query is "
+    "reached through the BTP destination it names, and the entry holds no "
+    "credential of its own"
+)
+
+
+def _validate_ina_entry(cfg: dict[str, Any]) -> None:
+    """The block of a ``builtin:ina`` entry: exactly ``{queries}``.
+
+    `_validate_odata_entry` for analytical queries: allowed by exact key,
+    the rest refused -- ``user_context`` and ``destination`` too, also with
+    their default values, because the destination and the identity belong
+    to each registered query (design addendum (k), part 2 point 3) and no
+    agent may run a query as someone else by editing its own entry.
+
+    Messages name the field, never the value: a query name is repeated only
+    when it has the slug form, a key only when it is a known field. Storage
+    (`agents.db._clean_ina_entry`) keeps the same one key.
+    """
+    keys = {str(k) for k in cfg}
+    if cfg.get(_ODATA_ECHOED_KEY) is False:
+        keys.discard(_ODATA_ECHOED_KEY)
+    stray = keys - set(INA_ENTRY_KEYS)
+    identity = sorted(stray & _ODATA_IDENTITY_KEYS)
+    if identity:
+        raise ValueError(
+            f"{BUILTIN_INA_URL} takes no oauth.{', oauth.'.join(identity)}: the "
+            "destination and identity belong to each registered query; register "
+            "the query again to run it as another identity"
+        )
+    credential = sorted(stray & _ODATA_CREDENTIAL_KEYS)
+    if credential:
+        raise ValueError(
+            f"{BUILTIN_INA_URL} stores no credential of its own; remove "
+            f"oauth.{', oauth.'.join(credential)} (the credential lives in the "
+            "destination of each registered query)"
+        )
+    if stray:
+        known = sorted(stray & _OAUTH_FIELD_NAMES)
+        named = f"oauth.{', oauth.'.join(known)}" if known else "the unknown keys"
+        raise ValueError(f"a {BUILTIN_INA_URL} entry holds only oauth.queries; remove {named}")
+    queries = cfg.get("queries")
+    if queries is None or queries == []:
+        raise ValueError(
+            f"{BUILTIN_INA_URL} requires oauth.queries: the names of the registered "
+            "queries this agent may run (at least one)"
+        )
+    if not isinstance(queries, list):
+        raise ValueError("oauth.queries must be a list of registered query names")
+    if len(queries) > MAX_INA_ENTRY_QUERIES:
+        raise ValueError(f"oauth.queries lists more than {MAX_INA_ENTRY_QUERIES} queries")
+    seen: set[str] = set()
+    for name in queries:
+        if not isinstance(name, str) or not re.fullmatch(QUERY_NAME_RE, name):
+            raise ValueError(
+                "oauth.queries: invalid query name (lower-case letters, digits "
+                "and '-', at most 64 characters)"
+            )
+        if name in seen:
+            raise ValueError(f"oauth.queries: duplicate query '{name}'")
+        seen.add(name)
+
+
 # Built-ins that originate mail through agents/mail_render and so read a
 # `theme`. Mirrors `_MAIL_THEME_URLS` in agents/db.py.
 _MAIL_THEME_URLS = frozenset({BUILTIN_SMTP_URL, BUILTIN_OUTLOOK_URL})
@@ -3362,6 +3489,11 @@ async def _destination_health() -> list[dict[str, Any]]:
                         row.name, oauth, catalogue, config, resolvers
                     )
                 )
+                continue
+            if _server_key(srv.get("url")) == BUILTIN_INA_URL:
+                # Its entry names no destination either; each registered query
+                # does, and is checked from its own page (Describe, Test).
+                # Reported here, it would read as "no destination name".
                 continue
             name = str(oauth.get("destination") or "").strip()
             user_context = oauth.get("user_context") is True

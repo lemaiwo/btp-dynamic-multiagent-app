@@ -29,6 +29,7 @@ builtin:smtp       --        --        app (MAIL)    --       --
 builtin:sapnotes   --        --        app (public)  default  --
 builtin:sapnotedetail --     --        app (cookie)  --       default
 builtin:odata      --        --        user / app    --       --
+builtin:ina        --        --        user / app    --       --
 builtin:sharepoint --        app (ro)  app (ro)      --       --
 builtin:bitbucket  --        --        app           --       --
 builtin:confluence --        --        app           --       --
@@ -51,6 +52,12 @@ only factory that is handed more than its entry -- the catalogue snapshot the
 registry loaded -- through ``context``; see :mod:`agents.odata.tools`. Its
 writes are recorded: the factory always gets the storing audit recorder
 (:mod:`agents.odata.audit`), without which the toolset refuses every write.
+
+``builtin:ina`` is its sibling for analytical queries (BW / embedded
+analytics over SAP's InA protocol), reads only: its config block lists
+registered queries (``queries``), each of which names its own destination and
+identity, and the factory is handed the snapshot of those registrations the
+registry loaded (``context["ina_queries"]``); see :mod:`agents.ina.tools`.
 
 ``builtin:sharepoint`` reads one pinned workbook as the application and has
 no per-user mode: ``user_context`` is refused in both of its modes. Its
@@ -87,6 +94,8 @@ from agents.confluence_tools import BUILTIN_CONFLUENCE_URL, confluence_toolset
 from agents.git_config import BUILTIN_GIT_URL
 from agents.git_tools import git_toolset
 from agents.gmail_tools import BUILTIN_GMAIL_URL, gmail_toolset
+from agents.ina import BUILTIN_INA_URL
+from agents.ina.tools import ina_toolset
 from agents.jira_tools import BUILTIN_JIRA_URL, jira_toolset
 from agents.odata import BUILTIN_ODATA_URL
 from agents.odata.audit import stored_recorder
@@ -110,6 +119,7 @@ _FACTORIES: dict[str, Callable[..., Any]] = {
     BUILTIN_SAPNOTES_URL: sapnotes_toolset,
     BUILTIN_SAPNOTEDETAIL_URL: sapnotedetail_toolset,
     BUILTIN_ODATA_URL: odata_toolset,
+    BUILTIN_INA_URL: ina_toolset,
     BUILTIN_SHAREPOINT_URL: sharepoint_toolset,
     BUILTIN_BITBUCKET_URL: bitbucket_toolset,
     BUILTIN_CONFLUENCE_URL: confluence_toolset,
@@ -139,10 +149,12 @@ def build_builtin_toolset(
     optional so existing callers keep the per-user behaviour they already had.
 
     ``context`` is what the registry knows and an entry does not hold:
-    ``odata_services`` (the catalogue snapshot, by service name) and
-    ``agent_name``. Only ``builtin:odata`` receives it, and ``builtin:git``
-    the agent name alone; every other factory is called exactly as before,
-    so none has to accept keywords it ignores.
+    ``odata_services`` (the catalogue snapshot, by service name),
+    ``ina_queries`` (the registered InA queries, by name) and
+    ``agent_name``. Only ``builtin:odata`` and ``builtin:ina`` receive their
+    snapshot and the agent name, and ``builtin:git`` the agent name alone;
+    every other factory is called exactly as before, so none has to accept
+    keywords it ignores.
 
     ``builtin:odata`` is always built with the storing audit recorder of
     this process. It is not read from ``context``: no caller can build the
@@ -163,6 +175,15 @@ def build_builtin_toolset(
             services=context.get("odata_services") or {},
             agent_name=context.get("agent_name") or "",
             recorder=stored_recorder(),
+        )
+    if key == BUILTIN_INA_URL:
+        context = context or {}
+        return factory(
+            oauth or {},
+            server_key=key,
+            auth_mode=auth_mode,
+            queries=context.get("ina_queries") or {},
+            agent_name=context.get("agent_name") or "",
         )
     if key == BUILTIN_GIT_URL:
         return factory(oauth or {}, server_key=key, auth_mode=auth_mode,

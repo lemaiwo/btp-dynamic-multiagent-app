@@ -54,6 +54,7 @@ from sqlalchemy.types import TypeDecorator
 
 from agents import hana_hdi
 from agents.ina import BUILTIN_INA_URL
+from agents.ina.models import QUERY_NAME_RE as _INA_QUERY_NAME_RE
 from agents.ina.models import InaQueryPayload, validate_ina_query
 from agents.odata import BUILTIN_ODATA_URL
 
@@ -2544,6 +2545,9 @@ def _clean_destination(oauth: Any, url: str | None = None) -> dict[str, Any]:
     if builtin == BUILTIN_ODATA_URL:
         # The one destination-mode block without a destination name.
         return _clean_odata_entry(src)
+    if builtin == BUILTIN_INA_URL:
+        # The other one: each registered query names its own destination.
+        return _clean_ina_entry(src)
     if builtin in _DEST_KEYS_BY_URL:
         # The built-ins that gained destination mode later keep their own
         # pinned keys plus the user-context switch; see `# --- destinations ---`.
@@ -2925,6 +2929,7 @@ def prepare_servers(
 
     normalized: list[dict[str, Any]] = []
     odata_seen = False
+    ina_seen = False
     bitbucket_seen = False
     git_seen = False
     for s in mcp_servers:
@@ -2947,6 +2952,16 @@ def prepare_servers(
             if odata_seen:
                 raise ValueError(ODATA_SINGLE_ENTRY_MESSAGE)
             odata_seen = True
+        elif url.rstrip("/").lower() == BUILTIN_INA_URL:
+            # Stored under exactly this spelling and counted after it is
+            # settled, for the reasons builtin:odata above is: `ina_entries`
+            # forgives the spelling, the registry's built-in lookup does not.
+            url = BUILTIN_INA_URL
+            if mode != AUTH_MODE_DESTINATION:
+                raise ValueError(_INA_MODE_MESSAGE)
+            if ina_seen:
+                raise ValueError(INA_SINGLE_ENTRY_MESSAGE)
+            ina_seen = True
         elif url.rstrip("/").lower() == _SHAREPOINT_URL:
             # Stored under exactly this spelling, for the reason above:
             # `_clean_oauth` forgives case and a trailing slash, the
@@ -3108,9 +3123,9 @@ async def upsert_agent(
     # through this function too, and none of them may store a service name
     # the catalogue does not have. On the prepared list, i.e. on exactly the
     # entries the row is about to hold.
-    await check_odata_services(
-        session, prepared_server_list(primary, extras, primary_oauth_json)
-    )
+    prepared = prepared_server_list(primary, extras, primary_oauth_json)
+    await check_odata_services(session, prepared)
+    await check_ina_queries(session, prepared)
     extras_json = json.dumps(extras) if extras else None
     skills_json = await normalize_skills_json(session, skills)
     # Order-preserving de-duplication: the same peer listed twice would
@@ -3591,6 +3606,56 @@ async def check_odata_services(session: AsyncSession, servers: list[dict[str, An
     missing = [n for n in names if n not in found]
     if missing:
         raise ValueError("unknown OData service " + ", ".join(f"'{n}'" for n in missing))
+
+
+async def existing_ina_query_names(
+    session: AsyncSession, names: list[str], *, lock: bool = False
+) -> set[str]:
+    """Which of ``names`` are registered InA queries (enabled or not);
+    ``lock`` as in `existing_odata_service_names`."""
+    if not names:
+        return set()
+    return set((await session.execute(_existing_ina_names_query(names, lock=lock))).scalars())
+
+
+def _existing_ina_names_query(names: list[str], *, lock: bool) -> Any:
+    """The statement of `existing_ina_query_names` (a test compiles it for
+    Postgres, as `_existing_odata_names_query`). At most 50 names per entry
+    and one entry per agent, so the ``IN`` list stays short."""
+    query = select(InaQuery.name).where(InaQuery.name.in_(sorted(set(names))))
+    if lock:
+        query = query.with_for_update(read=True)
+    return query
+
+
+async def check_ina_queries(session: AsyncSession, servers: list[dict[str, Any]]) -> None:
+    """Refuse a server list that attaches an InA query nobody registered.
+
+    `check_odata_services` for ``builtin:ina``, with its reasons: called by
+    every write of an agent's servers (`upsert_agent`, the admin update
+    route) on the prepared entries, in the session that writes the row and
+    with the found rows locked until that write commits. A dangling name
+    would attach the agent to the next query registered under it. A disabled
+    query exists and may be attached; the run time leaves it out.
+
+    ``ValueError("unknown InA query 'x'")`` names every missing name in the
+    order listed; a name without the slug form is "invalid query name",
+    without the value.
+    """
+    names: list[str] = []
+    for block in ina_entries(servers):
+        queries = block.get("queries")
+        for name in queries if isinstance(queries, list) else []:
+            if not isinstance(name, str) or not re.fullmatch(_INA_QUERY_NAME_RE, name):
+                raise ValueError("invalid query name")
+            if name not in names:
+                names.append(name)
+    if not names:
+        return
+    found = await existing_ina_query_names(session, names, lock=True)
+    missing = [n for n in names if n not in found]
+    if missing:
+        raise ValueError("unknown InA query " + ", ".join(f"'{n}'" for n in missing))
 
 
 async def _begin_before_savepoint(session: AsyncSession) -> None:
@@ -5148,6 +5213,11 @@ _DEST_KEYS_BY_URL: dict[str, tuple[str, ...]] = {
 # boundary (the reason `BUILTIN_PUBLIC_KEYS` is public).
 ODATA_ENTRY_KEYS = ("services", "allow_write")
 MAX_ODATA_ENTRY_SERVICES = 50
+# builtin:ina likewise stores no destination: each registered query
+# (`InaQuery`) names its own destination and identity, and the entry only
+# which queries the agent may run. Public for the admin gate, as above.
+INA_ENTRY_KEYS = ("queries",)
+MAX_INA_ENTRY_QUERIES = 50
 def bitbucket_approves(servers: Any) -> bool:
     """Whether a server list holds a ``builtin:bitbucket`` entry (any
     spelling of the URL) that asks for approving
@@ -5283,6 +5353,16 @@ _ODATA_MODE_MESSAGE = (
     "builtin:odata requires auth_mode=destination: every catalogue service "
     "is reached through the BTP destination it names"
 )
+# One entry per agent, as for builtin:odata: two would share the server key
+# and so their tools' names. Public for the reason the OData message is.
+INA_SINGLE_ENTRY_MESSAGE = (
+    "an agent may have at most one builtin:ina entry; list every query in that "
+    "entry's oauth.queries"
+)
+_INA_MODE_MESSAGE = (
+    "builtin:ina requires auth_mode=destination: every registered query is "
+    "reached through the BTP destination it names"
+)
 # Built-ins whose destination may act as the signed-in user. NVD has no user
 # to act as and the me.sap.com cookie is one shared session, so the switch is
 # dropped for those rather than stored as a promise nothing keeps.
@@ -5353,6 +5433,34 @@ def _clean_odata_entry(src: dict[str, Any]) -> dict[str, Any]:
     if src.get("allow_write") is True:
         cleaned["allow_write"] = True
     return cleaned
+
+
+def _clean_ina_entry(src: dict[str, Any]) -> dict[str, Any]:
+    """Normalize the block of a ``builtin:ina`` entry for storage.
+
+    Exactly ``{"queries": [...]}``; every other key is dropped,
+    ``destination`` and ``user_context`` included (identity belongs to each
+    registered query). As `_clean_odata_entry`, the last gate before the
+    row: ``queries`` must be a non-empty list of query names (the slug form
+    of ``agents.ina.models.QUERY_NAME_RE``), anything else is refused rather
+    than skipped, duplicates are dropped (first occurrence wins) and at most
+    ``MAX_INA_ENTRY_QUERIES`` remain. Whether the names are registered is
+    `check_ina_queries`' question. The message never repeats a value.
+    """
+    raw = src.get("queries")
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("builtin:ina requires at least one query")
+    queries: list[str] = []
+    for name in raw:
+        if not isinstance(name, str) or not re.fullmatch(_INA_QUERY_NAME_RE, name):
+            raise ValueError("builtin:ina queries: invalid query name")
+        if name not in queries:
+            queries.append(name)
+    if len(queries) > MAX_INA_ENTRY_QUERIES:
+        raise ValueError(
+            f"builtin:ina allows at most {MAX_INA_ENTRY_QUERIES} queries per entry"
+        )
+    return {"queries": queries}
 
 
 # The data catalogue tables (agents/data_catalog/models.py) live in their own
