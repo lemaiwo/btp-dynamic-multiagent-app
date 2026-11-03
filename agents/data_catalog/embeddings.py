@@ -1,15 +1,33 @@
 """Embedding vectors of catalogue nodes, through SAP AI Core, optional.
 
-The model is ``AICORE_EMBEDDING_MODEL`` when set, else the deployed model
-``text-embedding-3-large`` when AI Core lists it, else the first deployed
-model whose name contains ``embedding``, else none: then nothing is embedded
-and the search ranks lexically. The call goes through the same
-``gen_ai_hub`` proxy client as the chat models (``AsyncOpenAI(proxy_client=
-...).embeddings.create``). Every failure (no credentials, no deployment, a
-refused call, a timeout) means "no vectors", logged by exception class only.
+Which model (design addendum (l), point 1; :func:`resolve_model_detail`
+answers it with where it came from, for the admin's status):
 
-``DATA_CATALOG_EMBEDDINGS=0`` switches embedding off (the test suite does;
-a developer's ``.env`` may hold real AI Core credentials).
+1. ``DATA_CATALOG_EMBEDDINGS=0`` -> none (the test suite sets it; a
+   developer's ``.env`` may hold real AI Core credentials; an emergency
+   switch on a landscape);
+2. the admin's setting off (``orchestrator_config.embeddings_enabled = 0``)
+   -> none;
+3. the admin's model (``embedding_model``) -> that model while AI Core lists
+   a RUNNING deployment of it, else none: no fallback, the admin chose it
+   (source ``setting`` either way);
+4. ``AICORE_EMBEDDING_MODEL`` -> that model (source ``env``);
+5. discovery: the deployed ``text-embedding-3-large``, else the first
+   deployed model whose name contains ``embedding`` (source ``discovery``);
+   else none.
+
+With no model nothing is embedded and the search ranks lexically. The
+setting and the list of deployments are each cached for 10 minutes (a
+search must not read the row or ask AI Core every time);
+``agents.db.set_embedding_setting`` resets the caches after its commit. The
+caches are per process: another app instance sees a save after its own 10
+minutes. A setting that cannot be read means none, and is read again on the
+next call (fail closed: an admin who switched embeddings off gets no call).
+
+The call goes through the same ``gen_ai_hub`` proxy client as the chat
+models (``AsyncOpenAI(proxy_client=...).embeddings.create``). Every failure
+(no credentials, no deployment, a refused call, a timeout) means "no
+vectors", logged by exception class only.
 
 Only catalogue text is embedded (names, labels, purpose, synonyms,
 examples), never a row of data. A vector is stored with the SHA-256 of the
@@ -32,6 +50,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agents.data_catalog.models import DataCatalogNode, DataCatalogVector
+from agents.db import SessionLocal, get_embedding_setting
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +65,16 @@ BATCH_SIZE = 64
 MAX_TEXT_CHARS = 2000
 _QUESTION_CACHE_SIZE = 256
 
-_model_cache: tuple[float, str | None] | None = None
+# Where the effective model came from (resolve_model_detail).
+SOURCES = ("setting", "env", "discovery", "none")
+
+# The clock of the two caches (a seam for the tests).
+_clock = time.monotonic
+_setting_cache: tuple[float, dict[str, Any]] | None = None
+_deployed_cache: tuple[float, list[str]] | None = None
+# Raised by every reset: a read that began before a reset is not cached,
+# so a save that lands while a resolve awaits the row is seen next time.
+_cache_epoch = 0
 _question_cache: OrderedDict[tuple[str, str], list[float]] = OrderedDict()
 
 
@@ -55,8 +83,10 @@ def enabled() -> bool:
 
 
 def reset_caches() -> None:
-    global _model_cache
-    _model_cache = None
+    global _setting_cache, _deployed_cache, _cache_epoch
+    _setting_cache = None
+    _deployed_cache = None
+    _cache_epoch += 1
     _question_cache.clear()
 
 
@@ -66,30 +96,71 @@ def _pick(deployed: list[str]) -> str | None:
     return next((m for m in deployed if "embedding" in m.lower()), None)
 
 
-async def resolve_model() -> str | None:
-    """The embedding model to use, or ``None``. Cached for 10 minutes,
-    a ``None`` included (no discovery call per search)."""
-    global _model_cache
-    if not enabled():
+async def _setting() -> dict[str, Any] | None:
+    """The admin's setting, cached for 10 minutes; ``None`` when it cannot
+    be read (not cached, so the next call tries again)."""
+    global _setting_cache
+    now, epoch = _clock(), _cache_epoch
+    if _setting_cache is not None and now - _setting_cache[0] < MODEL_CACHE_SECONDS:
+        return _setting_cache[1]
+    try:
+        async with SessionLocal() as db:
+            setting = await get_embedding_setting(db)
+    except Exception as exc:  # noqa: BLE001 - no vectors, see the module docstring
+        logger.warning(
+            "data catalogue: embedding setting unreadable (%s)", type(exc).__name__)
         return None
-    configured = (os.environ.get(MODEL_ENV) or "").strip()
-    if configured:
-        return configured
-    now = time.monotonic()
-    if _model_cache is not None and now - _model_cache[0] < MODEL_CACHE_SECONDS:
-        return _model_cache[1]
+    if epoch == _cache_epoch:
+        _setting_cache = (now, setting)
+    return setting
+
+
+async def _deployed() -> list[str]:
+    """The model names AI Core lists with a RUNNING deployment, cached for
+    10 minutes, an empty list included (no discovery call per search)."""
+    global _deployed_cache
+    now, epoch = _clock(), _cache_epoch
+    if _deployed_cache is not None and now - _deployed_cache[0] < MODEL_CACHE_SECONDS:
+        return _deployed_cache[1]
     from agents.shared import _discover_deployed_models
 
     try:
-        deployed = await asyncio.wait_for(
+        found = await asyncio.wait_for(
             asyncio.to_thread(_discover_deployed_models), DISCOVERY_TIMEOUT_SECONDS
         )
     except Exception as exc:  # noqa: BLE001 - no vectors, see the module docstring
         logger.warning("data catalogue: model discovery failed (%s)", type(exc).__name__)
-        deployed = []
-    model = _pick(list(deployed or []))
-    _model_cache = (now, model)
-    return model
+        found = []
+    deployed = [m for m in (found or []) if isinstance(m, str)]
+    if epoch == _cache_epoch:
+        _deployed_cache = (now, deployed)
+    return deployed
+
+
+async def resolve_model_detail() -> tuple[str | None, str]:
+    """``(model, source)``: the embedding model to use, or ``None``, and
+    where it came from, one of :data:`SOURCES`, in the order of the module
+    docstring. ``setting`` with ``None`` is an admin's model that AI Core
+    does not list as deployed; switched off (by the environment or the
+    admin) and nothing found are ``none``."""
+    if not enabled():
+        return None, "none"
+    setting = await _setting()
+    if setting is None or not setting["enabled"]:
+        return None, "none"
+    chosen = setting["model"]
+    if chosen:
+        return (chosen if chosen in await _deployed() else None), "setting"
+    configured = (os.environ.get(MODEL_ENV) or "").strip()
+    if configured:
+        return configured, "env"
+    model = _pick(await _deployed())
+    return model, ("discovery" if model else "none")
+
+
+async def resolve_model() -> str | None:
+    """The embedding model to use, or ``None`` (see the module docstring)."""
+    return (await resolve_model_detail())[0]
 
 
 async def _create(model: str, texts: list[str]) -> list[list[float]]:

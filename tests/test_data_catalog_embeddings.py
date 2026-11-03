@@ -1,0 +1,364 @@
+"""Embeddings of the data catalogue, switched on and run from the admin
+(design addendum 2026-11-03 (l)).
+
+Point 1, the setting: the two columns on ``orchestrator_config``
+(``embeddings_enabled``, ``embedding_model``), their storage gate, and the
+order in which ``embeddings.resolve_model`` picks the model:
+``DATA_CATALOG_EMBEDDINGS=0`` -> none; the admin's ``embeddings_enabled = 0``
+-> none; the admin's model -> that model, only while AI Core lists it
+deployed (else nothing, source still ``setting``); ``AICORE_EMBEDDING_MODEL``;
+discovery. The setting is read through the 10-minute cache and a save
+resets it.
+
+No network: discovery is patched (``agents.shared._discover_deployed_models``)
+and the suite's ``DATA_CATALOG_EMBEDDINGS=0`` (``tests/conftest.py``) is set
+to ``1`` here only where a rung needs it.
+"""
+
+from __future__ import annotations
+
+import os
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+from tests.testdb import use_test_database  # noqa: E402
+
+use_test_database()
+
+import pytest  # noqa: E402
+from sqlalchemy import select, update  # noqa: E402
+
+import agents.shared as shared  # noqa: E402
+from agents.data_catalog import embeddings  # noqa: E402
+from agents.db import (  # noqa: E402
+    OrchestratorConfig,
+    SessionLocal,
+    get_embedding_setting,
+    init_db,
+    set_embedding_setting,
+)
+
+SECRET = "s3cr3t-embedding-token"
+DEPLOYED = ["gpt-4o", "text-embedding-3-small", "text-embedding-3-large"]
+
+
+class Discovery:
+    """Stands in for AI Core's list of RUNNING deployments; counts the calls."""
+
+    def __init__(self, models: list[str]) -> None:
+        self.models = list(models)
+        self.calls = 0
+
+    def __call__(self) -> list[str]:
+        self.calls += 1
+        return list(self.models)
+
+
+async def store(enabled: int, model: str | None) -> None:
+    """Write the row directly: no storage gate and no cache reset."""
+    async with SessionLocal() as s:
+        await s.execute(
+            update(OrchestratorConfig)
+            .where(OrchestratorConfig.id == 1)
+            .values(embeddings_enabled=enabled, embedding_model=model)
+            .execution_options(synchronize_session=False)
+        )
+        await s.commit()
+
+
+async def stored() -> tuple[int, str | None]:
+    async with SessionLocal() as s:
+        row = (await s.execute(
+            select(OrchestratorConfig.embeddings_enabled, OrchestratorConfig.embedding_model)
+            .where(OrchestratorConfig.id == 1)
+        )).one()
+    return row[0], row[1]
+
+
+@pytest.fixture(autouse=True)
+async def _defaults(monkeypatch):
+    """Every test starts (and leaves the shared session database) with the
+    column defaults: embeddings on, the model automatic."""
+    await init_db()
+    await store(1, None)
+    embeddings.reset_caches()
+    monkeypatch.setenv(embeddings.SWITCH_ENV, "1")
+    monkeypatch.delenv(embeddings.MODEL_ENV, raising=False)
+    yield
+    await store(1, None)
+    embeddings.reset_caches()
+
+
+@pytest.fixture
+def discovery(monkeypatch) -> Discovery:
+    found = Discovery(DEPLOYED)
+    monkeypatch.setattr(shared, "_discover_deployed_models", found)
+    return found
+
+
+@pytest.fixture
+def no_embedding_call(monkeypatch):
+    async def refuse(model, texts):  # pragma: no cover - the test fails if reached
+        raise AssertionError("an embedding call was made")
+
+    monkeypatch.setattr(embeddings, "_create", refuse)
+
+
+# --- the columns and their storage --------------------------------------------------------
+
+
+def test_the_two_columns_and_their_defaults():
+    table = OrchestratorConfig.__table__
+    enabled, model = table.c.embeddings_enabled, table.c.embedding_model
+    assert not enabled.nullable and enabled.server_default.arg == "1"
+    assert model.nullable and model.type.length == 128 and model.server_default is None
+
+
+async def test_without_the_row_embeddings_are_on_and_the_model_automatic():
+    class NoRow:
+        async def get(self, *args, **kwargs):
+            return None
+
+    assert await get_embedding_setting(NoRow()) == {"enabled": True, "model": None}
+
+
+async def test_the_row_init_db_ensures_has_the_defaults():
+    async with SessionLocal() as s:
+        assert await get_embedding_setting(s) == {"enabled": True, "model": None}
+
+
+async def test_the_setting_is_stored_and_read_back():
+    async with SessionLocal() as s:
+        await set_embedding_setting(s, False, "text-embedding-3-small")
+    assert await stored() == (0, "text-embedding-3-small")
+    async with SessionLocal() as s:
+        assert await get_embedding_setting(s) == {
+            "enabled": False, "model": "text-embedding-3-small"}
+        await set_embedding_setting(s, True, None)
+    assert await stored() == (1, None)
+    async with SessionLocal() as s:
+        assert await get_embedding_setting(s) == {"enabled": True, "model": None}
+
+
+async def test_any_stored_value_but_zero_is_on_and_an_empty_model_is_automatic():
+    await store(2, "")
+    async with SessionLocal() as s:
+        assert await get_embedding_setting(s) == {"enabled": True, "model": None}
+
+
+@pytest.mark.parametrize("enabled", [1, 0, "true", "false", None, 1.0])
+async def test_storage_refuses_an_enabled_that_is_not_a_boolean(enabled):
+    async with SessionLocal() as s:
+        with pytest.raises(ValueError) as refused:
+            await set_embedding_setting(s, enabled, None)
+    assert str(refused.value).startswith("enabled: ")
+    assert await stored() == (1, None)
+
+
+@pytest.mark.parametrize("model", [
+    "", " text-embedding-3-small", "text-embedding-3-small ", "text embedding",
+    "text-embedding\n", "a\x00b", "x" * 129, f"{SECRET}​", 5, ["x"], True,
+])
+async def test_storage_refuses_a_model_that_is_not_a_model_name(model):
+    async with SessionLocal() as s:
+        with pytest.raises(ValueError) as refused:
+            await set_embedding_setting(s, True, model)
+    message = str(refused.value)
+    assert message.startswith("model: ")
+    assert SECRET not in message and "embedding\n" not in message
+    assert await stored() == (1, None)
+
+
+async def test_a_model_name_of_128_characters_is_stored():
+    name = "a" * 128
+    async with SessionLocal() as s:
+        await set_embedding_setting(s, True, name)
+    assert await stored() == (1, name)
+
+
+def test_an_existing_database_gets_both_columns_with_their_defaults(tmp_path):
+    """A database of an earlier version has neither column; init_db adds them
+    (twice is a no-op) and the existing row reads on and automatic."""
+    db = tmp_path / "old.db"
+    con = sqlite3.connect(db)
+    con.executescript(
+        """
+        CREATE TABLE orchestrator_config (id INTEGER PRIMARY KEY, instructions TEXT NOT NULL,
+          model_name VARCHAR(128), updated_at DATETIME);
+        INSERT INTO orchestrator_config VALUES (1, 'old orchestrator', 'gpt-4o', NULL);
+        """
+    )
+    con.commit()
+    con.close()
+    env = {**os.environ, "DATABASE_URL": f"sqlite+aiosqlite:///{db}"}
+    code = (
+        "import asyncio; from agents.db import init_db; "
+        "asyncio.run(init_db()); asyncio.run(init_db())"
+    )
+    r = subprocess.run(
+        [sys.executable, "-c", code], cwd=ROOT, env=env, capture_output=True, text=True
+    )
+    assert r.returncode == 0, r.stderr
+    con = sqlite3.connect(db)
+    assert con.execute(
+        "SELECT instructions, model_name, embeddings_enabled, embedding_model "
+        "FROM orchestrator_config"
+    ).fetchall() == [("old orchestrator", "gpt-4o", 1, None)]
+    con.close()
+
+
+# --- the resolution order ----------------------------------------------------------------
+
+
+async def test_the_switch_wins_over_everything(monkeypatch, discovery, no_embedding_call):
+    await store(1, "text-embedding-3-small")
+    monkeypatch.setenv(embeddings.MODEL_ENV, "my-embedder")
+    monkeypatch.setenv(embeddings.SWITCH_ENV, "0")
+    assert await embeddings.resolve_model_detail() == (None, "none")
+    assert await embeddings.resolve_model() is None
+    assert await embeddings.embed_texts(["x"]) is None
+    assert discovery.calls == 0
+
+
+async def test_the_admin_switched_off_means_none_whatever_else_is_set(
+    monkeypatch, discovery, no_embedding_call
+):
+    await store(0, "text-embedding-3-small")
+    monkeypatch.setenv(embeddings.MODEL_ENV, "my-embedder")
+    assert await embeddings.resolve_model_detail() == (None, "none")
+    assert await embeddings.embed_texts(["x"]) is None
+    assert discovery.calls == 0
+
+
+async def test_the_admin_model_wins_over_the_environment_while_it_is_deployed(
+    monkeypatch, discovery
+):
+    await store(1, "text-embedding-3-small")
+    monkeypatch.setenv(embeddings.MODEL_ENV, "my-embedder")
+    assert await embeddings.resolve_model_detail() == ("text-embedding-3-small", "setting")
+    assert await embeddings.resolve_model() == "text-embedding-3-small"
+
+
+async def test_an_admin_model_that_is_not_deployed_embeds_nothing(
+    monkeypatch, discovery, no_embedding_call
+):
+    """No fallback to the environment or to discovery: the admin chose a
+    model, and the status says that one is not there."""
+    await store(1, "text-embedding-ada-002")
+    monkeypatch.setenv(embeddings.MODEL_ENV, "my-embedder")
+    assert await embeddings.resolve_model_detail() == (None, "setting")
+    assert await embeddings.embed_texts(["x"]) is None
+    assert discovery.calls == 1
+
+
+async def test_a_failed_discovery_leaves_an_admin_model_unusable(monkeypatch, caplog):
+    def boom():
+        raise RuntimeError(f"https://user:{SECRET}@aicore.example/v2/lm/deployments")
+
+    monkeypatch.setattr(shared, "_discover_deployed_models", boom)
+    await store(1, "text-embedding-3-small")
+    assert await embeddings.resolve_model_detail() == (None, "setting")
+    assert "RuntimeError" in caplog.text and SECRET not in caplog.text
+
+
+async def test_automatic_takes_the_environment_model_without_a_deployment_check(
+    monkeypatch, discovery
+):
+    monkeypatch.setenv(embeddings.MODEL_ENV, " my-embedder ")
+    assert await embeddings.resolve_model_detail() == ("my-embedder", "env")
+    assert discovery.calls == 0
+
+
+@pytest.mark.parametrize(("deployed", "expected"), [
+    (DEPLOYED, ("text-embedding-3-large", "discovery")),
+    (["gpt-4o", "Gemini-Embedding-001", "text-embedding-3-small"],
+     ("Gemini-Embedding-001", "discovery")),
+    (["gpt-4o", "claude-sonnet"], (None, "none")),
+    ([], (None, "none")),
+])
+async def test_automatic_without_the_environment_discovers(monkeypatch, deployed, expected):
+    monkeypatch.setattr(shared, "_discover_deployed_models", Discovery(deployed))
+    assert await embeddings.resolve_model_detail() == expected
+
+
+async def test_an_unreadable_setting_embeds_nothing_and_is_read_again(
+    monkeypatch, discovery, caplog
+):
+    """Fail closed: an admin who switched embeddings off must not get calls
+    because the row could not be read. The failure is not cached."""
+    real = embeddings.get_embedding_setting
+
+    async def unreadable(session):
+        raise RuntimeError(f"postgresql://app:{SECRET}@db.internal/registry")
+
+    monkeypatch.setattr(embeddings, "get_embedding_setting", unreadable)
+    assert await embeddings.resolve_model_detail() == (None, "none")
+    assert "RuntimeError" in caplog.text and SECRET not in caplog.text
+    monkeypatch.setattr(embeddings, "get_embedding_setting", real)
+    assert await embeddings.resolve_model_detail() == ("text-embedding-3-large", "discovery")
+
+
+# --- the cache ---------------------------------------------------------------------------
+
+
+class Clock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+async def test_the_setting_and_the_deployments_are_read_through_the_ten_minute_cache(
+    monkeypatch, discovery
+):
+    clock = Clock()
+    monkeypatch.setattr(embeddings, "_clock", clock)
+    reads = 0
+    real = embeddings.get_embedding_setting
+
+    async def counted(session):
+        nonlocal reads
+        reads += 1
+        return await real(session)
+
+    monkeypatch.setattr(embeddings, "get_embedding_setting", counted)
+    assert await embeddings.resolve_model_detail() == ("text-embedding-3-large", "discovery")
+    await store(0, None)  # behind the cache's back: no save, no reset
+    clock.now += embeddings.MODEL_CACHE_SECONDS - 1
+    assert await embeddings.resolve_model_detail() == ("text-embedding-3-large", "discovery")
+    assert (reads, discovery.calls) == (1, 1)
+    clock.now += 2
+    assert await embeddings.resolve_model_detail() == (None, "none")
+    assert reads == 2
+
+
+async def test_a_save_resets_the_cache(discovery):
+    assert await embeddings.resolve_model_detail() == ("text-embedding-3-large", "discovery")
+    async with SessionLocal() as s:
+        await set_embedding_setting(s, True, "text-embedding-3-small")
+    assert await embeddings.resolve_model_detail() == ("text-embedding-3-small", "setting")
+    async with SessionLocal() as s:
+        await set_embedding_setting(s, False, "text-embedding-3-small")
+    assert await embeddings.resolve_model_detail() == (None, "none")
+
+
+async def test_a_read_that_a_save_overtook_is_not_cached(monkeypatch, discovery):
+    """A save that lands while a resolve is reading the row: the value read
+    is used once but not cached, so the next resolve sees the save."""
+    real = embeddings.get_embedding_setting
+
+    async def overtaken(session):
+        value = await real(session)
+        await store(0, None)
+        embeddings.reset_caches()  # what set_embedding_setting does after its commit
+        return value
+
+    monkeypatch.setattr(embeddings, "get_embedding_setting", overtaken)
+    assert await embeddings.resolve_model_detail() == ("text-embedding-3-large", "discovery")
+    monkeypatch.setattr(embeddings, "get_embedding_setting", real)
+    assert await embeddings.resolve_model_detail() == (None, "none")

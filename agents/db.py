@@ -804,6 +804,14 @@ class OrchestratorConfig(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+    # The data catalogue's embeddings (addendum (l)), read through
+    # get_embedding_setting: 0 switches them off; a NULL model is automatic
+    # (AICORE_EMBEDDING_MODEL, else discovery). Appended last so HDI alters
+    # the table in place (HANA schema generation 10).
+    embeddings_enabled: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    embedding_model: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
 
 class SkillConfig(Base):
@@ -2060,6 +2068,11 @@ async def _create_and_migrate() -> None:
             conn, "odata_services", "kind", "VARCHAR(16) NOT NULL DEFAULT 'odata'"
         )
         await _ensure_column(conn, "data_catalog_edges", "curated_at", tstz)
+        # The data catalogue's embedding setting (addendum (l)).
+        await _ensure_column(
+            conn, "orchestrator_config", "embeddings_enabled", "INTEGER NOT NULL DEFAULT 1"
+        )
+        await _ensure_column(conn, "orchestrator_config", "embedding_model", "VARCHAR(128)")
         await _backfill_ide_revisions(conn)
         await _resync_ide_revisions(conn)
         # create_all only creates indexes together with a new table; an
@@ -4948,6 +4961,59 @@ async def set_active_model_name(session: AsyncSession, model_name: str) -> None:
     else:
         row.model_name = model_name
     await session.commit()
+
+
+# What an embedding model may be called when it is stored: AI Core's model
+# names (``text-embedding-3-large``, ``amazon--titan-embed-text``). Checked
+# with ``fullmatch``, so a trailing line break is refused too.
+EMBEDDING_MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}")
+
+
+async def get_embedding_setting(session: AsyncSession) -> dict[str, Any]:
+    """The data catalogue's embedding setting: ``{"enabled", "model"}``.
+
+    ``model`` ``None`` is automatic. Only a stored 0 is off (the design's
+    ``embeddings_enabled = 0``); without the row it is what the columns
+    default to, on and automatic. Callers outside the admin read it through
+    ``agents.data_catalog.embeddings.resolve_model``, which caches it.
+    """
+    row = await session.get(OrchestratorConfig, 1)
+    if row is None:
+        return {"enabled": True, "model": None}
+    return {"enabled": row.embeddings_enabled != 0, "model": row.embedding_model or None}
+
+
+async def set_embedding_setting(
+    session: AsyncSession, enabled: bool, model: str | None
+) -> None:
+    """Store the embedding setting, commit, then drop the embedding caches.
+
+    The last gate (the admin route checks first, and alone checks that the
+    model is a deployed embedding model, which needs AI Core): ``enabled`` a
+    boolean, ``model`` ``None`` or a model name, stored exactly as given. A
+    refusal is a ``ValueError`` naming the field and the rule, never the
+    value. The caches are reset after the commit: reset earlier, a resolve
+    running meanwhile could cache the old row for ten minutes.
+    """
+    if not isinstance(enabled, bool):
+        raise ValueError("enabled: must be a boolean")
+    if model is not None and (
+        not isinstance(model, str) or EMBEDDING_MODEL_RE.fullmatch(model) is None
+    ):
+        raise ValueError(
+            "model: must be null or a model name of 1 to 128 letters, digits, "
+            "'.', '_', ':', '/' or '-'"
+        )
+    row = await session.get(OrchestratorConfig, 1)
+    if row is None:
+        row = OrchestratorConfig(id=1, instructions=DEFAULT_ORCHESTRATOR_INSTRUCTIONS)
+        session.add(row)
+    row.embeddings_enabled = 1 if enabled else 0
+    row.embedding_model = model
+    await session.commit()
+    from agents.data_catalog import embeddings
+
+    embeddings.reset_caches()
 
 
 # ---------------------------------------------------------------------------
