@@ -433,7 +433,11 @@ async def test_run_sends_the_analytics_request_exactly():
                             "Selection": {
                                 "SetOperand": {
                                     "FieldName": "0P_CALYEAR",
-                                    "Elements": [{"Comparison": "=", "Low": "2026", "IsExcluding": False}],
+                                    "Elements": [{
+                                        "Comparison": "=",
+                                        "Low": "2026",
+                                        "IsExcluding": False,
+                                    }],
                                 }
                             }
                         },
@@ -444,7 +448,11 @@ async def test_run_sends_the_analytics_request_exactly():
                             "Selection": {
                                 "SetOperand": {
                                     "FieldName": "ZV_REGION",
-                                    "Elements": [{"Comparison": "=", "Low": "NORTH", "IsExcluding": False}],
+                                    "Elements": [{
+                                        "Comparison": "=",
+                                        "Low": "NORTH",
+                                        "IsExcluding": False,
+                                    }],
                                 }
                             }
                         },
@@ -456,7 +464,12 @@ async def test_run_sends_the_analytics_request_exactly():
                                 "SetOperand": {
                                     "FieldName": "ZV_PERIOD",
                                     "Elements": [
-                                        {"Comparison": "BETWEEN", "Low": "01", "High": "06", "IsExcluding": False}
+                                        {
+                                            "Comparison": "BETWEEN",
+                                            "Low": "01",
+                                            "High": "06",
+                                            "IsExcluding": False,
+                                        }
                                     ],
                                 }
                             }
