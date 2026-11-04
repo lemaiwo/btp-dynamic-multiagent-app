@@ -1323,7 +1323,11 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     nothing is closed. The Close is best effort (`_close`): also after a
     refused submit or read, never raised, a failure logged by exception class
     (and HTTP status) only, within what is left of the deadline and at most
-    `CLOSE_DEADLINE_SECONDS` (10), not sent while the caller is cancelled.
+    `CLOSE_DEADLINE_SECONDS` (10), not sent while the caller is cancelled:
+    a run cancelled mid-sequence (the admin Test route's 25 s budget, a
+    stopped chat turn) raises `CancelledError` and leaves its query instance
+    open in the SAP session until ICF ends that session
+    (`tests/test_ina_run.py`).
     Streamed up to `MAX_RESPONSE_BYTES` (8 MB) per answer, no redirect, one
     deadline of `CALL_DEADLINE_SECONDS` (120, `asyncio.timeout` with
     `expired()`) for a describe and for a run's whole sequence, a 407 body

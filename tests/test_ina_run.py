@@ -10,7 +10,8 @@ submit answer sets travel with the read and the Close and are kept; a 403 at
 either step drops the session and redoes the whole sequence once; a refusal
 of the submit or the read is the run's error and the instance is still
 closed; a Close that fails never fails the run and is logged by exception
-class only; the total deadline covers the whole sequence; a definition
+class only; the total deadline covers the whole sequence; a run cancelled
+during the read raises CancelledError and sends no Close; a definition
 described before 2.37.1 sends and reads the ``Measures`` structure.
 
 Same doubles as ``tests/test_ina_client.py`` (real ``destination_http_client``
@@ -261,6 +262,28 @@ async def test_the_total_deadline_covers_the_whole_sequence(monkeypatch):
     error = await refused(make(sap, known=definition()).run(**RUN))
     assert error.code == "timeout"
     assert sap.kinds == ["GET", "submit", "read"]  # no time is left for a Close
+
+
+async def test_a_run_cancelled_during_the_read_propagates_and_sends_no_close():
+    """A cancelled caller (the admin Test route's budget, a chat turn that is
+    stopped) gets its CancelledError; no Close is sent while the task is
+    being cancelled, so the instance lives until ICF ends the SAP session."""
+    reading = asyncio.Event()
+
+    async def hang(request: httpx.Request) -> httpx.Response:
+        reading.set()
+        await asyncio.sleep(30)
+        return httpx.Response(200, json=fixture("run_ok.json"))
+
+    sap = Sap()
+    sap.answers = [hang]
+    task = asyncio.create_task(make(sap, known=definition()).run(**RUN))
+    await asyncio.wait_for(reading.wait(), 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert sap.kinds == ["GET", "submit", "read"]
+    assert sap.closes == []
 
 
 # --------------------------------------------------------- definitions old and new
