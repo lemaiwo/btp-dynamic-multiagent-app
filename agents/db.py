@@ -206,8 +206,10 @@ class DatabaseTarget:
     # SAP HANA only: the design-time user that deploys the tables.
     hdi: hana_hdi.HdiCredentials | None = field(default=None, repr=False)
     # PostgreSQL only: the schema of our own (``PG_SCHEMA``), the connection's
-    # whole ``search_path``; ``None`` is ``public`` as before.
+    # whole ``search_path``; ``None`` is ``public`` as before. With it
+    # ``PG_SCHEMA_ADOPT`` (agents/pg_schema.py): None, True or False.
     schema: str | None = None
+    schema_adopt: bool | None = None
 
 
 def _on_cloud_foundry() -> bool:
@@ -320,11 +322,13 @@ def _postgres_target(creds: dict[str, Any]) -> DatabaseTarget:
         database=str(dbname),
         query={"ssl": sslmode},
     )
+    schema, adopt = pg_schema.settings()
     return DatabaseTarget(
         url.render_as_string(hide_password=False),
         "postgres",
         ssl_ca=ssl_ca,
-        schema=pg_schema.schema_setting(),
+        schema=schema,
+        schema_adopt=adopt,
     )
 
 
@@ -417,7 +421,8 @@ def _target_from_url(url: str, *, on_cf: bool = False) -> DatabaseTarget:
     elif url.startswith("postgresql://") and "+asyncpg" not in url:
         url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
     if url.startswith("postgresql"):
-        return DatabaseTarget(url, "postgres", schema=pg_schema.schema_setting())
+        schema, adopt = pg_schema.settings()
+        return DatabaseTarget(url, "postgres", schema=schema, schema_adopt=adopt)
     if not url.startswith("sqlite"):
         return DatabaseTarget(url, "other")
     if on_cf:
@@ -1989,7 +1994,7 @@ async def _create_and_migrate() -> None:
     """The schema step of :func:`init_db` on Postgres and SQLite."""
     async with engine.begin() as conn:
         if _target.schema:
-            await _adopt_schema(conn, _target.schema)
+            await _adopt_schema(conn, _target.schema, adopt=_target.schema_adopt)
         await conn.run_sync(Base.metadata.create_all)
         # Lightweight migrations: SQLAlchemy create_all doesn't add columns
         # to existing tables.
@@ -2280,12 +2285,17 @@ async def _resync_ide_revisions(conn) -> None:
 
 
 async def _adopt_schema(
-    conn: AsyncConnection, schema: str, *, source_schema: str = "public"
+    conn: AsyncConnection,
+    schema: str,
+    *,
+    adopt: bool | None = None,
+    source_schema: str = "public",
 ) -> AdoptionPlan:
     """:func:`agents.pg_schema.adopt_schema` on this app's models, the first
-    step of :func:`_create_and_migrate` under ``PG_SCHEMA``."""
+    step of :func:`_create_and_migrate` under ``PG_SCHEMA`` (``adopt`` is
+    ``PG_SCHEMA_ADOPT``)."""
     return await pg_schema.adopt_schema(
-        conn, schema, Base.metadata, source_schema=source_schema
+        conn, schema, Base.metadata, adopt=adopt, source_schema=source_schema
     )
 
 
