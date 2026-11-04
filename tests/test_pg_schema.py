@@ -12,8 +12,10 @@ Run:  python -m pytest tests/test_pg_schema.py -q
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import json
 import logging
+import re
 import sys
 import types
 from pathlib import Path
@@ -189,6 +191,30 @@ def test_an_identical_shape_is_ours():
 def test_a_widened_table_refuses():
     columns = _model_columns("skill_configs") | {"legacy_col"}
     assert agents_db.classify_table(_table("skill_configs"), columns) == ("refused", "legacy_col")
+
+
+async def test_no_column_the_migrations_add_is_required(monkeypatch):
+    """The ownership rule relies on it: a column ``_ensure_column`` adds
+    later is missing from an older table of ours, so the model must not
+    require it (NOT NULL without a server default), or that table would be
+    taken for another app's. The columns are the real chain's calls,
+    recorded, not a copy of them."""
+    added = []
+
+    async def record(conn, table, column, ddl_type):
+        added.append((table, column, ddl_type))
+
+    monkeypatch.setattr(agents_db, "_ensure_column", record)
+    monkeypatch.setattr(agents_db, "_target", dataclasses.replace(agents_db._target, schema=None))
+    await agents_db._create_and_migrate()
+    # Every call site ran (none sits behind a branch SQLite skips).
+    source = inspect.getsource(agents_db._create_and_migrate)
+    assert len(added) == len(re.findall(r"await _ensure_column\(", source))
+    pairs = {(table, column) for table, column, _ in added}
+    assert {("agent_configs", "auth_mode"), ("agent_configs", "run_timeout_seconds")} <= pairs
+    assert sum("NOT NULL" in ddl.upper() for _, _, ddl in added) >= 15
+    for table, column, _ in added:
+        assert column not in agents_db.required_columns(_table(table)), (table, column)
 
 
 def _plan(in_schema, in_source, fks=()):
