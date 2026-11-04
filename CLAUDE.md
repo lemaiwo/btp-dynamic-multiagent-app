@@ -289,7 +289,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   because another deployment of this very app in `public` has our shape:
   `adopt_schema` takes `pg_advisory_xact_lock(ADVISORY_LOCK_KEY)` (one fixed
   key, held to the commit of `init_db`'s schema step, so two starting
-  instances take turns), reads `pg_catalog` once (base tables and columns of
+  instances take turns; waited for at most 30 s, `ADVISORY_LOCK_WAIT`, inside
+  CF's 60 s start timeout, then the start is refused with the fixed
+  `LOCK_WAIT_REFUSAL` (SQLSTATE 55P03), and the lock timeout is back at
+  `DEFAULT` before anything else), reads `pg_catalog` once (base tables and columns of
   both schemas; every foreign key that starts or ends in `public`, from any
   schema; not `information_schema`, which hides what the role has no
   privilege on), plans (`plan_schema_adoption`, pure), then by
@@ -303,7 +306,11 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   table with `ALTER TABLE ... SET SCHEMA` (rows, indexes, owned sequences)
   under `SET LOCAL lock_timeout = '10s'`, reset to `DEFAULT` after the last
   move; **`false`** leaves every `public` table alone, one WARNING per table
-  name, and `create_all` makes ours in the schema. The schema is looked up in
+  name, and `create_all` makes ours in the schema. **`true` is for the one
+  deploy that moves the tables**: remove it (or set `false`) in the next
+  deploy, since a later start with it still `true` moves any table of our
+  names that reappears in `public` (the automatic move the switch exists to
+  prevent). The schema is looked up in
   `pg_namespace` and created only when missing, after the decisions
   (`CREATE SCHEMA IF NOT EXISTS` needs CREATE on the database even for an
   existing schema). A foreign table of one of our names is left with one
@@ -3114,7 +3121,8 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `agents/pg_schema.py` (the adoption moved out of `agents/db.py`); no new resource,
   table, column or HANA generation. A landscape that sets `PG_SCHEMA` and still has
   this app's tables in `public` needs `PG_SCHEMA_ADOPT: true` (or `false`) in its
-  `.mtaext` before deploying 2.37.0
+  `.mtaext` before deploying 2.37.0, and `true` removed again (or set `false`) in
+  the deploy after the one that moved the tables
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets
@@ -3152,7 +3160,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   HANA) so its start deploys the HANA tables; then run the task with the
   schema on its command line, `PG_SCHEMA=<schema> python
   scripts/copy_registry_config.py --from postgres --to hana` (dry run, then
-  `--apply`; without it the Postgres side is read from `public`); then
+  `--apply`; without it the Postgres side is read from `public`; the output's
+  first line, and a failure line, name the schema each Postgres side reads:
+  `postgres (schema public) -> hana: dry run`); then
   restart. Dry run by default (`--apply`
   writes): per table the counts to insert / replace / unchanged and the
   names concerned (counts only for the OAuth tables); no other column value

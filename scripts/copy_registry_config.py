@@ -60,7 +60,9 @@ this order:
        PG_SCHEMA=<schema> python scripts/copy_registry_config.py --from postgres --to hana
 
    Without ``PG_SCHEMA`` the Postgres side is read from ``public``: the
-   dry run shows the wrong rows (or none);
+   output names the schema each Postgres side reads (``postgres (schema
+   public) -> hana``), and the dry run shows the wrong rows (or fails on a
+   missing table);
 3. restart the app.
 
 Back to Postgres: set ``DB_KIND=postgres`` with ``PG_SCHEMA`` (and
@@ -497,6 +499,16 @@ def _target(kind: str | None, env: str | None, side: str) -> DatabaseTarget:
     return agents_db._target_from_url(url)
 
 
+def _side(target: DatabaseTarget) -> str:
+    """A side as the output names it: the kind, and for Postgres the schema
+    it reads (``PG_SCHEMA``, else ``public``), so a ``PG_SCHEMA=`` forgotten
+    on the task's command line shows. A schema name is an identifier, never
+    a credential."""
+    if target.kind != "postgres":
+        return target.kind
+    return f"postgres (schema {target.schema or 'public'})"
+
+
 def _identity(target: DatabaseTarget) -> tuple[Any, ...]:
     """What makes two targets the same database (never shown)."""
     url = make_url(target.url)
@@ -565,20 +577,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--apply", action="store_true",
                         help="write to the target (default: dry run)")
     args = parser.parse_args(argv)
+    sides = ""
     try:
         source = _target(getattr(args, "from"), args.from_env, "from")
         target = _target(args.to, args.to_env, "to")
+        sides = f"{_side(source)} -> {_side(target)}"
         plans = asyncio.run(run(source, target, apply=args.apply))
     except (CopyRefused, DatabaseConfigError) as refused:
         print(f"refused: {refused}", file=sys.stderr)
         return 2
     except Exception as failed:  # noqa: BLE001 -- its text may quote a row
+        # A Postgres side names its schema: reading the wrong one (``public``
+        # for a forgotten PG_SCHEMA) typically fails here, on a missing table.
+        where = f"; {sides}" if "postgres" in sides else ""
         print(
-            f"copy failed ({type(failed).__name__}); nothing was written to the target",
+            f"copy failed ({type(failed).__name__}); nothing was written to the target{where}",
             file=sys.stderr,
         )
         return 1
-    print(f"{source.kind} -> {target.kind}: " + ("APPLIED" if args.apply else "dry run"))
+    print(f"{sides}: " + ("APPLIED" if args.apply else "dry run"))
     for plan in plans:
         print("  " + plan.line())
     print("  not copied: " + ", ".join(NOT_COPIED))

@@ -268,3 +268,18 @@ async def test_two_starts_take_turns(world):
         finally:
             if not waiting.done():
                 waiting.cancel()
+
+
+async def test_a_start_that_waits_too_long_is_refused(world, monkeypatch):
+    # The real wait is 30 s; half a second proves the same mapping: asyncpg's
+    # lock_not_available (55P03) through SQLAlchemy becomes the fixed refusal.
+    monkeypatch.setattr(pg_schema, "_ADVISORY_WAIT", text("SET LOCAL lock_timeout = '500ms'"))
+    w = world
+    async with w.on_dst.connect() as first, w.on_dst.connect() as second:
+        async with first.begin():
+            await agents_db._adopt_schema(first, w.dst, adopt=None, source_schema=w.src)
+            with pytest.raises(DatabaseConfigError) as info:
+                async with second.begin():
+                    await agents_db._adopt_schema(
+                        second, w.dst, adopt=None, source_schema=w.src)
+            assert str(info.value) == pg_schema.LOCK_WAIT_REFUSAL

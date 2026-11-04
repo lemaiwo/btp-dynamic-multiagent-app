@@ -12,7 +12,9 @@ Ownership is decided by column shape, and another deployment of this very
 app in ``public`` has the same shape. So the move is never automatic: with
 ``PG_SCHEMA_ADOPT`` unset a start that finds anything to move is refused,
 ``true`` moves, ``false`` leaves ``public`` as it is (the app's tables are
-created in the schema).
+created in the schema). ``true`` is meant for the one deploy that moves the
+tables and is removed (or set ``false``) in the next: left in place it would
+move any table of our names that reappears in ``public``.
 
 * :func:`schema_setting` and :func:`adopt_setting` read and check the two
   variables. The validated name is the only text ever interpolated into the
@@ -37,6 +39,7 @@ from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 
 from sqlalchemy import MetaData, Table, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from agents.db_errors import DatabaseConfigError
@@ -245,14 +248,28 @@ _SCHEMA_EXISTS = text("SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = :sc
 # Two instances that start together (a rolling deploy, ``instances > 1``)
 # take turns: the transaction-level advisory lock is held until the schema
 # step of ``init_db`` commits. One fixed key ("pgschema" in ASCII) for every
-# schema: only this step takes it, and its wait is seconds.
+# schema: only this step takes it. The wait is bounded, 30 s, inside Cloud
+# Foundry's default 60 s start timeout (as agents/hana_hdi.py's container
+# lock): a start that waits longer is refused with LOCK_WAIT_REFUSAL rather
+# than killed by the platform, and the timeout is back at its default before
+# the catalogue is read.
 ADVISORY_LOCK_KEY = int.from_bytes(b"pgschema", "big")
+ADVISORY_LOCK_WAIT = "30s"
+_ADVISORY_WAIT = text(f"SET LOCAL lock_timeout = '{ADVISORY_LOCK_WAIT}'")
 _ADVISORY_LOCK = text("SELECT pg_advisory_xact_lock(:key)")
+# SQLSTATE lock_not_available: what a lock_timeout that ran out raises.
+_LOCK_NOT_AVAILABLE = "55P03"
+LOCK_WAIT_REFUSAL = (
+    "PG_SCHEMA: another instance is adopting the schema; this start waited 30 s "
+    "for it and stopped, nothing was changed. Start again once that instance "
+    "is up"
+)
 # ALTER TABLE ... SET SCHEMA takes ACCESS EXCLUSIVE: a lock somebody else
 # holds (an old instance mid-deploy, an operator's open transaction) would
 # otherwise block the start until the platform kills it, and again.
-# Back to the default after the last move: create_all and the _ensure_*
-# chain run in the same transaction and must not inherit it.
+# Back to the default after the last move (as after the advisory lock):
+# create_all and the _ensure_* chain run in the same transaction and must
+# not inherit it.
 _MOVE_LOCK_TIMEOUT = text("SET LOCAL lock_timeout = '10s'")
 _LOCK_TIMEOUT_RESET = text("SET LOCAL lock_timeout = DEFAULT")
 
@@ -267,7 +284,8 @@ async def adopt_schema(
 ) -> AdoptionPlan:
     """The first step of ``agents.db._create_and_migrate`` under ``PG_SCHEMA``.
 
-    Takes the advisory lock, reads the catalogue once and plans
+    Takes the advisory lock (at most 30 s of waiting, else
+    ``LOCK_WAIT_REFUSAL``), reads the catalogue once and plans
     (:func:`plan_schema_adoption`). Then, by ``adopt`` (``PG_SCHEMA_ADOPT``):
 
     * ``None``: anything to move (:meth:`AdoptionPlan.pending`) refuses the
@@ -289,7 +307,7 @@ async def adopt_schema(
     """
     if conn.dialect.name != "postgresql":
         return AdoptionPlan([], [], [], [])
-    await conn.execute(_ADVISORY_LOCK, {"key": ADVISORY_LOCK_KEY})
+    await _take_the_lock(conn)
     result = await conn.execute(
         _CATALOGUE_COLUMNS, {"schema": schema, "source": source_schema}
     )
@@ -327,6 +345,27 @@ async def adopt_schema(
         logger.info("PG_SCHEMA: moved %s.%s to %s", source_schema, name, schema)
     await conn.execute(_LOCK_TIMEOUT_RESET)
     return plan
+
+
+async def _take_the_lock(conn: AsyncConnection) -> None:
+    """The advisory lock, waited for at most ``ADVISORY_LOCK_WAIT``; the
+    lock timeout is reset right after, so the catalogue reads and the
+    decisions run under the default and only the moves set their own."""
+    await conn.execute(_ADVISORY_WAIT)
+    try:
+        await conn.execute(_ADVISORY_LOCK, {"key": ADVISORY_LOCK_KEY})
+    except DBAPIError as error:
+        if _sqlstate(error) != _LOCK_NOT_AVAILABLE:
+            raise
+        raise DatabaseConfigError(LOCK_WAIT_REFUSAL) from None
+    await conn.execute(_LOCK_TIMEOUT_RESET)
+
+
+def _sqlstate(error: DBAPIError) -> str | None:
+    """The SQLSTATE of a driver error: SQLAlchemy's asyncpg adapter puts it
+    on ``orig`` as ``sqlstate`` (and ``pgcode``)."""
+    orig = error.orig
+    return getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
 
 
 def _refuse_unset(plan: AdoptionPlan, schema: str, source: str) -> None:

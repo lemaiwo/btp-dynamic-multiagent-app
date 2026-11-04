@@ -21,6 +21,7 @@ import types
 from pathlib import Path
 
 import pytest
+from sqlalchemy.exc import OperationalError
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -337,14 +338,16 @@ class FakeConn:
     constraint, referenced schema, referenced table)``) and whether the
     schema exists."""
 
-    def __init__(self, rows, fks=(), *, schema_exists=False):
+    def __init__(self, rows, fks=(), *, schema_exists=False, lock_error=None):
         self.rows, self.fks, self.statements = rows, list(fks), []
-        self.schema_exists = schema_exists
+        self.schema_exists, self.lock_error = schema_exists, lock_error
         self.dialect = types.SimpleNamespace(name="postgresql")
 
     async def execute(self, stmt, params=None):
         sql = str(stmt)
         self.statements.append((sql, dict(params or {})))
+        if sql == str(pg_schema._ADVISORY_LOCK) and self.lock_error is not None:
+            raise self.lock_error
         if sql == str(pg_schema._CATALOGUE_COLUMNS):
             return _Result(self.rows)
         if sql == str(pg_schema._CATALOGUE_FOREIGN_KEYS):
@@ -372,6 +375,27 @@ DANGLING_FKS = [("public", "chat_files", "chat_files_conversation_id_fkey",
 CHAT_FILES = [("public", "chat_files", c) for c in sorted(_model_columns("chat_files"))]
 
 
+MOVE_TIMEOUT = "SET LOCAL lock_timeout = '10s'"
+LOCK_PREAMBLE = [
+    "SET LOCAL lock_timeout = '30s'",
+    "SELECT pg_advisory_xact_lock(:key)",
+    "SET LOCAL lock_timeout = DEFAULT",
+]
+
+
+class _DriverError(Exception):
+    """What SQLAlchemy's asyncpg adapter hands on as ``orig``: the SQLSTATE
+    on ``sqlstate``."""
+
+    def __init__(self, sqlstate):
+        super().__init__(f"driver error {sqlstate}")
+        self.sqlstate = sqlstate
+
+
+def _dbapi_error(sqlstate):
+    return OperationalError("SELECT pg_advisory_xact_lock(:key)", {}, _DriverError(sqlstate))
+
+
 def _warnings(caplog):
     return [r for r in caplog.records if r.levelno >= logging.WARNING]
 
@@ -396,10 +420,10 @@ async def test_true_moves_ours_under_a_lock_timeout_it_resets(caplog):
 async def test_the_lock_comes_first_and_the_schema_is_created_only_when_missing():
     conn = FakeConn(CATALOGUE)
     await agents_db._adopt_schema(conn, SCHEMA, adopt=True)
-    (first, params), *_ = conn.statements
-    assert first == "SELECT pg_advisory_xact_lock(:key)"
-    assert params == {"key": pg_schema.ADVISORY_LOCK_KEY}
+    assert conn.texts()[:3] == LOCK_PREAMBLE
+    assert conn.statements[1][1] == {"key": pg_schema.ADVISORY_LOCK_KEY}
     texts = conn.texts()
+    assert texts[3] == str(pg_schema._CATALOGUE_COLUMNS)
     create = texts.index('CREATE SCHEMA IF NOT EXISTS "pydantic_agent"')
     assert texts.index(str(pg_schema._SCHEMA_EXISTS)) < create
     assert texts.index(str(pg_schema._CATALOGUE_FOREIGN_KEYS)) < create
@@ -409,7 +433,23 @@ async def test_the_lock_comes_first_and_the_schema_is_created_only_when_missing(
     existing = FakeConn(CATALOGUE, schema_exists=True)
     await agents_db._adopt_schema(existing, SCHEMA, adopt=True)
     assert not any(s.startswith("CREATE SCHEMA") for s in existing.texts())
-    assert existing.texts()[0] == "SELECT pg_advisory_xact_lock(:key)"
+    assert existing.texts()[:3] == LOCK_PREAMBLE
+
+
+async def test_a_lock_another_start_holds_too_long_refuses_with_a_fixed_text():
+    # 55P03 lock_not_available: the 30 s wait ran out.
+    conn = FakeConn(CATALOGUE, lock_error=_dbapi_error("55P03"))
+    with pytest.raises(DatabaseConfigError) as info:
+        await agents_db._adopt_schema(conn, SCHEMA, adopt=True)
+    assert str(info.value) == pg_schema.LOCK_WAIT_REFUSAL
+    assert "30 s" in str(info.value) and "driver error" not in str(info.value)
+    assert conn.texts() == LOCK_PREAMBLE[:2], "nothing after the lock"
+
+
+async def test_any_other_failure_of_the_lock_is_not_relabelled():
+    conn = FakeConn(CATALOGUE, lock_error=_dbapi_error("57014"))
+    with pytest.raises(OperationalError):
+        await agents_db._adopt_schema(conn, SCHEMA, adopt=True)
 
 
 async def test_the_reads_use_pg_catalog_for_base_tables_and_keys_into_the_source():
@@ -435,7 +475,7 @@ async def test_unset_refuses_when_anything_would_move_and_changes_nothing(caplog
     message = str(info.value)
     assert "PG_SCHEMA_ADOPT" in message and "2 tables" in message
     assert "true" in message and "false" in message
-    assert conn.ddl() == [] and not any("lock_timeout" in s for s in conn.texts())
+    assert conn.ddl() == [] and MOVE_TIMEOUT not in conn.texts()
 
 
 async def test_unset_counts_one_table_as_one():
@@ -463,7 +503,7 @@ async def test_false_leaves_every_public_table_with_one_warning_each(caplog):
     with caplog.at_level(logging.INFO, logger="agents.pg_schema"):
         plan = await agents_db._adopt_schema(conn, SCHEMA, adopt=False)
     assert conn.ddl() == ['CREATE SCHEMA IF NOT EXISTS "pydantic_agent"']
-    assert not any("lock_timeout" in s for s in conn.texts())
+    assert MOVE_TIMEOUT not in conn.texts()
     warned = sorted(r.args[1] for r in _warnings(caplog))
     assert warned == ["agent_configs", "chat_conversations", "chat_files", "workflows"]
     assert all("PG_SCHEMA_ADOPT" in r.getMessage() for r in _warnings(caplog))
@@ -500,10 +540,10 @@ async def test_a_shared_table_stops_the_start_before_any_change():
     assert conn.ddl() == []
 
 
-async def test_no_lock_timeout_is_set_when_nothing_moves():
+async def test_no_move_timeout_is_set_when_nothing_moves():
     conn = FakeConn([])
     await agents_db._adopt_schema(conn, SCHEMA, adopt=True)
-    assert not any("lock_timeout" in s for s in conn.texts())
+    assert MOVE_TIMEOUT not in conn.texts()
 
 
 async def test_a_foreign_twin_is_logged_below_warning(caplog):
