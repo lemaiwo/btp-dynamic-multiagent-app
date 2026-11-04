@@ -80,7 +80,7 @@ from .errors import InaError
 
 # The grid reader holds the cap of an answer's cells; both names are kept here.
 from .grid import MAX_CELLS, read_grid
-from .models import InaDefinition
+from .models import InaDefinition, InaDimension
 
 # The caps of one run (design addendum (k), part 2 point 2; MAX_CELLS is the
 # grid reader's).
@@ -320,8 +320,15 @@ def _elements(operator: str, value: object, where: str) -> list[dict[str, str]]:
     return [{"Comparison": _COMPARISON[operator], "Low": _wire_value(value, where)}]
 
 
-def _selection(field_name: str, elements: list[dict[str, str]]) -> dict[str, Any]:
+def _selection(field_name: str, elements: list[dict[str, Any]]) -> dict[str, Any]:
     return {"SetOperand": {"FieldName": field_name, "Elements": elements}}
+
+
+def key_of(dimension: InaDimension) -> str:
+    """The key attribute of a dimension, the one name a filter and the read
+    use: the described key field, else ``<dimension>.KEY`` (the system's
+    ``KeyAttribute`` for each of its dimensions)."""
+    return dimension.key_field or f"{dimension.name}.KEY"
 
 
 def plan_run(
@@ -365,10 +372,9 @@ def plan_run(
             raise _refuse(f"{where}.dimension", "not a dimension of this query")
         if operator not in FILTER_OPERATORS:
             raise _refuse(f"{where}.operator", f"one of {', '.join(FILTER_OPERATORS)}")
-        target = dimensions[name]
         selections.append(
             _selection(
-                target.key_field or target.name,
+                key_of(dimensions[name]),
                 _elements(operator, entry["value"], f"{where}.value"),
             )
         )
@@ -431,12 +437,13 @@ def plan_run(
             elements = _elements("in", value, where)
         # SIA's form (recorded run 5): the value named by its dimension's
         # key, each element marked inclusive.
-        for element in elements:
-            element["IsExcluding"] = False  # type: ignore[assignment]
+        inclusive: list[dict[str, Any]] = [{**e, "IsExcluding": False} for e in elements]
         wire_variables.append(
             {
                 "Name": variable.name,
-                "Values": {"Selection": _selection(variable.key_field or variable.name, elements)},
+                "Values": {
+                    "Selection": _selection(variable.key_field or variable.name, inclusive)
+                },
             }
         )
     return RunPlan(
@@ -447,7 +454,7 @@ def plan_run(
         variables=wire_variables,
         top=top,
         structure=structure,
-        keys={name: dimensions[name].key_field or f"{name}.KEY" for name in chosen_dimensions},
+        keys={name: key_of(dimensions[name]) for name in chosen_dimensions},
     )
 
 
@@ -629,6 +636,7 @@ __all__ = [
     "analytics_capabilities",
     "analytics_request",
     "check_caps",
+    "key_of",
     "close_request",
     "data_source",
     "describe_request",

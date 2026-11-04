@@ -1372,7 +1372,8 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     total rows came); the measure structure by its described name on
     `Columns` (`measure_structure`, `Measures` for a row described before
     2.37.1); a `Selection` of `And` over member filters `=`, `<>`, `>=`,
-    `<=`, `between`, `in` on the dimension's `key_field`, `Sort`,
+    `<=`, `between`, `in` on the dimension's key (`key_of`: the same
+    attribute the read lists as the key), `Sort`,
     `Variables` (each value named by its dimension's key, `key_field` of the
     variable, `IsExcluding: false`), `ResultFormat: Version2`, `RowTo` =
     `top + 1`, no `MaxResultRecords`, `Options: ["StatefulServer"]`),
@@ -1381,7 +1382,8 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     `ProcessingDirectives: {ProcessingStep: VariableSubmit}`),
     `close_request` (`Actions: [{Type: Close, DataSources: [<instance>]}]`),
     `data_source(query, package, instance_id)`, `text_attributes(cube,
-    group_by)`, `RunPlan.keys` (`key_field` else `<dim>.KEY`) and
+    group_by)`, `key_of(dimension)` (`key_field` else `<dim>.KEY`; the one
+    key rule of a filter and of `RunPlan.keys`) and
     `RunPlan.texts`, `plan_run` / `check_caps` (every argument rule; an unknown measure or
     dimension is `invalid_filter` `<field>[i]: not a measure|dimension of
     this query`, the name sent never echoed; a mandatory variable left out is

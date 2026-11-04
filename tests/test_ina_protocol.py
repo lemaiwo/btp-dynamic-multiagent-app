@@ -205,9 +205,22 @@ def test_filters_become_one_selection_each_on_the_key_field():
     ]
 
 
-def test_a_dimension_without_a_key_field_is_filtered_by_its_name():
+def test_a_dimension_without_a_key_field_is_filtered_by_the_key_the_read_asks_for():
+    """One key per dimension (``protocol.key_of``): the filter names the
+    attribute the read lists as the key, ``<dimension>.KEY`` without a
+    described key field (the system's ``KeyAttribute`` for each of its
+    dimensions)."""
     out = plan(filters=one("=", "x")["filters"])
-    assert out.selections[0]["SetOperand"]["FieldName"] == "D0"
+    assert out.selections[0]["SetOperand"]["FieldName"] == "D0.KEY"
+    assert out.keys["D0"] == "D0.KEY"
+
+
+def test_key_of_is_the_described_key_field_else_the_dimension_key():
+    from agents.ina.models import InaDimension
+    from agents.ina.protocol import key_of
+
+    assert key_of(InaDimension(name="D1", key_field="[D1].[KEY]")) == "[D1].[KEY]"
+    assert key_of(InaDimension(name="D2")) == "D2.KEY"
 
 
 def test_a_value_is_a_json_string_never_part_of_a_name():
