@@ -459,9 +459,15 @@ def _resolve_database() -> DatabaseTarget:
     SQLite file is used. ``PG_SCHEMA`` set while the choice is not
     PostgreSQL (a HANA binding, a HANA or SQLite URL, the local fallback) is
     a ``DatabaseConfigError``: whoever set it meant Postgres.
+
+    ``PG_SCHEMA`` and ``PG_SCHEMA_ADOPT`` are checked first, once: read
+    later, inside the guard around the bound service, a bad value would be
+    answered as "could not be read" (or, locally, end on SQLite) instead of
+    with its rule.
     """
+    schema, _adopt = pg_schema.settings()
     target = _resolve_database_unchecked()
-    if target.kind != "postgres" and pg_schema.schema_setting():
+    if target.kind != "postgres" and schema:
         raise DatabaseConfigError(
             "PG_SCHEMA applies to PostgreSQL only; this process resolved another database"
         )

@@ -111,6 +111,43 @@ def test_a_postgres_database_url_follows_it_too(env):
     assert agents_db._resolve_database().schema == "pydantic_agent"
 
 
+@pytest.mark.parametrize("value, expected", [("true", True), ("false", False), ("", None),
+                                             ("  ", None)])
+def test_the_switch_rides_on_the_target(env, value, expected):
+    env(VCAP_SERVICES=json.dumps(POSTGRES), PG_SCHEMA="pydantic_agent", PG_SCHEMA_ADOPT=value)
+    target = agents_db._resolve_database()
+    assert target.schema == "pydantic_agent" and target.schema_adopt is expected
+
+
+@pytest.mark.parametrize("value", ["TRUE", "True", "yes", "1", "on", " true", "false "])
+def test_the_switch_is_exactly_true_or_false(env, value):
+    env(VCAP_SERVICES=json.dumps(POSTGRES), PG_SCHEMA="pydantic_agent", PG_SCHEMA_ADOPT=value)
+    with pytest.raises(DatabaseConfigError) as info:
+        agents_db._resolve_database()
+    assert str(info.value) == pg_schema.PG_SCHEMA_ADOPT_RULE
+
+
+def test_the_switch_needs_the_schema(env):
+    env(VCAP_SERVICES=json.dumps(POSTGRES), PG_SCHEMA_ADOPT="true")
+    with pytest.raises(DatabaseConfigError, match="only together with PG_SCHEMA"):
+        agents_db._resolve_database()
+
+
+@pytest.mark.parametrize("name, value, rule", [
+    ("PG_SCHEMA", "Not-Valid", pg_schema.PG_SCHEMA_RULE),
+    ("PG_SCHEMA_ADOPT", "yes", pg_schema.PG_SCHEMA_ADOPT_RULE),
+])
+def test_on_cloud_foundry_the_operator_sees_the_rule(env, name, value, rule):
+    # The bound service is read inside a guard that answers "could not be
+    # read" for any error; the settings are checked before it.
+    env(VCAP_APPLICATION='{"application_name": "app"}', VCAP_SERVICES=json.dumps(POSTGRES),
+        PG_SCHEMA="pydantic_agent")
+    env(**{name: value})
+    with pytest.raises(DatabaseConfigError) as info:
+        agents_db._resolve_database()
+    assert str(info.value) == rule
+
+
 # --- the ownership rule and the planner ------------------------------------------
 
 # Another application's tables under two of our names (made up): neither has
