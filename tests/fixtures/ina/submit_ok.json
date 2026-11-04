@@ -1,0 +1,28 @@
+{
+ "Cube": {
+  "Name": "ZQ_SALES_01",
+  "Dimensions": [
+   {
+    "Name": "0CALMONTH",
+    "DimensionType": 3,
+    "KeyAttribute": "0CALMONTH.KEY",
+    "TextAttribute": "0CALMONTH.LONG_TEXT"
+   },
+   {
+    "Name": "ZREGION",
+    "DimensionType": 3,
+    "KeyAttribute": "ZREGION.KEY",
+    "TextAttribute": "ZREGION.LONG_TEXT"
+   },
+   {
+    "Name": "Measures",
+    "DimensionType": 2,
+    "KeyAttribute": "Measures.KEY"
+   }
+  ],
+  "ServerState": {
+   "State": 0
+  }
+ },
+ "Messages": []
+}

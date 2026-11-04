@@ -219,10 +219,12 @@ async def test_the_test_runs_the_first_measure_with_top_1_and_answers_no_value(c
     assert body["ok"] is True and body["status"] == 200
     assert isinstance(body["duration_ms"], int) and body["columns"] == ["0AMOUNT"]
     assert str(VALUE) not in r.text and "EUR" not in r.text
-    (post,) = remote.sap.posts
-    sent = json.dumps(json.loads(post.content))
+    # No variable is given: the read and the Close, no VariableSubmit.
+    assert remote.sap.kinds == ["GET", "read", "close"]
+    (read,) = remote.sap.reads
+    sent = json.dumps(json.loads(read.content))
     assert "0AMOUNT" in sent and "0QUANTITY" not in sent
-    assert '"MaxResultRecords": 2' in sent  # top 1, plus the one that says "more"
+    assert '"RowTo": 2' in sent  # top 1, plus the one that says "more"
 
 
 async def test_the_test_of_an_undescribed_query_describes_first_and_stores_nothing(
@@ -236,7 +238,7 @@ async def test_the_test_of_an_undescribed_query_describes_first_and_stores_nothi
     r = await client.post(f"{ONE}/test")
     assert r.status_code == 200, r.text
     assert r.json()["columns"] == ["0AMOUNT"]
-    assert len(remote.sap.posts) == 2
+    assert remote.sap.kinds == ["GET", "describe", "read", "close"]
     stored = (await client.get(ONE)).json()
     assert stored["described"] is False and stored["updated_at"] == created["updated_at"]
 

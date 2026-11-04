@@ -5,11 +5,13 @@ session cookie; every ``GetResponse`` sends them back. That pair is a SAP
 session of whoever the destination signed in as, so it is kept per
 destination and per signed-in user in the ``InaSessionStore``, never in the
 shared HTTP client. Covered: one fetch per (destination, user) and its token
-reused; two destinations, and the technical and a user entry of one
+reused, by the describe and by every request of a run (VariableSubmit, read,
+Close); two destinations, and the technical and a user entry of one
 destination, never share a session; a cookie SAP rotates on a JSON answer
 replaces the stored one, while one from a sign-in page is not stored; a 403
 re-fetches once, then ``csrf_failed`` or ``forbidden``; a GetServerInfo that
 hands out no token or no Analytics service, or is refused, sends no POST.
+The run's sequence itself is ``tests/test_ina_run.py``.
 
 Same doubles as ``tests/test_ina_client.py`` (real ``destination_http_client``
 over ``httpx.MockTransport``).
@@ -56,7 +58,7 @@ async def test_server_info_is_fetched_once_per_destination_and_user_and_its_toke
     (get,) = sap.gets
     assert get.url.path == INFO_PATH and get.headers["X-CSRF-Token"] == "Fetch"
     assert "cookie" not in get.headers
-    assert len(sap.posts) == 2
+    assert sap.kinds == ["GET", "describe", "submit", "read", "close"]
     for post in sap.posts:
         assert post.url.path == RESPONSE_PATH
         assert post.headers["X-CSRF-Token"] == "csrf-1"
@@ -77,13 +79,12 @@ async def test_each_signed_in_user_has_a_session_of_their_own():
     with signed_in(BOB):
         await make(sap, user_context=True, store=store, known=definition()).run(**RUN)
     assert len(sap.gets) == 2
+    # Each run is submit, read and Close: six requests of Alice's, three of Bob's.
     tokens = [p.headers["X-CSRF-Token"] for p in sap.posts]
-    assert tokens == ["csrf-1", "csrf-1", "csrf-2"]
+    assert tokens == ["csrf-1"] * 6 + ["csrf-2"] * 3
     assert [p.headers["Authorization"] for p in sap.posts] == [
-        f"Bearer user-token-of-{ALICE}",
-        f"Bearer user-token-of-{ALICE}",
-        f"Bearer user-token-of-{BOB}",
-    ]
+        f"Bearer user-token-of-{ALICE}"
+    ] * 6 + [f"Bearer user-token-of-{BOB}"] * 3
 
 
 async def test_the_shared_http_client_keeps_no_cookie():
@@ -102,9 +103,9 @@ async def test_two_destinations_on_one_store_never_share_a_session():
         await make(sap, destination=name, store=store, known=definition()).run(**RUN)
     assert len(sap.gets) == 2
     sent = [(p.headers["X-CSRF-Token"], p.headers["Cookie"]) for p in sap.posts]
-    first = ("csrf-1", "SAP_SESSIONID_XYZ_100=sess-1")
-    second = ("csrf-2", "SAP_SESSIONID_XYZ_100=sess-2")
-    assert sent == [first, second, first, second]
+    first = [("csrf-1", "SAP_SESSIONID_XYZ_100=sess-1")] * 3
+    second = [("csrf-2", "SAP_SESSIONID_XYZ_100=sess-2")] * 3
+    assert sent == first + second + first + second
 
 
 async def test_the_technical_and_a_user_session_of_one_destination_are_apart():
@@ -116,12 +117,15 @@ async def test_the_technical_and_a_user_session_of_one_destination_are_apart():
         await make(sap, user_context=True, store=store, known=definition()).run(**RUN)
     await make(sap, store=store, known=definition()).run(**RUN)
     assert len(sap.gets) == 2
-    assert [p.headers["X-CSRF-Token"] for p in sap.posts] == ["csrf-1", "csrf-2", "csrf-1"]
-    assert [p.headers["Authorization"] for p in sap.posts] == [
+    assert [p.headers["X-CSRF-Token"] for p in sap.reads] == ["csrf-1", "csrf-2", "csrf-1"]
+    assert [p.headers["Authorization"] for p in sap.reads] == [
         "Bearer dest-token",
         f"Bearer user-token-of-{ALICE}",
         "Bearer dest-token",
     ]
+    assert [p.headers["X-CSRF-Token"] for p in sap.posts] == (
+        ["csrf-1"] * 3 + ["csrf-2"] * 3 + ["csrf-1"] * 3
+    )
 
 
 def _with_cookie(response: httpx.Response, cookie: str) -> httpx.Response:
@@ -142,11 +146,13 @@ async def test_a_cookie_sap_rotates_on_an_answer_replaces_the_stored_one():
     await make(sap, store=store, known=definition()).run(**RUN)
     await make(sap, store=store, known=definition()).run(**RUN)
     assert len(sap.gets) == 1
+    # Rotated on the first read: its Close and the whole second run send it.
     assert [p.headers["Cookie"] for p in sap.posts] == [
         "SAP_SESSIONID_XYZ_100=sess-1",
-        "SAP_SESSIONID_XYZ_100=sess-rotated",
+        "SAP_SESSIONID_XYZ_100=sess-1",
+        *["SAP_SESSIONID_XYZ_100=sess-rotated"] * 4,
     ]
-    assert [p.headers["X-CSRF-Token"] for p in sap.posts] == ["csrf-1", "csrf-1"]
+    assert {p.headers["X-CSRF-Token"] for p in sap.posts} == {"csrf-1"}
 
 
 async def test_a_cookie_of_a_sign_in_page_is_not_stored():
@@ -162,10 +168,8 @@ async def test_a_cookie_of_a_sign_in_page_is_not_stored():
     error = await refused(make(sap, store=store, known=definition()).run(**RUN))
     assert error.code == "not_json"
     await make(sap, store=store, known=definition()).run(**RUN)
-    assert [p.headers["Cookie"] for p in sap.posts] == [
-        "SAP_SESSIONID_XYZ_100=sess-1",
-        "SAP_SESSIONID_XYZ_100=sess-1",
-    ]
+    assert sap.kinds == ["GET", *["submit", "read", "close"] * 2]
+    assert {p.headers["Cookie"] for p in sap.posts} == {"SAP_SESSIONID_XYZ_100=sess-1"}
 
 
 async def test_a_403_on_the_post_fetches_the_token_again_once():
@@ -176,8 +180,9 @@ async def test_a_403_on_the_post_fetches_the_token_again_once():
     ]
     out = await make(sap, known=definition()).run(**RUN)
     assert out["row_count"] == 3
-    assert [r.method for r in sap.requests] == ["GET", "POST", "GET", "POST"]
-    assert [p.headers["X-CSRF-Token"] for p in sap.posts] == ["csrf-1", "csrf-2"]
+    # The read was refused: the whole run again, in a new session.
+    assert sap.kinds == ["GET", "submit", "read", "GET", "submit", "read", "close"]
+    assert [p.headers["X-CSRF-Token"] for p in sap.reads] == ["csrf-1", "csrf-2"]
 
 
 async def test_a_second_403_is_csrf_failed():
@@ -185,7 +190,7 @@ async def test_a_second_403_is_csrf_failed():
     sap.answers = [httpx.Response(403, headers={"x-csrf-token": "Required"})]
     error = await refused(make(sap, known=definition()).run(**RUN))
     assert error.code == "csrf_failed"
-    assert [r.method for r in sap.requests] == ["GET", "POST", "GET", "POST"]
+    assert sap.kinds == ["GET", "submit", "read", "GET", "submit", "read"]
 
 
 async def test_a_403_that_is_no_csrf_refusal_is_forbidden_after_the_one_retry():
@@ -194,7 +199,7 @@ async def test_a_403_that_is_no_csrf_refusal_is_forbidden_after_the_one_retry():
     error = await refused(make(sap, known=definition()).run(**RUN))
     assert error.code == "forbidden"
     assert "html" not in error.message and "authorisation" not in error.message
-    assert len(sap.posts) == 2
+    assert len(sap.reads) == 2 and sap.closes == []
 
 
 async def test_server_info_without_a_token_is_csrf_failed():

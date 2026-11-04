@@ -1,13 +1,14 @@
 """The InA wire format (``agents/ina/protocol.py``) without HTTP.
 
-The three readers and the one gate of a run, as pure functions: what a run's
+The gate of a run and the requests, as pure functions: what a run's
 arguments may be (``plan_run``: every cap and rule, refused with a code of
 the closed list and a text that names the argument, never the value), what
 ``read_description`` makes of an odd description (cleaned, cut, skipped,
-capped: always something the save-time gate takes) and what ``read_grid``
-lets through (only what was asked, and nothing of a grid of a form it does
-not know). The client suite (``tests/test_ina_client.py``) runs the same
-paths through the real HTTP client.
+capped: always something the save-time gate takes), the three requests of a
+run in the form SIA answered (VariableSubmit, read, Close) and the text
+attributes a submit answer names. The grid reader is
+``tests/test_ina_grid.py``; the client suite (``tests/test_ina_client.py``)
+runs the same paths through the real HTTP client.
 
 Run:  python -m pytest tests/test_ina_protocol.py
 """
@@ -15,7 +16,6 @@ Run:  python -m pytest tests/test_ina_protocol.py
 from __future__ import annotations
 
 import copy
-import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -28,7 +28,6 @@ sys.path.insert(0, str(ROOT))
 from agents.ina.errors import InaError  # noqa: E402
 from agents.ina.models import InaDefinition  # noqa: E402
 from agents.ina.protocol import (  # noqa: E402
-    MAX_CELLS,
     MAX_DIMENSIONS,
     MAX_FILTERS,
     MAX_MEASURES,
@@ -36,10 +35,10 @@ from agents.ina.protocol import (  # noqa: E402
     RunPlan,
     plan_run,
     read_description,
-    read_grid,
     sap_message_error,
+    text_attributes,
 )
-from tests.test_ina_client import definition, fixture, grid  # noqa: E402
+from tests.test_ina_client import definition, fixture  # noqa: E402
 
 YEAR = {"0P_CALYEAR": "2026"}
 
@@ -448,157 +447,6 @@ def test_a_description_without_dimensions_is_sap_error(cube):
     assert info.value.code == "sap_error"
 
 
-# --------------------------------------------------------------------- grid
-
-
-def run_plan(measures: list[str], group_by: list[str], top: int = 100) -> RunPlan:
-    return plan_run(
-        definition(),
-        measures=measures,
-        group_by=group_by,
-        filters=None,
-        top=top,
-        order=None,
-        variables=dict(YEAR),
-    )
-
-
-def unreadable(payload: Any, measures: list[str], group_by: list[str], **kw: Any) -> InaError:
-    with pytest.raises(InaError) as info:
-        read_grid(payload, run_plan(measures, group_by, **kw))
-    return info.value
-
-
-def test_a_measure_whose_unit_varies_gets_a_unit_column():
-    payload = grid(
-        ["ZREGION"],
-        [["NORTH"], ["SOUTH"]],
-        ["0AMOUNT"],
-        [{"Value": 5, "Currency": "EUR"}, {"Value": 7, "Currency": "USD"}],
-    )
-    out = read_grid(payload, run_plan(["0AMOUNT"], ["ZREGION"]))
-    assert out["columns"] == ["ZREGION", "0AMOUNT", "0AMOUNT.unit"]
-    assert out["rows"] == [["NORTH", 5, "EUR"], ["SOUTH", 7, "USD"]]
-    assert out["units"] == {}
-
-
-def test_what_sap_returns_beyond_what_was_asked_is_not_passed_on():
-    """A column of a measure that was not asked for is dropped; text in the
-    grid is cleaned and cut."""
-    payload = grid(
-        ["ZREGION"],
-        [["NORTH\u202e\x07"]],
-        ["0AMOUNT", "0SECRET"],
-        [{"Value": 5, "Unit": "EUR"}, {"Value": 99, "Unit": "EUR"}],
-    )
-    out = read_grid(payload, run_plan(["0AMOUNT"], ["ZREGION"]))
-    assert out["columns"] == ["ZREGION", "0AMOUNT"]
-    assert out["rows"] == [["NORTH", 5]]
-    assert "0SECRET" not in json.dumps(out) and "99" not in json.dumps(out["rows"])
-
-
-def test_a_long_text_value_is_cut_and_cleaned():
-    payload = grid(["ZREGION"], [["N"]], ["0AMOUNT"], [{"Value": "v\u2029" + "w" * 400}])
-    out = read_grid(payload, run_plan(["0AMOUNT"], ["ZREGION"]))
-    (row,) = out["rows"]
-    assert row[1] == ("v" + "w" * 400)[:255]
-
-
-def test_an_empty_result_is_no_rows():
-    payload = grid(["ZREGION"], [], ["0AMOUNT"], [])
-    out = read_grid(payload, run_plan(["0AMOUNT"], ["ZREGION"]))
-    assert out == {
-        "columns": ["ZREGION", "0AMOUNT"],
-        "rows": [],
-        "units": {},
-        "row_count": 0,
-        "truncated": False,
-    }
-
-
-def test_without_group_by_the_one_row_is_the_total():
-    payload = grid([], [[]], ["0AMOUNT"], [{"Value": 42, "Unit": "EUR"}])
-    out = read_grid(payload, run_plan(["0AMOUNT"], []))
-    assert out["rows"] == [[42]] and out["units"] == {"0AMOUNT": "EUR"}
-
-
-@pytest.mark.parametrize(
-    "mangle",
-    [
-        lambda g: g["Grids"][0].pop("Cells"),
-        lambda g: g["Grids"][0]["Cells"].pop(),
-        lambda g: g["Grids"][0]["Cells"].__setitem__(0, {"Value": {"nested": 1}}),
-        lambda g: g["Grids"][0]["Cells"].__setitem__(0, {"Value": True}),
-        lambda g: g["Grids"][0]["Cells"].__setitem__(0, {"Foo": 1}),
-        lambda g: g["Grids"][0]["Cells"].__setitem__(0, {}),
-        lambda g: g["Grids"][0]["Cells"].__setitem__(0, "1200.5"),
-        lambda g: g["Grids"][0]["Axes"][0]["Dimensions"].__setitem__(0, {"Name": "ZOTHER"}),
-        lambda g: g["Grids"][0]["Axes"][0]["Tuples"][0]["Members"].append({"Name": "X"}),
-        lambda g: g["Grids"][0]["Axes"][0]["Tuples"][0]["Members"][0].pop("Name"),
-        lambda g: g["Grids"][0]["Axes"][1]["Tuples"].pop(),
-        lambda g: g["Grids"][0]["Axes"][1]["Dimensions"].append({"Name": "ZREGION"}),
-        lambda g: g["Grids"][0]["Axes"].pop(),
-        lambda g: g["Grids"][0]["Axes"].append(copy.deepcopy(g["Grids"][0]["Axes"][0])),
-        lambda g: g["Grids"].clear(),
-        lambda g: g.pop("Grids"),
-    ],
-)
-def test_a_grid_this_reader_does_not_know_is_sap_error(mangle):
-    payload = fixture("run_ok.json")
-    mangle(payload)
-    error = unreadable(payload, ["0AMOUNT", "0QUANTITY"], ["0CALMONTH"])
-    assert error.code == "sap_error"
-
-
-def test_a_grid_of_more_than_max_cells_is_result_too_large_never_cut():
-    measures = [f"M{i}" for i in range(3)]
-    rows = [[f"R{i}"] for i in range(MAX_CELLS // 3 + 1)]
-    cells = [{"Value": i} for i in range(len(rows) * 3)]
-    payload = grid(["D0"], rows, measures, cells)
-    with pytest.raises(InaError) as info:
-        read_grid(payload, plan(measures=measures, top=MAX_TOP))
-    assert info.value.code == "result_too_large"
-
-
-def test_a_grid_of_exactly_max_cells_is_read():
-    measures = [f"M{i}" for i in range(5)]
-    rows = [[f"R{i}"] for i in range(MAX_CELLS // 5)]
-    cells = [{"Value": i} for i in range(MAX_CELLS)]
-    payload = grid(["D0"], rows, measures, cells)
-    out = read_grid(payload, plan(measures=measures, top=MAX_TOP))
-    assert out["row_count"] == MAX_CELLS // 5 and out["truncated"] is False
-
-
-def test_the_row_beyond_top_says_truncated_and_is_not_returned():
-    out = read_grid(
-        fixture("run_ok.json"), run_plan(["0AMOUNT", "0QUANTITY"], ["0CALMONTH"], top=2)
-    )
-    assert out["truncated"] is True and out["row_count"] == 2
-    assert [row[0] for row in out["rows"]] == ["202601", "202602"]
-
-
-def test_exactly_top_rows_is_not_truncated():
-    out = read_grid(
-        fixture("run_ok.json"), run_plan(["0AMOUNT", "0QUANTITY"], ["0CALMONTH"], top=3)
-    )
-    assert out["truncated"] is False and out["row_count"] == 3
-
-
-def test_the_cell_cap_counts_what_is_returned_not_the_extra_row():
-    measures = [f"M{i}" for i in range(5)]
-    top = MAX_CELLS // 5
-    rows = [[f"R{i}"] for i in range(top + 1)]
-    cells = [{"Value": i} for i in range(len(rows) * 5)]
-    payload = grid(["D0"], rows, measures, cells)
-    out = read_grid(payload, plan(measures=measures, top=top))
-    assert out["row_count"] == top and out["truncated"] is True
-
-
-def test_more_rows_than_top_plus_one_is_result_too_large():
-    error = unreadable(fixture("run_ok.json"), ["0AMOUNT", "0QUANTITY"], ["0CALMONTH"], top=1)
-    assert error.code == "result_too_large"
-
-
 # ------------------------------------------------ the run SIA answered (run 5)
 # Recorded 2026-11-04: SIA refuses a read whose variables travel in its own
 # ``Definition`` (no ``DirectVariableTransfer``). It answered with a grid only
@@ -606,6 +454,8 @@ def test_more_rows_than_top_plus_one_is_result_too_large():
 # ``ProcessingDirectives.ProcessingStep``) came first, as a request of its own,
 # on the ``InstanceId`` the read then used, with each value named by the key
 # of its variable's dimension and the measure structure by its real name.
+
+from dataclasses import replace  # noqa: E402
 
 from agents.ina.protocol import (  # noqa: E402
     analytics_request,
@@ -671,13 +521,142 @@ def test_the_run_names_values_by_the_dimension_key_and_the_real_structure():
     ]
 
 
-def test_the_submit_is_the_read_with_the_processing_step():
+SIA_ROWS = ["2CIMMPURGORG", "2CI_SUPPLIER_CDS"]
+HIDE_TOTALS = [
+    {"Result": "Members", "Visibility": "Visible"},
+    {"Result": "Total", "Visibility": "Hidden"},
+]
+STRUCTURE = {
+    "Name": "ELTUIDSTRCMMPURORDQUERY",
+    "Axis": "Columns",
+    "Members": [{"Name": "ELTUIDCMP1", "Visibility": "Visible"}],
+}
+
+
+def sia_texts(group_by: list[str]) -> dict[str, str]:
+    return text_attributes(fixture("submit_sia.json")["Cube"], group_by)
+
+
+def test_the_read_asks_each_row_dimension_for_its_key_and_text_and_hides_totals():
+    """Run 8, the read SIA answered with keys and texts: each Rows entry
+    lists its key and text attribute and hides the totals; no
+    ``MaxResultRecords``, ``RowTo`` is top + 1."""
+    plan = replace(sia_plan(group_by=SIA_ROWS, top=3), texts=sia_texts(SIA_ROWS))
     source = data_source("2CCMMPURORDQUERY", "", instance_id="ina0123456789abcdef")
-    plan = sia_plan()
-    read = analytics_request(["C"], source, plan)
-    submit = variable_submit_request(["C"], source, plan)
-    assert submit["Analytics"].pop("ProcessingDirectives") == {"ProcessingStep": "VariableSubmit"}
-    assert submit == read
+    definition = analytics_request(["C"], source, plan)["Analytics"]["Definition"]
+    assert definition["Dimensions"] == [
+        {
+            "Name": "2CIMMPURGORG",
+            "Axis": "Rows",
+            "Attributes": [
+                {"Name": "2CIMMPURGORG.KEY", "Obtainability": "Always"},
+                {"Name": "2CIMMPURGORG.LONG_TEXT", "Obtainability": "Always"},
+            ],
+            "ResultStructure": HIDE_TOTALS,
+        },
+        {
+            "Name": "2CI_SUPPLIER_CDS",
+            "Axis": "Rows",
+            "Attributes": [
+                {"Name": "2CI_SUPPLIER_CDS.KEY", "Obtainability": "Always"},
+                {"Name": "2CI_SUPPLIER_CDS.LONG_TEXT", "Obtainability": "Always"},
+            ],
+            "ResultStructure": HIDE_TOTALS,
+        },
+        STRUCTURE,
+    ]
+    assert definition["ResultSetFeatureRequest"] == {
+        "ResultFormat": "Version2",
+        "ResultEncoding": "None",
+        "SubSetDescription": {"RowFrom": 0, "RowTo": 4, "ColumnFrom": 0, "ColumnTo": -1},
+        "UseDefaultAttributeKey": False,
+    }
+
+
+def test_a_row_dimension_without_a_known_text_asks_for_its_key_alone():
+    plan = sia_plan(group_by=["2CCMMPURORDSPND-COMPANYCODE"])
+    plan = replace(plan, texts=sia_texts(plan.group_by))
+    (row, _) = analytics_request(["C"], data_source("Q", ""), plan)["Analytics"]["Definition"][
+        "Dimensions"]
+    assert row["Attributes"] == [
+        {"Name": "2CCMMPURORDSPND-COMPANYCODE.KEY", "Obtainability": "Always"}]
+
+
+def test_the_key_attribute_is_the_described_key_field_else_the_dimension_key():
+    d = InaDefinition.model_validate({
+        "dimensions": [{"name": "D1", "key_field": "[D1].[KEY]"}, {"name": "D2"}],
+        "measures": [{"name": "M"}],
+    })
+    plan = plan_run(d, measures=["M"], group_by=["D1", "D2"], filters=None, top=1, order=None,
+                    variables=None)
+    rows = analytics_request(["C"], data_source("Q", ""), plan)["Analytics"]["Definition"][
+        "Dimensions"][:2]
+    assert [r["Attributes"] for r in rows] == [
+        [{"Name": "[D1].[KEY]", "Obtainability": "Always"}],
+        [{"Name": "D2.KEY", "Obtainability": "Always"}],
+    ]
+
+
+def test_the_submit_is_sent_in_the_form_sia_accepted():
+    """Runs 5 to 8: the VariableSubmit was the read of the earlier form (Rows
+    without attributes, ``MaxResultRecords``) with the processing step, on
+    the read's ``InstanceId``, the same variables."""
+    source = data_source("2CCMMPURORDQUERY", "", instance_id="ina0123456789abcdef")
+    plan = sia_plan(group_by=SIA_ROWS, top=3)
+    submit = variable_submit_request(["C"], source, plan)["Analytics"]
+    read = analytics_request(["C"], source, plan)["Analytics"]
+    assert submit["ProcessingDirectives"] == {"ProcessingStep": "VariableSubmit"}
+    assert submit["DataSource"] == read["DataSource"]
+    assert submit["Definition"]["Variables"] == read["Definition"]["Variables"]
+    assert submit["Definition"]["Dimensions"] == [
+        {"Name": "2CIMMPURGORG", "Axis": "Rows"},
+        {"Name": "2CI_SUPPLIER_CDS", "Axis": "Rows"},
+        STRUCTURE,
+    ]
+    assert submit["Definition"]["ResultSetFeatureRequest"] == {
+        "ResultFormat": "Version2",
+        "ResultEncoding": "None",
+        "MaxResultRecords": 4,
+        "SubSetDescription": {"RowFrom": 0, "RowTo": 4, "ColumnFrom": 0, "ColumnTo": -1},
+        "UseDefaultAttributeKey": False,
+    }
+
+
+def test_the_text_attributes_the_submit_answer_names():
+    """Only the submit answer's ``Cube`` names a text attribute for most
+    dimensions (11 of 35 on SIA; the describe answer names 1)."""
+    assert sia_texts([*SIA_ROWS, "2CCMMPURORDSPND-COMPANYCODE"]) == {
+        "2CIMMPURGORG": "2CIMMPURGORG.LONG_TEXT",
+        "2CI_SUPPLIER_CDS": "2CI_SUPPLIER_CDS.LONG_TEXT",
+    }
+    assert sia_texts([]) == {}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "2CIPLANT.LONG_TEXT",
+        "2CIMMPURGORG_LONG_TEXT",
+        "2CIMMPURGORG.LONG\nTEXT",
+        "2CIMMPURGORG.‮TXET",
+        "2CIMMPURGORG." + "X" * 130,
+        "2CIMMPURGORG.KEY",
+        5,
+        None,
+        ["2CIMMPURGORG.LONG_TEXT"],
+    ],
+)
+def test_a_text_attribute_that_is_not_the_dimensions_own_is_not_asked_for(text):
+    cube = fixture("submit_sia.json")["Cube"]
+    for dimension in cube["Dimensions"]:
+        if dimension["Name"] == "2CIMMPURGORG":
+            dimension["TextAttribute"] = text
+    assert text_attributes(cube, ["2CIMMPURGORG"]) == {}
+
+
+@pytest.mark.parametrize("cube", [None, [], "x", {"Dimensions": "x"}, {"Dimensions": [None, 5]}])
+def test_a_submit_answer_without_dimensions_names_no_text(cube):
+    assert text_attributes(cube, SIA_ROWS) == {}
 
 
 def test_a_sort_on_a_measure_names_the_real_structure():

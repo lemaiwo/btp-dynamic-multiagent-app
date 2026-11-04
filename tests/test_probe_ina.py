@@ -1,11 +1,14 @@
 """The request builders of ``scripts/probe_ina.py``.
 
-The probe is standalone (nothing of the app is imported), so its run body is
-a copy of ``agents.ina.protocol.analytics_request``; these tests hold the
-copy to the original, so a recorded exchange is the exchange the app makes.
-They also pin the switches that try SAP's own client's form (the variable
-named by its dimension's key, the ``VariableSubmit`` before the read) and
-that a dump prints only a name and a size.
+The probe is standalone (nothing of the app is imported), so its read, its
+VariableSubmit, its Close and its reading of the submit answer's text
+attributes are copies of ``agents.ina.protocol``'s ``analytics_request``,
+``variable_submit_request``, ``close_request`` and ``text_attributes``;
+these tests hold the copies to the originals, so a recorded exchange is the
+exchange the app makes. They also pin the switches that try SAP's own
+client's form (the variable named by its dimension's key, the
+``VariableSubmit`` before the read) and that a dump prints only a name and a
+size.
 
 Run:  python -m pytest tests/test_probe_ina.py
 """
@@ -96,22 +99,56 @@ def test_a_dump_prints_its_name_and_size_only(tmp_path, capsys):
     assert capsys.readouterr().out == ""
 
 
-def test_the_probes_grouped_run_on_an_instance_is_the_apps_run():
-    """The form run 5 answered (the variables named by their dimension's
-    key, the real structure) plus Rows and an InstanceId: the app's body."""
+GROUP_BY = ["2CIMMPURGORG", "2CIPLANT", "2CCMMPURORDSPND-COMPANYCODE"]
+VALUES = {"!CDS_P_P_DISPLAYCURRENCY": "EUR", "!CDS_P_P_DATEFUNCTION": "YEARTODATE"}
+
+
+def sia_plan():
     from agents.ina.protocol import read_description
 
     definition = read_description(sia_cube()).definition
-    values = {"!CDS_P_P_DISPLAYCURRENCY": "EUR", "!CDS_P_P_DATEFUNCTION": "YEARTODATE"}
-    plan = plan_run(definition, measures=["ELTUIDCMP1"], group_by=["2CIMMPURGORG", "2CIPLANT"],
-                    filters=None, top=3, order=None, variables=values)
-    app = analytics_request(CAPABILITIES, data_source("2CCMMPURORDQUERY", "", "probe1"), plan)
-    body = probe._run_request(
-        CAPABILITIES, "2CCMMPURORDQUERY", "ELTUIDCMP1", list(values.items()), top=3,
+    return plan_run(definition, measures=["ELTUIDCMP1"], group_by=GROUP_BY,
+                    filters=None, top=3, order=None, variables=VALUES)
+
+
+def probe_body(**kw) -> dict:
+    return probe._run_request(
+        CAPABILITIES, "2CCMMPURORDQUERY", "ELTUIDCMP1", list(VALUES.items()), top=3,
         structure="ELTUIDSTRCMMPURORDQUERY", fields=probe._variable_fields(sia_cube()),
-        group_by=["2CIMMPURGORG", "2CIPLANT"], instance="probe1",
+        group_by=GROUP_BY, instance="probe1", **kw,
     )
-    assert without_client_info(body) == without_client_info(app)
+
+
+def submit_cube() -> dict:
+    return json.loads((FIXTURES / "submit_sia.json").read_text(encoding="utf-8"))["Cube"]
+
+
+def test_the_probes_texts_are_the_apps_texts():
+    from agents.ina.protocol import text_attributes
+
+    texts = probe._texts(submit_cube(), GROUP_BY)
+    assert texts == text_attributes(submit_cube(), GROUP_BY)
+    assert texts == {"2CIMMPURGORG": "2CIMMPURGORG.LONG_TEXT", "2CIPLANT": "2CIPLANT.LONG_TEXT"}
+
+
+def test_the_probes_grouped_read_on_an_instance_is_the_apps_read():
+    """The form runs 5 to 8 answered (the variables named by their
+    dimension's key, the real structure, each row's key and text, totals
+    hidden) on an InstanceId: the app's body."""
+    from dataclasses import replace
+
+    texts = probe._texts(submit_cube(), GROUP_BY)
+    plan = replace(sia_plan(), texts=texts)
+    app = analytics_request(CAPABILITIES, data_source("2CCMMPURORDQUERY", "", "probe1"), plan)
+    assert without_client_info(probe_body(texts=texts)) == without_client_info(app)
+
+
+def test_the_probes_submit_is_the_apps_submit():
+    from agents.ina.protocol import variable_submit_request
+
+    app = variable_submit_request(
+        CAPABILITIES, data_source("2CCMMPURORDQUERY", "", "probe1"), sia_plan())
+    assert without_client_info(probe_body(submit=True)) == without_client_info(app)
 
 
 def test_the_probes_close_is_the_apps_close():

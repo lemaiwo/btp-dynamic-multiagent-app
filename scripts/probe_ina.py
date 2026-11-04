@@ -27,26 +27,28 @@ SIA exchange): the RAW JSON of ``GetServerInfo`` (``server_info.json``), of
 the query's describe answer (``describe.json``) and, with ``--run``, of one
 ``Analytics`` read (``<label>.request.json`` and ``<label>.response.json``,
 ``--label`` defaults to ``run``) is written to DIR; stdout still shows only
-statuses, sizes and counts. ``--run`` sends the body the app's
+statuses, sizes and counts. ``--run`` sends the read the app's
 ``agents.ina.protocol.analytics_request`` builds (mirrored here, not
-imported): the first measure of the describe answer (or ``--measure``), no
-grouping, no filter, ``top=1`` (``MaxResultRecords`` 2), and every
-``--variable NAME=VALUE`` (repeatable) as a single-value variable in the
-form ``plan_run`` sends. Three switches try what SAP's own InA client does
-instead: ``--variable-form sap`` names each value by the key of the
-variable's dimension (as the describe answer states a value),
-``--structure NAME`` puts the real measure structure on Columns, and
-``--submit batch|separate`` sends a ``VariableSubmit`` (a copy of the read
-with ``ProcessingDirectives.ProcessingStep``) before the read, on one
-``InstanceId``. On SIA (2026-11-04) the plain run, also with both mandatory
-variables and in either variable form, was refused ("all mandatory
-variables need values"); the batch was answered with the submit's
-``Cube`` alone (``ServerState`` 0, the derived variables filled), no grid;
+imported) on a fresh ``InstanceId``: the first measure of the describe
+answer (or ``--measure``), no filter, ``top=1`` (``RowTo`` 2), the
+dimensions of ``--group-by DIM`` (repeatable) on Rows, each listing its key
+(and its text, once a submit answer named one) and hiding its totals, and
+every ``--variable NAME=VALUE`` (repeatable) as a single-value variable in
+the form ``plan_run`` sends. Switches for SAP's own InA client's form:
+``--variable-form sap`` names each value by the key of the variable's
+dimension (as the describe answer states a value), ``--structure NAME``
+puts the real measure structure on Columns, ``--submit separate`` sends the
+app's ``variable_submit_request`` before the read, on the same instance, and
+takes the text attributes from its answer (``batch`` sends the two as one
+``{"Batch": [...]}`` instead), ``--top N`` sets the rows asked for and
+``--close`` releases the instance afterwards (firefly's ``Close`` action).
+On SIA (2026-11-04) the read alone, also with both mandatory variables and
+in either variable form, was refused ("all mandatory variables need
+values"); the batch was answered with the submit's ``Cube`` alone, no grid;
 ``--submit separate --variable-form sap --structure <real name>`` was
-answered with a grid (run 5): the form the app sends since 2.37.1.
-``--group-by DIM`` (repeatable) puts dimensions on Rows, ``--top N`` sets
-the rows asked for, and ``--close`` releases the query instance afterwards
-(firefly's ``Close`` action).
+answered with a grid (run 5); with Rows the read needed each row's key and
+text as ``Attributes`` and the totals hidden (runs 6 to 8): the sequence the
+app sends since 2.37.1 (``agents/ina/client.py``).
 
 A run answer holds DATA: DIR must lie under the system temp directory
 (``tempfile.gettempdir()``, ``/tmp`` in the container; anything else is
@@ -296,29 +298,51 @@ def _variable_fields(cube: Any) -> dict[str, str]:
     return out
 
 
+HIDE_TOTALS = [{"Result": "Members", "Visibility": "Visible"},
+               {"Result": "Total", "Visibility": "Hidden"}]
+
+
+def _row(name: str, texts: dict[str, str] | None, submit: bool) -> dict[str, Any]:
+    """A Rows entry: the read lists the key (``<dim>.KEY``) and the text the
+    submit answer named and hides totals (firefly's
+    ``QInAField.exportComponentWithStructure``; a dimension's
+    ``ResultSetFields`` was ignored by SIA, run 7); the submit keeps the
+    plain form."""
+    entry: dict[str, Any] = {"Name": name, "Axis": "Rows"}
+    if not submit:
+        names = [f"{name}.KEY", *([texts[name]] if texts and texts.get(name) else [])]
+        entry["Attributes"] = [{"Name": n, "Obtainability": "Always"} for n in names]
+        entry["ResultStructure"] = [dict(x) for x in HIDE_TOTALS]
+    return entry
+
+
 def _run_request(capabilities: list[str], query: str, measure: str,
                  variables: list[tuple[str, str]], top: int = 1,
                  structure: str = "Measures",
                  fields: dict[str, str] | None = None,
                  group_by: list[str] | None = None,
-                 instance: str = "") -> dict[str, Any]:
-    """The body ``analytics_request`` builds for one measure, the dimensions
-    of ``group_by`` on Rows, no filter, no sort (mirrored from
-    ``agents/ina/protocol.py``)."""
+                 instance: str = "",
+                 texts: dict[str, str] | None = None,
+                 submit: bool = False) -> dict[str, Any]:
+    """The read ``analytics_request`` builds for one measure, the dimensions
+    of ``group_by`` on Rows, no filter, no sort -- or with ``submit`` the
+    ``variable_submit_request`` (mirrored from ``agents/ina/protocol.py``)."""
+    feature: dict[str, Any] = {
+        "ResultFormat": "Version2",
+        "ResultEncoding": "None",
+        "SubSetDescription": {"RowFrom": 0, "RowTo": top + 1,
+                              "ColumnFrom": 0, "ColumnTo": -1},
+        "UseDefaultAttributeKey": False,
+    }
+    if submit:
+        feature["MaxResultRecords"] = top + 1
     definition: dict[str, Any] = {
-        "Dimensions": [*({"Name": name, "Axis": "Rows"} for name in group_by or []), {
+        "Dimensions": [*(_row(name, texts, submit) for name in group_by or []), {
             "Name": structure,
             "Axis": "Columns",
             "Members": [{"Name": measure, "Visibility": "Visible"}],
         }],
-        "ResultSetFeatureRequest": {
-            "ResultFormat": "Version2",
-            "ResultEncoding": "None",
-            "MaxResultRecords": top + 1,
-            "SubSetDescription": {"RowFrom": 0, "RowTo": top + 1,
-                                  "ColumnFrom": 0, "ColumnTo": -1},
-            "UseDefaultAttributeKey": False,
-        },
+        "ResultSetFeatureRequest": feature,
     }
     if variables:
         definition["Variables"] = [_variable_entry(n, v, (fields or {}).get(n, ""))
@@ -326,16 +350,32 @@ def _run_request(capabilities: list[str], query: str, measure: str,
     source = {"ObjectName": query, "Type": "Query"}
     if instance:
         source["InstanceId"] = instance
-    return {
-        "ClientInfo": CLIENT_INFO,
-        "Analytics": {
-            "Capabilities": capabilities,
-            "DataSource": source,
-            "Definition": definition,
-            "Language": "EN",
-        },
-        "Options": ["StatefulServer"],
+    analytics: dict[str, Any] = {
+        "Capabilities": capabilities,
+        "DataSource": source,
+        "Definition": definition,
+        "Language": "EN",
     }
+    if submit:
+        analytics["ProcessingDirectives"] = {"ProcessingStep": "VariableSubmit"}
+    return {"ClientInfo": CLIENT_INFO, "Analytics": analytics, "Options": ["StatefulServer"]}
+
+
+def _texts(cube: Any, group_by: list[str]) -> dict[str, str]:
+    """The text attribute of each of ``group_by`` a submit answer's ``Cube``
+    names, as ``agents.ina.protocol.text_attributes`` takes it (one printable
+    line of at most 128 characters, ``<dim>.``, not the key)."""
+    raw = cube.get("Dimensions") if isinstance(cube, dict) else None
+    out: dict[str, str] = {}
+    for dim in raw if isinstance(raw, list) else []:
+        name = dim.get("Name") if isinstance(dim, dict) else None
+        text = dim.get("TextAttribute") if isinstance(dim, dict) else None
+        if (isinstance(name, str) and name in group_by and name not in out
+                and isinstance(text, str) and 0 < len(text) <= 128 and text.isprintable()
+                and text.startswith(f"{name}.")
+                and text not in (f"{name}.KEY", dim.get("KeyAttribute"))):
+            out[name] = text
+    return out
 
 
 def _batch_with_submit(body: dict[str, Any], instance: str) -> dict[str, Any]:
@@ -348,33 +388,6 @@ def _batch_with_submit(body: dict[str, Any], instance: str) -> dict[str, Any]:
     submit = json.loads(json.dumps(read))
     submit["Analytics"]["ProcessingDirectives"] = {"ProcessingStep": "VariableSubmit"}
     return {"Batch": [submit, read]}
-
-
-HIDE_TOTALS = [{"Result": "Members", "Visibility": "Visible"},
-               {"Result": "Total", "Visibility": "Hidden"}]
-
-
-def _shape_rows(body: dict[str, Any], cube: Any) -> dict[str, Any]:
-    """``--rows-form fields`` (runs 7, 8): each Rows dimension asks for its
-    key and text attribute (``KeyAttribute`` / ``TextAttribute`` of the
-    submit answer's ``Cube``) as ``Attributes`` and hides totals (the shape of
-    SAP's ``DefaultResultStructure``); ``MaxResultRecords`` is left out, so
-    the rows are cut by ``SubSetDescription.RowTo`` alone (firefly sends
-    ``MaxResultRecords`` only when an application set one)."""
-    meta = {d.get("Name"): d for d in (cube or {}).get("Dimensions", []) if isinstance(d, dict)}
-    definition = body["Analytics"]["Definition"]
-    for entry in definition["Dimensions"]:
-        if entry.get("Axis") != "Rows":
-            continue
-        dim = meta.get(entry["Name"], {})
-        fields = [f for f in (dim.get("KeyAttribute") or f"{entry['Name']}.KEY",
-                              dim.get("TextAttribute")) if isinstance(f, str) and f]
-        # firefly's form (QInAField.exportComponentWithStructure); a
-        # dimension's `ResultSetFields` was ignored by SIA (run 7).
-        entry["Attributes"] = [{"Name": f, "Obtainability": "Always"} for f in fields]
-        entry["ResultStructure"] = [dict(x) for x in HIDE_TOTALS]
-    definition["ResultSetFeatureRequest"].pop("MaxResultRecords", None)
-    return body
 
 
 def _close_request(instance: str) -> dict[str, Any]:
@@ -492,26 +505,31 @@ async def run(args: argparse.Namespace, environ: dict[str, str]) -> int:
             if not measure:
                 raise ProbeError("no measure: describe the query or pass --measure")
             instance = "probe" + os.urandom(8).hex()
-            body = _run_request(
-                capabilities, args.query, measure, _parse_variables(args.variable or []),
-                top=args.top,
-                structure=args.structure or "Measures",
-                fields=_variable_fields(cube) if args.variable_form == "sap" else None,
-                group_by=args.group_by or [],
-            )
+            group_by = args.group_by or []
+            request: dict[str, Any] = {
+                "top": args.top,
+                "structure": args.structure or "Measures",
+                "fields": _variable_fields(cube) if args.variable_form == "sap" else None,
+                "group_by": group_by,
+                "instance": instance,
+            }
+            variables = _parse_variables(args.variable or [])
+            body = _run_request(capabilities, args.query, measure, variables, **request)
             if args.submit == "batch":
                 body = _batch_with_submit(body, instance)
             elif args.submit == "separate":
-                # The submit alone first, on the InstanceId the read then uses.
-                submit, body = _batch_with_submit(body, instance)["Batch"]
+                # The submit alone first, on the InstanceId the read then uses;
+                # the read asks for the texts its answer names.
+                submit = _run_request(capabilities, args.query, measure, variables,
+                                      submit=True, **request)
                 _dump(args.dump, f"{args.label}.submit.request.json",
                       json.dumps(submit, indent=1).encode("utf-8"))
                 status, ctype, payload, raw = await _send(
                     proxied, "POST", url, headers, submit, csrf)
                 _dump(args.dump, f"{args.label}.submit.response.json", raw)
                 cube_out = payload.get("Cube") if isinstance(payload, dict) else None
-                if args.rows_form == "fields":
-                    body = _shape_rows(body, cube_out)
+                body = _run_request(capabilities, args.query, measure, variables,
+                                    texts=_texts(cube_out, group_by), **request)
                 state = cube_out.get("ServerState") if isinstance(cube_out, dict) else None
                 shown = _name(state.get("State")) if isinstance(state, dict) else "-"
                 print(f"{'PASS' if status == 200 else 'FAIL'} submit {_name(args.label)}: "
@@ -526,7 +544,7 @@ async def run(args: argparse.Namespace, environ: dict[str, str]) -> int:
             print(f"{'PASS' if ok else 'FAIL'} run {_name(args.label)}: HTTP {status} {ctype} "
                   f"bytes={len(raw)} keys={_top_keys(payload)} grids={grids} "
                   f"variables={len(args.variable or [])} messages={_messages(payload)}")
-            if args.close and args.submit == "separate":
+            if args.close:
                 close = _close_request(instance)
                 _dump(args.dump, f"{args.label}.close.request.json",
                       json.dumps(close, indent=1).encode("utf-8"))
@@ -599,17 +617,14 @@ def main() -> int:
     parser.add_argument("--group-by", action="append", metavar="DIMENSION",
                         help="a dimension of the run on Rows (repeatable)")
     parser.add_argument("--top", type=int, default=1, help="rows asked for (default 1)")
-    parser.add_argument("--rows-form", choices=("plain", "fields"), default="plain",
-                        help="fields: Rows ask for key and text, totals hidden, no "
-                        "MaxResultRecords (needs --submit separate)")
     parser.add_argument("--close", action="store_true",
-                        help="with --submit separate: release the query instance afterwards")
+                        help="release the query instance afterwards")
     parser.add_argument("--variable-form", choices=("app", "sap"), default="app",
                         help="app: FieldName the variable name (as plan_run sends it); "
                         "sap: the key of the variable's dimension, as the describe states it")
     parser.add_argument("--submit", choices=("none", "batch", "separate"), default="none",
-                        help="batch: send the run as Batch [VariableSubmit, read]; "
-                        "separate: the VariableSubmit, then the read, on one InstanceId")
+                        help="separate: the VariableSubmit, then the read, on one InstanceId "
+                        "(the app's sequence); batch: both as one Batch [VariableSubmit, read]")
     parser.add_argument("--structure", default="",
                         help="name of the measure structure on Columns (default Measures, "
                         "as analytics_request sends it)")

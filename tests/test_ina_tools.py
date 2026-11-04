@@ -50,6 +50,7 @@ for _v in (
     os.environ.pop(_v, None)
 
 from agents.ina import tools as ina_tools  # noqa: E402
+from agents.ina.protocol import read_description  # noqa: E402
 from agents.ina.tools import (  # noqa: E402
     MAX_RESULT_CHARS,
     TRUNCATED_HINT,
@@ -281,22 +282,63 @@ async def test_run_query_passes_the_clients_answer_through():
         "row_count": 3,
         "truncated": False,
     }
-    # The stored description is the client's: one GetServerInfo, one run,
-    # no Describe; through the query's own destination.
-    assert [r.method for r in w.sap.requests] == ["GET", "POST"]
-    assert "Analytics" in w.sap.body() and "Metadata" not in w.sap.body()
-    assert w.sap.body()["Analytics"]["DataSource"]["ObjectName"] == QUERY
+    # The stored description is the client's: one GetServerInfo, one run
+    # (VariableSubmit, read, Close), no Describe; through the query's own
+    # destination.
+    assert w.sap.kinds == ["GET", "submit", "read", "close"]
+    assert w.sap.read_body()["Analytics"]["DataSource"]["ObjectName"] == QUERY
     assert w.resolved == [DESTINATION]
+
+
+async def test_run_query_with_variables_end_to_end_on_the_answers_sia_gave():
+    """SIA's describe, VariableSubmit and grid answers (recorded 2026-11-04,
+    sanitised): the values go in the submit, named by their dimension's key;
+    the read asks for the texts the submit answer named; the rows come back
+    with their texts, the instance is closed."""
+    described = read_description(fixture("describe_sia.json")["Cube"]).definition
+    w = world(row(definition=described.model_dump(mode="json")))
+    w.sap.submit_answers = [fixture("submit_sia.json")]
+    w.sap.answers = [fixture("run_sia_grid.json")]
+    values = {"!CDS_P_P_DISPLAYCURRENCY": "EUR", "!CDS_P_P_DATEFUNCTION": "YEARTODATE"}
+    answer = await w.tool("run_query")(
+        SALES, ["ELTUIDCMP1"], ["2CIMMPURGORG", "2CI_SUPPLIER_CDS"], top=3, variables=values
+    )
+    assert answer == {
+        "columns": ["2CIMMPURGORG", "2CIMMPURGORG.text", "2CI_SUPPLIER_CDS",
+                    "2CI_SUPPLIER_CDS.text", "ELTUIDCMP1"],
+        "rows": [
+            ["P100", "Purchasing organisation 100", "0000000101", "Supplier A", 125.5],
+            ["P100", "Purchasing organisation 100", "0000000102", "Supplier B", 2400.0],
+            ["P100", "Purchasing organisation 100", "0000000103", "Supplier C", 310.25],
+        ],
+        "units": {"ELTUIDCMP1": "EUR"},
+        "row_count": 3,
+        "truncated": True,
+        "hint": TRUNCATED_HINT,
+    }
+    assert w.sap.kinds == ["GET", "submit", "read", "close"]
+    submit = json.loads(w.sap.submits[0].content)["Analytics"]
+    read = w.sap.read_body()["Analytics"]
+    assert [v["Values"]["Selection"]["SetOperand"]["FieldName"]
+            for v in submit["Definition"]["Variables"]] == [
+        "2CH0Y9FATWMXU07PABNUMVE2HHX.KEY", "2CCGCALDFVH.KEY"]
+    assert submit["DataSource"]["InstanceId"] == read["DataSource"]["InstanceId"]
+    assert read["Definition"]["Dimensions"][1]["Attributes"] == [
+        {"Name": "2CI_SUPPLIER_CDS.KEY", "Obtainability": "Always"},
+        {"Name": "2CI_SUPPLIER_CDS.LONG_TEXT", "Obtainability": "Always"},
+    ]
 
 
 async def test_the_defaults_of_the_optional_arguments():
     w = world(row(definition=definition().model_copy(update={"variables": []})
                   .model_dump(mode="json")))
-    answer = await w.tool("run_query")(SALES, ["0AMOUNT"], ["0CALMONTH"])
+    answer = await w.tool("run_query")(SALES, ["0AMOUNT", "0QUANTITY"], ["0CALMONTH"])
     assert answer["row_count"] == 3
-    request = w.sap.body()["Analytics"]["Definition"]
+    request = w.sap.read_body()["Analytics"]["Definition"]
     assert "Filter" not in request and "Sort" not in request and "Variables" not in request
-    assert request["ResultSetFeatureRequest"]["MaxResultRecords"] == 101  # top 100 + 1
+    rows = request["ResultSetFeatureRequest"]["SubSetDescription"]["RowTo"]
+    assert rows == 101  # top 100 + 1
+    assert w.sap.kinds == ["GET", "read", "close"]  # no variables: no VariableSubmit
 
 
 async def test_a_truncated_answer_says_so_with_a_hint():
@@ -359,14 +401,12 @@ async def test_a_refusal_of_sap_is_an_error_object_not_an_exception():
 async def test_an_answer_over_the_result_cap_is_refused_not_cut():
     keys = [[f"{i:06d}"] for i in range(1500)]
     cells = [{"Value": 123456789.123, "Unit": "EUR"} for _ in keys]
-    w = world(row(definition=definition().model_copy(update={"variables": []})
-                  .model_dump(mode="json")))
-    big = grid(["ZREGION"], keys, ["0AMOUNT"], cells)
-    for tuple_ in big["Grids"][0]["Axes"][0]["Tuples"]:
-        key = tuple_["Members"][0]["Name"]
-        tuple_["Members"][0]["Text"] = f"Region {key} " + "x" * 40
-    w.sap.answers = [big]
-    answer = await w.tool("run_query")(SALES, ["0AMOUNT"], ["ZREGION"], top=2000)
+    w = world()
+    # The submit answer (submit_ok.json) names ZREGION's text attribute.
+    w.sap.answers = [grid(["ZREGION"], keys, ["0AMOUNT"], cells,
+                          texts=[[f"Region {k[0]} " + "x" * 40] for k in keys])]
+    answer = await w.tool("run_query")(SALES, ["0AMOUNT"], ["ZREGION"], top=2000,
+                                       variables={"0P_CALYEAR": "2026"})
     error = error_of(answer)
     assert error["code"] == "result_too_large"
     assert str(MAX_RESULT_CHARS) in error["message"]
@@ -386,7 +426,7 @@ async def test_one_session_per_identity_serves_every_run_of_the_toolset():
     w = world()
     await w.tool("run_query")(SALES, **RUN)
     await w.tool("run_query")(SALES, **RUN)
-    assert [r.method for r in w.sap.requests] == ["GET", "POST", "POST"]
+    assert w.sap.kinds == ["GET", *["submit", "read", "close"] * 2]
     assert w.resolved == [DESTINATION]  # one client per query, built once
 
 
