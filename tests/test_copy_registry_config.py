@@ -717,6 +717,27 @@ def test_the_script_can_be_imported_with_both_services_bound():
         assert secret not in result.stdout + result.stderr
 
 
+def test_the_script_runs_as_postgres_while_the_app_runs_on_hana():
+    """The task of an app switched to HANA (``DB_KIND=hana``) with the
+    Postgres side's ``PG_SCHEMA`` on its command line: ``agents.db`` alone
+    refuses PG_SCHEMA on HANA, so the script imports it as Postgres."""
+    import os
+    import subprocess
+
+    environment = {"PATH": os.environ.get("PATH", ""), "VCAP_SERVICES": json.dumps(BOTH),
+                   "VCAP_APPLICATION": "{\"application_name\": \"app\"}",
+                   "DB_KIND": "hana", "PG_SCHEMA": "pydantic_agent"}
+    result = subprocess.run(
+        [sys.executable, "scripts/copy_registry_config.py", "--from", "postgres",
+         "--to", "postgres"],
+        cwd=ROOT, env=environment, capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 2, result.stderr[-400:]
+    assert result.stderr.endswith("refused: Source and target are the same database\n")
+    for secret in ("pg-pass", "rt-pass", "dt-pass"):
+        assert secret not in result.stdout + result.stderr
+
+
 # --- from a real Postgres (opt-in) ------------------------------------------------------
 
 
