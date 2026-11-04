@@ -6,7 +6,7 @@ test mounts the router on a bare app with a stub validator, as
 ``tests/test_odata_admin_api.py`` does (the suite's app runs without an
 XSUAA binding, where every scope check passes). SAP is a mock transport
 behind the module's seams (``_resolver``, ``_transport``, ``_connectivity``),
-with the recorded answers of ``tests/test_ina_client.py``.
+with the recorded answers and doubles of ``tests/ina_helpers.py``.
 """
 
 from __future__ import annotations
@@ -63,8 +63,7 @@ from agents.db import (  # noqa: E402
 )
 from agents.ina import admin_calls, admin_routes  # noqa: E402
 from agents.odata import admin_routes as odata_routes  # noqa: E402
-from tests.odata_helpers import FakeResolver  # noqa: E402
-from tests.test_ina_client import (  # noqa: E402
+from tests.ina_helpers import (  # noqa: E402
     DESTINATION,
     QUERY,
     SIA_URL,
@@ -73,6 +72,7 @@ from tests.test_ina_client import (  # noqa: E402
     fixture,
     grid,
 )
+from tests.odata_helpers import FakeResolver  # noqa: E402
 
 BASE = "/admin/api/ina/queries"
 NAME = "sales-by-month"

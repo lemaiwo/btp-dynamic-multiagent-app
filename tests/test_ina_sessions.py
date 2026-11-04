@@ -13,7 +13,7 @@ re-fetches once, then ``csrf_failed`` or ``forbidden``; a GetServerInfo that
 hands out no token or no Analytics service, or is refused, sends no POST.
 The run's sequence itself is ``tests/test_ina_run.py``.
 
-Same doubles as ``tests/test_ina_client.py`` (real ``destination_http_client``
+The doubles of ``tests/ina_helpers.py`` (real ``destination_http_client``
 over ``httpx.MockTransport``).
 
 Run:  python -m pytest tests/test_ina_sessions.py
@@ -31,7 +31,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from agents.ina.client import InaSessionStore  # noqa: E402
-from tests.test_ina_client import (  # noqa: E402
+from tests.ina_helpers import (  # noqa: E402
     ALICE,
     BOB,
     DESTINATION,

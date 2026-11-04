@@ -81,7 +81,7 @@ from agents.deep import DeepState, WorkspaceScope, current_workspace  # noqa: E4
 from agents.ide.readonly import POLICIES, REFUSED_PREFIX, ReadOnlyGuard, policy_name  # noqa: E402
 from agents.ina.models import check_query_names  # noqa: E402
 from agents.odata import admin_routes  # noqa: E402
-from tests.test_ina_client import definition  # noqa: E402
+from tests.ina_helpers import definition  # noqa: E402
 
 REAL_LIVE_REGISTRY = admin_routes._live_registry
 

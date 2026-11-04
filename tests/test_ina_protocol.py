@@ -38,7 +38,7 @@ from agents.ina.protocol import (  # noqa: E402
     sap_message_error,
     text_attributes,
 )
-from tests.test_ina_client import definition, fixture  # noqa: E402
+from tests.ina_helpers import definition, fixture  # noqa: E402
 
 YEAR = {"0P_CALYEAR": "2026"}
 

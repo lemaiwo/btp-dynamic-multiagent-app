@@ -23,7 +23,6 @@ Run:  python -m pytest tests/test_ina_client.py
 from __future__ import annotations
 
 import json
-import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -34,7 +33,6 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from agents.auth import current_jwt, current_principal  # noqa: E402
 from agents.destination import DestinationError  # noqa: E402
 from agents.destination_auth import destination_http_client  # noqa: E402
 from agents.ina import client as ina_client  # noqa: E402
@@ -48,22 +46,30 @@ from agents.ina.client import (  # noqa: E402
     InaSessionStore,
 )
 from agents.ina.errors import ERROR_CODES, InaError  # noqa: E402
-from agents.ina.models import InaDefinition, validate_ina_query  # noqa: E402
-from tests.ina_helpers import (  # noqa: E402, F401 - re-exported for the other suites
+from agents.ina.models import validate_ina_query  # noqa: E402
+from tests.ina_helpers import (  # noqa: E402, F401
+    ALICE,
+    BOB,
     CLOSED,
+    DESTINATION,
     FIXTURES,
     INFO_PATH,
+    INSTANCE,
+    QUERY,
     RESPONSE_PATH,
+    RUN,
+    SIA_URL,
     Sap,
+    definition,
     fixture,
     grid,
     kind_of,
+    make,
+    refused,
+    signed_in,
 )
 from tests.odata_helpers import FakeConnectivity, FakeResolver, OnPremiseResolver  # noqa: E402
 
-DESTINATION = "SIA_INA"
-QUERY = "ZQ_SALES_01"
-SIA_URL = "https://sia.example.test:44300"
 CAPABILITIES = [
     "AggregationNOPNULL",
     "ClientCapabilities",
@@ -71,106 +77,12 @@ CAPABILITIES = [
     "SupportsComplexFilters",
     "Variables",
 ]
-ALICE = "alice@example.com"
-BOB = "bob@example.com"
 
 
-def definition() -> InaDefinition:
-    """The definition ``describe`` reads from ``describe_ok.json``."""
-    return InaDefinition.model_validate(
-        {
-            "measure_structure": "Measures",
-            "dimensions": [
-                {"name": "0CALMONTH", "label": "Calendar Year/Month", "key_field": "0CALMONTH.KEY"},
-                {"name": "ZREGION", "label": "Sales region", "key_field": "ZREGION.KEY"},
-            ],
-            "measures": [
-                {"name": "0AMOUNT", "label": "Net amount", "unit": "EUR"},
-                {"name": "0QUANTITY", "label": "Quantity", "unit": "PC"},
-            ],
-            "variables": [
-                {
-                    "name": "0P_CALYEAR",
-                    "label": "Calendar year",
-                    "mandatory": True,
-                    "type": "single",
-                },
-                {"name": "ZV_REGION", "label": "Regions", "mandatory": False, "type": "multiple"},
-                {
-                    "name": "ZV_PERIOD",
-                    "label": "Period range",
-                    "mandatory": False,
-                    "type": "interval",
-                },
-            ],
-        }
-    )
-
-
-def make(
-    sap: Sap,
-    *,
-    user_context: bool = False,
-    destination: str = DESTINATION,
-    resolver: Any = None,
-    store: InaSessionStore | None = None,
-    known: InaDefinition | None = None,
-    package: str = "",
-) -> InaClient:
-    resolver = resolver or FakeResolver(url=SIA_URL, name=destination)
-    http = destination_http_client(
-        resolver,
-        user_context=user_context,
-        server_key="builtin:ina",
-        expected_hosts=(),
-        connectivity=None,
-        transport=httpx.MockTransport(sap.handler),
-    )
-    return InaClient(
-        http,
-        store if store is not None else InaSessionStore(),
-        destination=destination,
-        user_context=user_context,
-        query=QUERY,
-        package=package,
-        definition=known,
-    )
-
-
-class signed_in:
-    """A bound user, as the request middleware leaves it."""
-
-    def __init__(self, principal: str) -> None:
-        self.principal = principal
-
-    def __enter__(self) -> None:
-        self._jwt = current_jwt.set(f"jwt-of-{self.principal}")
-        self._principal = current_principal.set(self.principal)
-
-    def __exit__(self, *exc: Any) -> None:
-        current_jwt.reset(self._jwt)
-        current_principal.reset(self._principal)
-
-
-# One measure per run (``protocol.check_caps``) until the column order of
-# several is verified on SAP.
-RUN = {
-    "measures": ["0AMOUNT"],
-    "group_by": ["0CALMONTH"],
-    "variables": {"0P_CALYEAR": "2026"},
-}
-# The instance a run opens in the SAP session: "ina" and 16 hex digits.
-INSTANCE = re.compile(r"ina[0-9a-f]{16}")
 HIDE_TOTALS = [
     {"Result": "Members", "Visibility": "Visible"},
     {"Result": "Total", "Visibility": "Hidden"},
 ]
-
-
-async def refused(coro: Any) -> InaError:
-    with pytest.raises(InaError) as info:
-        await coro
-    return info.value
 
 
 # ----------------------------------------------------------------- the error list

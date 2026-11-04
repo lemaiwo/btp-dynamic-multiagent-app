@@ -6,7 +6,13 @@ behind ``httpx.MockTransport``. No network.
   answered (``run_sia_grid.json``, recorded 2026-11-04);
 * :class:`Sap` answers ``GetServerInfo`` (a new CSRF token and session
   cookie per call) and ``GetResponse`` from a queue per kind of request
-  (:func:`kind_of`: describe, VariableSubmit, read, Close).
+  (:func:`kind_of`: describe, VariableSubmit, read, Close);
+* :func:`make` builds an ``InaClient`` on the real
+  ``destination_http_client`` over a :class:`Sap`; :func:`definition` is the
+  description of ``describe_ok.json``, :data:`RUN` a run of it;
+  :class:`signed_in` binds a user, :func:`refused` awaits an ``InaError``.
+
+The suites import these from here, never from one another.
 
 Placeholders only: no real host, destination, user or data belongs here.
 """
@@ -14,10 +20,19 @@ Placeholders only: no real host, destination, user or data belongs here.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any, Callable
 
 import httpx
+import pytest
+
+from agents.auth import current_jwt, current_principal
+from agents.destination_auth import destination_http_client
+from agents.ina.client import InaClient, InaSessionStore
+from agents.ina.errors import InaError
+from agents.ina.models import InaDefinition
+from tests.odata_helpers import FakeResolver
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "ina"
 INFO_PATH = "/sap/bw/ina/GetServerInfo"
@@ -208,3 +223,106 @@ class Sap:
                 return answer
             return httpx.Response(200, json=answer)
         return httpx.Response(404)
+
+
+# -- the client over the SAP double -------------------------------------------
+
+DESTINATION = "SIA_INA"
+QUERY = "ZQ_SALES_01"
+SIA_URL = "https://sia.example.test:44300"
+ALICE = "alice@example.com"
+BOB = "bob@example.com"
+
+
+def definition() -> InaDefinition:
+    """The definition ``describe`` reads from ``describe_ok.json``."""
+    return InaDefinition.model_validate(
+        {
+            "measure_structure": "Measures",
+            "dimensions": [
+                {"name": "0CALMONTH", "label": "Calendar Year/Month", "key_field": "0CALMONTH.KEY"},
+                {"name": "ZREGION", "label": "Sales region", "key_field": "ZREGION.KEY"},
+            ],
+            "measures": [
+                {"name": "0AMOUNT", "label": "Net amount", "unit": "EUR"},
+                {"name": "0QUANTITY", "label": "Quantity", "unit": "PC"},
+            ],
+            "variables": [
+                {
+                    "name": "0P_CALYEAR",
+                    "label": "Calendar year",
+                    "mandatory": True,
+                    "type": "single",
+                },
+                {"name": "ZV_REGION", "label": "Regions", "mandatory": False, "type": "multiple"},
+                {
+                    "name": "ZV_PERIOD",
+                    "label": "Period range",
+                    "mandatory": False,
+                    "type": "interval",
+                },
+            ],
+        }
+    )
+
+
+def make(
+    sap: Sap,
+    *,
+    user_context: bool = False,
+    destination: str = DESTINATION,
+    resolver: Any = None,
+    store: InaSessionStore | None = None,
+    known: InaDefinition | None = None,
+    package: str = "",
+) -> InaClient:
+    resolver = resolver or FakeResolver(url=SIA_URL, name=destination)
+    http = destination_http_client(
+        resolver,
+        user_context=user_context,
+        server_key="builtin:ina",
+        expected_hosts=(),
+        connectivity=None,
+        transport=httpx.MockTransport(sap.handler),
+    )
+    return InaClient(
+        http,
+        store if store is not None else InaSessionStore(),
+        destination=destination,
+        user_context=user_context,
+        query=QUERY,
+        package=package,
+        definition=known,
+    )
+
+
+class signed_in:
+    """A bound user, as the request middleware leaves it."""
+
+    def __init__(self, principal: str) -> None:
+        self.principal = principal
+
+    def __enter__(self) -> None:
+        self._jwt = current_jwt.set(f"jwt-of-{self.principal}")
+        self._principal = current_principal.set(self.principal)
+
+    def __exit__(self, *exc: Any) -> None:
+        current_jwt.reset(self._jwt)
+        current_principal.reset(self._principal)
+
+
+# One measure per run (``protocol.check_caps``) until the column order of
+# several is verified on SAP.
+RUN = {
+    "measures": ["0AMOUNT"],
+    "group_by": ["0CALMONTH"],
+    "variables": {"0P_CALYEAR": "2026"},
+}
+# The instance a run opens in the SAP session: "ina" and 16 hex digits.
+INSTANCE = re.compile(r"ina[0-9a-f]{16}")
+
+
+async def refused(coro: Any) -> InaError:
+    with pytest.raises(InaError) as info:
+        await coro
+    return info.value

@@ -14,8 +14,8 @@ class only; the total deadline covers the whole sequence; a run cancelled
 during the read raises CancelledError and sends no Close; a definition
 described before 2.37.1 sends and reads the ``Measures`` structure.
 
-Same doubles as ``tests/test_ina_client.py`` (real ``destination_http_client``
-over ``httpx.MockTransport``, ``tests/ina_helpers.py``).
+The doubles of ``tests/ina_helpers.py`` (real ``destination_http_client``
+over ``httpx.MockTransport``), as in ``tests/test_ina_client.py``.
 
 Run:  python -m pytest tests/test_ina_run.py
 """
@@ -37,8 +37,16 @@ sys.path.insert(0, str(ROOT))
 from agents.ina import client as ina_client  # noqa: E402
 from agents.ina.models import InaDefinition  # noqa: E402
 from agents.ina.protocol import close_request, read_description  # noqa: E402
-from tests.ina_helpers import Sap, fixture, grid  # noqa: E402
-from tests.test_ina_client import INSTANCE, RUN, definition, make, refused  # noqa: E402
+from tests.ina_helpers import (  # noqa: E402
+    INSTANCE,
+    RUN,
+    Sap,
+    definition,
+    fixture,
+    grid,
+    make,
+    refused,
+)
 
 SIA_VALUES = {"!CDS_P_P_DISPLAYCURRENCY": "EUR", "!CDS_P_P_DATEFUNCTION": "YEARTODATE"}
 

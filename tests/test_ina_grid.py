@@ -48,7 +48,7 @@ from agents.ina.protocol import (  # noqa: E402
     read_grid,
     text_attributes,
 )
-from tests.test_ina_client import definition, fixture, grid  # noqa: E402
+from tests.ina_helpers import definition, fixture, grid  # noqa: E402
 
 SIA_VALUES = {"!CDS_P_P_DISPLAYCURRENCY": "EUR", "!CDS_P_P_DATEFUNCTION": "YEARTODATE"}
 SIA_ROWS = ["2CIMMPURGORG", "2CI_SUPPLIER_CDS"]

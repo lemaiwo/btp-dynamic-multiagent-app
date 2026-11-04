@@ -5,7 +5,7 @@ Split from ``tests/test_ina_admin.py`` (which holds the CRUD, reload, health
 and scope cases and the shared fixtures, imported from there): what a
 Describe stores and answers, what a Test sends and answers, the refusals of
 both, the two-call slot limit, and the reload a Describe of a query in use
-causes. SAP is the mock transport of ``tests/test_ina_client.py`` behind the
+causes. SAP is the mock transport of ``tests/ina_helpers.py`` behind the
 seams of ``agents.ina.admin_calls``.
 """
 
@@ -29,6 +29,7 @@ from agents.db import InaQuery, SessionLocal, update_ina_query  # noqa: E402
 from agents.ina import admin_calls, admin_routes  # noqa: E402
 from agents.ina.errors import ERROR_CODES  # noqa: E402
 from tests import test_ina_admin as admin_suite  # noqa: E402
+from tests.ina_helpers import DESTINATION, definition, fixture  # noqa: E402
 from tests.odata_helpers import OnPremiseResolver  # noqa: E402
 from tests.test_ina_admin import (  # noqa: E402
     BASE,
@@ -44,7 +45,6 @@ from tests.test_ina_admin import (  # noqa: E402
     query,
     total,
 )
-from tests.test_ina_client import DESTINATION, definition, fixture  # noqa: E402
 
 # The admin suite's fixtures, bound by name so pytest finds them in this
 # module too (imported, every test argument would read as a redefinition).

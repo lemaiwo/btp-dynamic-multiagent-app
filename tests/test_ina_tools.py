@@ -5,7 +5,7 @@ catalogue lines), ``describe_query`` (the stored description, never read
 from SAP here) and ``run_query`` (one ``Analytics`` read through the real
 client, ``agents/ina/client.py``). The toolset runs on the real
 ``destination_http_client``; only the destination service and SAP behind it
-are doubles (``tests/test_ina_client.py``'s ``Sap`` over
+are doubles (``tests/ina_helpers.py``'s ``Sap`` over
 ``httpx.MockTransport``).
 
 Covered: what each tool answers and what it leaves out; a name the entry does
@@ -59,8 +59,7 @@ from agents.ina.tools import (  # noqa: E402
     attached_queries,
     ina_toolset,
 )
-from tests.odata_helpers import FakeResolver  # noqa: E402
-from tests.test_ina_client import (  # noqa: E402
+from tests.ina_helpers import (  # noqa: E402
     DESTINATION,
     QUERY,
     RUN,
@@ -71,6 +70,7 @@ from tests.test_ina_client import (  # noqa: E402
     grid,
     signed_in,
 )
+from tests.odata_helpers import FakeResolver  # noqa: E402
 
 TOOLS = {"list_queries", "describe_query", "run_query"}
 SALES = "sales-by-month"
