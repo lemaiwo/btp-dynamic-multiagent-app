@@ -68,13 +68,16 @@ QUnit.test("entryIndex finds the agent's odata entry and can skip the row being 
 });
 
 QUnit.test("rows keep a service the catalogue lacks, as missing", function (assert) {
-    const catalogue = [summary("a", { user_context: true }), summary("b", { enabled: false }), summary("c", { title: MARKUP, purpose: MARKUP })];
+    const catalogue = [
+        summary("a", { user_context: true }), summary("b", { enabled: false, kind: "generic" }),
+        summary("c", { title: MARKUP, purpose: MARKUP })
+    ];
     assert.deepEqual(odataEntry.rows(["gone", "a", "b", "c"], catalogue), [
-        { name: "gone", title: "gone", purpose: "", userContext: false, state: "missing" },
-        { name: "a", title: "Title of a", purpose: "Purpose of a", userContext: true, state: "ok" },
-        { name: "b", title: "Title of b", purpose: "Purpose of b", userContext: false, state: "disabled" },
-        { name: "c", title: MARKUP, purpose: MARKUP, userContext: false, state: "ok" }
-    ]);
+        { name: "gone", title: "gone", purpose: "", userContext: false, state: "missing", kind: "odata" },
+        { name: "a", title: "Title of a", purpose: "Purpose of a", userContext: true, state: "ok", kind: "odata" },
+        { name: "b", title: "Title of b", purpose: "Purpose of b", userContext: false, state: "disabled", kind: "generic" },
+        { name: "c", title: MARKUP, purpose: MARKUP, userContext: false, state: "ok", kind: "odata" }
+    ], "a service whose kind is not known (missing, or not said) is odata, the kind whose rule makes no exception");
     assert.deepEqual(odataEntry.rows(["gone", "a"], null).map((row) => row.state), ["unknown", "unknown"],
         "an unread catalogue calls nothing missing");
     assert.deepEqual(odataEntry.rows(["toString"], [])[0].state, "missing", "a name that every object has is still a name");
@@ -95,6 +98,28 @@ QUnit.test("opens lists the enabled writes by service, in the words of the servi
         { name: "r", title: "Title of r", items: [] },
         { name: "unread", title: "Title of unread", items: null }
     ], "a GET that only reads and an operation that is not enabled are no writes; an unread service is not 'nothing'");
+});
+
+QUnit.test("opens: a GET function import of a generic service is no write; the same import of an odata service is", function (assert) {
+    const months: ODataDefinition = {
+        entity_sets: [],
+        operations: [{
+            name: "MONTH_NAMES_GET", qualified_name: "", title: "Month names", kind: "function_import", http_method: "GET",
+            bound_to: null, parameters: [], description: "", enabled: true, changes_data: true
+        }]
+    };
+    const selected = odataEntry.rows(["generic", "odata", "unsaid"], [
+        summary("generic", { kind: "generic" }), summary("odata", { kind: "odata" }), summary("unsaid")
+    ]);
+    const definitions = { "=generic": months, "=odata": months, "=unsaid": months };
+    assert.deepEqual(odataEntry.opens(selected, definitions), [
+        { name: "generic", title: "Title of generic", items: [] },
+        { name: "odata", title: "Title of odata", items: ["Month names"] },
+        { name: "unsaid", title: "Title of unsaid", items: ["Month names"] }
+    ], "a service whose kind the catalogue does not say keeps the rule of odata");
+    assert.deepEqual(odataEntry.opens(odataEntry.rows(["generic"], null), definitions), [
+        { name: "generic", title: "generic", items: ["Month names"] }
+    ], "and so does every service while the catalogue could not be read");
 });
 
 QUnit.test("newlyGiven: off to on names every service", function (assert) {

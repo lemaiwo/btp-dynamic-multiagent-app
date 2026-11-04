@@ -1,0 +1,153 @@
+<core:FragmentDefinition
+    xmlns="sap.m"
+    xmlns:core="sap.ui.core"
+    xmlns:f="sap.ui.layout.form">
+    <!-- Registers an analytical query. What SAP describes (dimensions,
+         measures, variables) is read afterwards by Describe, on the
+         query's own page, which this dialog opens on success. -->
+    <Dialog
+        id="inaCreateDialog"
+        title="{i18n>inaCreateDialogTitle}"
+        contentWidth="34rem"
+        afterClose=".onCreateClosed">
+        <content>
+            <VBox class="sapUiSmallMarginBeginEnd sapUiSmallMarginTop">
+                <Text id="inaCreateHint" text="{i18n>inaCreateHint}" />
+                <!-- What the server refuses about no field of this dialog,
+                     in its own words, as plain text. -->
+                <MessageStrip
+                    id="inaCreateError"
+                    visible="{= !!${create>/error} }"
+                    type="Error"
+                    showIcon="true"
+                    class="sapUiSmallMarginTop"
+                    text="{create>/error}" />
+            </VBox>
+            <f:SimpleForm editable="true" layout="ResponsiveGridLayout">
+                <Label text="{i18n>inaName}" required="true" labelFor="inaCreateName" />
+                <VBox>
+                    <Input
+                        id="inaCreateName"
+                        value="{create>/form/name}"
+                        valueState="{ path: 'create>/errors/name', formatter: '.formatErrorState' }"
+                        valueStateText="{create>/errors/name}"
+                        class="odataTechnical"
+                        ariaDescribedBy="inaCreateNameHint"
+                        liveChange=".onCreateEdit"
+                        submit=".onCreateConfirm">
+                        <customData><core:CustomData key="field" value="name" /></customData>
+                    </Input>
+                    <Text id="inaCreateNameHint" text="{i18n>inaNameHint}" class="odataHint" />
+                </VBox>
+
+                <Label text="{i18n>inaTitle}" required="true" labelFor="inaCreateTitle" />
+                <Input
+                    id="inaCreateTitle"
+                    value="{create>/form/title}"
+                    valueState="{ path: 'create>/errors/title', formatter: '.formatErrorState' }"
+                    valueStateText="{create>/errors/title}"
+                    liveChange=".onCreateEdit"
+                    submit=".onCreateConfirm">
+                    <customData><core:CustomData key="field" value="title" /></customData>
+                </Input>
+
+                <Label text="{i18n>inaDestination}" required="true" labelFor="inaCreateDestination" />
+                <!-- The destination field of the OData service page
+                     (DestinationField), judged against the identity chosen
+                     below. Enter in it takes a name from the list, so it
+                     does not also create the query. -->
+                <VBox>
+                    <Input
+                        id="inaCreateDestination"
+                        value="{create>/form/destination}"
+                        showSuggestion="{= !${device>/system/phone} }"
+                        autocomplete="false"
+                        showValueHelp="{= ${dest>/items}.length > 0 }"
+                        suggestionItems="{ path: 'dest>/items', templateShareable: false }"
+                        valueState="{ parts: ['create>/errors/destination', 'dest>/create/notice'], formatter: '.formatDestinationState' }"
+                        valueStateText="{ parts: ['create>/errors/destination', 'dest>/create/noticeText'], formatter: '.formatDestinationStateText' }"
+                        class="odataTechnical"
+                        ariaDescribedBy="inaCreateDestinationHint">
+                        <suggestionItems>
+                            <core:ListItem text="{dest>name}" additionalText="{dest>info}" />
+                        </suggestionItems>
+                    </Input>
+                    <Text
+                        id="inaCreateDestinationHint"
+                        text="{dest>/hint}"
+                        visible="{= !!${dest>/hint} }"
+                        class="odataHint" />
+                </VBox>
+
+                <Label id="inaCreateRunsAsLabel" text="{i18n>inaRunsAs}" labelFor="inaCreateRunsAs" />
+                <VBox>
+                    <SegmentedButton
+                        id="inaCreateRunsAs"
+                        selectedKey="{= ${create>/form/user_context} ? 'user' : 'technical' }"
+                        selectionChange=".onCreateRunsAsChange"
+                        ariaLabelledBy="inaCreateRunsAsLabel"
+                        ariaDescribedBy="inaCreateRunsAsHint">
+                        <items>
+                            <SegmentedButtonItem key="user" text="{i18n>odataRunsAsUser}" />
+                            <SegmentedButtonItem key="technical" text="{i18n>odataRunsAsTechnical}" />
+                        </items>
+                    </SegmentedButton>
+                    <Text
+                        id="inaCreateRunsAsHint"
+                        text="{= ${create>/form/user_context} ? ${i18n>odataRunsAsUserHint} : ${i18n>odataRunsAsTechnicalHint} }"
+                        class="odataHint" />
+                </VBox>
+
+                <Label text="{i18n>inaQuery}" required="true" labelFor="inaCreateQuery" />
+                <VBox>
+                    <Input
+                        id="inaCreateQuery"
+                        value="{create>/form/query}"
+                        valueState="{ path: 'create>/errors/query', formatter: '.formatErrorState' }"
+                        valueStateText="{create>/errors/query}"
+                        class="odataTechnical"
+                        ariaDescribedBy="inaCreateQueryHint"
+                        liveChange=".onCreateEdit"
+                        submit=".onCreateConfirm">
+                        <customData><core:CustomData key="field" value="query" /></customData>
+                    </Input>
+                    <Text id="inaCreateQueryHint" text="{i18n>inaQueryHint}" class="odataHint" />
+                </VBox>
+
+                <Label text="{i18n>inaPackage}" labelFor="inaCreatePackage" />
+                <Input
+                    id="inaCreatePackage"
+                    value="{create>/form/package}"
+                    valueState="{ path: 'create>/errors/package', formatter: '.formatErrorState' }"
+                    valueStateText="{create>/errors/package}"
+                    class="odataTechnical"
+                    liveChange=".onCreateEdit"
+                    submit=".onCreateConfirm">
+                    <customData><core:CustomData key="field" value="package" /></customData>
+                </Input>
+
+                <Label text="{i18n>inaPurpose}" required="true" labelFor="inaCreatePurpose" />
+                <Input
+                    id="inaCreatePurpose"
+                    value="{create>/form/purpose}"
+                    valueState="{ path: 'create>/errors/purpose', formatter: '.formatErrorState' }"
+                    valueStateText="{create>/errors/purpose}"
+                    liveChange=".onCreateEdit"
+                    submit=".onCreateConfirm">
+                    <customData><core:CustomData key="field" value="purpose" /></customData>
+                </Input>
+            </f:SimpleForm>
+        </content>
+        <beginButton>
+            <Button
+                id="inaCreateConfirm"
+                text="{i18n>inaCreateConfirm}"
+                type="Emphasized"
+                enabled="{= !${create>/busy} }"
+                press=".onCreateConfirm" />
+        </beginButton>
+        <endButton>
+            <Button id="inaCreateCancel" text="{i18n>cancel}" press=".onCreateCancel" />
+        </endButton>
+    </Dialog>
+</core:FragmentDefinition>

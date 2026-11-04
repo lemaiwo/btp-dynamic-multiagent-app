@@ -35,11 +35,16 @@ from agents.db import (  # noqa: E402
     AgentConfig,
     ODataAuditLog,
     ODataService,
+    StaleRow,
+    create_ina_query,
     create_odata_service,
     existing_odata_service_names,
+    get_ina_query,
     get_odata_service,
+    update_ina_query,
     validate_odata_service,
 )
+from agents.ina.models import validate_ina_query  # noqa: E402
 from agents.odata import admin_routes  # noqa: E402
 from agents.odata.audit import StoredWriteRecorder  # noqa: E402
 from agents.odata.tools import WriteAudit  # noqa: E402
@@ -115,6 +120,72 @@ async def test_two_concurrent_saves_from_the_same_loaded_state_one_wins(client, 
         assert all(type(value) is bool for value in outcome.values()), outcome
         stored = (await client.get(ONE)).json()
         assert stored == winner
+
+
+INA: dict[str, Any] = {
+    "name": "sales-by-region", "title": "Sales by region",
+    "purpose": "Net sales per region and month", "destination": "S4_INA_USER",
+    "user_context": True, "query": "2CZQ_SALES",
+}
+
+
+def ina(**patch: Any):
+    return validate_ina_query({**INA, **patch})
+
+
+async def test_two_concurrent_ina_updates_from_the_same_loaded_stamp_one_wins(sessions):
+    """`update_ina_query` (addendum (k)) on Postgres: both read the row ``FOR
+    UPDATE``; the second waits for the first's commit, is handed the
+    committed row and raises StaleRow."""
+    async with sessions() as s:
+        await create_ina_query(s, ina())
+    for round_ in range(5):
+        async with sessions() as s:
+            stamp = (await get_ina_query(s, "sales-by-region")).updated_at
+
+        async def save(title: str, destination: str) -> str:
+            async with sessions() as s:
+                try:
+                    await update_ina_query(
+                        s, "sales-by-region", ina(title=title, destination=destination),
+                        expected_updated_at=stamp,
+                    )
+                except StaleRow:
+                    return "stale"
+            return title
+
+        answers = await asyncio.gather(
+            save(f"A{round_}", "S4_INA_USER"), save(f"B{round_}", "S4_INA_TECH")
+        )
+        assert sorted(a == "stale" for a in answers) == [False, True], answers
+        winner = next(a for a in answers if a != "stale")
+        async with sessions() as s:
+            stored = await get_ina_query(s, "sales-by-region")
+        assert stored.title == winner
+        assert stored.destination == ("S4_INA_USER" if winner.startswith("A") else "S4_INA_TECH")
+        assert stored.updated_at.tzinfo is not None and stored.updated_at > stamp
+
+
+async def test_an_ina_row_the_session_already_holds_is_compared_as_committed(sessions):
+    """READ COMMITTED hands the locked read the other writer's row; the
+    session must compare that row, not the instance it read before (held
+    here: the identity map keeps an instance only while it is referenced)."""
+    async with sessions() as s:
+        await create_ina_query(s, ina())
+    async with sessions() as a:
+        held = await get_ina_query(a, "sales-by-region")
+        stamp = held.updated_at
+        async with sessions() as b:
+            await update_ina_query(
+                b, "sales-by-region", ina(title="Other tab"), expected_updated_at=stamp
+            )
+        with pytest.raises(StaleRow):
+            await update_ina_query(
+                a, "sales-by-region", ina(title="This tab"), expected_updated_at=stamp
+            )
+        assert held.title == "Other tab"  # the locked read refreshed it
+    async with sessions() as s:
+        assert (await get_ina_query(s, "sales-by-region")).title == "Other tab"
 
 
 async def test_the_stamp_a_client_got_back_is_never_a_false_409(client, created, sessions):

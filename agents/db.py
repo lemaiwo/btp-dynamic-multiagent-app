@@ -28,8 +28,10 @@ from urllib.parse import SplitResult, urlsplit
 
 from sqlalchemy import (
     DateTime,
+    ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     String,
     Text,
     UniqueConstraint,
@@ -51,6 +53,9 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import TypeDecorator
 
 from agents import hana_hdi
+from agents.ina import BUILTIN_INA_URL
+from agents.ina.models import MAX_ENTRY_QUERIES as _INA_MAX_ENTRY_QUERIES
+from agents.ina.models import InaQueryPayload, check_query_names, validate_ina_query
 from agents.odata import BUILTIN_ODATA_URL
 
 # The catalogue's save-time gate lives with its models; re-exported because
@@ -618,6 +623,21 @@ class AgentConfig(Base):
     result_schema_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Attachment limits (`agents.invoke_config.clean_limits`); null = defaults.
     invoke_limits_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # --- access tier (agents/access.py) --- "basic" (every chat user) or
+    # "advanced" (the developer role): an advanced specialist is reachable
+    # from chat only in an advanced context. Jobs, workflows and invoke run
+    # named agents and ignore it.
+    tier: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="basic", server_default="basic"
+    )
+    # --- tools usable by personal agents (web chat addendum (g)) --- 1: the
+    # MCP servers and built-ins of this agent may be attached to a personal
+    # agent (`BuildResult.shared_toolsets`). Only an enabled agent shares; an
+    # approving builtin:bitbucket agent never does
+    # (`check_bitbucket_approver_reach`, and again at build).
+    share_tools: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
 
     @property
     def mcp_servers(self) -> list[dict[str, Any]]:
@@ -712,6 +732,8 @@ class AgentConfig(Base):
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
             "deep": self.deep.model_dump(),
+            "tier": self.tier or "basic",
+            "share_tools": bool(self.share_tools),
             **self._invoke_dict(),
         }
 
@@ -740,6 +762,8 @@ class AgentConfig(Base):
             "run_timeout_seconds": self.run_timeout_seconds,
             "model_name": self.model_name or "",
             "deep": self.deep.model_dump(),
+            "tier": self.tier or "basic",
+            "share_tools": bool(self.share_tools),
             **self._invoke_dict(),
         }
 
@@ -780,6 +804,14 @@ class OrchestratorConfig(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+    # The data catalogue's embeddings (addendum (l)), read through
+    # get_embedding_setting: 0 switches them off; a NULL model is automatic
+    # (AICORE_EMBEDDING_MODEL, else discovery). Appended last so HDI alters
+    # the table in place (HANA schema generation 10).
+    embeddings_enabled: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    embedding_model: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
 
 class SkillConfig(Base):
@@ -906,6 +938,12 @@ class ODataService(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+    # `odata` or `generic` (the ZAGENT_DATA registration, addendum (k) part
+    # 3; HANA schema generation 9). Last, so HDI adds it to the table in
+    # place; the server default fills the rows that are already there.
+    kind: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="odata", server_default="odata"
+    )
 
     def _stored_definition(self) -> dict[str, Any] | None:
         """The stored definition, or None when it is not a JSON object."""
@@ -940,9 +978,12 @@ class ODataService(Base):
         has_write = any(
             op in _ODATA_WRITE_OPS for e in sets for op in e.get("operations") or []
         ) or any(
-            # The models' own rule: a missing flag and every POST are writes.
+            # The models' own rule: a missing flag and every POST are writes;
+            # a GET function import of a generic service is a read.
             bool(o.get("enabled"))
-            and _odata_operation_is_write(o.get("changes_data"), o.get("http_method"))
+            and _odata_operation_is_write(
+                o.get("changes_data"), o.get("http_method"), self.kind or "odata", o.get("kind")
+            )
             for o in ops
         )
         return {"entity_sets": len(sets), "operations": len(ops)}, has_write
@@ -952,6 +993,7 @@ class ODataService(Base):
         timestamp except when the metadata was read."""
         return {
             "name": self.name,
+            "kind": self.kind or "odata",
             "title": self.title,
             "purpose": self.purpose,
             "not_for": self.not_for or "",
@@ -1102,6 +1144,105 @@ class ODataAuditLog(Base):
             "run_principal": self.run_principal,
             "token_digest": self.token_digest,
         }
+
+
+class InaQuery(Base):
+    """One registered analytical query of ``builtin:ina``.
+
+    The InA sibling of ``ODataService`` (addendum (k), part 2): the
+    destination a call goes through and whose identity it carries
+    (``user_context``), the query's InA ``DataSource.ObjectName``
+    (``query``) and ``PackageName`` (``package``), and what ``Describe``
+    read from SAP (``definition_json``, an ``agents.ina.models.InaDefinition``;
+    NULL until the first describe). Agents name a query in their
+    ``builtin:ina`` entry, so the name is the stable handle and is never
+    changed after creation. HANA schema generation 9.
+    """
+
+    __tablename__ = "ina_queries"
+    __table_args__ = (UniqueConstraint("name", name="uq_ina_queries_name"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # Widths follow the limits in agents/ina/models.py, which Postgres and
+    # HANA enforce and SQLite does not; tests/test_ina_db.py holds the two
+    # together.
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    title: Mapped[str] = mapped_column(String(120), nullable=False)
+    purpose: Mapped[str] = mapped_column(String(200), nullable=False)
+    not_for: Mapped[str] = mapped_column(
+        String(200), nullable=False, default="", server_default=""
+    )
+    destination: Mapped[str] = mapped_column(String(200), nullable=False)
+    # 1 = as the signed-in user (principal propagation), 0 = as the
+    # destination's technical user; Integer 0/1 as on ODataService.
+    user_context: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    query: Mapped[str] = mapped_column(String(128), nullable=False)
+    package: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="", server_default=""
+    )
+    definition_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    metadata_fetched_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    enabled: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    # The version `update_ina_query` compares with ``expected_updated_at``;
+    # no ``onupdate``, for the reason given at ``ODataService.updated_at``.
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    def _stored_definition(self) -> dict[str, Any] | None:
+        """The stored description; None when there is none yet, and when the
+        stored text is not a JSON object (logged by name, so a broken row
+        still lists and can be described again)."""
+        if self.definition_json is None:
+            return None
+        try:
+            value = json.loads(self.definition_json)
+        except (TypeError, ValueError):
+            value = None
+        if not isinstance(value, dict):
+            logger.warning("Malformed definition_json on InA query %s", self.name)
+            return None
+        return value
+
+    def to_export(self) -> dict[str, Any]:
+        """Exactly an ``InaQueryPayload`` dump (``model_dump(mode="json")``):
+        portable, no ids, no row timestamps, so an export goes back through
+        `validate_ina_query` unchanged."""
+        return {
+            "name": self.name,
+            "title": self.title,
+            "purpose": self.purpose,
+            "not_for": self.not_for or "",
+            "destination": self.destination,
+            "user_context": bool(self.user_context),
+            "query": self.query,
+            "package": self.package or "",
+            "definition": self._stored_definition(),
+            "metadata_fetched_at": _odata_stamp(self.metadata_fetched_at),
+            "enabled": bool(self.enabled),
+        }
+
+    def to_dict(self, used_by: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        """``to_export`` plus the row's id and timestamps (``updated_at`` is
+        what a client sends back as ``expected_updated_at``) and the agents
+        that name the query (`ina_query_referrers`)."""
+        data = self.to_export()
+        data.update(
+            id=self.id,
+            created_at=self.created_at.isoformat() if self.created_at else None,
+            updated_at=self.updated_at.isoformat() if self.updated_at else None,
+            used_by=list(used_by or []),
+        )
+        return data
 
 
 class Workflow(Base):
@@ -1498,6 +1639,188 @@ class AdminNotificationState(Base):
     )
 
 
+def _chat_uuid() -> str:
+    return str(uuid.uuid4())
+
+
+def _chat_now() -> datetime:
+    # Python-side next to the server default: microsecond precision keeps
+    # rows written in the same second in order on SQLite.
+    return datetime.now(timezone.utc)
+
+
+def _chat_conversation_fk() -> ForeignKey:
+    return ForeignKey("chat_conversations.id", ondelete="CASCADE")
+
+
+class ChatConversation(Base):
+    """One conversation of the web chat (``agents/webchat``), owned by one
+    principal. ``status`` is the run lock: ``idle`` -> ``running`` in a
+    conditional UPDATE, one run per conversation at a time.
+
+    SQLite enforces the ``ON DELETE CASCADE`` of the child tables only with
+    ``PRAGMA foreign_keys=ON``, which this app does not set, so
+    ``agents.webchat.store`` also deletes the children explicitly.
+    """
+
+    __tablename__ = "chat_conversations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_chat_uuid)
+    principal: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(
+        String(120), nullable=False, default="", server_default=""
+    )
+    model_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_chat_now,
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_chat_now,
+        server_default=func.now(), index=True,
+    )
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="idle", server_default="idle"
+    )
+    # Who answers in this conversation: NULL = the orchestrator,
+    # ``admin:<name>`` = an admin specialist straight, ``mine:<id>`` = one of
+    # the owner's personal agents (``agents/webchat/user_agents.py``).
+    agent_ref: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    # The access tier of this conversation (``agents/access.py``): "basic" or
+    # "advanced"; "advanced" needs the developer role, checked at every turn.
+    access: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="basic", server_default="basic"
+    )
+
+
+class ChatMessage(Base):
+    """One message of a conversation; ``position`` counts 1..n.
+
+    ``content``, ``parts_json`` and ``model_json`` are ``Text`` (NCLOB on
+    SAP HANA): never compared, ordered or grouped in SQL.
+    """
+
+    __tablename__ = "chat_messages"
+    __table_args__ = (
+        UniqueConstraint("conversation_id", "position", name="uq_chat_messages_position"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_chat_uuid)
+    conversation_id: Mapped[str] = mapped_column(
+        String(36), _chat_conversation_fk(), nullable=False, index=True
+    )
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    role: Mapped[str] = mapped_column(String(16), nullable=False)  # user|assistant
+    content: Mapped[str | None] = mapped_column(Text, nullable=True)
+    parts_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # pydantic-ai's new_messages() of this turn (assistant rows that ended done).
+    model_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="done", server_default="done"
+    )  # done|running|failed|canceled
+    error: Mapped[str | None] = mapped_column(String(400), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_chat_now,
+        server_default=func.now(),
+    )
+
+
+class ChatFile(Base):
+    """A file of a conversation: an upload or a generated document.
+
+    ``data`` is the bytes; a listing never selects it.
+    """
+
+    __tablename__ = "chat_files"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_chat_uuid)
+    conversation_id: Mapped[str] = mapped_column(
+        String(36), _chat_conversation_fk(), nullable=False, index=True
+    )
+    message_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    principal: Mapped[str] = mapped_column(String(255), nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)  # upload|generated
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    media_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    size: Mapped[int] = mapped_column(Integer, nullable=False)
+    data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_chat_now,
+        server_default=func.now(),
+    )
+
+
+class ChatUserAgent(Base):
+    """A personal agent of the web chat: prompt-level only (instructions,
+    attached skills, a model, the admin specialists it may consult), owned by
+    one principal. Never read by the registry build, A2A, invoke or jobs.
+
+    ``name_key`` is the case-folded name, unique per principal.
+    ``instructions``, ``skills_json`` and ``consults_json`` are ``Text``:
+    never compared, ordered or grouped in SQL.
+    """
+
+    __tablename__ = "chat_user_agents"
+    __table_args__ = (
+        UniqueConstraint("principal", "name_key", name="uq_chat_user_agents_name"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_chat_uuid)
+    principal: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    name_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    description: Mapped[str] = mapped_column(
+        String(300), nullable=False, default="", server_default=""
+    )
+    instructions: Mapped[str] = mapped_column(Text, nullable=False)
+    # [{"scope": "admin"|"mine", "name": "..."}]
+    skills_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # ["<admin agent name>", ...]
+    consults_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # ["<admin agent name>", ...]: admin agents with share_tools whose MCP
+    # servers and built-ins this agent gets at run time (addendum (g)).
+    tools_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    model_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # 1 = the deep-agent tools (plan, scratchpad, sub-agents) at run time;
+    # only a developer may switch it on (addendum (d)).
+    deep: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_chat_now,
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_chat_now,
+        server_default=func.now(),
+    )
+
+
+class ChatUserSkill(Base):
+    """A personal skill of the web chat (a named instruction block), owned by
+    one principal; attached to that principal's personal agents by name."""
+
+    __tablename__ = "chat_user_skills"
+    __table_args__ = (
+        UniqueConstraint("principal", "name_key", name="uq_chat_user_skills_name"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_chat_uuid)
+    principal: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    name_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    description: Mapped[str] = mapped_column(
+        String(300), nullable=False, default="", server_default=""
+    )
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_chat_now,
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_chat_now,
+        server_default=func.now(),
+    )
+
+
 class McpOAuthToken(Base):
     """Per-user OAuth2 tokens for an MCP server (auth_mode="oauth2").
 
@@ -1722,6 +2045,34 @@ async def _create_and_migrate() -> None:
         await _ensure_column(conn, "ide_workspace_files", "base_checked_at", tstz)
         # ide_comments already exists where the redesign ran before quotes.
         await _ensure_column(conn, "ide_comments", "quote", "VARCHAR(200)")
+        # The web chat's agent picker (personal agents, addendum (c)).
+        await _ensure_column(conn, "chat_conversations", "agent_ref", "VARCHAR(80)")
+        # Basic and advanced access (addendum (d)).
+        await _ensure_column(
+            conn, "agent_configs", "tier", "VARCHAR(16) NOT NULL DEFAULT 'basic'"
+        )
+        await _ensure_column(
+            conn, "chat_conversations", "access", "VARCHAR(16) NOT NULL DEFAULT 'basic'"
+        )
+        await _ensure_column(
+            conn, "chat_user_agents", "deep", "INTEGER NOT NULL DEFAULT 0"
+        )
+        # Tools for personal agents (addendum (g)).
+        await _ensure_column(
+            conn, "agent_configs", "share_tools", "INTEGER NOT NULL DEFAULT 0"
+        )
+        await _ensure_column(conn, "chat_user_agents", "tools_json", "TEXT")
+        # The catalogue for every kind (addendum (k)): a service's kind and
+        # the links an admin draws. ina_queries is a new table (create_all).
+        await _ensure_column(
+            conn, "odata_services", "kind", "VARCHAR(16) NOT NULL DEFAULT 'odata'"
+        )
+        await _ensure_column(conn, "data_catalog_edges", "curated_at", tstz)
+        # The data catalogue's embedding setting (addendum (l)).
+        await _ensure_column(
+            conn, "orchestrator_config", "embeddings_enabled", "INTEGER NOT NULL DEFAULT 1"
+        )
+        await _ensure_column(conn, "orchestrator_config", "embedding_model", "VARCHAR(128)")
         await _backfill_ide_revisions(conn)
         await _resync_ide_revisions(conn)
         # create_all only creates indexes together with a new table; an
@@ -2207,6 +2558,9 @@ def _clean_destination(oauth: Any, url: str | None = None) -> dict[str, Any]:
     if builtin == BUILTIN_ODATA_URL:
         # The one destination-mode block without a destination name.
         return _clean_odata_entry(src)
+    if builtin == BUILTIN_INA_URL:
+        # The other one: each registered query names its own destination.
+        return _clean_ina_entry(src)
     if builtin in _DEST_KEYS_BY_URL:
         # The built-ins that gained destination mode later keep their own
         # pinned keys plus the user-context switch; see `# --- destinations ---`.
@@ -2345,6 +2699,29 @@ def _clean_bitbucket_entry(oauth: Any, mode: str) -> dict[str, Any]:
     return clean_entry(oauth)
 
 
+# builtin:git: provider, destination, repositories, base branch, branch prefix
+# and the two write switches. Nothing else is stored for it.
+_GIT_URL = "builtin:git"
+
+
+def _clean_git_entry(oauth: Any, mode: str) -> dict[str, Any]:
+    """Normalize the block of a ``builtin:git`` entry for storage.
+
+    The last gate before the row, whoever the caller is: the block is read by
+    ``agents.git_config`` (the reading the admin gate and the toolset use), a
+    value is stored only in the form that was checked, an unknown key and
+    ``user_context: true`` are a ValueError, and the switches that let an
+    agent write (``allow_push``, ``allow_pull_request``) are stored only for
+    the JSON boolean ``true``. No fallback to the row being replaced: the
+    block holds no secret (the destination holds the token).
+    """
+    from agents.git_config import clean_entry
+
+    if mode != AUTH_MODE_DESTINATION:
+        raise ValueError(f"{_GIT_URL} requires auth_mode=destination")
+    return clean_entry(oauth)
+
+
 def _clean_oauth(
     oauth: Any, mode: str, fallback: dict[str, Any] | None, url: str | None = None
 ) -> dict[str, Any] | None:
@@ -2363,6 +2740,10 @@ def _clean_oauth(
         # Its own cleaner for the same reason: the generic destination code
         # would keep Jira's keys and its `allow_comment`.
         return _clean_bitbucket_entry(oauth, mode)
+    if builtin == _GIT_URL:
+        # Its own cleaner, as builtin:bitbucket: a list and the switches are
+        # stored only as checked.
+        return _clean_git_entry(oauth, mode)
     cleaned = _clean_oauth_block(oauth, mode, fallback, url=url)
     if cleaned is not None and builtin in _MAIL_THEME_URLS and isinstance(oauth, dict):
         from agents.mail_render import MailTheme
@@ -2561,7 +2942,9 @@ def prepare_servers(
 
     normalized: list[dict[str, Any]] = []
     odata_seen = False
+    ina_seen = False
     bitbucket_seen = False
+    git_seen = False
     for s in mcp_servers:
         url = (s.get("url") or "").strip()
         mode = (s.get("auth_mode") or AUTH_MODE_JWT).strip().lower()
@@ -2582,6 +2965,16 @@ def prepare_servers(
             if odata_seen:
                 raise ValueError(ODATA_SINGLE_ENTRY_MESSAGE)
             odata_seen = True
+        elif url.rstrip("/").lower() == BUILTIN_INA_URL:
+            # Stored under exactly this spelling and counted after it is
+            # settled, for the reasons builtin:odata above is: `ina_entries`
+            # forgives the spelling, the registry's built-in lookup does not.
+            url = BUILTIN_INA_URL
+            if mode != AUTH_MODE_DESTINATION:
+                raise ValueError(_INA_MODE_MESSAGE)
+            if ina_seen:
+                raise ValueError(INA_SINGLE_ENTRY_MESSAGE)
+            ina_seen = True
         elif url.rstrip("/").lower() == _SHAREPOINT_URL:
             # Stored under exactly this spelling, for the reason above:
             # `_clean_oauth` forgives case and a trailing slash, the
@@ -2598,6 +2991,13 @@ def prepare_servers(
             if bitbucket_seen:
                 raise ValueError(BITBUCKET_SINGLE_ENTRY_MESSAGE)
             bitbucket_seen = True
+        elif url.rstrip("/").lower() == _GIT_URL:
+            # Stored under exactly this spelling and counted after it is
+            # settled, as builtin:bitbucket is.
+            url = _GIT_URL
+            if git_seen:
+                raise ValueError(GIT_SINGLE_ENTRY_MESSAGE)
+            git_seen = True
         oauth = _clean_oauth(s.get("oauth"), mode, prev_oauth_by_url.get(url), url=url)
         entry: dict[str, Any] = {"url": url, "auth_mode": mode}
         if oauth is not None:
@@ -2676,6 +3076,10 @@ class _Keep:
 
 KEEP = _Keep()
 
+# The access tiers of an admin agent (``agents.access.TIERS`` repeats them;
+# agents.access imports nothing from here).
+AGENT_TIERS = ("basic", "advanced")
+
 
 async def upsert_agent(
     session: AsyncSession,
@@ -2706,6 +3110,12 @@ async def upsert_agent(
     expose_invoke: bool | _Keep = KEEP,
     result_schema: dict[str, Any] | None | _Keep = KEEP,
     invoke_limits: dict[str, Any] | None | _Keep = KEEP,
+    # --- access tier --- KEEP (not sent) preserves what is stored; for a
+    # new row it means "basic". Only "basic" and "advanced" are stored.
+    tier: str | _Keep = KEEP,
+    # --- tools usable by personal agents --- KEEP (not sent) preserves what
+    # is stored; for a new row it means off. Stored 1 only for ``True``.
+    share_tools: bool | _Keep = KEEP,
 ) -> AgentConfig:
     """Create or update the agent named ``name``.
 
@@ -2718,15 +3128,17 @@ async def upsert_agent(
     (`check_bitbucket_approver_reach`).
     """
     name = name.strip()
+    if not isinstance(tier, _Keep) and tier not in AGENT_TIERS:
+        raise ValueError("tier must be basic or advanced")
     existing = await get_agent_by_name(session, name)
     primary, extras, primary_oauth_json = prepare_servers(mcp_servers, existing)
     # Here rather than in the admin routes: scripts and seeds write agents
     # through this function too, and none of them may store a service name
     # the catalogue does not have. On the prepared list, i.e. on exactly the
     # entries the row is about to hold.
-    await check_odata_services(
-        session, prepared_server_list(primary, extras, primary_oauth_json)
-    )
+    prepared = prepared_server_list(primary, extras, primary_oauth_json)
+    await check_odata_services(session, prepared)
+    await check_ina_queries(session, prepared)
     extras_json = json.dumps(extras) if extras else None
     skills_json = await normalize_skills_json(session, skills)
     # Order-preserving de-duplication: the same peer listed twice would
@@ -2758,6 +3170,11 @@ async def upsert_agent(
         bool(existing is not None and existing.expose_invoke)
         if isinstance(expose_invoke, _Keep) else expose_invoke is True
     )
+    # Same rule: only the boolean True shares.
+    share_on = (
+        bool(existing is not None and existing.share_tools)
+        if isinstance(share_tools, _Keep) else share_tools is True
+    )
     # Here for the same reason as the OData check above: the last gate for an
     # approving agent, on the entries and the peer list the row will hold.
     await check_bitbucket_approver_reach(
@@ -2766,6 +3183,7 @@ async def upsert_agent(
         servers=prepared_server_list(primary, extras, primary_oauth_json),
         expose_chat=bool(expose_chat),
         expose_invoke=invoke_on,
+        share_tools=share_on,
         peers=(
             (list(existing.peers) if existing is not None else [])
             if isinstance(peers, _Keep) else cleaned_peers
@@ -2823,6 +3241,8 @@ async def upsert_agent(
         row.expose_invoke = 1 if invoke_on else 0
         row.result_schema_json = None if isinstance(schema_json, _Keep) else schema_json
         row.invoke_limits_json = None if isinstance(limits_json, _Keep) else limits_json
+        row.tier = "basic" if isinstance(tier, _Keep) else tier
+        row.share_tools = 1 if share_on else 0
     else:
         existing.description = description
         existing.instructions = instructions
@@ -2857,6 +3277,9 @@ async def upsert_agent(
             existing.result_schema_json = schema_json
         if not isinstance(limits_json, _Keep):
             existing.invoke_limits_json = limits_json
+        if not isinstance(tier, _Keep):
+            existing.tier = tier
+        existing.share_tools = 1 if share_on else 0
         row = existing
     if commit:
         await session.commit()
@@ -3087,6 +3510,7 @@ def odata_service_columns(data: dict[str, Any]) -> dict[str, Any]:
     """
     definition = _ODataServiceDefinition.model_validate(data.get("definition") or {})
     return {
+        "kind": data.get("kind") or "odata",
         "title": data["title"],
         "purpose": data["purpose"],
         "not_for": data.get("not_for") or "",
@@ -3195,6 +3619,53 @@ async def check_odata_services(session: AsyncSession, servers: list[dict[str, An
     missing = [n for n in names if n not in found]
     if missing:
         raise ValueError("unknown OData service " + ", ".join(f"'{n}'" for n in missing))
+
+
+async def existing_ina_query_names(
+    session: AsyncSession, names: list[str], *, lock: bool = False
+) -> set[str]:
+    """Which of ``names`` are registered InA queries (enabled or not);
+    ``lock`` as in `existing_odata_service_names`."""
+    if not names:
+        return set()
+    return set((await session.execute(_existing_ina_names_query(names, lock=lock))).scalars())
+
+
+def _existing_ina_names_query(names: list[str], *, lock: bool) -> Any:
+    """The statement of `existing_ina_query_names` (a test compiles it for
+    Postgres, as `_existing_odata_names_query`). At most 50 names per entry
+    and one entry per agent, so the ``IN`` list stays short."""
+    query = select(InaQuery.name).where(InaQuery.name.in_(sorted(set(names))))
+    if lock:
+        query = query.with_for_update(read=True)
+    return query
+
+
+async def check_ina_queries(session: AsyncSession, servers: list[dict[str, Any]]) -> None:
+    """Refuse a server list that attaches an InA query nobody registered.
+
+    `check_odata_services` for ``builtin:ina``, with its reasons: called by
+    every write of an agent's servers (`upsert_agent`, the admin update
+    route) on the prepared entries, in the session that writes the row and
+    with the found rows locked until that write commits. A dangling name
+    would attach the agent to the next query registered under it. A disabled
+    query exists and may be attached; the run time leaves it out.
+
+    ``ValueError("unknown InA query 'x'")`` names every missing name in the
+    order listed; a list that breaks the entry's rule is refused by
+    `check_query_names`, which never repeats a value that is no query name.
+    """
+    names: list[str] = []
+    for block in ina_entries(servers):
+        for name in check_query_names(block.get("queries")):
+            if name not in names:
+                names.append(name)
+    if not names:
+        return
+    found = await existing_ina_query_names(session, names, lock=True)
+    missing = [n for n in names if n not in found]
+    if missing:
+        raise ValueError("unknown InA query " + ", ".join(f"'{n}'" for n in missing))
 
 
 async def _begin_before_savepoint(session: AsyncSession) -> None:
@@ -3344,6 +3815,27 @@ def _next_odata_stamp(previous: datetime | None) -> datetime:
     return stored + timedelta(microseconds=1)
 
 
+def _warn_generic_kind(name: str) -> None:
+    """One WARNING when a write sets a service's kind to ``generic``.
+
+    The kind relaxes the catalogue's rules on trust: whatever service is
+    registered as generic gets them (a GET function import is a read, so not
+    audited and callable without ``allow_write``; a complex result reaches
+    the model whole), so who did it should show in the log. The service name
+    and the caller's principal, nothing of the body. Every writer goes
+    through `create_odata_service` / `update_odata_service` (the catalogue
+    routes, Duplicate, the bundle import), so this is said in one place.
+    """
+    from agents.auth import current_principal
+
+    logger.warning(
+        "odata service '%s' set to kind generic (GET function imports are read "
+        "without audit, complex results reach the model whole) by %s",
+        name,
+        current_principal.get() or "unknown principal",
+    )
+
+
 async def create_odata_service(
     session: AsyncSession,
     data: dict[str, Any],
@@ -3373,6 +3865,8 @@ async def create_odata_service(
             await session.flush()
     except IntegrityError:
         raise ValueError(taken) from None
+    if row.kind == "generic":
+        _warn_generic_kind(name)
     if commit:
         await session.commit()
     await session.refresh(row)
@@ -3422,8 +3916,11 @@ async def update_odata_service(
     """
     if data["name"] != row.name:
         raise ValueError("name cannot be changed; duplicate the service instead")
+    was_generic = row.kind == "generic"
     for column, value in (columns or odata_service_columns(data)).items():
         setattr(row, column, value)
+    if row.kind == "generic" and not was_generic:
+        _warn_generic_kind(row.name)
     row.updated_at = _next_odata_stamp(row.updated_at)
     if commit:
         await session.commit()
@@ -3446,20 +3943,27 @@ async def delete_odata_service(
     return True
 
 
-def odata_entries(servers: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """The ``builtin:odata`` config blocks of a server list, in order.
+def _builtin_entries(servers: list[dict[str, Any]], builtin: str) -> list[dict[str, Any]]:
+    """The config blocks of the ``builtin`` entries of a server list, in order.
 
-    An entry without a block, or with one that is not an object, has no
-    services and is left out.
+    The URL is compared in the spelling storage and the gate accept (edge
+    whitespace, a trailing ``/`` and the case do not count). An entry
+    without a block, or with one that is not an object, is left out.
     """
     blocks: list[dict[str, Any]] = []
     for server in servers or []:
         if not isinstance(server, dict):
             continue
         url = str(server.get("url") or "").strip().rstrip("/").lower()
-        if url == BUILTIN_ODATA_URL and isinstance(server.get("oauth"), dict):
+        if url == builtin and isinstance(server.get("oauth"), dict):
             blocks.append(server["oauth"])
     return blocks
+
+
+def odata_entries(servers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The ``builtin:odata`` config blocks of a server list, in order (an
+    entry without an object block has no services and is left out)."""
+    return _builtin_entries(servers, BUILTIN_ODATA_URL)
 
 
 async def odata_service_referrers(
@@ -3495,6 +3999,300 @@ async def odata_service_referrers(
                 })
                 entry["allow_write"] = entry["allow_write"] or allow_write
     return {service: list(by_agent.values()) for service, by_agent in found.items()}
+
+
+# --- InA queries (builtin:ina) ---
+# The refusals of the CRUD: the field and the rule, never a value.
+INA_NAME_TAKEN = "name: already exists"
+INA_NAME_FIXED = "name: cannot be changed; register the query under the new name instead"
+# The columns a ``Describe`` writes rather than an admin types; one pair,
+# kept by an update whose payload has no ``definition`` key.
+_INA_DESCRIBED = ("definition_json", "metadata_fetched_at")
+
+
+class StaleRow(Exception):
+    """A compare-and-set on ``updated_at`` lost: the row moved on since the
+    client loaded it, and nothing was written. A route answers 409.
+
+    The message is fixed: it names neither the row nor anything of the
+    payload, so it can be answered and logged as it is.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("changed since it was loaded; reload it and save again")
+
+
+def _ina_payload(data: InaQueryPayload | dict[str, Any]) -> InaQueryPayload:
+    """``data`` as the gate's model. Anything but a payload goes through
+    `validate_ina_query` here, so a caller without the admin route (an import
+    script, a test) cannot store what the gate refuses."""
+    return data if isinstance(data, InaQueryPayload) else validate_ina_query(data)
+
+
+def ina_query_columns(payload: InaQueryPayload) -> dict[str, Any]:
+    """Column values for a query from the validated payload (all but the name).
+
+    The definition is stored as the model's own ``model_dump_json()``, so
+    `InaQuery.to_export` reads back exactly what the gate produced; no
+    description yet is NULL. ``definition`` and ``metadata_fetched_at`` are
+    one pair, the stamp saying when that definition was read: without a
+    definition there is no stamp (a stamp sent with ``null`` is dropped),
+    and a definition sent without a stamp is stamped now.
+    """
+    described_at = None
+    if payload.definition is not None:
+        described_at = _odata_utc(payload.metadata_fetched_at) or _odata_now()
+    return {
+        "title": payload.title,
+        "purpose": payload.purpose,
+        "not_for": payload.not_for,
+        "destination": payload.destination,
+        "user_context": 1 if payload.user_context is True else 0,
+        "query": payload.query,
+        "package": payload.package,
+        "definition_json": (
+            None if payload.definition is None else payload.definition.model_dump_json()
+        ),
+        "metadata_fetched_at": described_at,
+        "enabled": 1 if payload.enabled is True else 0,
+    }
+
+
+def _ina_written_columns(payload: InaQueryPayload) -> dict[str, Any]:
+    """What an update of an existing query writes: `ina_query_columns`
+    without the description pair when the payload has no ``definition``
+    key (an edit form, which never holds what ``Describe`` read)."""
+    columns = ina_query_columns(payload)
+    if "definition" not in payload.model_fields_set:
+        for column in _INA_DESCRIBED:
+            del columns[column]
+    return columns
+
+
+async def list_ina_queries(session: AsyncSession, *, lock: bool = False) -> list[InaQuery]:
+    """Every registered query, in name order; ``lock`` as in `list_odata_services`."""
+    query = select(InaQuery).order_by(InaQuery.name)
+    if lock:
+        query = query.with_for_update()
+    return list((await session.execute(query)).scalars().all())
+
+
+async def get_ina_query(session: AsyncSession, name: str) -> InaQuery | None:
+    result = await session.execute(select(InaQuery).where(InaQuery.name == name))
+    return result.scalar_one_or_none()
+
+
+async def create_ina_query(
+    session: AsyncSession,
+    data: InaQueryPayload | dict[str, Any],
+    *,
+    commit: bool = True,
+) -> InaQuery:
+    """Store a new query; ``data`` is `validate_ina_query` output (a dict is
+    validated first).
+
+    A taken name is ``ValueError(INA_NAME_TAKEN)``. As in
+    `create_odata_service`: the lookup gives the answer, the unique
+    constraint closes the check-then-write race, and the insert runs in a
+    SAVEPOINT so a caller with ``commit=False`` (an import) loses only this
+    row when it loses that race.
+    """
+    payload = _ina_payload(data)
+    if await get_ina_query(session, payload.name) is not None:
+        raise ValueError(INA_NAME_TAKEN)
+    row = InaQuery(name=payload.name, **ina_query_columns(payload))
+    await _begin_before_savepoint(session)
+    try:
+        async with session.begin_nested():
+            session.add(row)
+            await session.flush()
+    except IntegrityError:
+        # `from None`: the IntegrityError carries the statement and its values.
+        raise ValueError(INA_NAME_TAKEN) from None
+    if commit:
+        await session.commit()
+    await session.refresh(row)
+    return row
+
+
+def stamp_moved(stored: datetime | None, expected: datetime | None) -> bool:
+    """Whether a row's ``updated_at`` (``stored``) is no longer ``expected``.
+
+    The one comparison of every ``expected_updated_at`` check (the OData
+    update route, `update_ina_query`). Instants are compared, not texts: the
+    same moment is written with an offset by Postgres and without one by
+    SQLite (naive means UTC), and a client may hand back either.
+    ``expected`` None asks for no check; a row without a stamp is always
+    moved. Only meaningful on a row read under the lock the write then keeps.
+    """
+    if expected is None:
+        return False
+    stored_utc = _odata_utc(stored)
+    return stored_utc is None or stored_utc != _odata_utc(expected)
+
+
+def _locked_ina_query(name: str) -> Any:
+    """The query row with an exclusive row lock (Postgres, HANA; SQLAlchemy
+    leaves ``FOR UPDATE`` out on SQLite).
+
+    ``populate_existing``: the session may already hold this row from an
+    earlier read, and SQLAlchemy hands back such an instance as it is, so
+    the comparison would be made on the stamp of that read, not on the row
+    the lock waited for.
+    """
+    return (
+        select(InaQuery)
+        .where(InaQuery.name == name)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+
+
+async def update_ina_query(
+    session: AsyncSession,
+    name: str,
+    data: InaQueryPayload | dict[str, Any],
+    *,
+    expected_updated_at: datetime | None = None,
+    commit: bool = True,
+    write_locked: bool = False,
+) -> InaQuery | None:
+    """Replace everything but the name of query ``name`` with ``data``.
+
+    Serialise, lock, compare, write in the caller's transaction, as the
+    OData update route does: `begin_exclusive_write` (SQLite has no row
+    locks; it makes the transaction a writer, and logs a WARNING when the
+    caller's transaction is already open), then the row read ``FOR UPDATE``
+    and re-read into the session (`_locked_ina_query`), and with
+    ``expected_updated_at`` the row is replaced only while its
+    ``updated_at`` is still that instant (`stamp_moved`), else `StaleRow`
+    and nothing changes. Of two saves that loaded the same stamp the second
+    waits at the locked read and then compares against the first one's new
+    stamp. Without ``expected_updated_at`` the replace is unconditional
+    (scripts, imports).
+
+    Answers None for an unknown name; a different name in ``data`` is
+    ``ValueError(INA_NAME_FIXED)``: agents name a query, so a rename would
+    detach them silently. The description is a pair that follows
+    ``definition`` (`ina_query_columns`): a payload without the
+    ``definition`` key (an edit form, which never holds what ``Describe``
+    read) keeps the stored definition AND its ``metadata_fetched_at``,
+    whatever stamp it sends; ``definition: null`` clears both. ``updated_at``
+    moves forward on every call (`_next_odata_stamp`), also when no field
+    changed.
+
+    ``write_locked``: the caller has taken what serialises this write
+    already -- on SQLite `begin_exclusive_write` at its transaction's first
+    statement, on Postgres and HANA the row lock of a read such as
+    ``list_ina_queries(lock=True)`` -- so none is asked for here: in an open
+    transaction `begin_exclusive_write` takes no lock and logs a WARNING per
+    call. The bundle import (`agents.admin.api_import`), which writes
+    without ``expected_updated_at``.
+    """
+    payload = _ina_payload(data)
+    if not write_locked:
+        await begin_exclusive_write(session)
+    row = (await session.execute(_locked_ina_query(name))).scalar_one_or_none()
+    if row is None:
+        return None
+    if payload.name != row.name:
+        raise ValueError(INA_NAME_FIXED)
+    if stamp_moved(row.updated_at, expected_updated_at):
+        raise StaleRow()
+    for column, value in _ina_written_columns(payload).items():
+        setattr(row, column, value)
+    row.updated_at = _next_odata_stamp(row.updated_at)
+    if commit:
+        await session.commit()
+    else:
+        await session.flush()
+    await session.refresh(row)
+    return row
+
+
+async def upsert_ina_query(
+    session: AsyncSession,
+    data: InaQueryPayload | dict[str, Any],
+    *,
+    existing: InaQuery | None = None,
+    commit: bool = True,
+    write_locked: bool = False,
+) -> str:
+    """Store ``data`` by name: ``"created"``, ``"updated"`` or ``"unchanged"``.
+
+    For the bulk writers that carry a whole record (the bundle import,
+    ``scripts/import_bundle.py``). ``existing`` is the stored row when the
+    caller has read it already (the import, under its lock), else it is
+    looked up. A record that would change nothing is not written and so not
+    restamped: ``updated_at`` is what an open admin tab hands back as
+    ``expected_updated_at``, and a query the import left as it was must not
+    answer that tab's save with 409 (`odata_service_unchanged`, which
+    compares stored form with stored form for any row). Without the
+    ``definition`` key the stored description and its stamp are kept and
+    not compared, as `update_ina_query` keeps them. The replace is
+    unconditional (no ``expected_updated_at``); ``write_locked`` as there.
+    """
+    payload = _ina_payload(data)
+    row = existing if existing is not None else await get_ina_query(session, payload.name)
+    if row is None:
+        await create_ina_query(session, payload, commit=commit)
+        return "created"
+    if odata_service_unchanged(row, _ina_written_columns(payload)):  # type: ignore[arg-type]
+        return "unchanged"
+    await update_ina_query(
+        session, payload.name, payload, commit=commit, write_locked=write_locked
+    )
+    return "updated"
+
+
+async def delete_ina_query(
+    session: AsyncSession, row: InaQuery, *, commit: bool = True
+) -> bool:
+    """Delete the query. Whether agents still name it is the caller's
+    question (`ina_query_referrers`); nothing is detached here."""
+    await session.delete(row)
+    if commit:
+        await session.commit()
+    else:
+        await session.flush()
+    return True
+
+
+def ina_entries(servers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The ``builtin:ina`` config blocks of a server list, in order (the
+    `odata_entries` rule)."""
+    return _builtin_entries(servers, BUILTIN_INA_URL)
+
+
+async def ina_query_referrers(
+    session: AsyncSession, name: str | None = None
+) -> dict[str, list[dict[str, Any]]]:
+    """Which agents name which query in a ``builtin:ina`` entry.
+
+    ``{query name: [{agent_id, agent, enabled, expose_api, api_slug}]}``,
+    agents in name order, enabled and disabled alike (a disabled agent
+    breaks when its query is deleted and it is turned back on). One pass
+    over the agents; ``name`` narrows the answer to one query (absent when
+    nobody names it). An agent naming a query twice appears once; a name
+    that is not a string is ignored.
+    """
+    found: dict[str, dict[int, dict[str, Any]]] = {}
+    for agent in await list_agents(session):
+        for block in ina_entries(agent.mcp_servers):
+            queries = block.get("queries")
+            if not isinstance(queries, (list, tuple)):
+                continue
+            for query in queries:
+                if not isinstance(query, str) or (name is not None and query != name):
+                    continue
+                found.setdefault(query, {}).setdefault(agent.id, {
+                    "agent_id": agent.id,
+                    "agent": agent.name,
+                    "enabled": bool(agent.enabled),
+                    "expose_api": bool(agent.expose_api),
+                    "api_slug": agent.api_slug,
+                })
+    return {query: list(by_agent.values()) for query, by_agent in found.items()}
 
 
 # The longest retention the purge computes with (100 years): a larger
@@ -4165,6 +4963,59 @@ async def set_active_model_name(session: AsyncSession, model_name: str) -> None:
     await session.commit()
 
 
+# What an embedding model may be called when it is stored: AI Core's model
+# names (``text-embedding-3-large``, ``amazon--titan-embed-text``). Checked
+# with ``fullmatch``, so a trailing line break is refused too.
+EMBEDDING_MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}")
+
+
+async def get_embedding_setting(session: AsyncSession) -> dict[str, Any]:
+    """The data catalogue's embedding setting: ``{"enabled", "model"}``.
+
+    ``model`` ``None`` is automatic. Only a stored 0 is off (the design's
+    ``embeddings_enabled = 0``); without the row it is what the columns
+    default to, on and automatic. Callers outside the admin read it through
+    ``agents.data_catalog.embeddings.resolve_model``, which caches it.
+    """
+    row = await session.get(OrchestratorConfig, 1)
+    if row is None:
+        return {"enabled": True, "model": None}
+    return {"enabled": row.embeddings_enabled != 0, "model": row.embedding_model or None}
+
+
+async def set_embedding_setting(
+    session: AsyncSession, enabled: bool, model: str | None
+) -> None:
+    """Store the embedding setting, commit, then drop the embedding caches.
+
+    The last gate (the admin route checks first, and alone checks that the
+    model is a deployed embedding model, which needs AI Core): ``enabled`` a
+    boolean, ``model`` ``None`` or a model name, stored exactly as given. A
+    refusal is a ``ValueError`` naming the field and the rule, never the
+    value. The caches are reset after the commit: reset earlier, a resolve
+    running meanwhile could cache the old row for ten minutes.
+    """
+    if not isinstance(enabled, bool):
+        raise ValueError("enabled: must be a boolean")
+    if model is not None and (
+        not isinstance(model, str) or EMBEDDING_MODEL_RE.fullmatch(model) is None
+    ):
+        raise ValueError(
+            "model: must be null or a model name of 1 to 128 letters, digits, "
+            "'.', '_', ':', '/' or '-'"
+        )
+    row = await session.get(OrchestratorConfig, 1)
+    if row is None:
+        row = OrchestratorConfig(id=1, instructions=DEFAULT_ORCHESTRATOR_INSTRUCTIONS)
+        session.add(row)
+    row.embeddings_enabled = 1 if enabled else 0
+    row.embedding_model = model
+    await session.commit()
+    from agents.data_catalog import embeddings
+
+    embeddings.reset_caches()
+
+
 # ---------------------------------------------------------------------------
 # Per-user OAuth2 token + flow-state storage (auth_mode="oauth2")
 # ---------------------------------------------------------------------------
@@ -4503,6 +5354,11 @@ _DEST_KEYS_BY_URL: dict[str, tuple[str, ...]] = {
 # boundary (the reason `BUILTIN_PUBLIC_KEYS` is public).
 ODATA_ENTRY_KEYS = ("services", "allow_write")
 MAX_ODATA_ENTRY_SERVICES = 50
+# builtin:ina likewise stores no destination: each registered query
+# (`InaQuery`) names its own destination and identity, and the entry only
+# which queries the agent may run. Public for the admin gate, as above.
+INA_ENTRY_KEYS = ("queries",)
+MAX_INA_ENTRY_QUERIES = _INA_MAX_ENTRY_QUERIES
 def bitbucket_approves(servers: Any) -> bool:
     """Whether a server list holds a ``builtin:bitbucket`` entry (any
     spelling of the URL) that asks for approving
@@ -4533,6 +5389,11 @@ BITBUCKET_APPROVER_INVOKE_MESSAGE = (
     "has allow_approve; an approving agent runs only from the scheduler run "
     "endpoint or an admin's Run now, never from the invoke API"
 )
+# A personal agent that got the approving agent's tools would approve with a
+# chat user's prompt (web chat addendum (g)).
+BITBUCKET_APPROVER_SHARE_MESSAGE = (
+    "share_tools: an agent that approves pull requests cannot share its tools"
+)
 _BITBUCKET_APPROVER_PEER_RULE = (
     "an approving agent may not be a peer: no agent may delegate to an agent "
     "whose builtin:bitbucket entry has allow_approve"
@@ -4557,14 +5418,15 @@ async def check_bitbucket_approver_reach(
     stored_name: str | None = None,
     ignore_names: set[str] | None = None,
     expose_invoke: Any = False,
+    share_tools: Any = False,
 ) -> None:
     """Refuse an agent write that would make an approving agent reachable.
 
     ``ValueError`` with a fixed text when, as the row is about to be stored:
     the agent approves (`bitbucket_approves`) and is exposed to chat or to
     the invoke API (``expose_invoke``: the caller chooses the prompt there
-    as in chat); it
-    approves and another agent lists it as a peer (any other row, enabled or
+    as in chat) or shares its tools with personal agents (``share_tools``);
+    it approves and another agent lists it as a peer (any other row, enabled or
     not: enabling that one later would touch neither); or one of its own
     ``peers`` is an agent that approves. Called by every write of an agent
     (`upsert_agent`, and the admin update route beside its own
@@ -4586,6 +5448,8 @@ async def check_bitbucket_approver_reach(
             raise ValueError(BITBUCKET_APPROVER_CHAT_MESSAGE)
         if expose_invoke:
             raise ValueError(BITBUCKET_APPROVER_INVOKE_MESSAGE)
+        if share_tools:
+            raise ValueError(BITBUCKET_APPROVER_SHARE_MESSAGE)
         listers = [
             r.name for r in await list_agents(session)
             if r.name not in own and r.name not in ignore and own & set(r.peers)
@@ -4620,9 +5484,25 @@ BITBUCKET_SINGLE_ENTRY_MESSAGE = (
     "an agent may have at most one builtin:bitbucket entry; pin every "
     "repository it reviews in that entry's oauth.repositories"
 )
+# Two entries would share the server key and their tools' names; the one
+# with the wider switches could not be told from the other.
+GIT_SINGLE_ENTRY_MESSAGE = (
+    "an agent may have at most one builtin:git entry; pin every repository it "
+    "uses in that entry's oauth.repositories"
+)
 _ODATA_MODE_MESSAGE = (
     "builtin:odata requires auth_mode=destination: every catalogue service "
     "is reached through the BTP destination it names"
+)
+# One entry per agent, as for builtin:odata: two would share the server key
+# and so their tools' names. Public for the reason the OData message is.
+INA_SINGLE_ENTRY_MESSAGE = (
+    "an agent may have at most one builtin:ina entry; list every query in that "
+    "entry's oauth.queries"
+)
+_INA_MODE_MESSAGE = (
+    "builtin:ina requires auth_mode=destination: every registered query is "
+    "reached through the BTP destination it names"
 )
 # Built-ins whose destination may act as the signed-in user. NVD has no user
 # to act as and the me.sap.com cookie is one shared session, so the switch is
@@ -4694,3 +5574,24 @@ def _clean_odata_entry(src: dict[str, Any]) -> dict[str, Any]:
     if src.get("allow_write") is True:
         cleaned["allow_write"] = True
     return cleaned
+
+
+def _clean_ina_entry(src: dict[str, Any]) -> dict[str, Any]:
+    """Normalize the block of a ``builtin:ina`` entry for storage.
+
+    Exactly ``{"queries": [...]}``; every other key is dropped,
+    ``destination`` and ``user_context`` included (identity belongs to each
+    registered query). As `_clean_odata_entry`, the last gate before the
+    row: the list is held to the entry's one rule (`check_query_names`:
+    refused rather than skipped, duplicates dropped, at most
+    ``MAX_INA_ENTRY_QUERIES``). Whether the names are registered is
+    `check_ina_queries`' question. The message never repeats a value.
+    """
+    return {"queries": check_query_names(src.get("queries"))}
+
+
+# The data catalogue tables (agents/data_catalog/models.py) live in their own
+# package but must be on `Base.metadata` wherever the schema is used:
+# `create_all`, the HDI artifacts and the schema history script. Imported
+# last, once `Base` exists; that module imports nothing else of the app.
+import agents.data_catalog.models  # noqa: E402,F401

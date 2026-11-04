@@ -27,9 +27,14 @@ from openai import omit as OMIT
 from pydantic import AnyUrl
 from pydantic_ai.exceptions import ModelRetry
 from pydantic_ai.mcp import MCPServerStreamableHTTP
-from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
+from pydantic_ai.models.openai import (
+    OpenAIChatModel,
+    OpenAIChatModelSettings,
+    OpenAIStreamedResponse,
+)
 from pydantic_ai.profiles.openai import OpenAIModelProfile
 from pydantic_ai.providers.openai import OpenAIProvider
+from pydantic_ai.usage import RequestUsage
 
 from agents.auth import current_jwt
 from agents.errors import describe_exception, mask_text
@@ -449,15 +454,77 @@ def create_mcp_server(
 # ---------------------------------------------------------------------------
 # SAP AI Core LLM model
 # ---------------------------------------------------------------------------
+def _usage_from_chat_completion(response: Any, mapped: RequestUsage) -> RequestUsage:
+    """The token counts of an OpenAI-compatible answer, read as the answer says them.
+
+    pydantic-ai maps usage through genai-prices and swallows every error of
+    that mapping (``RequestUsage.extract``), answering zero tokens. With
+    pydantic-ai 1.72 and genai-prices 0.1.9 / 0.2.1 the mapping hands back
+    ``output_reasoning_tokens``, which ``RequestUsage`` does not take, so
+    EVERY chat answer that carries ``completion_tokens_details`` (the GPT
+    deployments of AI Core always do, seen on acc with ``gpt-5.6-terra`` and
+    ``gpt-4o``) counted 0 in / 0 out. When the mapped usage is empty while
+    the answer holds ``prompt_tokens`` / ``completion_tokens``, those are
+    taken, with ``cached_tokens`` as the cache reads; the mapped ``details``
+    are kept. An answer without usage (a stream chunk before the last one)
+    is left as mapped.
+    """
+    raw = getattr(response, "usage", None)
+    if raw is None or mapped.input_tokens or mapped.output_tokens:
+        return mapped
+    prompt = getattr(raw, "prompt_tokens", None) or 0
+    completion = getattr(raw, "completion_tokens", None) or 0
+    if not isinstance(prompt, int) or not isinstance(completion, int) or not (prompt or completion):
+        return mapped
+    details = getattr(raw, "prompt_tokens_details", None)
+    cached = getattr(details, "cached_tokens", None) if details is not None else None
+    written = getattr(details, "cache_write_tokens", None) if details is not None else None
+    return RequestUsage(
+        input_tokens=prompt,
+        cache_read_tokens=cached if isinstance(cached, int) else 0,
+        cache_write_tokens=written if isinstance(written, int) else 0,
+        output_tokens=completion,
+        details=dict(mapped.details),
+    )
+
+
+class SAPAICoreStreamedResponse(OpenAIStreamedResponse):
+    """The streamed answer of ``SAPAICoreModel``: usage read as the chunk says it."""
+
+    def _map_usage(self, response):  # type: ignore[override]
+        return _usage_from_chat_completion(response, super()._map_usage(response))
+
+
+# ``stream_options: {include_usage: true}`` asks an OpenAI-compatible stream
+# for a last chunk with the token counts; without it a streamed request
+# (every request of a run with an ``event_stream_handler``: the chats, the
+# delegations) counts nothing. AI Core's deployments accept it (checked on
+# acc with gpt-5.6-terra, gpt-4o and anthropic--claude-4.6-sonnet, 2026-10-31);
+# ``AICORE_STREAM_USAGE=0`` strips it again, as this class did before, for a
+# deployment that refuses the parameter.
+AICORE_STREAM_USAGE = "AICORE_STREAM_USAGE"
+
+
 class SAPAICoreModel(OpenAIChatModel):
     """OpenAI-compatible model adapted for SAP AI Core compatibility.
 
-    Strips stream_options and cleans MCP tool schemas that contain
-    non-standard fields SAP AI Core rejects ($schema, typeless props, etc).
+    Cleans MCP tool schemas that contain non-standard fields SAP AI Core
+    rejects ($schema, typeless props, etc), reads the token counts of every
+    answer directly (``_usage_from_chat_completion``) and asks a stream for
+    its usage chunk unless ``AICORE_STREAM_USAGE`` is ``0``.
     """
 
     def _get_stream_options(self, model_settings: OpenAIChatModelSettings):
-        return OMIT
+        if os.environ.get(AICORE_STREAM_USAGE, "1").strip() == "0":
+            return OMIT
+        return super()._get_stream_options(model_settings)
+
+    @property
+    def _streamed_response_cls(self):  # type: ignore[override]
+        return SAPAICoreStreamedResponse
+
+    def _map_usage(self, response):  # type: ignore[override]
+        return _usage_from_chat_completion(response, super()._map_usage(response))
 
     async def _map_messages(self, messages, model_request_parameters):
         """Leave out an assistant message that carries neither text nor a tool call.
@@ -505,19 +572,37 @@ DEFAULT_AVAILABLE_MODELS = (
 )
 
 
-def _discover_deployed_models() -> list[str]:
+def _discover_deployed_models(refresh: bool = False) -> list[str] | None:
     """Query SAP AI Core for the model names that are actually deployed.
 
     Returns an empty list if discovery fails (no credentials, network error,
-    etc.) so the caller can fall back to the static default list.
+    etc.) so the caller can fall back to the static default list; a refresh
+    that fails returns ``None`` instead, so the data catalogue can tell "no
+    answer" from "no deployments" and asks again.
+
+    ``get_proxy_client("gen-ai-hub")`` is ONE instance per process
+    (gen_ai_hub caches it by its arguments), and its ``deployments`` are read
+    from AI Core only while its list is empty: a deployment that reaches
+    RUNNING later is not in it. ``refresh`` reads the list again first
+    (``update_deployments()``); the data catalogue asks for it when AI Core's
+    own list names a RUNNING embedding model this list does not
+    (``agents/data_catalog/embeddings.py``). The chat's model list keeps the
+    default.
     """
     try:
         from gen_ai_hub.proxy import get_proxy_client
 
         client = get_proxy_client("gen-ai-hub")
-        names = {d.model_name for d in client.deployments if d.model_name}
+        deployments = client.update_deployments() if refresh else client.deployments
+        names = {d.model_name for d in deployments if d.model_name}
         return sorted(names)
-    except Exception:
+    except Exception as exc:
+        if refresh:
+            # The class only: gen_ai_hub's traceback names the AI API host
+            # and quotes what it answered.
+            logger.warning("Could not refresh the deployed models from AI Core (%s)",
+                           type(exc).__name__)
+            return None
         logger.warning("Could not discover deployed models from AI Core", exc_info=True)
         return []
 

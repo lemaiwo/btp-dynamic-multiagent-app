@@ -172,3 +172,22 @@ QUnit.test("starting with a done outcome polls nothing", function (assert) {
         done();
     }, 40);
 });
+
+QUnit.test("a poller's own intervals win over the defaults, which stay as they are", function (assert) {
+    const done = assert.async();
+    const own = new Poller(async () => "done", { intervalMs: 2000, slowIntervalMs: 10000 });
+    assert.deepEqual(own.intervals, { intervalMs: 2000, slowIntervalMs: 10000 });
+    assert.deepEqual(new Poller(async () => "done").intervals, { intervalMs: 10, slowIntervalMs: 20 },
+        "a poller without its own reads the defaults");
+    let ticks = 0;
+    const fast = new Poller(async () => {
+        ticks++;
+        return ticks < 2 ? "live" : "done";
+    }, { intervalMs: 5, slowIntervalMs: 5 });
+    fast.start();
+    setTimeout(() => {
+        assert.strictEqual(ticks, 2, "the own interval drives the ticks");
+        assert.notOk(fast.isActive());
+        done();
+    }, 200);
+});

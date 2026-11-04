@@ -10,6 +10,9 @@ import validators, { validateDeep } from "../model/validators";
 import oauthConfig from "../model/oauthConfig";
 import odataEntry from "../model/odataEntry";
 import bitbucketEntry from "../model/bitbucketEntry";
+import gitEntry from "../model/gitEntry";
+import inaEntry from "../model/inaEntry";
+import InaEntryPart from "./agent/InaEntryPart";
 import type { ODataEntryGiven, ODataEntryOpens, ODataEntryRow } from "../model/odataEntry";
 import { AUTH_MODE_TEXT_KEYS, BUILTINS, authModesFor, findBuiltin } from "../model/builtins";
 import formatter from "../model/formatter";
@@ -35,6 +38,8 @@ const EMPTY_AGENT: AgentInput = {
     skills: [],
     enabled: true,
     expose_chat: true,
+    tier: "basic",
+    share_tools: false,
     expose_api: false,
     api_slug: "",
     run_as_principal: "",
@@ -91,6 +96,8 @@ export default class AgentDetail extends BaseController {
     /** True from a Save press until its request is answered or its question
      *  is cancelled: one press, one question, one request. */
     private saving = false;
+    // --- ina --- The dialog's "Analytical queries (InA)" entry.
+    private ina!: InaEntryPart;
 
     public onInit(): void {
         this.setModel(new JSONModel({
@@ -112,6 +119,14 @@ export default class AgentDetail extends BaseController {
             runsCount: runsCountLabel(0)
         }), "agent");
         this.setModel(new JSONModel({}), "server");
+        this.ina = new InaEntryPart({
+            serverModel: () => this.getModel("server") as JSONModel,
+            agentModel: () => this.getModel("agent") as JSONModel,
+            service: () => this.getAdminService(),
+            text: (key, args) => this.text(key, args),
+            box: () => this.byId("inaEntryQueries") as unknown as { setSelectedKeys(keys: string[]): void } | undefined,
+            editingIndex: () => this.editingServerIndex
+        });
 
         this.getRouter().getRoute("agentDetail")?.attachPatternMatched((event: Route$PatternMatchedEvent) => {
             const id = (event.getParameter("arguments") as { agentId: string }).agentId;
@@ -213,6 +228,10 @@ export default class AgentDetail extends BaseController {
                 skills: agent.skills ?? [],
                 enabled: agent.enabled,
                 expose_chat: agent.expose_chat,
+                // An older server sends no tier: basic.
+                tier: agent.tier === "advanced" ? "advanced" : "basic",
+                // An older server sends no share_tools: off.
+                share_tools: agent.share_tools === true,
                 expose_api: agent.expose_api,
                 api_slug: agent.api_slug ?? "",
                 run_as_principal: agent.run_as_principal ?? "",
@@ -315,11 +334,17 @@ export default class AgentDetail extends BaseController {
         // one the fragment's bindings test for.
         const isBitbucket = bitbucketEntry.isBitbucketUrl(server.url);
         const pins = ((isBitbucket ? server.oauth : undefined) ?? {}) as Record<string, unknown>;
+        // --- git --- Likewise: its own state, its canonical spelling.
+        const isGit = gitEntry.isGitUrl(server.url);
+        const git = ((isGit ? server.oauth : undefined) ?? {}) as Record<string, unknown>;
         const blankOAuth = { dcr: false, client_id: "", client_secret: "", uaa_url: "", authorize_url: "", token_url: "", scope: "", mailbox: "", allow_send: false, lookback: "", destination: "", project: "", status: "", api_base: "", labels: "", spaces: "", allow_comment: false, min_score: "", recipients: "", from: "", team: "", channels: "", user_context: false };
         const opening = ++this.odataOpening;
         this.odataCatalogue = null;
         this.odataDefinitions = {};
         const loadError = isOData ? await this.loadODataCatalogue() : "";
+        // --- ina --- Its own state, read first for a stored entry as above.
+        const isIna = inaEntry.isInaUrl(server.url);
+        const ina = await this.ina.begin(server);
         if (opening !== this.odataOpening) {
             return;
         }
@@ -328,15 +353,18 @@ export default class AgentDetail extends BaseController {
             // exactly `builtin:odata`: an entry stored in another spelling
             // (`Builtin:OData`) is held in that one, or OK would write back
             // an `allow_write` the admin never saw.
-            url: isOData ? odataEntry.ODATA_URL : isBitbucket ? bitbucketEntry.BITBUCKET_URL : server.url,
+            url: isOData ? odataEntry.ODATA_URL : isIna ? inaEntry.INA_URL : isBitbucket ? bitbucketEntry.BITBUCKET_URL
+                : isGit ? gitEntry.GIT_URL : server.url,
             auth_mode: server.auth_mode,
             odata: {
                 services: stored.services, allowWrite: stored.allow_write, loaded: isOData, loadError,
                 options: [], rows: [], noData: "", duplicate: "", missing: "", disabled: "", warning: "", writeText: ""
             },
-            oauth: isOData || !server.oauth ? blankOAuth
+            ina,
+            oauth: isOData || isIna || !server.oauth ? blankOAuth
                 : isBitbucket ? { ...blankOAuth, destination: typeof pins.destination === "string" ? pins.destination : "" }
-                    : server.oauth,
+                    : isGit ? { ...blankOAuth, destination: typeof git.destination === "string" ? git.destination : "" }
+                        : server.oauth,
             // --- bitbucket --- Workspace and branch as stored (never
             // trimmed); the switches as real booleans. No stored
             // `require_green_builds` means the builds must be successful:
@@ -348,6 +376,16 @@ export default class AgentDetail extends BaseController {
                 allowComment: pins.allow_comment === true,
                 allowApprove: pins.allow_comment === true && pins.allow_approve === true,
                 requireGreenBuilds: pins.require_green_builds !== false
+            },
+            // --- git --- As stored (never trimmed); a new entry starts on
+            // GitHub; the switches as real booleans, on only for `true`.
+            git: {
+                provider: isGit ? (typeof git.provider === "string" ? git.provider : "") : "github",
+                repositoriesText: gitEntry.formatRepositories(git.repositories),
+                baseBranch: typeof git.base_branch === "string" ? git.base_branch : "",
+                branchPrefix: typeof git.branch_prefix === "string" ? git.branch_prefix : "",
+                allowPush: git.allow_push === true,
+                allowPullRequest: git.allow_pull_request === true
             },
             // "mcp" for a remote server, otherwise the built-in's url.
             kind: findBuiltin(server.url)?.url ?? "mcp",
@@ -370,6 +408,8 @@ export default class AgentDetail extends BaseController {
         this.syncServerKind();
         this.showODataOptions();
         this.showODataEntry();
+        this.ina.showOptions();
+        this.ina.show();
 
         if (!this.serverDialog) {
             this.serverDialog = await Fragment.load({
@@ -392,6 +432,8 @@ export default class AgentDetail extends BaseController {
             serverModel.setProperty("/auth_mode", builtin.defaultAuthMode);
             if (odataEntry.isODataUrl(builtin.url)) {
                 void this.enterODataEntry();
+            } else if (inaEntry.isInaUrl(builtin.url)) {
+                void this.ina.enter();
             }
         } else if (findBuiltin(serverModel.getProperty("/url") as string)) {
             // Back to a remote server: the built-in's pseudo-url is no
@@ -414,7 +456,17 @@ export default class AgentDetail extends BaseController {
             void this.enterODataEntry();
         } else if (bitbucketEntry.isBitbucketUrl(url)) {
             serverModel.setProperty("/url", bitbucketEntry.BITBUCKET_URL);
+        } else if (gitEntry.isGitUrl(url)) {
+            serverModel.setProperty("/url", gitEntry.GIT_URL);
+        } else if (inaEntry.isInaUrl(url)) {
+            serverModel.setProperty("/url", inaEntry.INA_URL);
+            void this.ina.enter();
         }
+    }
+
+    /** --- ina --- A tick, a selection or a removed token in the query box. */
+    public onInaEntryChange(event: Event): void {
+        this.ina.onChange(event);
     }
 
     /**
@@ -777,6 +829,26 @@ export default class AgentDetail extends BaseController {
         delete oauthRaw.repositories;
         delete oauthRaw.allow_approve;
         delete oauthRaw.require_green_builds;
+        // --- git --- Likewise its own keys.
+        delete oauthRaw.provider;
+        delete oauthRaw.base_branch;
+        delete oauthRaw.branch_prefix;
+        delete oauthRaw.allow_push;
+        delete oauthRaw.allow_pull_request;
+        if (gitEntry.isGitUrl(url)) {
+            // Only the entry's own values reach cleanOAuth: the destination
+            // name and what the Git fields hold now, as typed.
+            const destination = oauthRaw.destination;
+            const form = serverModel.getProperty("/git") as Record<string, unknown>;
+            Object.keys(oauthRaw).forEach((key) => { delete oauthRaw[key]; });
+            oauthRaw.destination = destination;
+            oauthRaw.provider = form.provider;
+            oauthRaw.repositories = gitEntry.parseRepositories(form.repositoriesText as string);
+            oauthRaw.base_branch = form.baseBranch;
+            oauthRaw.branch_prefix = form.branchPrefix;
+            oauthRaw.allow_push = form.allowPush === true;
+            oauthRaw.allow_pull_request = form.allowPullRequest === true;
+        }
         if (bitbucketEntry.isBitbucketUrl(url)) {
             // Only the entry's own values reach cleanOAuth: the destination
             // name and what the Bitbucket fields hold now. Workspace and
@@ -802,6 +874,14 @@ export default class AgentDetail extends BaseController {
             Object.keys(oauthRaw).forEach((key) => { delete oauthRaw[key]; });
             oauthRaw.services = this.odataSelection();
             oauthRaw.allow_write = serverModel.getProperty("/odata/allowWrite") === true;
+        }
+        if (inaEntry.isInaUrl(url)) {
+            // --- ina --- Only the entry's one value reaches cleanOAuth.
+            if (!this.ina.confirm(() => this.onConfirmServer())) {
+                return;
+            }
+            Object.keys(oauthRaw).forEach((key) => { delete oauthRaw[key]; });
+            oauthRaw.queries = this.ina.block().queries;
         }
         if (oauthConfig.supportsMailTheme(url)) {
             const parsedTheme = oauthConfig.parseMailTheme(serverModel.getProperty("/themeJson") as string);
@@ -955,6 +1035,9 @@ export default class AgentDetail extends BaseController {
         const agentId = this.agentId;
         const toSave = JSON.parse(JSON.stringify(data)) as AgentInput;
         toSave.expose_invoke = data.expose_invoke === true;
+        // Always sent: an absent key keeps what is stored on the server.
+        toSave.tier = data.tier === "advanced" ? "advanced" : "basic";
+        toSave.share_tools = data.share_tools === true;
         toSave.result_schema = invoke.result_schema;
         toSave.invoke_limits = invoke.invoke_limits;
         // Decided before anything is read: whether this save gives writes
@@ -1012,8 +1095,11 @@ export default class AgentDetail extends BaseController {
         try {
             // --- odata --- The entry is sent as exactly { services,
             // allow_write: <boolean> }, also when its dialog was never opened
-            // and the form still holds the form the server answered with.
-            const sent = { ...data, mcp_servers: odataEntry.explicit(data.mcp_servers) } as AgentInput & ReloadOutcome;
+            // and the form still holds the form the server answered with;
+            // --- ina --- likewise exactly { queries }.
+            const sent = {
+                ...data, mcp_servers: inaEntry.explicit(odataEntry.explicit(data.mcp_servers))
+            } as AgentInput & ReloadOutcome;
             // What a save answers about the reload is no field of an agent;
             // it never goes back in a body, whatever the form was filled from.
             delete sent.reloaded;
@@ -1053,6 +1139,13 @@ export default class AgentDetail extends BaseController {
                 errors[`${field}State`] = ValueState.Error;
             }
         });
+
+        // --- share_tools --- refused for an agent that approves pull
+        // requests: the Switch has no value state, so the message is shown
+        // in a strip under it.
+        if (fieldErrors.share_tools) {
+            errors.share_tools = fieldErrors.share_tools;
+        }
 
         const serverMessages = Object.keys(fieldErrors)
             .filter((key) => key.indexOf("mcp_servers") === 0)

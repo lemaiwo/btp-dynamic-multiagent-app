@@ -1,0 +1,36 @@
+{
+  "Grids": [
+    {
+      "Axes": [
+        {
+          "Name": "Rows",
+          "Type": 1,
+          "Dimensions": [{"Name": "0CALMONTH"}],
+          "Tuples": [
+            {"Members": [{"Name": "202601", "Text": "01.2026"}]},
+            {"Members": [{"Name": "202602", "Text": "02.2026"}]},
+            {"Members": [{"Name": "202603", "Text": "03.2026"}]}
+          ]
+        },
+        {
+          "Name": "Columns",
+          "Type": 2,
+          "Dimensions": [{"Name": "Measures"}],
+          "Tuples": [
+            {"Members": [{"Name": "0AMOUNT", "Text": "Net amount"}]},
+            {"Members": [{"Name": "0QUANTITY", "Text": "Quantity"}]}
+          ]
+        }
+      ],
+      "Cells": [
+        {"Value": 1200.5, "Unit": "EUR"},
+        {"Value": 10, "Unit": "PC"},
+        {"Value": 980.0, "Unit": "EUR"},
+        {"Value": 8, "Unit": "PC"},
+        {"Value": 1430.25, "Unit": "EUR"},
+        {"Value": 12, "Unit": "PC"}
+      ]
+    }
+  ],
+  "Messages": []
+}

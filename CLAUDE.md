@@ -81,6 +81,49 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   holds no secret, so a switch an edit leaves out is gone), is stored under
   the canonical URL, and `prepare_servers` refuses a second one in any
   spelling (`BITBUCKET_SINGLE_ENTRY_MESSAGE`).
+  `ODataService.kind` (`odata_services.kind`, `String(16)`, NOT NULL,
+  `server_default` `"odata"`, the last column; `_ensure_column` adds it to an
+  existing Postgres or SQLite table) is `odata` or `generic` (see
+  `agents/odata/`); `to_export()` carries it, so a bundle, Duplicate and
+  `scripts/copy_registry_config.py` keep it. `InaQuery` (`ina_queries`,
+  `uq_ina_queries_name`) registers one InA analytical query (`agents/ina/`):
+  `name` (slug, the catalogue's `source_name`), `title`, `purpose`,
+  `not_for`, `destination`, `user_context`, `query` (the InA object name),
+  `package`, `definition_json` (`NULL` = not described yet; an unreadable one
+  reads back `None`, logged by row name), `metadata_fetched_at`, `enabled`,
+  `created_at`, `updated_at` (no `onupdate`). CRUD: `list_ina_queries`,
+  `get_ina_query`, `create_ina_query` (`ValueError(INA_NAME_TAKEN)`, also for
+  the unique constraint inside a SAVEPOINT), `update_ina_query(session, name,
+  data, *, expected_updated_at=None, commit=True, write_locked=False)`
+  (`begin_exclusive_write` unless `write_locked`: it is not idempotent and
+  logs a WARNING inside an open transaction, so the bundle import takes it
+  once and passes `write_locked=True`; then the row `FOR UPDATE` with
+  `populate_existing`, `StaleRow` when the stamp moved, a rename is
+  `ValueError(INA_NAME_FIXED)`, `None` for an unknown name),
+  `upsert_ina_query` (`created` | `updated` | `unchanged`; an unchanged query
+  is not restamped), `delete_ina_query`, `ina_query_referrers` (`{query:
+  [{agent_id, agent, enabled, expose_api, api_slug}]}`). **The description is
+  a pair** (`_ina_written_columns`): `definition_json` and
+  `metadata_fetched_at` are written together; an update without the
+  `definition` key keeps both, so a form that never held the description
+  cannot wipe it; `definition: null` clears both; a definition without a
+  stamp is stamped now. `stamp_moved(stored, expected)` is the one
+  `expected_updated_at` compare (instants, not texts), also behind the OData
+  routes' `_is_stale`. `_builtin_entries(servers, url)` is the one loop under
+  `odata_entries` and `ina_entries`. The `builtin:ina` entry of an agent is
+  exactly `{"url": "builtin:ina", "auth_mode": "destination", "oauth":
+  {"queries": [...]}}` (`_clean_ina_entry`, dispatched from
+  `_clean_destination`: 1 to 50 slugs through `check_query_names`, repeats
+  dropped, every other key DROPPED; the save-time gate `_validate_ina_entry`
+  in `agents/admin.py` is the one that refuses another key, without its
+  value; no destination and no `user_context`: those belong to each
+  registered query); `prepare_servers`
+  stores the canonical URL, requires `destination` mode and refuses a second
+  entry in any spelling (`INA_SINGLE_ENTRY_MESSAGE`); `check_ina_queries`
+  (`upsert_agent` and the admin update route, next to
+  `check_odata_services`) refuses an unknown query name, the rows found held
+  `FOR SHARE` until the agent write commits (a disabled query may be
+  attached; the run leaves it out).
   **Which database** (`_resolve_database`, read once at import): a bound
   service wins over `DATABASE_URL`. One kind bound (a postgres label, or
   `hana`; of several `hana` bindings the HDI container: plan `hdi-shared` or
@@ -261,7 +304,24 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   reached through a BTP destination (`auth_mode="destination"`,
   `_destination_mcp_server`): the destination names the host and holds the
   credential, as the signed-in user when `user_context` is true; no JWT bound
-  means a refusal, never an app-level fallback
+  means a refusal, never an app-level fallback. **Token counts are read directly** (`_usage_from_chat_completion`,
+  `SAPAICoreStreamedResponse`): pydantic-ai 1.72 maps usage through
+  genai-prices and swallows every error of that mapping, and with the
+  genai-prices versions in use (0.1.9 locally, 0.2.1 on the platform: it is
+  not pinned) the mapping hands back a field `RequestUsage` does not take, so
+  every chat answer with `completion_tokens_details` counted 0 in / 0 out
+  (seen on acc/AI 2026-10-31 with `gpt-5.6-terra` and `gpt-4o`; the Claude
+  deployments were not affected). `_get_stream_options` no longer strips
+  `stream_options` (AI Core accepts `include_usage`, checked on the three
+  deployed model families); `AICORE_STREAM_USAGE=0` strips it again for a
+  deployment that refuses it (`tests/test_model_usage.py`).
+  `_discover_deployed_models(refresh=False)` lists the deployed model names from
+  gen_ai_hub's proxy client (one per process, its list read from AI Core only while
+  empty): the chat's `available_models()` reads that list (`[]` on a failure, logged
+  with the traceback); `refresh=True` (the data catalogue, after `note_running`)
+  reads AI Core again through `client.update_deployments()` and answers `None` on a
+  failure, logged by exception class only (gen_ai_hub's traceback names the AI API
+  host)
 - `agents/oauth2.py` — per-user OAuth2 authorization_code for
   `auth_mode="oauth2"`: `PerUserOAuth2Auth` (httpx auth that attaches/
   refreshes the user's token, raises `OAuthAuthorizationRequired`),
@@ -291,11 +351,13 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   write switches Jira `allow_comment` and the `allow_send` of oauth2 and
   app_only Outlook/Teams/Gmail are stored true only for the JSON boolean
   `true` (`is True`, never `bool()`: the string `"false"` is truthy).
-  `builtin:odata` is the one whose entry
-  names no destination and the one factory that also receives the catalogue
-  snapshot the registry loaded; it is always built with the storing audit
-  recorder (`stored_recorder()`), so no caller can build it with writes that
-  are not recorded. `builtin:sharepoint` is the one that is application-level
+  `builtin:odata` and `builtin:ina` are the two whose entry
+  names no destination (each catalogue service or registered query names its
+  own) and the two factories that also receive the snapshot the registry
+  loaded (catalogue services, `context["ina_queries"]`); `builtin:odata` is
+  always built with the storing audit recorder (`stored_recorder()`), so no
+  caller can build it with writes that are not recorded. `builtin:sharepoint`
+  is the one that is application-level
   in both of its modes (`app_only`, `destination`): `user_context` is refused.
   `builtin:bitbucket` has one mode, `destination`, as the destination's
   technical user (the table line `app` under `destination` only):
@@ -728,6 +790,51 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   previous step's text). Likewise not closed: the agent's own
   deep sub-agents share its toolsets (`tests/test_bitbucket_reach.py`).
   `tests/test_bitbucket_config.py`, `tests/test_bitbucket_registration.py`
+- `agents/git_tools.py` + `agents/git_config.py` + `agents/git_http.py` +
+  `agents/git_providers.py` — Git remotes as an in-process toolset (`builtin:git`,
+  design addendum h of the web chat design): GitHub (cloud or GHES), Bitbucket
+  Cloud and GitLab (gitlab.com or self-hosted) behind ONE tool contract, REST
+  only (no git binary, no clone). **Destination mode only**, Internet
+  destinations (an OnPremise one is `destination_error` when a call resolves
+  it), `user_context` refused: the technical user of the destination commits,
+  the chat user and the conversation (or run) id go into a commit trailer.
+  The entry is exactly `{"url": "builtin:git", "auth_mode": "destination",
+  "oauth": {destination, provider: github|bitbucket|gitlab, repositories (1..50
+  paths: `owner/name`, `workspace/slug`, `group[/subgroup]/project`),
+  base_branch (default `main`), branch_prefix (default `agent/`), allow_push,
+  allow_pull_request}}`; `git_config.py` is the one reading (gate
+  `_validate_raw_git_entry` in `agents/admin.py`, storage `_clean_git_entry` in
+  `agents/db.py`, build), switches stored only as `true`, unknown keys and a
+  second entry per agent refused (`GIT_SINGLE_ENTRY_MESSAGE`; a hand-written
+  row with two gets no git tools, one WARNING). Tools: `list_repositories`,
+  `list_files`, `read_repository_file` (NOT `read_file`: the deep agents'
+  scratchpad owns that name and a single-server agent's tools are not
+  prefixed), `list_branches`, `get_pull_request`, `get_pipeline_status`; with
+  `allow_push` `create_branch` (always under the prefix) and `commit_files`
+  (ONE commit per call, on a prefixed branch only, never the base branch;
+  1..50 files/deletes, 1 MB each, 5 MB in all, confined paths; pipeline files
+  `.github/workflows/*`, `bitbucket-pipelines.yml`, `.gitlab-ci.yml`,
+  `.gitlab/` refused: an agent must not define the CI that holds the deploy
+  credentials); with `allow_pull_request` `open_pull_request` (an open one of
+  that branch is answered with `already_open`). GitHub commits through the Git
+  Data API (only the final ref `PATCH` is the write: a 422 there is
+  `branch_moved`), Bitbucket one multipart `src` POST, GitLab one `commits`
+  POST with `actions` (project, file and branch encoded as ONE segment, which
+  is why the client is `GitAuth`, a `BitbucketAuth` subclass that keeps the raw
+  path: the plain `DestinationAuth` rebuilds the URL from the decoded path).
+  Every refusal is `{"error": {code, message, hint?}}` from the closed
+  `ERROR_CODES` (`git_http.py`), never the provider's text, a URL or a header;
+  a write that may have left is `outcome_unknown`, never repeated; only a 429
+  is retried. Activity previews are fixed-form lines (`activity_summary`), as
+  for Bitbucket. An agent save that changes the entry reloads the registry
+  (`_entry_signature`). Shared helpers are imported from `bitbucket_tools.py`
+  (log filter, `_shown_text`, `BitbucketAuth`), not copied. Denied in ABAP
+  Assistant sessions. Unit-tested only (`tests/test_git_config.py`,
+  `tests/test_git_tools.py`, `tests/test_git_registration.py`,
+  `tests/test_git_activity.py`): **never run against a real remote**; setup
+  per provider in `docs/GIT_SETUP.md` (local, not in repo). Usable by any
+  admin agent and, through a shared tool source (addendum g), by personal
+  agents; the intended holders are the advanced UI5/Fiori and CAP agents
 - `agents/slack_tools.py` — Slack over the Web API (`builtin:slack`), as a
   bot. Slack has no client-credentials grant, so the `xoxb-` token lives in a
   BTP destination (NoAuthentication + `URL.headers.Authorization`, which
@@ -868,13 +975,39 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   parameter value, checked field by field against the catalogue (V4 enum
   fields only with a typed literal, complex and collection fields never); a
   navigation or `$expand` needs the target set enabled in the catalogue.
-  **The write rule**: a call is a read only when the operation's
-  `changes_data` is false AND its method is `GET`; everything else (create,
+  **The write rule** (`operation_is_write(changes_data, http_method, kind,
+  operation_kind)` in `models.py`, said once; the TS mirror is
+  `operationIsWrite` in `ui5-admin/webapp/model/odataCatalog.ts`): a call is
+  a read only when the operation's `changes_data` is false AND its method is
+  `GET`, or when the service kind is exactly `generic`, the operation kind
+  exactly `function_import` and the method exactly `GET` (whatever
+  `changes_data` says: the SAP allow-list owner vouches that a listed module
+  only reads; every default, an operation kind not given included, falls to
+  the first rule, so three arguments never relax it); everything else (create,
   update, delete, and every call that is not such a read, a V2 function import
-  or a V4 action always) is a write and needs the catalogue operation enabled
-  AND `allow_write` exactly `true`, and is audited. A `POST` stored with
-  `changes_data: false` is not refused at save: it is stored and run as an
-  audited write. Tools are denied in ABAP Assistant sessions by
+  of an `odata` service or a V4 action always) is a write and needs the
+  catalogue operation enabled AND `allow_write` exactly `true`, and is
+  audited. A `POST` stored with `changes_data: false` is not refused at save:
+  it is stored and run as an audited write.
+  **Kind `generic`** (`odata_services.kind`, design addendum k): one
+  registration per SAP system of the `ZAGENT_DATA_SRV` Gateway service, whose
+  tables, views and function modules come from SAP's allow-list
+  (`ZAGENT_DATA_OBJ`) through `$metadata` (the set's and the function
+  import's `sap:label` become their titles); always OData V2 (the gate
+  refuses V4 at `kind`: `kind: a generic service is OData V2`); the catalogue
+  imports it as `source_kind` `generic`. The service name is unique across
+  both kinds, so `("odata", name)` and `("generic", name)` name one row
+  everywhere (registry, catalogue routes, rebuild). The relaxation trusts
+  whatever service is registered as generic: its GET function imports become
+  unaudited reads (callable without `allow_write`) and its complex results
+  reach the model whole, so every write that sets or changes a service's kind
+  to `generic` (create, update, Duplicate, the bundle import: the CRUD in
+  `agents/db.py`, `_warn_generic_kind`) is one WARNING naming the service and
+  the caller's principal, never the body. **Verified locally only**,
+  against the recorded `$metadata` of A4H's `ZAGENT_DATA_SRV`
+  (`tests/fixtures/odata/zagent_data_metadata.xml`): A4H is not reachable
+  from BTP, and no landscape has the ABAP package yet. Tools are denied in
+  ABAP Assistant sessions by
   `ReadOnlyGuard` (default-deny by name; they are not in `READONLY_POLICY`)
   - `models.py` — the definition models (`ODataServicePayload`,
     `ServiceDefinition`, `EntitySetDef`, `FieldDef`, `OperationDef`; all
@@ -882,10 +1015,19 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     unique, keys are fields, `list`/`get` need a selectable field, `create`/
     `update` a writable one, V2 allows only function imports, V4 only actions
     (`POST`) and functions (`GET`), `title`/`purpose`/`not_for` one line,
-    `definition` required, booleans strict. Refusals name the field and the
-    rule, never a value (`agents/loc_fields.py`). `OperationDef.is_write` is
-    the one write rule; `returns` names the entity set an operation answers
-    with. Never imports `agents.db`
+    `definition` required, booleans strict, `kind` `odata` | `generic`.
+    Refusals name the field and the rule, never a value: `agents/loc_fields.py`
+    holds `loc_path`, `refusal_text(exc, root)` (the one formatter of the
+    OData, InA and data catalogue gates: at most `MAX_REPORTED_ERRORS` = 20
+    lines plus "and n more") and the one-line rule, `one_line_text(value, *,
+    refuse_format=False, field=None)` with the pydantic validators `one_line`
+    (control characters, line and paragraph separators refused) and
+    `one_line_strict` (format characters `Cf` as well, `refuse_format=True`:
+    InA names, labels and units; the catalogue hints call `one_line_text`
+    with it). `OperationDef.is_write(kind)` and
+    `ServiceDefinition.has_write(kind)` apply the one write rule;
+    `returns` names the entity set an operation answers with. Never imports
+    `agents.db`
   - `urls.py`, `common.py` — path confinement (`confine_service_path`,
     `join_path`: a model or admin value is only ever a path below the
     destination's host), the key predicate (one segment, written by typed
@@ -926,7 +1068,31 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     through the connectivity proxy is `proxy_refused`, with a hint for the
     admin (binding, location id, `CONNECTIVITY_PP_MODE`, Cloud Connector
     trust) in the preview and test call, and one for the model (nothing was
-    changed, tell the user, do not retry)
+    changed, tell the user, do not retry). **A generic service's reading
+    function import answers whole** (design addendum k 4b; `CallPlan.whole`:
+    service kind `generic`, operation kind `function_import`, a read, no
+    `returns`): the app has no field catalogue for complex types, so one
+    structure or a collection of them comes back with every property
+    (`returned` `structure` / `collection`, `WHOLE_RETURNS`; `__metadata`,
+    other `__` keys and annotations dropped), but only when every row passes
+    `_is_structure`, positive recognition of complex-type data: no entity
+    marks, no `__deferred` navigation, no catalogue set's entity type at any
+    depth (so a module cannot read past a set's field allowlist), every key an
+    EDM name (an annotation key only when each part is one), at most
+    `MAX_STRUCTURE_DEPTH` (10) deep; anything else stays `withheld`. A whole
+    result over the cap is `result_too_large`, never cut; so is a server-paged
+    one (`__next`, `_paged_refusal`; the next page is never fetched); an
+    object with no property left is `nothing`. On a bound import without
+    `returns`, rows must name their type (`__metadata.type`) to pass whole;
+    untyped rows fall to the entity rule (cut to the bound set's fields, or
+    withheld). A generic read whose entity answer SAP paged is refused the
+    same way (`not plan.changes`: never after a change). For `odata` services
+    all of this is unchanged, including the older gap that a paged entity
+    answer of a call (`returns` / `bound_to`) is returned as if complete.
+    `V2Dialect.parse_call` knows the shape `structure` (an object under `d`,
+    or Gateway's `d.<name>`, without `__metadata` or `results`). The real body
+    of a ZAGENT_DATA function import (`MONTH_NAMES_GET`) has never been read
+    live: the shapes are those of the hand-written fixture
   - `session.py` — `CsrfSessionStore`: token and SAP session cookies per
     destination and per user, in memory, never in the shared HTTP client; the
     key follows the credential that is *sent* (`user:<principal>:<sha256 jwt>`),
@@ -979,7 +1145,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     moved (lock, compare, write in one transaction); without it (absent or
     `null`) the `PUT` replaces unconditionally, as API clients and scripts
     may, and each such save is one WARNING line naming the service and the
-    caller's principal, never the body (both UIs always send it); `DELETE` answers 409 while
+    caller's principal, never the body (both UIs always send it); a `PUT`
+    is a whole replace, so one without `kind` resets it to `odata` (the
+    stricter direction: a UI that edits a generic service must send it);
+    `DELETE` answers 409 while
     any agent, enabled or not, attaches the service. After the commit, a
     `PUT` or `DELETE` of a service that is in use (an agent row attaches it,
     or the running build still holds a copy of it) rebuilds the registry and
@@ -1008,6 +1177,459 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     `unknown_target`, `operation_disabled`, `no_destination_service`,
     `token_failed`, `list_failed`); a test that ran and failed is a 200 with
     `ok: false`
+- `agents/ina/` — SAP analytical queries (BW / embedded analytics) over the
+  InA protocol as an in-process toolset (`builtin:ina`, design addendum k,
+  part 2), **read-only**: an InA call changes nothing, is recorded in the run
+  activity like an OData read and never in `odata_audit_log`. An admin
+  registers each query (`ina_queries`, page "Analytical queries"); identity is
+  per query (`destination` + `user_context`), never per agent; the agent's
+  entry only names queries (`agents/db.py`). The tools are denied in ABAP
+  Assistant sessions (not in `READONLY_POLICY`). **Unit-tested only, on
+  synthetic fixtures**: the describe envelope is the one SIA accepted in the
+  2.34.0 probe (`scripts/probe_ina.py`), but the Analytics request and the
+  result grid are a best reading of the design and of a reference
+  implementation, NOT of a recorded SIA exchange (no SIA query was named for
+  this release), so the data read is unverified; the first landscape check is
+  a Describe of a dummy name, which proves transport, CSRF and the message
+  envelope by answering `query_unknown`
+  - `models.py` — the save-time gate, never imports `agents.db`:
+    `validate_ina_query(data)` returns the model (`InaQueryPayload`,
+    `extra="forbid"`, strict strings and booleans; `definition` and
+    `metadata_fetched_at` optional: storage decides what an absent key means)
+    or raises a `ValueError` of `<field>: <rule>` lines (`refusal_text`;
+    never a value, a member's duplicate named by position). `name` matches
+    `QUERY_NAME_RE` (`^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$`), `title` ≤ 120 and
+    `purpose` ≤ 200 required, `destination` the OData gate's
+    `DESTINATION_NAME_RE`, `query` (the InA object name) ≤ 128; the
+    definition holds dimensions `{name, label, key_field?}` and measures
+    `{name, label, unit?}` (≤ 100 each), variables `{name, label, mandatory,
+    type: single|interval|multiple}` (≤ 50), names distinct per list
+    (case-sensitive), member names, labels and units one line without control
+    OR format characters (`one_line_strict`, i.e. `one_line_text(...,
+    refuse_format=True)`: a bidi override in a name is refused).
+    `check_query_names(names, *, field="oauth.queries", distinct=False)` is
+    the one slug-list rule of the entry (gate, storage, `check_ina_queries`):
+    a list of 1 to `MAX_ENTRY_QUERIES` (50) names, repeats dropped or refused
+  - `client.py` — `InaClient(http, sessions, *, destination, user_context,
+    query, package, definition)` with `describe()` and `run(measures,
+    group_by, filters, top, order, variables)`; `build_ina_http_client` (the
+    one builder of the tools and the admin calls:
+    `destination_http_client(..., connectivity=...)` with a `NoCookieJar`, so
+    OnPremise destinations through the Cloud Connector work, SIA is one);
+    `InaSessionStore` (a `CsrfSessionStore` keyed like OData's, per
+    destination and signed-in user and token digest, that also keeps the
+    Analytics capabilities). `GET /sap/bw/ina/GetServerInfo` with
+    `X-CSRF-Token: Fetch` once per session, then `POST
+    /sap/bw/ina/GetResponse` with the token and an explicit `Cookie` (one
+    drop, refetch and resend after a 403; `csrf_failed` when SAP says
+    `Required` again; cookies taken only from a 2xx JSON answer); the
+    resolved destination must be the registration's (name and
+    `user_context`). Streamed up to `MAX_RESPONSE_BYTES` (8 MB), no redirect,
+    a total deadline of `CALL_DEADLINE_SECONDS` (120, `asyncio.timeout` with
+    `expired()`), a 407 body never read. **Caps** (refused before anything is
+    sent, never cut): 20 dimensions, 20 measures, 30 filters, `top` ≤ 2,000
+    (default 100), 10 order terms, 50 `in` values, 255 characters per value;
+    5,000 cells counted on what is returned. `MaxResultRecords` is `top + 1`:
+    the extra row means `truncated: true` and is not returned; more than
+    `top + 1` rows is `result_too_large`. Every failure is an `InaError` from
+    the closed `ERROR_CODES` of `errors.py` (`destination_error`,
+    `proxy_refused`, `user_token_required`, `unauthorized`, `forbidden`,
+    `csrf_failed`, `query_unknown`, `variable_required`, `invalid_filter`,
+    `result_too_large`, `sap_error`, `unreachable`, `timeout`, `not_json`;
+    `to_dict()` = `{code, message, hint?}`); `admin_text` (a refused
+    destination's fixed text for the admin) is kept outside `to_dict`. SAP's
+    error message reaches the caller only as `sap_error` (cleaned, masked, ≤
+    500 characters); "query ... is unknown" is `query_unknown`; info and
+    warning messages are dropped. No user JWT with `user_context` is
+    `user_token_required` before anything is resolved
+  - `protocol.py` — the wire format as pure functions: `describe_request`,
+    `analytics_request` (dimensions on `Rows`, the `Measures` structure on
+    `Columns`, a `Selection` of `And` over member filters `=`, `<>`, `>=`,
+    `<=`, `between`, `in` on the dimension's `key_field`, `Sort`,
+    `Variables`, `ResultFormat: Version2`, `Options: ["StatefulServer"]`),
+    `plan_run` / `check_caps` (every argument rule; an unknown measure or
+    dimension is `invalid_filter` `<field>[i]: not a measure|dimension of
+    this query`, the name sent never echoed; a mandatory variable left out is
+    `variable_required`), `read_description` (labels cut to 120, units to
+    32, a name the gate would refuse or a repeat skipped and counted, more
+    than 100/100/50 sets `truncated`) and `read_grid` (`{columns, rows, units,
+    row_count, truncated}`; a `<dim>.text` column when SAP sent a text other
+    than the key, a `<measure>.unit` column when the unit differs per row).
+    **The real SIA grid shape is UNVERIFIED**: `read_grid` reads
+    `Grids[0].Axes[].Tuples[].Members[]` and `Cells[]` of `{Value, Unit}`;
+    a reference implementation reads a columnar Version2 grid
+    (`Cells.Values.Values`, `MemberIndexes`) instead. A shape the reader does
+    not know is `sap_error` ("a form this client does not read"), and a cell
+    without a `Value` key is never read as null: it fails closed, never
+    leaks. Record one describe and one run on SIA (`scripts/probe_ina.py`)
+    before a pilot and adapt `read_grid` / `read_description` then
+  - `tools.py` — `ina_toolset(...)` (the factory of `agents/builtins.py`,
+    `queries=` the snapshot of registered queries the registry loaded;
+    `attached_queries` is the one selection; no usable query is
+    `NoUsableQueryError`, one WARNING, the agent built without the tools):
+    `list_queries()` (`{queries: [{name, title, purpose, not_for}]}`, enabled
+    ones in entry order; no destination, InA name or member),
+    `describe_query(query)` (from the stored description only, never SAP;
+    `key_field` left out) and `run_query(query, measures, group_by,
+    filters=None, top=100, order=None, variables=None)` (arguments checked by
+    `plan_run` before a client or resolver is built; `truncated` adds the
+    hint to narrow the filters or raise `top`). A name the entry does not
+    hold, or holds disabled, is `query_unknown` without the name sent; a
+    query no admin has described is the tool-level code `not_described`
+    (`NOT_DESCRIBED`, outside `ERROR_CODES`, hint "ask an admin to describe
+    the query") for both tools, and nothing is sent: the tools never read
+    metadata from SAP and never write the catalogue. An answer over
+    `MAX_RESULT_CHARS` (60,000 JSON characters) is `result_too_large`, refused,
+    not cut. One HTTP client per query (built on its first run, closed with
+    the registry build) and one `InaSessionStore` per toolset. **No result is
+    stored**: `activity_summary` gives the fixed lines `list_queries: n
+    queries`, `describe_query: d dimensions, m measures, v variables`,
+    `run_query: n rows[, truncated]`, `error: <code>`, plain or prefixed
+    (`ina_`, `ina_0_`). `registry.build_orchestrator` adds the `##
+    Analytical queries` block (`_ina_instructions`: `- **<name>**:
+    <purpose>` per query between `<ina-queries>` tags, which the tag regex
+    neutralises in the text), adds `("ina", name)` to the data catalogue
+    scope, keeps the names of the queries it handed out in
+    `BuildResult.ina_queries` (`Registry.holds_ina_query`: does a query edit
+    need a reload), and gives a hand-written row with two
+    `builtin:ina` entries NO InA tools (one WARNING; the agent keeps its other
+    servers). The gate (`_validate_raw_ina_entry` / `_validate_ina_entry` in
+    `agents/admin.py`: exactly `queries`, `destination` and `user_context`
+    refused even at their defaults, a second entry refused), storage and the
+    build each hold to one entry per agent; an agent save that changes the
+    entry reloads the registry and rebuilds its catalogue sources
+    (`_entry_signature`)
+  - `admin_routes.py` + `admin_calls.py` — `/admin/api/ina/queries`
+    (`GET`, `POST` 201), `/queries/{name}` (`GET`, `PUT` with
+    `expected_updated_at`: 409 when the row moved, 409 `INA_NAME_FIXED` for a
+    rename; without the stamp it replaces, logged as one WARNING naming the
+    query and the caller, never the body; `DELETE` 409 while an agent
+    attaches it, 204 with `X-Ina-Reloaded` / `X-Ina-Reload-Failed`), every
+    route with its own `require_admin`, bodies read raw (≤ 1 MB, a call body
+    ≤ 4 KB) and validated in the handler, never echoed. `POST
+    .../describe` reads SAP, stores the definition and its stamp over the row
+    it read (409 when the row moved meanwhile, nothing stored; 404 when it was
+    deleted), moves `updated_at` and answers `{dimensions, measures,
+    variables, names, truncated, skipped, metadata_fetched_at, reloaded,
+    reload_failed}` (an unchanged description reloads nothing); `POST
+    .../test` is one `run_query` of the first measure, `top=1`, no grouping,
+    answering exactly `{ok, status, duration_ms, columns}`, never a value (an
+    undescribed query is described first, nothing stored; a query with a
+    mandatory variable is refused 422 `variable_required` before anything is
+    sent: Describe is its connectivity check). Failures carry the client's
+    code in `X-Ina-Error` and the `admin_text` or the client's text (≤ 500
+    characters): 424 `user_token_required`, 504 `timeout` (the route's 25 s
+    budget, `CALL_BUDGET_SECONDS`, below the approuter's 30 s), 422
+    `variable_required` / `invalid_filter`, 502 for every other code; at most
+    two Describe/Test calls at a time per app instance
+    (`MAX_CONCURRENT_CALLS`, a semaphore checked before the take): the third
+    is 429 `X-Ina-Error: busy` and nothing is resolved. A `PUT`, `DELETE` or
+    Describe of a query in use reloads the registry and rebuilds that
+    catalogue source through the OData routes' `_reload_if_in_use(names,
+    referrers, what, holds=)` (`reload_if_in_use` passes `holds_ina_query`);
+    as for OData, the rebuild reaches only the instance that served the
+    request. The destination field reuses `GET
+    /admin/api/odata/destinations`. Every Describe/Test opens a fresh SAP
+    session (GetServerInfo each time; with `StatefulServer` it lives until
+    ICF times it out). The bundle (`agents/admin.py`) carries `ina_queries`
+    (`InaQuery.to_export()`, ≤ 200), imported right after `odata_services`
+    and before the agents in the same transaction (`begin_exclusive_write`
+    once at the start; `_bounded_section`, `_CatalogueImport` and
+    `_finish_catalogue_import` are shared with the OData section), with the
+    same `replace` rule and the answer keys
+    `imported_/created_/updated_/removed_ina_queries`,
+    `removed_ina_query_names`, `ina_identity_changes`;
+    `scripts/import_bundle.py` imports them one by one (`enabled` required,
+    `FAIL   ina query <name|#n>: <rule>`, exit 1, no replace).
+    `GET /admin/api/credential-health` lists a `builtin:ina` entry once per
+    query it names (`query`, `query_enabled`, `destination`, `user_context`,
+    `state`; `missing` for a name nobody registered).
+  Tests: `tests/test_ina_models.py`, `test_ina_client.py`,
+  `test_ina_protocol.py`, `test_ina_sessions.py`, `test_ina_tools.py`,
+  `test_ina_registration.py`, `test_ina_db.py`, `test_ina_admin.py`,
+  `test_ina_bundles.py` (fixtures in `tests/fixtures/ina/`, synthetic, placeholder
+  names). Never run against a real SIA query
+- `agents/data_catalog/` — the **data catalogue graph** (design addendum j, part 1):
+  one graph of every data source attached to at least one enabled agent, built once
+  and scoped at query time, so an agent finds the right source without a prompt that
+  grows with the catalogue. Tables (HANA schema generation 8) `data_catalog_nodes`
+  (`kind` source|entity|field|function|query|dimension|measure (`NODE_KINDS`),
+  `source_kind` odata|generic|ina (`SOURCE_KINDS`; `CATALOGUE_KINDS` = odata,
+  generic: the two kinds of an `odata_services` row), `source_name`, `name`, `label`,
+  `purpose`, `not_for`, `synonyms_json`, `examples_json`, `unit` (`UNIT_MAX`),
+  `readable`, `writable`, `is_key`, `type_name`, `parent_id`, `updated_at`,
+  `curated_at`), `data_catalog_edges` (`kind` navigation|same_object|aggregates|
+  contains, plus `curated_at`, nullable, set on an edge an admin drew: generation 9),
+  `data_catalog_vectors` (float32 `LargeBinary` per node and text hash; cosine in
+  Python over the scoped set, no HANA vector type in v1). `importer.py` turns an
+  `odata_services` definition into nodes and edges (readable = selectable, writable
+  from the operations, `same_object` by entity type name) under the row's kind
+  (`service_kind(row)`: `generic` only for exactly `"generic"`; the write rule of that
+  kind makes a generic GET function import readable), and a registered InA query
+  (`plan_ina_query` / `import_ina_query`) into a source node, one `query` node
+  (`type_name` = the InA object name, label = the title; its purpose and "not for"
+  are the source's) and a `dimension` / `measure` node per member (`unit`), all
+  readable, none writable or a key, variables no nodes; an undescribed query is source
+  plus query, a stored description that does not validate leaves the nodes (one
+  WARNING). It is incremental: an admin's hints (`curated_at` set) are never
+  overwritten by a re-import, `readable` can only be narrowed by a hint, never widened
+  past the registration (a curated node whose catalogue `readable` goes from 0 to 1
+  stays 0: no record says whose 0 it was). **A kind flip** odata ↔ generic re-keys the
+  nodes in place (`_follow_kind`, one conditional `UPDATE` of `source_kind`), so ids,
+  hints, vectors and drawn links survive it; `("odata", n)` and `("generic", n)` are
+  one handle for `rebuild`. **Cross-kind links** (`links.py`, `link_same_objects`,
+  pass 2, on names, never on data; re-exported by `importer.py`): a generic entity is
+  the object its entity TYPE names, never its set (`ZCL_AGENT_DATA_MODEL` serves
+  `<OBJ>` as the set `<OBJ>Set` of `ZAGENT_DATA_SRV.<OBJ>`; a set without a type joins
+  nothing across kinds); `same_object` between an InA query `2C<view>` and a generic
+  entity of the object `<view>` or an odata entity type `<view>` / `<view>Type`
+  (compared upper-cased: repository names are case-insensitive, a CDS entity's OData
+  type keeps camel case), and between a generic entity and an odata entity type of
+  exactly its object's name (exact case, as pass 1, which under SAP's naming already
+  joins the two); one edge per pair. **Curated edges**: a
+  re-import never deletes an edge with `curated_at` (a node that disappears takes its
+  edges); one link per kind per pair, so a drawn `same_object` keeps the import's
+  `same_object` of that pair out (`_curated_pairs`), a drawn `aggregates` leaves it.
+  Rebuilt for the changed sources by `reload_after_catalogue_change`, by a `PUT`,
+  `DELETE` or Describe of an InA query in use, by an agent save that changes its
+  OData or InA entry (`_reload_for_changed_entry`), after a bundle import, and in the
+  background at startup (`app.py`; a full rebuild first drops sources no enabled agent
+  names, `wanted_ina_queries` for InA); failures are logged, never a 500 of the
+  save. `embeddings.py` (design addendum l): **the setting** is two columns of the
+  orchestrator row, `orchestrator_config.embeddings_enabled` (`Integer`, NOT NULL,
+  `server_default "1"`; only a stored 0 is off) and `embedding_model` (`String(128)`,
+  nullable, `NULL` = automatic; `EMBEDDING_MODEL_RE`), HANA schema generation 10, read
+  and written by `get_embedding_setting` / `set_embedding_setting` in `agents/db.py`
+  (the last gate: `enabled` a real `bool`, `model` `None` or a model name; a refusal
+  names the field, never the value; the caches are reset after the commit).
+  **Resolution order** (`resolve_model_detail()` -> `(model, source)`, `source`
+  setting|env|discovery|none; `resolve_model()` is its first half):
+  `DATA_CATALOG_EMBEDDINGS=0` -> none (the test suite sets it; the emergency switch);
+  the setting unreadable (logged by class, not cached: fail closed) or switched off ->
+  none; an admin model -> that model while gen_ai_hub discovery lists a RUNNING
+  deployment of it, else `(None, "setting")`, no fallback and nothing embedded; else
+  `AICORE_EMBEDDING_MODEL` (no deployment check); else discovery
+  (`text-embedding-3-large`, else the first deployed name holding `embed`,
+  case-insensitive); else none (lexical ranking). Two caches per process, the setting
+  row and the discovered deployments, 10 minutes each (an empty or failed discovery
+  60 s, `EMPTY_CACHE_SECONDS`), reset by a save (`reset_caches`; an epoch keeps a read
+  that a save overtook out of the cache); another app instance sees a save after its
+  own 10 minutes. Discovery reads gen_ai_hub's proxy client, ONE instance per process
+  whose list of deployments is read from AI Core only while it is empty, so a
+  deployment that reaches RUNNING later is not in it and our cache reset does not
+  change that. Every fresh AI Core deployment list (the status, the `PUT`'s check,
+  the run when no model resolves) goes to `note_running`: when the cached discovery
+  disagrees about the RUNNING embedding models, or there is none since the last
+  reset, it drops the cache and sets `_refresh_next`, and the next discovery calls
+  `_discover_deployed_models(refresh=True)` (`client.update_deployments()`), so a
+  deployment that reached RUNNING is the model in effect at the next read, for the
+  admin's model as for Automatic. The flag is cleared only once such a refresh
+  answered and no note or reset overtook it: a refresh that fails (`None`) is asked
+  again (after the 60 s a failed discovery is cached); a save does not clear it.
+  Embedding goes through
+  `gen_ai_hub`'s `AsyncOpenAI(proxy_client=...).embeddings`; only names, labels,
+  purpose, synonyms and examples of `EMBEDDED_KINDS` (source, entity, function, query)
+  are embedded, never data and never fields. `refresh_vectors(db, scope=, model=,
+  on_progress=, commit_batches=)` embeds what is stale (`_changed`: no vector of the
+  model or an old text hash) in batches of 64. **One embed-and-write at a time per
+  process**: an `asyncio.Lock` (`_writing()`, one per event loop) covers reading what
+  is stale, the embedding calls and the commit, so a catalogue or hint save, the
+  startup rebuild and the admin's run never send the same nodes twice nor write the
+  same `(node_id, model)` from two transactions (another app instance is not
+  covered). The import and startup path writes in one transaction that it commits
+  before it releases the lock (a failure writes nothing) and replaces a re-sent
+  node's vectors of every model; the admin's run passes `commit_batches`
+  (`_refresh_in_batches`: the lock per batch, the batch's nodes and hashes read again
+  under it so what a save embedded meanwhile is not sent again; each batch committed
+  once embedded and replacing vectors of the run's model only, so a failure or a
+  `ModelChanged` at batch n keeps the batches before it AND every node's vector of
+  the previous model; the next run sends only what is still stale) and checks the
+  model before each write and before the drop (`_still_in_effect`: a save that
+  changed it ends the run as `ModelChanged`, nothing more written or dropped; a check
+  that cannot tell, an unreadable setting or an empty discovery, is tried once more
+  and the run goes on with its model, the admin's or the environment's model being
+  compared by name). A refresh of ALL nodes that did not fail also deletes the
+  vectors of every other model (the startup rebuild too); the admin's run skips that
+  drop when its last check could not tell.
+  **`embedding_routes.py`** (`/admin/api/data-catalog/embeddings`, included by
+  `agents/admin.py` after the catalogue router, every route `require_admin`, raw JSON
+  <= 4 KB through `routes._json_body`, registered on the bare prefix: no trailing
+  slash): `GET` the status (`setting`, `effective_model`, `source`, `env_override`,
+  `deployed` (embedding deployments in any status, from `agents/aicore_deployments.py`,
+  while `effective_model` comes from gen_ai_hub discovery: two views, two caches),
+  `available` (offered models without a RUNNING, PENDING or UNKNOWN deployment),
+  `nodes`, `vectors` (of the effective model), `stale`, `running`, `progress`,
+  `last_run`, plus `resource_group` and `aicore_error` (a code: AI Core unreadable
+  still answers 200 with both lists empty, so no deploy is offered for a model whose
+  live state is unknown); the lists are read before the model is resolved and
+  cached 10 s, a failed read as well); `PUT` `{enabled, model}` (both required, `enabled` strictly
+  boolean, `model` 1..128 characters or `null`) answers the status; AI Core is asked
+  only when it switches on with a model other than the stored one: that model must be
+  in `list_deployments()`, read fresh, any status, else 422 `model: not a deployed
+  embedding model` (AI Core unreachable then: 502); switching off or keeping the
+  stored model never asks AI Core, so a deleted deployment or an unreachable AI Core
+  cannot keep an admin from switching off; `POST /run` (no body or `{}`) 202
+  `{running: true}`, 409 while a run is in flight or when no model is in effect (then
+  with `X-Embeddings-Error: no_model`); it reads the AI Core lists ONLY when no model
+  resolves (a deployment may have reached RUNNING since) and resolves once more after
+  them;
+  `POST /deploy` `{model}`: the name is checked (`EMBEDDING_MODEL_RE`) and must be
+  offered by `list_models()` (else 422 `model: not an embedding model AI Core offers`,
+  nothing logged), then ONE WARNING `AI Core deployment of <model> requested by
+  <principal> in resource group <rg>` (it bills), then `deploy(model)` in its own task,
+  awaited through `asyncio.shield` for at most 300 s (`DEPLOY_WAIT_SECONDS`: a deploy
+  makes at least six AI API calls of up to 30 s each plus the token, the lists' further
+  pages and a re-read after an unconfirmed create; a client that goes away does not
+  cancel it); 202 `{deployment_id, status, created}`,
+  idempotent (a live deployment of the model is answered, nothing created);
+  `model_unknown` is a 422, every other failure a 502 with a fixed text and the code
+  (`aicore_unavailable`, `token_failed`, `deploy_failed`) in `X-Embeddings-Error`;
+  one INFO line with the answer; the lists cache is dropped after every deploy; the
+  lifespan waits at most 15 s for deploys in flight (`drain_deploys`, never cancels
+  them: a create may already be with AI Core; one WARNING for what still runs), side
+  by side with the IDE approvals' drain (`asyncio.gather`: CF kills 10 s after
+  SIGTERM). No
+  undeploy route (an ops step in AI Core). **`embedding_run.py`**: one run per
+  process (`start` is a synchronous check-and-set; the task is created in the request
+  context; a save's or the startup rebuild's embedding takes turns with its batches
+  through the lock above), `progress` `{done, total}` (`done` counts nodes dealt
+  with) and `last_run` `{started_at, finished_at, model, embedded` (the vectors it
+  wrote; after a failure the nodes of the committed batches)`, error_class}` in
+  memory (gone at a
+  restart, not shared between instances; the vectors are rows and survive), cancelled
+  at shutdown (`cancel_all` in the lifespan: `finished_at` null, `error_class`
+  `CancelledError`). `search.py`
+  `find_sources(question, allowed_sources, tier, scope_tier, k=5)` filters to the
+  allowed sources BEFORE scoring (no leak of unattached sources through ranking or
+  empty results; an edge to a node outside the scope is dropped; `CANDIDATE_KINDS`
+  entity, function, query; `CHILD_KINDS` field, dimension, measure feed the boost and
+  `keys`; an InA query is answered, as a candidate and as a relation's end, under its
+  registration's slug, never its InA object name: the slug is what `run_query` takes);
+  `scope.py`: an agent's scope is its own `builtin:odata` services and
+  `builtin:ina` queries (`allowed_sources_of`, `listed_names`; a row with more than
+  one `builtin:ina` entry has no InA source, as the registry builds none), and
+  `node_sources` widens `("odata"|"generic", n)` to both catalogue kinds (the name is unique in
+  `odata_services`, so it names the one row; an InA query of the same slug stays
+  apart). `tool.py`: the toolset `data-catalog` with `find_data_source(question)` (≤ 5
+  candidates with hints, keys and one-hop relations, drawn links named like imported
+  ones, or a fixed hint) and `list_data_sources()`, attached by
+  `registry.build_orchestrator` to every specialist with at least one usable OData
+  service or InA query; above `DATA_CATALOG_INDEX_MAX` (10) sources of either kind the
+  `## OData services` / `## Analytical queries` blocks become a `## Data sources`
+  heading naming the two tools and the OData tools, the InA tools or both, and with
+  an InA entry the line "pass the returned name as `query` to `run_query`"
+  (`_data_catalog_instructions(count, odata_prefixes, ina_prefixes)`). `routes.py`
+  (`/admin/api/data-catalog`, each route `require_admin`, raw JSON ≤ 64 KB, 422
+  `<field>: <rule>`; an id is `_row_id`: `[0-9]{1,10}` and ≤ 2^31-1, else 404):
+  `GET /sources` (every kind: catalogue services under their own kind, InA queries
+  with `title`, `destination`, `user_context`, `enabled`, `used_by`;
+  `hint_completeness` 0..1 = the share of the source node, its entities, functions
+  and InA query (not fields, dimensions or measures) an admin saved hints for,
+  `curated_at` set; imported labels do not count), `GET /sources/{kind}/{name}`
+  (`odata` and `generic` (one row, either handle): source, entities with fields,
+  functions, edges, used_by; `ina`: source, `query: {node, dimensions, measures}`,
+  edges, used_by; never imported: `source: null`; unknown: 404; every edge carries
+  `id`, `curated` and both ends with `kind` / `source_kind`), `PUT /nodes/{id}/hints`
+  (label, purpose, not_for, synonyms ≤ 50, examples ≤ 20, readable; `_planned` reads
+  the registration of any kind, so a narrowed node is widened back at most to what it
+  allows, and refused once the registration is gone), `POST /search` ({question,
+  agent?} → candidates, `scope` agent|all, `mode` vector|lexical: `find_sources_detail`
+  answers `(candidates, mode)`, `vector` when the question was embedded and at least
+  one candidate had a vector of the effective model; the agents' tool keeps
+  `find_sources`), `GET /graph?agent=&kind=&q=` (`kind` one
+  node kind or several comma-separated, applied before the cap; ≤ 2,000 nodes,
+  `contains` edges, `truncated`; every edge `curated: bool`), `POST /rebuild`
+  ({source?} → counts; 503 on failure), **`POST /edges`** (201; `{from_id, to_id,
+  kind: same_object|aggregates}`, `extra="forbid"`, ids `StrictInt`; both nodes an
+  entity, query or function of different sources (odata and generic of one name are
+  one source); 409 "The two nodes are already linked" only for an edge of the SAME
+  kind between the pair, either direction, imported or drawn; check and insert in one
+  transaction: `begin_exclusive_write` on SQLite, both node rows `FOR UPDATE` in id
+  order on Postgres and HANA (`_lock_nodes_stmt`, the id column only); answers the
+  edge with `curated: true`) and **`DELETE /edges/{edge_id}`** (204; a conditional
+  `DELETE ... WHERE curated_at IS NOT NULL` by rowcount: an imported edge is 409, an
+  unknown id 404). The importer takes no node lock: a concurrent rebuild may drop a
+  drawn link's end, which the routes and the search then skip (an accepted gap). UI5
+  admin area "Data catalogue" (list with a kind filter, detail per kind with inline
+  hints, the Links panel and test search, graph on
+  `sap.suite.ui.commons.networkgraph` with a 2D/3D toggle, opening with every node kind
+  but `field`: `DEFAULT_GRAPH_KINDS` in `model/dataCatalog.ts`; the embeddings panel
+  on the Settings page; see `ui5-admin/`).
+  `tests/test_data_catalog.py`, `tests/test_data_catalog_kinds.py` (generic and InA
+  import, the routes per kind, the edge routes), `tests/test_data_catalog_links.py`
+  (kind flip, look-alike names, SAP's generic naming for rules (a) and (b) against the
+  recorded `$metadata`, cross-kind scope, curated edges against re-imports),
+  `tests/test_data_catalog_embeddings.py` (the setting, the resolution order, the
+  caches), `tests/test_data_catalog_embedding_routes.py` (the four routes, the run,
+  the deploy, `mode`). Embeddings and the panel's AI Core calls have never run
+  against a real AI Core yet
+- `agents/aicore_deployments.py` — the SAP AI Core deployments client of the
+  embeddings panel (design addendum l), standard library plus httpx only, no
+  `agents.*` import (pinned by a test): `list_models()` (`GET
+  /lm/scenarios/foundation-models/models`: `[{model, versions}]`, names holding
+  `embed`, case-insensitive), `list_deployments()` (`GET /lm/deployments?scenarioId=`:
+  `[{model, status, deployment_id}]` of the resource group in any status; the model
+  from `details.resources.backend_details.model.name` or `modelName`, else from a
+  `configurationName` of `<model>-embeddings` (`CONFIGURATION_SUFFIX`: a deployment
+  just created names no model yet; a model the details do name wins); a status that
+  cannot be read is `UNKNOWN`) and `deploy(model)` (it bills). Resource group
+  `AICORE_RESOURCE_GROUP` (blank = `default`). **Credentials from ONE source, in
+  gen_ai_hub's order**: `AICORE_CLIENT_ID` / `_CLIENT_SECRET` / `_AUTH_URL` /
+  `_BASE_URL` when any of the four is set (then all four; the log names the missing
+  variable names), else the `aicore` binding of `VCAP_SERVICES` (by label:
+  `clientid`, `clientsecret`, `url`, `serviceurls.AI_API_URL`); never mixed, https
+  only (http on loopback), no userinfo, query or fragment; a set
+  `AICORE_SERVICE_KEY` is refused (`aicore_unavailable`, the log names the
+  variable); an x509 binding and the SDK's config-file profiles are not read. On CF
+  only the binding is there (`mta.yaml` sets no `AICORE_*` credential). Token by
+  client credentials, cached until `expires_in` minus 60 s, fetched once at a time; a
+  token AI Core answered 401 to is not handed out again. **Lists are paged**
+  (`_list_all`): `/lm/deployments` and `/lm/configurations` are read in pages of
+  `$top=100` / `$skip=n`, and the read ENDS ON A PAGE SHORTER THAN `$top` (an empty
+  page included), never on `count`: if `count` were the page length, page one would
+  say 100 of 100 and a RUNNING deployment on page two would stay unseen (and be
+  deployed, and billed, again). `count` is only a consistency check, valid whether it
+  is the page length or the total: when present it must be a non-negative integer of
+  at least its page's entries, and at the end the entries received must be at least
+  the largest `count` seen; an absent `count` is accepted; an id on two pages (the
+  server ignored `$skip`, or the list moved) and more than `MAX_PAGES` (100) pages
+  refuse. A refusal is `aicore_unavailable`. A deployment list that cannot be read
+  stops `deploy` before anything is created; a CONFIGURATION list that cannot be read
+  is logged by code and falls through to a new configuration (it costs nothing: the
+  deployment list, read in full before it, is the barrier against billing twice).
+  **The residual**: a server that answers fewer than `$top` entries while more exist
+  (a page cap below 100, or `$top` ignored with a small default page) with `count`
+  absent or the page length is read as complete; task 7 of the plan probes `$top=1`
+  on acc. **Unverified**: the names of the paging parameters against a live AI Core
+  (`ai_api_client_sdk` sends `top` / `skip` for these endpoints, `ai_core_sdk`
+  `$top` / `$skip`); `$count=true` is not sent. **`deploy` is idempotent**, under a
+  per-process lock (two deploys take turns; ONE app instance assumed): a RUNNING,
+  PENDING or UNKNOWN deployment of the model is answered (`created: false`, RUNNING
+  preferred); a model that is not offered is `model_unknown` before anything is
+  created; the executable is the one whose `modelName` enum lists the model (the rule
+  of `scripts/deploy_claude.py`), else the model list's `executableId`, else
+  `deploy_failed`; a configuration of the same name (`<model>-embeddings`),
+  executable and scenario, with equal parameter bindings (any order) and no input
+  artifacts, is reused, otherwise one is posted (`modelVersion: latest` is bound only
+  when the executable declares that parameter: unverified); then `POST
+  /lm/deployments`. Every POST is sent once (only a 401 is repeated, with a new
+  token); a deployment create whose outcome is unknown (5xx, timeout, no id, a second
+  401) re-reads the list once under the lock and answers a live deployment found
+  there as `created: true`, with one WARNING. 30 s per request (httpx plus an
+  `asyncio.timeout`; `expired()` tells ours from the callee's), no redirect followed,
+  the body of an error status never read, answers streamed up to 8 MB, values from AI
+  Core kept only in identifier form (the UI and the route's WARNING show them).
+  `AICoreError(code)` with a fixed `.message`; the codes: `aicore_unavailable` (no or
+  unusable credentials, any failed or odd read), `token_failed`, `model_unknown`,
+  `deploy_failed`. A log line names the step and the status or exception class,
+  never a body, a URL, a token or a credential (httpx's own INFO request line, which
+  names the AI API host, is held back by `app.py` raising the `httpx` logger to
+  WARNING). `default_client()` is the per-process client that holds the token, built at
+  the first call of the module functions, `reset()` is for tests. Never run against a real AI Core
+  (`tests/test_aicore_deployments.py` on `httpx.MockTransport`; the scripted AI Core,
+  which answers `count` as the total, as the page length or not at all, is
+  `tests/aicore_helpers.py`). 693 lines: the credential resolution is the split
+  candidate (`agents/aicore_credentials.py`)
 - `agents/jira_tools.py` — in-process Jira tools over REST v2
   (`builtin:jira`), reached through a destination. JQL is built server-side
   from pinned `project`/`status` and a `lookback` ceiling; issues this
@@ -1091,7 +1713,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   attached service: name, title, purpose, "not for"; the text is stripped of
   control characters and of the delimiter tag); an entry with no usable
   service builds the agent without the OData tools; retired builds drain
-  their audit recorder
+  their audit recorder. For `builtin:ina` likewise: the snapshot of the
+  registered queries the agents name (their names kept in
+  `BuildResult.ina_queries`) and an `## Analytical queries` block (see
+  `agents/ina/`)
 - `agents/deep.py` — opt-in "deep agent" tools per specialist
   (`AgentConfig.deep_json`, parsed by `DeepConfig`): `write_todos`/
   `read_todos`, an in-memory per-run scratchpad (`ls`/`read_file`/
@@ -1543,6 +2168,290 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `tests/test_notifications.py`
 - `agents/chat_app.py` — `DynamicChatApp` ASGI wrapper that forwards to
   the current `Agent.to_web()` and is rebuilt on reload
+- `agents/webchat/` — the **web chat** at `GET /chat` (`templates/webchat.html`
+  + `static/chat/`), a Claude-style client next to the stock chat, which stays
+  at `/` (the stock app's catch-all `/{id}` used to answer `/chat` too; the new
+  route is registered before the mount and wins). Router prefix `/chat/api`,
+  every route `require_user`, owner-scoped by `current_principal` (`local-dev`
+  without XSUAA): a conversation or file of another user is 404. Tables
+  `chat_conversations`, `chat_messages` (one row per user and assistant turn:
+  `content`, `parts_json` = the rendered trail of `text`/`tool`/`file`/`note`
+  parts, `model_json` = pydantic-ai's `new_messages()` of that turn, which the
+  next turn concatenates as `message_history`; `Text` columns are never
+  compared) and `chat_files` (uploads and generated files as `LargeBinary`,
+  never selected in a list) are **HANA schema generation 4**. Design:
+  `docs/designs/2026-10-31-webchat.md` (local).
+  - `routes.py` — `GET /me` (principal, models, limits), conversations CRUD
+    (list newest first, `PATCH` title/model, `DELETE` 409 while running),
+    `POST /conversations/{id}/messages` (multipart `text` + `files` 0..5 +
+    `model`; answers an SSE stream: `start`, then `text`/`tool`/`note`/
+    `message`/`file` in arrival order, `error` on failure, `title` once,
+    `done`; `: ping` every 15 s; headers `Cache-Control: no-cache,
+    no-transform` and `X-Accel-Buffering: no` so the approuter does not buffer;
+    409 while a turn runs), `POST .../cancel` (the partial answer is kept,
+    status `canceled`), `GET .../stream` (re-attach: replay then live; 409
+    `not_running`), `GET /files/{id}` (`attachment` with `nosniff` and
+    `no-store`; `?inline=1` only for PNG/JPEG/PDF). A client disconnect does
+    not cancel the turn: it finishes and is stored
+  - `run.py` — one turn: conditional UPDATE idle→running, the prompt
+    (`BinaryContent` for PNG/JPEG/PDF, a delimited `<attachment>` block for
+    extracted text, the user text last), `registry.orchestrator.run(...,
+    toolsets=[docgen], event_stream_handler=..., model=<picked or None>,
+    usage_limits=run_usage_limits())` in its own task with the progress sink of
+    `chat_app.py` reproduced (`delegate_*` cards suppressed, specialists' tools
+    as `spec:` cards, the orchestrator's own tools as `own:` cards, heartbeat
+    "Working…" after 1.5 s), finalize through `describe_exception`; ghost
+    `running` conversations are reset at startup, live turns cancelled at
+    shutdown; one process (lock and cancel are in memory)
+  - `uploads.py` — media type by content, never by the declared type: PNG,
+    JPEG, PDF (≤ 50 pages) by magic bytes; `.docx`/`.xlsx` by `PK\x03\x04` +
+    extension + main part, text extracted with defusedxml / the SharePoint
+    reader's guarded archive, cut at 200,000 chars with a marker; `.txt`/
+    `.md`/`.csv`/`.json` only when UTF-8. Limits `CHAT_MAX_FILE_BYTES` (10 MiB),
+    `CHAT_MAX_FILES_PER_MESSAGE` (5), text 64 KiB; refusals are fixed texts
+    (413/415/422). The multipart reader is `agents/multipart_form.py`, shared
+    with the invoke API
+  - `docgen.py` + `md.py` — the document tools attached **per run** (never in the
+    registry build): `create_word_document`, `create_pdf_document`, `create_dashboard`
+    (see Dashboards below)
+    (markdown subset of `md.py`: headings, paragraphs with bold/italic/code,
+    lists, pipe tables, fenced code, hr) and `create_excel_workbook(sheets=
+    [{name, columns, rows}])` (bold frozen header, auto-filter, a cell starting
+    with `=` stored as text). Word is written as OOXML with `zipfile` and the
+    standard library; PDF with reportlab (built-in fonts: Latin-1, other
+    characters become `?`); Excel with openpyxl. **python-docx must not be
+    added**: it depends on lxml, and with lxml installed openpyxl stops using
+    defusedxml (`tests/test_sharepoint_requirements.py`). Files go to
+    `chat_files` through the `ChatRunContext` contextvar, never an argument;
+    caps 10 MiB, 10 per run, 500,000 cells; every refusal is `{"error": ...}`
+  - `store.py` — owner-scoped persistence, `CHAT_RETENTION_DAYS` (180, `0`
+    keeps) purge in the app's daily retention pass, `MAX_MESSAGES` 500
+  - **Usage and agent detail** (no table or column: parts and events only).
+    Every delegation is an `agent` part/event `{id` (the delegation's
+    `tool_call_id`)`, agent, parent` (the delegation it ran inside, `null` at
+    the top)`, status, prompt, output` (previews ≤ 400 chars, masked)`,
+    duration_ms, usage}`; a `tool` part carries `agent_id` (the delegation it
+    ran under, `null` for the orchestrator's own tools) and `duration_ms`;
+    a specialist's own `delegate_*` call is no tool card (the peer's `agent`
+    card is). One `usage` part/event per finished turn, before `done`:
+    `input_tokens, output_tokens, cache_read_tokens, total_tokens, requests,
+    tool_calls, model, duration_ms, agents[]`; totals are the whole run tree
+    (`result.usage()`), a specialist's share is the sum of
+    `ModelResponse.usage` over ITS run's `new_messages()`
+    (`registry.specialist_usage`), never `result.usage()`, which is the
+    shared cumulative object (`usage=ctx.usage`). `done` carries
+    `duration_ms`; the conversation detail answers `usage` summed over the
+    stored usage parts. The plumbing is in `agents/progress.py`:
+    `current_delegation` (a contextvar the delegation tool sets around
+    `specialist.run`, so every tool update carries `delegation_id` without a
+    change to the specialists' handlers), `delegation_start` with `prompt`
+    and `parent`, `delegation_end` with `ok`, `output`, `usage`,
+    `duration_ms`; all keyword arguments with defaults, so
+    `agents/run_activity.py` and `agents/chat_app.py` are unchanged.
+    `tests/test_delegation_usage.py`
+  - CSRF: the middleware's Origin check (`app.py`) covers `/chat/api` as well
+    as `/admin`; the client sends `X-Requested-With: XMLHttpRequest` on every
+    call. Tests: `tests/test_webchat_api.py`, `tests/test_webchat_docgen.py`,
+    `tests/test_webchat_uploads.py`
+  - **Personal agents and skills** (`my_models.py`, `my_store.py`,
+    `my_routes.py`, `user_agents.py`): a chat user's own agents and skills,
+    in `chat_user_agents` / `chat_user_skills` (owned by `principal`, unique
+    name per user case-insensitively via `name_key`; HANA schema generation
+    5 together with `chat_conversations.agent_ref`). A personal agent is
+    prompt-level only: name (`^[A-Za-z0-9][A-Za-z0-9 _.()-]{0,63}$`),
+    description, instructions (≤ 20,000), skills (`{scope: admin|mine,
+    name}`, ≤ 20), `consults` (≤ 10 admin agents that are enabled,
+    `expose_chat` and not approving: `chat_usable`), an optional model; no
+    MCP servers or built-ins of its own (it may attach an admin agent's shared
+    ones, see "Tools and connectors" below), no destinations, credentials or
+    personal peers, and **never in the registry build, A2A, jobs or the
+    invoke API**. Per user 50 agents and 100 skills (skill content ≤
+    50,000). A conversation's `agent_ref` (`null` = the orchestrator,
+    `admin:<name>` = that specialist run straight, with the document tools,
+    on its own model, holding `build.in_flight`; `mine:<id>` = a fresh
+    pydantic-ai `Agent` per turn: instructions + one `## Skill:` section per
+    resolvable skill + the document tools + the registry's delegation tool
+    for each usable consult) is validated at `POST`/`PATCH` (422 "Unknown
+    agent"); a ref that resolves to nothing at run time is a failed turn with
+    the fixed code `agent_unavailable`, a consult or skill that is gone is
+    skipped with one stored note. `GET /catalog` lists the admin agents a
+    user may reach and all admin skills by **name and description only**
+    (read-only in the UI). Export (`GET /my/export?agents=&skills=`) is a
+    `webchat-bundle/1` JSON of the user's OWN items (a selection brings the
+    own skills it attaches); import (`POST /my/import`, ≤ 1 MiB, multipart
+    `file` + `on_conflict` rename|replace|skip) validates per item, drops
+    references to admin agents/skills/models that do not exist here and
+    reports them (`dropped`), writes the valid items and reports the rest
+    (`errors` with fixed rule texts); deleting a skill or renaming it
+    updates the user's agents, deleting an agent resets the conversations
+    that pointed at it. `tests/test_webchat_my.py`,
+    `tests/test_webchat_user_agents.py`
+  - **Basic and advanced access** (`agents/access.py`). Two tiers: `basic`
+    (the `user` scope) and `advanced`, granted by the `developer` OR the
+    `admin` scope (`is_developer`; without an XSUAA validator everyone is
+    advanced, as `require_developer` admits everyone locally).
+    `AgentConfig.tier` (`basic` default | `advanced`; `AgentPayload.tier`
+    lax: absent keeps the stored value; in list/detail, export, import,
+    `scripts/import_bundle.py`, the seed loop; both admin UIs have a Tier
+    field) marks the developer agents (ABAP on ARC-1, UI5/Fiori, CAP deep
+    agents). `effective_tier()` = `current_access` (a contextvar the web chat
+    binds from the conversation's `access` column for the run) else the tier
+    the bound claims give; the orchestrator's delegation tools are registered
+    with a `prepare` (`_tier_gate`) that drops an advanced specialist's tool
+    in a basic run (peer tools are not gated; the "only ONE specialist" rule
+    is not applied when that one is advanced), and the orchestrator
+    instructions list advanced specialists under "Developer specialists
+    (advanced access only)". The classic chat, A2A and the IDE are gated by
+    the claims; jobs, workflows and invoke run named agents and are not. Web
+    chat: `/me` answers `developer`, `access_default`, `tiers`; `GET
+    /catalog?access=advanced` lists advanced admin agents only for a
+    developer/admin (every agent carries `tier`); `POST`/`PATCH
+    /conversations` take `access` (403 "Advanced access needs the developer
+    role" for anyone else, re-checked at every turn of an advanced
+    conversation before the run lock); an advanced admin or personal agent
+    named as `agent_ref` of a basic conversation is 422 "Unknown agent"; a
+    `PATCH` to basic resets an advanced `agent_ref` to the orchestrator. A
+    personal agent is `advanced` (computed live) when `deep` is on
+    (`chat_user_agents.deep`: the deep toolset with the default `DeepConfig`
+    and `scoped_deep_instructions`; its sub-agents get the document tools,
+    not its consults) or when it consults an advanced admin agent; `deep` and
+    advanced consults are accepted only from a developer/admin (422 at the
+    field), an import by anyone else drops them into `dropped`. The three
+    columns (`tier`, `access`, `deep`) are HANA schema generation 6. The seed
+    ships three DISABLED advanced deep agents (`abap-developer-deep` on a
+    destination placeholder `ARC1_DEV`, `ui5-fiori-developer-deep`,
+    `cap-developer-deep` on `*-replace-me.hana.ondemand.com` placeholders: a
+    `jwt` MCP URL must sit on `*.hana.ondemand.com` unless
+    `MCP_URL_ALLOWLIST` says otherwise) and the skills
+    `ui5-freestyle-conventions`, `fiori-elements-guidance`,
+    `cap-cds-modeling` (seed skills must not reuse IDE seed skill names:
+    `ensure_ide_seed` skips existing names). An admin's tier change applies
+    at the next reload, like `expose_chat`. `tests/test_access_tier.py`
+  - **The context of a conversation** (`context.py`): `GET
+    /conversations/{id}/context` answers what the next turn gets: `agent`
+    (ref, name, kind `orchestrator|admin|mine`, tier), `access`, `model`
+    (the id that will run and its `context_window`: a code table by substring,
+    `gpt-4o` 128k, `gpt-5` 400k, `claude` 200k, `gemini` 1M, overridden by
+    `CHAT_CONTEXT_WINDOWS` JSON, exact id then longest prefix; unknown
+    `null`), `instructions` (a personal agent's text always; the orchestrator's
+    and an admin agent's only for the `admin` scope, `is_admin` in
+    `agents/access.py`; skills: own with text, admin by name and length),
+    `history` (turns, messages, chars, `estimated_tokens` = chars/4 plus a
+    fixed figure per binary, `measured_tokens` = the `input_tokens` of the
+    last `ModelResponse` of the last stored turn, `attachments` of the
+    history with `excluded`), `tools` (document, deep, delegate targets the
+    tier allows; for an admin agent run straight also its own servers as
+    `connector` entries and, with at least one enabled OData service or InA query,
+    `find_data_source` / `list_data_sources` as `data_catalog`) and `usage`. Every upload enters the prompt as
+    `BinaryContent(identifier=<file_id>)` (the identifier survives
+    `ModelMessagesTypeAdapter`; it is never sent to the model in a user
+    prompt) or as an `<attachment id="<file_id>" …>` text block, so `POST
+    /conversations/{id}/context/attachments/{file_id}` with exactly
+    `{"excluded": bool}` can rewrite the stored `model_json` of that turn
+    (the part becomes `[attachment "<name>" removed from the context]`;
+    including puts the bytes or the extracted text back from `chat_files`),
+    under the conversation's run lock (409 while a turn runs), 404 for a
+    file that is not an upload of this conversation or whose turn stored no
+    history; `excluded` is derived from the history, no column.
+    `tests/test_webchat_context.py`
+  - **Tools and connectors for personal agents** (design addendum g). An
+    admin agent with `share_tools` (`agent_configs.share_tools`, NOT NULL,
+    `server_default "0"`; "Tools usable by personal agents" in both admin UIs;
+    `AgentPayload.share_tools` lax, absent or `null` keeps; export carries it;
+    the HTTP import, the seed and `scripts/import_bundle.py` store 1 only for
+    the JSON boolean `true`, the script refuses any other value) lends its MCP
+    servers and built-ins to personal agents: `BuildResult.shared_toolsets`
+    holds, for every enabled sharing row, the same guarded `servers` list its
+    specialist gets (never its own function tools: `load_skill`, `delegate_*`,
+    deep, IDE session tools). An agent whose `builtin:bitbucket` entry approves
+    cannot share (422 at `share_tools`, storage
+    `BITBUCKET_APPROVER_SHARE_MESSAGE`, nothing shared at build with one
+    WARNING). A personal agent names up to 5 sources in `tools`
+    (`chat_user_agents.tools_json`; `AgentIn.tools`): each must be enabled and
+    sharing (422 at `tools[i]` "not a tool source you can use"), an advanced
+    source makes the agent advanced and is accepted only from a developer/admin
+    ("advanced tools need the developer role"); an import drops a refused name
+    into `dropped` with a `rule` key and writes the agent without it.
+    `build_personal_agent` attaches `build.shared_toolsets[name]` for each
+    source that still shares and the turn's tier allows (a deep personal
+    agent's sub-agents get them too); with two or more sources every toolset is
+    prefixed by its source's name (`[^A-Za-z0-9_]` → `_`) so two connectors of
+    one name cannot collide; a source that is gone, disabled, no longer sharing
+    or above the tier is counted in the stored note ("… / n tool source(s) no
+    longer available"); a personal-agent turn holds the build's `in_flight`
+    counter so a reload cannot close the shared MCP clients mid-turn. `GET
+    /catalog` answers `tool_sources: [{name, description, tier, connectors}]`
+    (a connector label is the built-in's canonical URL or the MCP URL's host,
+    never a path, query, credential or destination name), filtered by tier
+    like `agents`; the context view lists `{"kind": "connector", "name",
+    "agent"}` per label of each attached source. The web chat editor has a
+    "Tools from admin agents" multi-select (advanced sources disabled for a
+    basic user), the lists a tools badge and a "Shares tools" tag.
+    `tests/test_webchat_tools.py`
+  - **Dashboards** (`dashboard.py`, design addendum i): the fourth document tool,
+    `create_dashboard(filename, title, widgets, description=None)`, stores a
+    validated spec (pydantic, `extra="forbid"`: 1..12 widgets of `bar | line |
+    area | pie | scatter` with `data {columns ≤ 20, rows ≤ 2,000}`, `x`, `y`
+    1..8 series (pie and scatter exactly one), `stacked` (bar/area only), `unit`,
+    `format number|percent|currency`, `size 1|2`, `note`; `kpi` with `value`,
+    `delta`, `delta_label`, `better higher|lower` (absent: the delta carries no
+    good or bad colour), `trend ≤ 60`; `table`; 200,000 chars of JSON, 1 MiB
+    stored; refusals `{"error": {code, message}}` with a 0-based place such as
+    `widgets[3].y: not a column of data`) as a `chat_files` row of media type
+    `application/vnd.sap-btp-agent.dashboard+json`, name `<filename>.dashboard.json`;
+    the answer carries `title` and `widgets` (count) next to the usual keys, and so
+    do the `file` part and event. The preview answers `kind: "dashboard"` with the
+    spec (defaults filled in), never `inline`. The web chat draws it itself
+    (`static/chat/render/charts.js` SVG, `render/dashboard.js`): no chart library,
+    fixed categorical palette in both themes (validated with the hub's `dataviz`
+    skill), one y axis, legend for ≥ 2 series, direct labels, hover tooltips, a
+    "Table" toggle behind every chart, "Download HTML" (standalone, no script) and
+    "Download data". The model never receives the SVG.
+    `tests/test_webchat_dashboard.py`, the dashboard section of
+    `tests/test_webchat_ui.mjs`
+  - **The viewer** (`preview.py`, design addendum f): a panel beside the
+    messages that shows a file of the conversation or, in an advanced
+    conversation, a code block the model wrote. `GET /files/{fid}/preview`
+    (owner-scoped, 404 otherwise) answers JSON by `kind`, `Cache-Control:
+    private, no-store`, parsed in a worker thread from the STORED media type,
+    never the name: `.xlsx` → `sheets` (openpyxl read-only through the guarded
+    archive `extract_xlsx` uses, cached values only; 10 sheets, 200 rows × 50
+    columns, `columns` are the column LETTERS, `row_count`, `truncated`; dates
+    ISO, `=` strings stay strings), `.docx` → `document` blocks (heading
+    1..6 from `Title`/`Heading n`, paragraph, list with `ordered` only for a
+    known `w:numFmt`, table 100 × 20 with nested tables flattened; 2,000
+    blocks / 200,000 chars; defusedxml, reusing `check_office_archive` and
+    `_paragraph_text`), text/markdown/csv/json → `text` (200,000 chars), PNG /
+    JPEG / PDF → `inline` with the `?inline=1` URL; any other type 415 `No
+    preview for this file type`, unreadable bytes 422 `The file could not be
+    read`. Nothing of a preview is stored. The front end (`viewer.js`) derives
+    the items from the conversation it holds (generated `file` parts, the
+    user's uploads, and in `access === "advanced"` every closed backtick code
+    block of an assistant message except `mermaid`; latest 50 of each), opens
+    on a file card's name/icon or the "Open" button of a code block header
+    (advanced only), opens itself at `done` for a generated file or (advanced,
+    no file) a code block of ≥ 5 lines unless the user closed it since the last
+    send, and is a two-column grid from 1100 px (`main.with-viewer`), an
+    overlay below. A code item downloads as the `file:` line's name or
+    `snippet-<n>.<ext>`. `tests/test_webchat_preview.py`, the viewer section
+    of `tests/test_webchat_ui.mjs`. The vendored highlight.js has no ABAP
+    grammar: ABAP shows uncoloured (a third-party grammar would be a vendored
+    file; not added)
+- `static/chat/` + `templates/webchat.html` — the web chat front end: vanilla
+  ES modules, no build step, nothing from a CDN (`static/vendor/`: marked,
+  DOMPurify, mermaid, highlight.js 11.12.0 with two GitHub themes). `api.js`
+  (every call with `X-Requested-With`, a hand-written SSE parser over the
+  `fetch` POST body, 401 → "Session expired" banner), `state.js` (parts
+  reducer), `render/*` (sidebar grouped Today/Yesterday/Previous 7 days/Older,
+  markdown through DOMPurify with copy buttons and mermaid, the collapsible
+  activity strip as a tree of agent cards (prompt, nested tool rows, answer,
+  duration, tokens) and the orchestrator's own tool rows, a usage line under
+  each answer and a conversation token total in the header, file cards, image
+  thumbnails), `composer.js` (Enter sends,
+  attach / drag-and-drop / paste, chips, Stop), `theme.js`. Same-origin
+  `/oauth/login` popup handling as `templates/chat.html`. Tests:
+  `node tests/test_webchat_ui.mjs` (jsdom); `tests/e2e/webchat_fake_server.py`
+  serves the page on a scripted backend for browser work
 - `agents/workflow_runner.py` — runs a workflow: the declared main line, a
   fan-out step returning `WorkItem`s, and per-item branches the fan-out step
   selects. Mirrors `job_runner.py` (task set, start lock, the stale sweep at
@@ -1583,8 +2492,11 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `ui5-admin/webapp/model/stepKinds.ts` and the step editors in both admins
 - `agents/admin.py` — FastAPI `/admin` router: agent + skill + workflow CRUD,
   reload, restart, import/export, seed-on-startup. It includes the OData
-  catalogue router (`agents/odata/admin_routes.py`). Export carries
-  `odata_services`; import takes them first (up to 200, `enabled` required,
+  catalogue router (`agents/odata/admin_routes.py`) and the InA router
+  (`agents/ina/admin_routes.py`). Export carries `odata_services` and
+  `ina_queries` (the latter imported right after the former, with the same
+  rules and `*_ina_queries` answer keys; see `agents/ina/`); import takes
+  them first (up to 200, `enabled` required,
   a duplicate name refused, unchanged services not restamped) and with
   `replace` deletes only a service that is absent from a non-empty section
   and attached by no remaining agent; the answer adds
@@ -1617,7 +2529,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `GET /admin/api/credential-health` lists a
   `builtin:odata` entry once per attached service (`service`,
   `service_enabled`, `destination`, `user_context`, `state`: `resolvable` |
-  `error` | `unbound` | `missing`); the `error` of every destination entry
+  `error` | `unbound` | `missing`) and a `builtin:ina` entry once per query it
+  names (`query`, `query_enabled`, the same keys; both through
+  `_record_destination_health`); the `error` of every destination entry
   (OData and the other built-ins alike) for a failed resolve is a fixed text
   ending in a code (`agents.odata.destinations.destination_failure`), any
   other failure "the destination could not be checked (<Class>)"; the
@@ -1744,13 +2658,24 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   URL passes through while it is typed (a half-typed name, another type)
   unticks nothing. An approving agent that is
   still exposed to chat is refused by the server (422, fixed text). It asks
-  no question when approving is switched on. The invoke API's settings
+  no question when approving is switched on. It does not offer
+  `builtin:ina` (no hint or option names it): a STORED `builtin:ina` row on
+  `destination` keeps its block on the row (`dataset.keptIna`) and is posted
+  back exactly as loaded (`has_client_secret` left out), shown as a
+  "Queries: a, b" line (`textContent`, names are data) with the fixed note
+  "Edited in the UI5 admin (Analytical queries)" and no destination field;
+  a typed one, a row without the kept block or one whose mode changed is
+  refused before the save with the fixed `INA_REFUSAL`, and a kept row whose
+  URL is edited to another built-in is an ordinary row. The invoke API's settings
   ("Expose to the invoke API", "Result schema (JSON)", the four attachment
   limits) sit under the run-endpoint hint: a schema that is not JSON or not
   an object and a count that is not a whole number are refused before the
   save with a fixed text; all limits blank sends `invoke_limits: null`; an
   untouched max-MB field sends the stored byte count back unchanged; the
-  list row shows an "Invoke" tag. The admin payload (`AgentPayload`) treats
+  list row shows an "Invoke" tag. A **Tier** select (Basic / Advanced, next to
+  "Available in chat", with a hint) is always sent as `tier`; an advanced
+  agent's row carries an "Advanced" tag; an agent loaded without `tier` is
+  shown and sent as basic (`agents/access.py`). list row shows an "Invoke" tag. The admin payload (`AgentPayload`) treats
   an ABSENT `expose_invoke` / `result_schema` / `invoke_limits` key as "keep
   what is stored" (`invoke_kwargs`, by `model_fields_set`), so an older
   client cannot wipe them, and an explicit `false` / `null` switches off or
@@ -1859,6 +2784,11 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     API slug input is always editable (before only with "Expose as an
     API-triggered job" on: an invoke-only agent could never get a slug).
     `test/unit/invokeSettings.qunit.ts`, six OPA tests in `AgentJourney.ts`
+  - Tier: a `Select` on the agent page bound to `tier` (Basic / Advanced, i18n
+    keys `tier*`, a hint), always sent on save, `basic` for a new agent or one
+    loaded without it; the list shows an "Advanced" `ObjectStatus`
+    (`AgentJourney.ts`, `FakeBackend.ts` refuse another value with a 422 at
+    `tier`).
   - Notifications: a bell with the unread count (also in its tooltip, for
     screen readers) and a toast in the app shell for finished agent and
     workflow runs, logic in `model/notifications.ts`. `GET notifications` is
@@ -1872,6 +2802,108 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     answered poll shows no toast, and inside a host shell that hides the
     header there is no bell, poll or toast. `e2e/notifications.spec.ts` checks
     it against the real backend.
+  - **Analytical queries** (`builtin:ina`, `agents/ina/`; nav entry
+    `inaQueries` between OData services and Data catalogue; routes
+    `ina-queries` and `ina-queries/{name}`): `view/InaQueries` (title and
+    name, query and package, destination, Runs as, used by, described at,
+    enabled; a client-side search on title, name and InA name; the Create
+    dialog `fragment/InaCreateDialog` sends exactly the nine payload keys as
+    typed and no definition, then opens the detail) and `view/InaQueryDetail`
+    (identity, purpose / not for, used by, the described dimensions,
+    measures and variables read-only). Save is a GET plus a `PUT` with
+    `expected_updated_at` that never carries `definition` or
+    `metadata_fetched_at` (the server keeps what Describe stored); a change
+    of Runs as, destination or InA name of a query in use is asked about
+    (Cancel is the default); leaving with unsaved changes asks
+    (`controller/LeaveGuard.ts`). Describe needs the changes saved and
+    re-reads the query (it moves `updated_at`; its 409 reloads); Test shows
+    status, duration and column names, never a value, and its 422
+    `variable_required` as Information; a 429 `busy` is a Warning strip with
+    a fixed text in both, never a dialog (`controller/ina/DescribeTest.ts`,
+    `controller/ina/QueryDelete.ts`, page state in `model/inaDetail.ts`, the
+    rules in `model/inaQueries.ts`, whose `validateInput` mirrors
+    `InaQueryPayload` rule for rule). `controller/DestinationField.ts` is the
+    OData page's destination field as a reusable class (suggestions, value
+    help, phone picker, Runs-as notice); the InA pages use it, the OData page
+    and its Duplicate dialog still hold their own copy. `service/inaTypes.ts`;
+    `AdminService` reads `X-Ina-Error` as the code next to `X-OData-Error`
+    and `X-Ina-Reloaded` / `X-Ina-Reload-Failed` on a delete. Tests:
+    `test/integration/FakeIna.ts`, `InaJourney.ts`, `inaQueries.qunit.ts`,
+    `AdminServiceDataAccess.qunit.ts`
+  - Agent server dialog, toolset "Analytical queries (InA)"
+    (`model/inaEntry.ts` mirrors `_validate_ina_entry` / `_clean_ina_entry`
+    and adds no rule; the dialog logic is `controller/agent/InaEntryPart.ts`):
+    auth mode fixed to destination, a multi-select of the registered queries
+    showing "Runs as" (a disabled or unregistered one keeps its token,
+    marked), the scheduled-run warning for a signed-in-user query on an agent
+    with a run endpoint, at most one entry per agent; the entry is always sent
+    as exactly `{queries}` (names as typed; `destination`, `user_context` and
+    the `has_client_secret` echo dropped). `AgentInaJourney.ts`
+  - OData services Kind (`odata` | `generic`): `odataKind`, a
+    `SegmentedButton` (OData service / Generic (ZAGENT_DATA)) like Runs as and
+    the version; generic locks the version on V2 and shows an information
+    strip; a "Generic" tag on the list row and the page. `operationIsWrite(
+    operation, serviceKind)` in `model/odataCatalog.ts` is the TS mirror of
+    `operation_is_write` (service AND operation kind), threaded through the
+    Write tag, the pending strip (`pendingWrites` / `pendingReads` judge each
+    side by its own kind, so a kind flip is a pending read or a pending
+    write), what Allow writes opens (`odataEntry.opens`), a bundle
+    (`importBundle.ts`) and the file import; a read-by-kind operation's
+    Changes data box is not editable. `payloadOf` always sends `kind`: the
+    server's default for an absent key is `odata`, which would turn a generic
+    service back into odata. `odataKind.qunit.ts`
+  - Data catalogue (`agents/data_catalog/`): a kind filter on the list
+    (`dcKindFilter`); the detail per kind (an InA source lists its query,
+    dimensions and measures in the entities table; an icon per node kind);
+    the **Links** panel in place of the relations list (`dcLinksTable`: From,
+    Relation, To, Origin "Added by an admin" / "Imported", a remove only on a
+    drawn link, asked first) with "Add link"
+    (`fragment/DataCatalogLinkDialog`, `controller/dataCatalog/LinkDialog.ts`:
+    From (the source's entities and functions, or its query), `same_object` /
+    `aggregates`, a search over the entities, queries and functions of OTHER
+    sources; a 409 or 422 is shown in the dialog; the new edge is added
+    without a reload, so unsaved hint edits survive). The graph page has a
+    2D / 3D toggle (`dcGraphMode`, a `SegmentedButton`; 2D, the network
+    graph, stays the default and the accessible view; drawn links are dashed):
+    3D draws the same `GET /graph` answer on a `<canvas>` with an
+    `aria-label`, no library and no WebGL; the math is the pure
+    `model/graph3d.ts` (sources on a ring, their nodes on tilted rings, fields
+    on a third, perspective projection, a hit test that picks the front-most
+    node, the draw list; QUnit on a recording fake 2D context) and the
+    controller only sizes the canvas and wires drag (rotate), wheel (zoom),
+    hover and click (opens the source's detail), with a slow auto-rotation
+    until the first drag. The detail's Test search shows the answer's `mode`
+    ("Ranked by vectors" / "Ranked by words")
+  - Data catalogue embeddings (design addendum l): a panel on the Settings page
+    after "LLM model" (`embeddingsPanel` in `view/Settings.view.xml`, its logic
+    in `controller/settings/Embeddings.ts` over the pure
+    `model/embeddingsSettings.ts`, types in `service/dataCatalogTypes.ts`,
+    `AdminService.getEmbeddings` / `setEmbeddings` / `runEmbeddings` /
+    `deployEmbeddingModel` on the bare `data-catalog/embeddings`): status lines
+    (Effective model and where it comes from, Vectors n of m nodes, Stale, Last
+    run), a strip when `AICORE_EMBEDDING_MODEL` is set ("in effect" only when the
+    source is `env`; a model chosen here wins over it), a Switch "Use
+    embeddings", a Select "Model" (Automatic under the key `__automatic__`, as a
+    `Select` reads "" as no selection; each deployed embedding model once with
+    its status; a saved model no longer deployed stays, marked "(not
+    deployed)"), Save (a GET first: a setting changed elsewhere meanwhile is
+    shown and not overwritten; then the PUT with both keys; a 422 at `model`
+    marks the Select), "Compute embeddings now" (202, then the status polled
+    every 2 s ONLY while `running` and the page is shown, 10 s after a failed
+    poll; leaving the page stops it, coming back reads the status and resumes;
+    a toast with the count or the error class when the run ends) and "Deploy an
+    embedding model…" (`fragment/EmbeddingsDeployDialog`: the `available`
+    models, then a confirmation with Cancel focused that names the model, the
+    resource group and that AI Core bills for it as long as it runs; after the
+    202 the status shows the PENDING deployment). No undeploy (an ops step in
+    AI Core). `test/unit/embeddingsSettings.qunit.ts`,
+    `test/integration/FakeEmbeddings.ts` (a scripted run and deploy),
+    `EmbeddingsJourney.ts`
+  - OPA convention: a `Select` is driven by `setSelectedKey` plus
+    `fireChange` on the control (a `MultiComboBox` by `setSelectedKeys`),
+    never by opening its picker: a picker opened by one journey was destroyed
+    by a later test's sweep and aborted the whole karma run ("valueStateText
+    was destroyed"); a choice of two or three is a `SegmentedButton`
 - `agents.seed.json` — Initial config imported when DB is empty. Holds the
   agent `pr-reviewer` with the skill `pull-request-review` (what to read,
   the blocking findings, how to choose the verdict; an administrator edits
@@ -1951,7 +2983,60 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   run still failed on 2.25.1), no descriptor change besides the version;
   2.26.0 is the `builtin:confluence` release (`agents/confluence_tools.py`):
   no new resource, environment variable, table or column (HANA schema
-  generation unchanged)
+  generation unchanged); 2.27.0 is the web chat release (`agents/webchat/`): no
+  new resource, one environment variable `CHAT_RETENTION_DAYS` (180), five
+  new tables and four columns (HANA schema generation 6: the three chat
+  tables are generation 4, the personal agents/skills tables and
+  `chat_conversations.agent_ref` generation 5, `agent_configs.tier`,
+  `chat_conversations.access` and `chat_user_agents.deep` generation 6),
+  `reportlab` in `requirements.txt`; 2.28.0 is the advanced-access release
+  (`agents/access.py`, the `tier` of admin agents): no new resource,
+  environment variable or role (advanced = the existing `developer` or
+  `admin` scope); schema generation 6 is deployed by it; 2.29.0 adds the context view of a
+  conversation (`agents/webchat/context.py`): no new resource, variable,
+  table or column (`CHAT_CONTEXT_WINDOWS` is optional and not in the
+  descriptor); 2.29.1 is the fix of the first signed-in test on acc/AI: the
+  token counts of AI Core's GPT deployments (every usage line, the context
+  view's measured size) were 0 (`SAPAICoreModel` reads them directly now and
+  asks a stream for its usage chunk; `AICORE_STREAM_USAGE=0` strips
+  `stream_options` again, not in the descriptor), and streamed text parts
+  around a tool call are shown as separate paragraphs; 2.30.0 adds the web
+  chat's viewer (`agents/webchat/preview.py`, `static/chat/render/viewer.js`):
+  no new resource, variable, table or column; 2.31.0 adds tools and connectors
+  for personal agents (`agent_configs.share_tools`, `chat_user_agents.tools_json`:
+  HANA schema generation 7, no new resource, variable or role); 2.31.1 is layout
+  polish of the web chat after the first look at acc (sidebar rows, agents page,
+  viewer header), no descriptor change besides the version; 2.32.0 is the
+  `builtin:git` release (`agents/git_tools.py`): no new resource, environment
+  variable, table or column (HANA schema generation unchanged); the credential of
+  a remote is a BTP destination created per landscape; 2.33.0 adds dashboards
+  (`create_dashboard`, `agents/webchat/dashboard.py`, drawn by the web chat's own
+  SVG renderer): no new resource, variable, table or column; 2.34.0 adds the data
+  catalogue graph (`agents/data_catalog/`: three new tables, HANA schema generation 8,
+  optional `AICORE_EMBEDDING_MODEL` / `DATA_CATALOG_EMBEDDINGS`, not in the descriptor)
+  and the InA probe `scripts/probe_ina.py`; 2.34.1 is the fix of the first signed-in look at
+  the catalogue on acc/AI (hint completeness counts only admin-written hints, the graph opens
+  without fields, the detail Name column, the context view lists an admin agent's own tools):
+  no descriptor change besides the version; 2.35.0 adds `builtin:ina` (`agents/ina/`: the
+  table `ina_queries`), the kind `generic` of an OData service (`odata_services.kind`) and
+  admin-drawn catalogue links (`data_catalog_edges.curated_at`): together HANA schema
+  generation 9 (one new table, a column added to each of two tables in place by the HDI
+  deploy, nothing undeployed, no `HANA_HDI_ALLOW_DROP`); no new resource, environment
+  variable or role; the 3D overview of the catalogue graph. Unverified on a landscape: the
+  InA data read (recorded and synthetic shapes only, no SIA query was named for this
+  release) and the generic kind (run locally only, against the recorded `$metadata` of
+  A4H's `ZAGENT_DATA_SRV`: A4H is not reachable from BTP); 2.36.0 lets an admin switch
+  the catalogue's embeddings on, compute the vectors and deploy an embedding model in
+  AI Core from the UI5 admin's Settings page (design addendum l:
+  `agents/data_catalog/embedding_routes.py`, `embedding_run.py`,
+  `agents/aicore_deployments.py`): `orchestrator_config.embeddings_enabled` /
+  `embedding_model`, HANA schema generation 10 (two columns added to the table in
+  place by the HDI deploy, nothing undeployed, no `HANA_HDI_ALLOW_DROP`); no new
+  resource, environment variable or role (the AI Core calls use the app's `aicore`
+  binding and `AICORE_RESOURCE_GROUP`); a deployment requested from the UI bills and
+  is logged as one WARNING naming the principal and the resource group; no undeploy
+  from the UI. Unverified on a landscape: every AI Core call of the panel (the lists,
+  the names of the paging parameters, the deploy) and the embedding itself
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets
@@ -1959,10 +3044,15 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   rows go from one database to the other inside one process, never through
   a file, a bundle, an argument or a log. **It copies configuration, not
   history**: `agent_configs` (every column), `skill_configs`, the
-  orchestrator row, `workflows` with branches and steps, `odata_services`,
-  `ide_conventions`, `mcp_oauth_clients`, `mcp_oauth_tokens`; not job or
-  workflow runs, the audit logs, IDE sessions and their children, OAuth flow
-  states, the notification read markers (`admin_notification_state`). Rows are matched by natural key (integer ids are the target's own;
+  orchestrator row, `workflows` with branches and steps, `odata_services`
+  (with their `kind`), `ina_queries` (by name, with the stored description and
+  its stamp), `ide_conventions`, `mcp_oauth_clients`, `mcp_oauth_tokens`; not
+  job or workflow runs, the audit logs, IDE sessions and their children, OAuth
+  flow states, the notification read markers (`admin_notification_state`),
+  the web chat's tables and the data catalogue (`data_catalog_*`: the app
+  rebuilds the graph from the registrations at start, so an admin's hints and
+  drawn links stay behind in the source). Rows are matched by natural key
+  (integer ids are the target's own;
   branches and steps follow their workflow's name); a target row of the same
   key is replaced, other target rows are left alone; a second run changes
   nothing; one transaction on the target. The target's schema must exist
@@ -2094,13 +3184,21 @@ SAP AI Core's Generative AI Hub is the LLM provider.
    written -> `GET /api/invoke/runs/{run_id}` answers result, the OData
    writes of the run (audit rows by `run_id`), text, activity and error to
    that caller only
+9. `POST /chat/api/conversations/{id}/messages` (the web chat, as the
+   signed-in user): the conversation is locked idle→running -> uploads are
+   read, sniffed and stored -> user and assistant rows -> the orchestrator
+   runs with the stored history, the attachments and the three document
+   tools -> the SSE stream relays text, tool cards, notes and generated files
+   -> the turn is stored (content, parts, `new_messages()`), the title set,
+   the lock released
 
 ## Running locally
 ```bash
 pip install -r requirements.txt
 cp .env.example .env  # AICORE_* + (optional) DATABASE_URL
 python app.py         # listens on 127.0.0.1; HOST=0.0.0.0 to open it up
-# Chat:  http://127.0.0.1:7932/chat
+# Chat:  http://127.0.0.1:7932/       (stock pydantic-ai UI)
+# Web chat: http://127.0.0.1:7932/chat  (agents/webchat; conversations, uploads, Word/PDF/Excel)
 # Admin: http://127.0.0.1:7932/admin  (no XSUAA locally → open access)
 ```
 
@@ -2117,6 +3215,9 @@ bump a pin, rerun the suites, then deploy.
 - `fastapi`, `jinja2`, `python-multipart` — admin UI
 - `builtin:odata` adds no dependency: `$metadata` is parsed with the standard
   library's expat
+- `reportlab` — the web chat's `create_pdf_document` (`agents/webchat/docgen.py`);
+  Word files are written with the standard library on purpose (python-docx
+  would bring lxml, see the next entry)
 - `openpyxl` and `defusedxml` — `builtin:sharepoint` reads `.xlsx`; openpyxl
   uses defusedxml when it is installed and then refuses entity declarations
   (not a DTD as such). That holds only without `lxml`: with it openpyxl

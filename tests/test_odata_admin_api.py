@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -412,6 +413,60 @@ async def test_duplicate_copies_the_definition_under_a_new_identity(client, crea
     # The original is untouched.
     original = (await client.get(ONE)).json()
     assert original["destination"] == "S4_ODATA_USER" and original["user_context"] is True
+
+
+async def test_duplicate_of_a_generic_service_is_generic(client):
+    """``kind`` is part of the copied definition: a copy of the ZAGENT_DATA
+    registration keeps its rules, and the copy of a plain one stays plain."""
+    r = await client.post(BASE, json=good(name="zagent-data", kind="generic"))
+    assert r.status_code == 201, r.text
+    r = await client.post(f"{BASE}/zagent-data/duplicate", json={"name": "zagent-data-jobs"})
+    assert r.status_code == 201, r.text
+    assert r.json()["kind"] == "generic"
+    assert (await client.get(f"{BASE}/zagent-data-jobs")).json()["kind"] == "generic"
+    assert (await client.post(BASE, json=good(name="plain"))).status_code == 201
+    r = await client.post(f"{BASE}/plain/duplicate", json={"name": "plain-copy"})
+    assert r.status_code == 201 and r.json()["kind"] == "odata"
+
+
+async def test_making_a_service_generic_is_one_warning_with_service_and_principal(
+    client, caplog
+):
+    """Kind ``generic`` trusts whatever is registered as generic (a GET
+    function import becomes an unaudited read, a complex result reaches the
+    model whole): a create or update that sets or changes the kind to it is
+    one WARNING naming the service and the caller's principal, never the
+    body. Keeping it generic, or a save back to ``odata`` (a ``PUT`` without
+    ``kind`` resets it: the stricter direction), says nothing."""
+    caplog.set_level(logging.INFO, logger="agents.db")
+
+    def lines() -> list[logging.LogRecord]:
+        return [r for r in caplog.records
+                if r.name == "agents.db" and "kind generic" in r.getMessage()]
+
+    r = await client.post(BASE, json=good(kind="generic", title=SECRET))
+    assert r.status_code == 201, r.text
+    [line] = lines()
+    message = line.getMessage()
+    assert line.levelno == logging.WARNING
+    # Without an XSUAA binding the middleware binds this principal.
+    assert "'purchase-requisitions'" in message and message.endswith(" by local-dev")
+    for value in (SECRET, "S4_ODATA_USER", "API_PURCHASEREQ_PROCESS_SRV", "ReleaseItem"):
+        assert value not in message
+    caplog.clear()
+    assert (await client.put(ONE, json=good(kind="generic", title="Again"))).status_code == 200
+    assert lines() == []
+    r = await client.put(ONE, json=good())
+    assert r.status_code == 200 and r.json()["kind"] == "odata" and lines() == []
+    assert (await client.put(ONE, json=good(kind="generic"))).status_code == 200
+    assert len(lines()) == 1
+    caplog.clear()
+    r = await client.post(f"{ONE}/duplicate", json={"name": "pr-copy"})
+    assert r.status_code == 201 and r.json()["kind"] == "generic"
+    assert [m.getMessage().split("'")[1] for m in lines()] == ["pr-copy"]
+    caplog.clear()
+    assert (await client.post(BASE, json=good(name="plain"))).status_code == 201
+    assert lines() == []
 
 
 async def test_duplicate_keeps_identity_fields_it_is_not_given(client, created):

@@ -31,7 +31,7 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import SplitResult, urlsplit
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, Response, status
@@ -42,44 +42,38 @@ from pydantic import (
     ConfigDict,
     Field,
     HttpUrl,
+    PrivateAttr,
     StrictBool,
     StrictStr,
     ValidationError,
+    ValidationInfo,
     field_validator,
     model_validator,
 )
 
+from agents import git_config
 from agents.auth import current_base_url, current_principal, require_admin
-from agents.chat_app import dynamic_chat_app
-from agents.builtins import BUILTIN_URLS, is_builtin_url
-from agents.confluence_tools import BUILTIN_CONFLUENCE_URL, normalize_spaces
-from agents.jira_tools import BUILTIN_JIRA_URL
-from agents.mail_render import MailTheme
-from agents.odata import BUILTIN_ODATA_URL
-from agents.odata.models import MAX_DEFINITION_BYTES, SERVICE_NAME_RE
-from agents.outlook_tools import BUILTIN_OUTLOOK_URL
-from agents.sapnotedetail_tools import BUILTIN_SAPNOTEDETAIL_URL
 from agents.bitbucket_config import BUILTIN_BITBUCKET_URL
 from agents.bitbucket_config import check_entry as check_bitbucket_entry
 from agents.bitbucket_config import clean_entry as clean_bitbucket_entry
-from agents.sharepoint_tools import BUILTIN_SHAREPOINT_URL
-from agents.sharepoint_views import check_pins, clean_views
-from agents.slack_tools import BUILTIN_SLACK_URL
-from agents.smtp_tools import BUILTIN_SMTP_URL, is_address
-from agents.teams_tools import BUILTIN_TEAMS_URL
-from agents.validation_errors import validation_item
-from agents.invoke_config import check_result_schema, clean_limits
+from agents.builtins import BUILTIN_URLS, is_builtin_url
+from agents.chat_app import dynamic_chat_app
+from agents.confluence_tools import BUILTIN_CONFLUENCE_URL, normalize_spaces
 from agents.db import (
-    AUTH_MODE_JWT,
-    AUTH_MODE_NONE,
     AUTH_MODE_APP_ONLY,
     AUTH_MODE_DESTINATION,
+    AUTH_MODE_JWT,
+    AUTH_MODE_NONE,
     AUTH_MODE_OAUTH2,
     AUTH_MODE_SESSION,
     BITBUCKET_APPROVER_CHAT_MESSAGE,
     BITBUCKET_APPROVER_INVOKE_MESSAGE,
+    BITBUCKET_APPROVER_SHARE_MESSAGE,
     BITBUCKET_SINGLE_ENTRY_MESSAGE,
     BUILTIN_PUBLIC_KEYS,
+    GIT_SINGLE_ENTRY_MESSAGE,
+    INA_ENTRY_KEYS,
+    INA_SINGLE_ENTRY_MESSAGE,
     KEEP,
     MAX_ODATA_ENTRY_SERVICES,
     OAUTH_CONFIG_MODES,
@@ -89,15 +83,19 @@ from agents.db import (
     SessionLocal,
     agent_referrers,
     agent_where_used,
+    begin_exclusive_write,
     bitbucket_approves,
     check_bitbucket_approver_reach,
     check_delegation_name_collision,
+    check_ina_queries,
+    check_odata_services,
+    create_ina_query,
+    create_odata_service,
     delete_agent,
+    delete_ina_query,
+    delete_odata_service,
     delete_skill,
     delete_workflow,
-    check_odata_services,
-    create_odata_service,
-    delete_odata_service,
     describe_referrers,
     get_active_model_name,
     get_agent,
@@ -109,7 +107,10 @@ from agents.db import (
     get_workflow_by_name,
     get_workflow_parts,
     get_workflow_run,
+    ina_entries,
+    ina_query_referrers,
     list_agents,
+    list_ina_queries,
     list_item_runs,
     list_odata_services,
     list_skills,
@@ -119,8 +120,8 @@ from agents.db import (
     normalize_skills_json,
     odata_entries,
     odata_service_columns,
-    odata_service_unchanged,
     odata_service_referrers,
+    odata_service_unchanged,
     prepare_servers,
     prepared_server_list,
     rename_agent_references,
@@ -129,17 +130,37 @@ from agents.db import (
     set_orchestrator_instructions,
     update_odata_service,
     upsert_agent,
+    upsert_ina_query,
     upsert_skill,
     upsert_workflow,
     validate_api_slug,
     validate_odata_service,
 )
-from agents.registry import registry
-from agents.shared import available_models, default_model_name
-from agents.workflow_runner import RunRefused as WorkflowRunRefused
-from agents.workflow_runner import start_workflow_run
+
 # --- deep agents ---
 from agents.deep import DeepConfig, dump_deep_config
+from agents.git_config import BUILTIN_GIT_URL
+from agents.git_config import check_entry as check_git_entry
+from agents.git_config import clean_entry as clean_git_entry
+from agents.ina import BUILTIN_INA_URL
+from agents.ina.models import QUERY_NAME_RE, check_query_names, validate_ina_query
+from agents.invoke_config import check_result_schema, clean_limits
+from agents.jira_tools import BUILTIN_JIRA_URL
+from agents.mail_render import MailTheme
+from agents.odata import BUILTIN_ODATA_URL
+from agents.odata.models import MAX_DEFINITION_BYTES, SERVICE_NAME_RE
+from agents.outlook_tools import BUILTIN_OUTLOOK_URL
+from agents.registry import registry
+from agents.sapnotedetail_tools import BUILTIN_SAPNOTEDETAIL_URL
+from agents.shared import available_models, default_model_name
+from agents.sharepoint_tools import BUILTIN_SHAREPOINT_URL
+from agents.sharepoint_views import check_pins, clean_views
+from agents.slack_tools import BUILTIN_SLACK_URL
+from agents.smtp_tools import BUILTIN_SMTP_URL, is_address
+from agents.teams_tools import BUILTIN_TEAMS_URL
+from agents.validation_errors import validation_item
+from agents.workflow_runner import RunRefused as WorkflowRunRefused
+from agents.workflow_runner import start_workflow_run
 
 logger = logging.getLogger(__name__)
 
@@ -326,6 +347,9 @@ class OAuthClientPayload(BaseModel):
     # and so open writes. See `_validate_odata_entry`.
     services: list[str] = Field(default_factory=list)
     allow_write: StrictBool = False
+    # builtin:ina only, and all its entry holds: the registered analytical
+    # queries the agent may run. See `_validate_ina_entry`.
+    queries: list[str] = Field(default_factory=list)
     # builtin:sharepoint only. The one workbook the toolset may read (`site`
     # is <tenant>.sharepoint.com:/sites/<site>) and the views of it an agent
     # may name. Pinned here, never tool arguments. agents/sharepoint_views.py
@@ -346,10 +370,20 @@ class OAuthClientPayload(BaseModel):
     branch: StrictStr = Field(default="", max_length=200)
     allow_approve: StrictBool = False
     require_green_builds: StrictBool | None = None
+    # builtin:git only. The provider, the base branch pull requests target,
+    # the prefix of every branch the agent may push to, and the two write
+    # switches; `repositories` (above) holds the repository paths.
+    # agents/git_config.py is the gate. Strict, and handed on untrimmed.
+    provider: StrictStr = Field(default="", max_length=16)
+    base_branch: StrictStr = Field(default="", max_length=200)
+    branch_prefix: StrictStr = Field(default="", max_length=41)
+    allow_push: StrictBool = False
+    allow_pull_request: StrictBool = False
 
     model_config = ConfigDict(populate_by_name=True)
 
-    @field_validator("services", "allow_write", "allow_approve", mode="before")
+    @field_validator("services", "allow_write", "allow_approve", "allow_push",
+                     "allow_pull_request", mode="before")
     @classmethod
     def _null_is_absent(cls, v: Any, info: Any) -> Any:
         """A client that serialises an unset field as ``null`` means "not
@@ -358,7 +392,8 @@ class OAuthClientPayload(BaseModel):
             return [] if info.field_name == "services" else False
         return v
 
-    @field_validator("site", "library", "path", "workspace", "branch", mode="before")
+    @field_validator("site", "library", "path", "workspace", "branch", "provider",
+                     "base_branch", "branch_prefix", mode="before")
     @classmethod
     def _null_pin_is_absent(cls, v: Any) -> Any:
         """``null`` means "not set", as for ``services`` and ``views``: a
@@ -495,6 +530,9 @@ class OAuthClientPayload(BaseModel):
             "path": self.path,
             "workspace": self.workspace,
             "branch": self.branch,
+            "provider": self.provider,
+            "base_branch": self.base_branch,
+            "branch_prefix": self.branch_prefix,
         }
         config = {k: v for k, v in fields.items() if v}
         if self.theme:
@@ -511,12 +549,18 @@ class OAuthClientPayload(BaseModel):
             config["services"] = list(self.services)
         if self.allow_write:
             config["allow_write"] = True
+        if self.queries:
+            config["queries"] = list(self.queries)
         if self.repositories is not None:
             config["repositories"] = list(self.repositories)
         if self.allow_approve:
             config["allow_approve"] = True
         if self.require_green_builds is False:
             config["require_green_builds"] = False
+        if self.allow_push:
+            config["allow_push"] = True
+        if self.allow_pull_request:
+            config["allow_pull_request"] = True
         return config
 
 
@@ -654,6 +698,25 @@ class McpServerPayload(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
+    def _validate_raw_ina_entry(cls, data: Any) -> Any:
+        """The ``builtin:ina`` block as the client sent it, for the reason
+        ``_validate_raw_odata_entry`` gives: afterwards a stray key, or
+        ``user_context: false``, can no longer be told from a correct entry.
+        The mode first, so a block of another mode is not judged by this
+        entry's keys."""
+        if isinstance(data, dict) and _server_key(data.get("url")) == BUILTIN_INA_URL:
+            mode = str(data.get("auth_mode") or "").strip().lower()
+            if mode != AUTH_MODE_DESTINATION:
+                raise ValueError(_INA_MODE_TEXT)
+            oauth = data.get("oauth")
+            if isinstance(oauth, OAuthClientPayload):
+                oauth = {k: getattr(oauth, k) for k in oauth.model_fields_set}
+            if isinstance(oauth, dict):
+                _validate_ina_entry(oauth)
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
     def _validate_raw_bitbucket_entry(cls, data: Any) -> Any:
         """The ``builtin:bitbucket`` block as the client sent it.
 
@@ -677,6 +740,26 @@ class McpServerPayload(BaseModel):
             check_bitbucket_entry(oauth)
         return data
 
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_raw_git_entry(cls, data: Any) -> Any:
+        """The ``builtin:git`` block as the client sent it, for the reason
+        ``_validate_raw_bitbucket_entry`` gives: afterwards a stray key or the
+        string "true" can no longer be told from a correct entry."""
+        if isinstance(data, dict) and _server_key(data.get("url")) == BUILTIN_GIT_URL:
+            mode = str(data.get("auth_mode") or "").strip().lower()
+            if mode != AUTH_MODE_DESTINATION:
+                raise ValueError(
+                    f"{BUILTIN_GIT_URL} requires auth_mode=destination: it holds no "
+                    "credential of its own and reaches the provider only through the "
+                    "BTP destination named in oauth.destination"
+                )
+            oauth = data.get("oauth")
+            if isinstance(oauth, OAuthClientPayload):
+                oauth = {k: getattr(oauth, k) for k in oauth.model_fields_set}
+            check_git_entry(oauth)
+        return data
+
     @model_validator(mode="after")
     def _validate_oauth(self) -> "McpServerPayload":
         if _server_key(self.url) == BUILTIN_ODATA_URL:
@@ -695,6 +778,17 @@ class McpServerPayload(BaseModel):
                 f"oauth.services and oauth.allow_write belong to a {BUILTIN_ODATA_URL} "
                 "entry only; no other server reads them"
             )
+        if _server_key(self.url) == BUILTIN_INA_URL:
+            # Its own rules, as builtin:odata above: no destination here.
+            if self.auth_mode != AUTH_MODE_DESTINATION:
+                raise ValueError(_INA_MODE_TEXT)
+            _validate_ina_entry(self.oauth.to_config() if self.oauth else {})
+            return self
+        if self.oauth is not None and self.oauth.queries:
+            raise ValueError(
+                f"oauth.queries belongs to a {BUILTIN_INA_URL} entry only; no other "
+                "server reads it"
+            )
         if self.oauth is not None and self.oauth.theme:
             _validate_mail_theme(self.url, self.oauth.theme)
         is_sharepoint = _server_key(self.url) == BUILTIN_SHAREPOINT_URL
@@ -709,8 +803,22 @@ class McpServerPayload(BaseModel):
         if is_sharepoint:
             self._validate_sharepoint()
         is_bitbucket = _server_key(self.url) == BUILTIN_BITBUCKET_URL
+        is_git = _server_key(self.url) == BUILTIN_GIT_URL
+        if not is_git and self.oauth is not None and (
+            self.oauth.provider or self.oauth.base_branch or self.oauth.branch_prefix
+            or self.oauth.allow_push or self.oauth.allow_pull_request
+        ):
+            raise ValueError(
+                "oauth.provider, oauth.base_branch, oauth.branch_prefix, oauth.allow_push "
+                f"and oauth.allow_pull_request belong to a {BUILTIN_GIT_URL} entry only; "
+                "no other server reads them"
+            )
+        if is_git:
+            # Again on the block the route hands to storage.
+            check_git_entry(self.oauth.to_config() if self.oauth else None)
         if not is_bitbucket and self.oauth is not None and (
-            self.oauth.workspace or self.oauth.repositories is not None or self.oauth.branch
+            self.oauth.workspace or self.oauth.branch
+            or (not is_git and self.oauth.repositories is not None)
             or self.oauth.allow_approve or self.oauth.require_green_builds is not None
         ):
             raise ValueError(
@@ -993,6 +1101,36 @@ class AgentPayload(BaseModel):
     expose_invoke: bool = False
     result_schema: dict[str, Any] | None = None
     invoke_limits: dict[str, Any] | None = None
+    # --- access tier (agents/access.py) --- None (absent) keeps the stored
+    # value; a new row is "basic". Any other string is a 422 at the field.
+    tier: Literal["basic", "advanced"] | None = None
+    # --- tools usable by personal agents (web chat addendum (g)) --- lax
+    # boolean like expose_chat; None (absent or null) keeps the stored value,
+    # a new row is off. Declared after mcp_servers: its validator reads them.
+    share_tools: bool | None = None
+    # Whether the body held the JSON boolean true itself (the import's rule:
+    # the string "true" of a hand-written bundle must not share anything).
+    _share_tools_json_true: bool = PrivateAttr(default=False)
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _remember_share_tools(cls, data: Any, handler: Any) -> "AgentPayload":
+        model = handler(data)
+        if isinstance(data, dict):
+            model._share_tools_json_true = data.get("share_tools") is True
+        return model
+
+    @field_validator("share_tools")
+    @classmethod
+    def _approver_shares_nothing(cls, v: bool | None, info: ValidationInfo) -> bool | None:
+        """An approving ``builtin:bitbucket`` agent never shares its tools: a
+        personal agent would approve with a chat user's prompt. At the field,
+        so the 422 names ``share_tools``; storage checks again
+        (`agents.db.check_bitbucket_approver_reach`)."""
+        servers = _servers_list(info.data.get("mcp_servers") or [])
+        if v is True and bitbucket_approves(servers):
+            raise ValueError(BITBUCKET_APPROVER_SHARE_MESSAGE)
+        return v
 
     @field_validator("result_schema")
     @classmethod
@@ -1097,11 +1235,15 @@ class AgentPayload(BaseModel):
         # that says what to do instead.
         if sum(1 for u in urls if _server_key(u) == BUILTIN_ODATA_URL) > 1:
             raise ValueError(ODATA_SINGLE_ENTRY_MESSAGE)
+        if sum(1 for u in urls if _server_key(u) == BUILTIN_INA_URL) > 1:
+            raise ValueError(INA_SINGLE_ENTRY_MESSAGE)
         # By server key, not by the string sent: the duplicate rule below
         # compares spellings, and storage stores every spelling of this URL
         # as the one entry (`prepare_servers`, which refuses this as well).
         if sum(1 for u in urls if _server_key(u) == BUILTIN_BITBUCKET_URL) > 1:
             raise ValueError(BITBUCKET_SINGLE_ENTRY_MESSAGE)
+        if sum(1 for u in urls if _server_key(u) == BUILTIN_GIT_URL) > 1:
+            raise ValueError(GIT_SINGLE_ENTRY_MESSAGE)
         if len(set(urls)) != len(urls):
             raise ValueError("mcp_servers contains duplicate urls")
         return self
@@ -1140,14 +1282,35 @@ class AgentPayload(BaseModel):
             out["invoke_limits"] = self.invoke_limits
         return out
 
+    def tier_kwargs(self) -> dict[str, Any]:
+        """``upsert_agent``'s ``tier`` when the client sent one; nothing
+        (KEEP) otherwise, so an older client or bundle keeps the tier."""
+        return {"tier": self.tier} if self.tier is not None else {}
+
+    def share_tools_kwargs(self, *, strict: bool = False) -> dict[str, Any]:
+        """``upsert_agent``'s ``share_tools`` when the client sent one;
+        nothing (KEEP) otherwise. ``strict`` (the import): on only for the
+        JSON boolean true of the body, not for what the lax bool accepts."""
+        if self.share_tools is None:
+            return {}
+        if strict:
+            return {"share_tools": self._share_tools_json_true}
+        return {"share_tools": self.share_tools is True}
+
     def to_servers_list(self) -> list[dict[str, Any]]:
-        out: list[dict[str, Any]] = []
-        for s in self.mcp_servers:
-            entry: dict[str, Any] = {"url": s.url, "auth_mode": s.auth_mode}
-            if s.auth_mode in OAUTH_CONFIG_MODES and s.oauth is not None:
-                entry["oauth"] = s.oauth.to_config()
-            out.append(entry)
-        return out
+        return _servers_list(self.mcp_servers)
+
+
+def _servers_list(servers: list[Any]) -> list[dict[str, Any]]:
+    """The storage form of validated ``McpServerPayload`` entries (url,
+    auth mode and the oauth block where the mode has one)."""
+    out: list[dict[str, Any]] = []
+    for s in servers:
+        entry: dict[str, Any] = {"url": s.url, "auth_mode": s.auth_mode}
+        if s.auth_mode in OAUTH_CONFIG_MODES and s.oauth is not None:
+            entry["oauth"] = s.oauth.to_config()
+        out.append(entry)
+    return out
 
 
 class OrchestratorPayload(BaseModel):
@@ -1253,7 +1416,11 @@ class ImportPayload(BaseModel):
     # validates every entry and reports field names and rules only.
     # None / absent / [] all mean "this bundle carries no catalogue".
     odata_services: Any = None
-    # if true, delete agents/skills/workflows/OData services not in the import
+    # The InA queries, one `InaQuery.to_export()` each; untyped for the same
+    # reason (`_import_ina_queries`). None / absent / [] carry none.
+    ina_queries: Any = None
+    # if true, delete agents/skills/workflows/OData services/InA queries not
+    # in the import
     replace: bool = False
 
 
@@ -1361,6 +1528,8 @@ async def api_create_agent(payload: AgentPayload) -> dict[str, Any]:
                 model_name=_or_keep(payload.model_name),
                 deep_json=_deep_json_or_keep(payload.deep),
                 **payload.invoke_kwargs(),
+                **payload.tier_kwargs(),
+                **payload.share_tools_kwargs(),
             )
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e)) from e
@@ -1372,12 +1541,14 @@ async def api_create_agent(payload: AgentPayload) -> dict[str, Any]:
 
 
 def _entry_signature(servers: Any, enabled: Any = True) -> list[Any]:
-    """What an agent's ``builtin:odata`` and ``builtin:bitbucket`` entries
-    let it do: the part of an agent row whose change must reach the running
-    build at once. ``[]`` for an agent with neither entry.
+    """What an agent's ``builtin:odata``, ``builtin:ina``, ``builtin:bitbucket``
+    and ``builtin:git`` entries let it do: the part of an agent row whose
+    change must reach the running build at once. ``[]`` for an agent with
+    none of these entries.
 
     Per OData entry the attached services (sorted) and whether it may write;
-    order-free, so a save that only reorders is no change. Per Bitbucket
+    order-free, so a save that only reorders is no change; per InA entry its
+    queries (sorted) the same way, under ``builtin:ina``. Per Bitbucket
     entry the block as it is stored (`agents.bitbucket_config.clean_entry`:
     destination, workspace, repositories, branch and the three switches), so
     a block that only says its defaults out loud is no change either. A
@@ -1411,7 +1582,35 @@ def _entry_signature(servers: Any, enabled: Any = True) -> list[Any]:
         bitbucket.append(
             (BUILTIN_BITBUCKET_URL, json.dumps(stored, sort_keys=True, default=str))
         )
-    return sorted(odata) + sorted(bitbucket)
+    # A ``builtin:git`` entry the same way: repositories, branches and the two
+    # switches are read from the build, so unticking "Allow pushing" must not
+    # wait for a manual reload either (addendum h).
+    git = []
+    for server in servers:
+        if not isinstance(server, dict) or _server_key(server.get("url")) != BUILTIN_GIT_URL:
+            continue
+        block = server.get("oauth")
+        try:
+            if server.get("auth_mode") != AUTH_MODE_DESTINATION:
+                raise ValueError("not a destination entry")
+            stored = clean_git_entry(block)
+            # The cleaner keeps a default that was spelled out; the build does
+            # not care, so neither does the signature.
+            stored.setdefault("base_branch", git_config.DEFAULT_BASE_BRANCH)
+            stored.setdefault("branch_prefix", git_config.DEFAULT_BRANCH_PREFIX)
+        except ValueError:
+            stored = {"refused": [server.get("auth_mode"), block]}
+        git.append((BUILTIN_GIT_URL, json.dumps(stored, sort_keys=True, default=str)))
+    # The queries an agent may run are read from the build as well: one taken
+    # out of the entry must not stay runnable until a manual reload.
+    ina = []
+    for block in ina_entries(servers):
+        queries = block.get("queries")
+        names = sorted({n for n in queries if isinstance(n, str)}) if isinstance(
+            queries, list
+        ) else []
+        ina.append((BUILTIN_INA_URL, tuple(names)))
+    return sorted(odata) + sorted(bitbucket) + sorted(git) + sorted(ina)
 
 
 async def _reload_for_changed_entry(before: Any, after: Any, what: str) -> dict[str, bool]:
@@ -1435,12 +1634,36 @@ async def _reload_for_changed_entry(before: Any, after: Any, what: str) -> dict[
     """
     if before == after:
         return dict(NOT_RELOADED)
-    return await reload_running_agents(f"{what} with a changed OData or Bitbucket entry")
+    outcome = await reload_running_agents(f"{what} with a changed data or review entry")
+    await _rebuild_data_catalog(before, after, what)
+    return outcome
+
+
+async def _rebuild_data_catalog(before: Any, after: Any, what: str) -> None:
+    """Bring the data catalogue graph up to date when an agent's
+    ``builtin:odata`` services or ``builtin:ina`` queries changed
+    (``agents.data_catalog``): the graph holds only sources an enabled agent
+    attaches. Never raises."""
+    if _catalogue_part(before) == _catalogue_part(after):
+        return
+    from agents.data_catalog.importer import rebuild_safely
+
+    await rebuild_safely(None, what=what)
+
+
+def _catalogue_part(signature: Any) -> list[Any]:
+    """The items of an `_entry_signature` that name data catalogue sources:
+    the OData ones (a tuple of services first) and the InA ones."""
+    return [
+        s for s in signature
+        if s and (isinstance(s[0], tuple) or s[0] == BUILTIN_INA_URL)
+    ]
 
 
 def _entry_signatures(rows: Any) -> dict[str, Any]:
-    """``{agent name: _entry_signature}`` of the agents that have OData or
-    Bitbucket access at all: what an import compares before and after."""
+    """``{agent name: _entry_signature}`` of the agents that have OData,
+    InA, Bitbucket or Git access at all: what an import compares before and
+    after."""
     out: dict[str, Any] = {}
     for row in rows:
         signature = _entry_signature(row.mcp_servers, row.enabled)
@@ -1480,6 +1703,7 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
         # one, else the stored one (an older client keeps it).
         invoke = payload.invoke_kwargs()
         invoke_on = invoke.get("expose_invoke", bool(row.expose_invoke))
+        share_on = payload.share_tools_kwargs().get("share_tools", bool(row.share_tools))
         try:
             primary, extras, primary_oauth_json = prepare_servers(
                 payload.to_servers_list(), row
@@ -1488,9 +1712,9 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
             # writes the row itself. Same session as the commit below, and
             # on the prepared entries: the ones the row is given further
             # down, not a second reading of the payload.
-            await check_odata_services(
-                session, prepared_server_list(primary, extras, primary_oauth_json)
-            )
+            prepared = prepared_server_list(primary, extras, primary_oauth_json)
+            await check_odata_services(session, prepared)
+            await check_ina_queries(session, prepared)
             # As `upsert_agent` does. The other agents' peer lists still hold
             # the old name here: the rename below rewrites them.
             await check_bitbucket_approver_reach(
@@ -1501,6 +1725,7 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
                 expose_chat=payload.expose_chat,
                 peers=list(row.peers) if payload.peers is None else payload.peers,
                 expose_invoke=invoke_on,
+                share_tools=share_on,
             )
             skills_json = await normalize_skills_json(session, payload.skills)
 
@@ -1559,6 +1784,15 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
         # --- deep agents ---
         if payload.deep is not None:
             row.deep_json = dump_deep_config(payload.deep)
+        # --- access tier --- absent keeps; the orchestrator's gate reads the
+        # tier of the build, so it applies at the next reload, as
+        # expose_chat does.
+        if payload.tier is not None:
+            row.tier = payload.tier
+        # --- tools usable by personal agents --- read by the next build
+        # (`BuildResult.shared_toolsets`); a personal agent's turn re-reads the
+        # row, so switching it off applies to the next turn.
+        row.share_tools = 1 if share_on else 0
         # --- invoke API --- No registry reload for these: the invoke route
         # reads the row on every call (`agents.invoke.invoke_agent`). The
         # schema and limits were checked (and the limits cleaned) by the
@@ -2288,6 +2522,9 @@ async def api_export() -> dict[str, Any]:
         # `metadata_fetched_at` in UTC with a `Z`, which is also what an
         # import stores, so export -> import -> export is byte-stable.
         services = await list_odata_services(session)
+        # The InA queries likewise: a destination NAME and an identity flag,
+        # the described names, no credential (`InaQuery.to_export`).
+        queries = await list_ina_queries(session)
         return {
             "version": 1,
             "orchestrator_instructions": orch,
@@ -2295,6 +2532,7 @@ async def api_export() -> dict[str, Any]:
             "agents": [r.to_export() for r in rows],
             "workflows": workflows,
             "odata_services": [s.to_export() for s in services],
+            "ina_queries": [q.to_export() for q in queries],
         }
 
 
@@ -2340,31 +2578,72 @@ MAX_IMPORT_ODATA_SERVICES = 200
 # off the event loop one entry at a time. The count alone would allow
 # 200 x 2 MB = 400 MB, i.e. the better part of a minute.
 MAX_IMPORT_ODATA_CHARS = 4 * MAX_DEFINITION_BYTES
-# What decides whose identity a call carries and which system it reaches.
+# What decides whose identity a call carries and which system it reaches
+# (a catalogue service's and an InA query's alike).
 _ODATA_SERVICE_IDENTITY_FIELDS = ("destination", "user_context")
+# The InA queries of one bundle: as many as catalogue services. A query is
+# small (at most 250 described members), so the section's ceiling in
+# characters is the catalogue's, which no real section comes near.
+MAX_IMPORT_INA_QUERIES = 200
+MAX_IMPORT_INA_CHARS = MAX_IMPORT_ODATA_CHARS
 
 
-class _ODataImport:
-    """What `_import_odata_services` did, for the replace step and the answer."""
+class _CatalogueImport:
+    """What `_import_odata_services` or `_import_ina_queries` did, for the
+    replace step (`_finish_catalogue_import`) and the answer."""
 
     def __init__(self) -> None:
-        self.carried = False  # the bundle has a non-empty catalogue section
+        self.carried = False  # the bundle has a non-empty section
         self.names: set[str] = set()  # stored by this import
-        # Every service the bundle names, stored or refused: a refused entry
+        # Every record the bundle names, stored or refused: a refused entry
         # is not an absent one, so replace must not want to remove it.
         self.named: set[str] = set()
         self.existing: dict[str, Any] = {}  # name -> row, as before the import
         self.created = 0
         self.updated = 0
-        # The services this import created or changed (not the unchanged).
+        # The records this import created or changed (not the unchanged).
         self.changed: set[str] = set()
         # name -> the identity fields an update changed
         self.identity: dict[str, list[str]] = {}
 
 
+def _bounded_section(
+    section: Any, *, key: str, items: str, max_count: int, max_chars: int, errors: list[str]
+) -> list[Any] | None:
+    """A bundle's catalogue section (``odata_services``, ``ina_queries``)
+    when it carries entries, else None.
+
+    Absent, ``null`` and ``[]`` all mean "no section". A section that is not
+    a list, holds more than ``max_count`` entries or more than ``max_chars``
+    characters of JSON is one fixed error line (``key`` and the rule, never
+    a value), checked before any entry is validated.
+    """
+    if section is None:
+        return None
+    if not isinstance(section, list):
+        errors.append(f"{key}: expected a list of {items}")
+        return None
+    if len(section) > max_count:
+        errors.append(f"{key}: more than {max_count} {items} in one bundle")
+        return None
+    if not section:
+        return None
+    try:
+        size = 0
+        for entry in section:
+            size += len(json.dumps(entry, ensure_ascii=False))
+            if size > max_chars:
+                errors.append(f"{key}: the section is too large for one import")
+                return None
+    except (TypeError, ValueError, RecursionError):
+        errors.append(f"{key}: expected a list of {items}")
+        return None
+    return section
+
+
 async def _import_odata_services(
     session: Any, section: Any, errors: list[str]
-) -> _ODataImport:
+) -> _CatalogueImport:
     """Upsert a bundle's catalogue services by name, without committing.
 
     Runs before the agents of the same bundle: `upsert_agent` refuses a
@@ -2391,28 +2670,16 @@ async def _import_odata_services(
     is validated, and each entry is validated once, in a worker thread,
     together with the column values its row gets (`_checked_odata_entry`).
     """
-    result = _ODataImport()
+    result = _CatalogueImport()
+    section = _bounded_section(
+        section,
+        key="odata_services",
+        items="services",
+        max_count=MAX_IMPORT_ODATA_SERVICES,
+        max_chars=MAX_IMPORT_ODATA_CHARS,
+        errors=errors,
+    )
     if section is None:
-        return result
-    if not isinstance(section, list):
-        errors.append("odata_services: expected a list of services")
-        return result
-    if len(section) > MAX_IMPORT_ODATA_SERVICES:
-        errors.append(
-            f"odata_services: more than {MAX_IMPORT_ODATA_SERVICES} services in one bundle"
-        )
-        return result
-    if not section:
-        return result
-    try:
-        size = 0
-        for entry in section:
-            size += len(json.dumps(entry, ensure_ascii=False))
-            if size > MAX_IMPORT_ODATA_CHARS:
-                errors.append("odata_services: the section is too large for one import")
-                return result
-    except (TypeError, ValueError, RecursionError):
-        errors.append("odata_services: expected a list of services")
         return result
     result.carried = True
     result.existing = {r.name: r for r in await list_odata_services(session, lock=True)}
@@ -2464,6 +2731,151 @@ async def _import_odata_services(
     return result
 
 
+async def _import_ina_queries(
+    session: Any, section: Any, errors: list[str]
+) -> _CatalogueImport:
+    """Upsert a bundle's InA queries by name, without committing.
+
+    `_import_odata_services` for ``ina_queries``, with its reasons: before
+    the agents of the bundle (`upsert_agent` refuses a query name nobody
+    registered, and reads this session), each entry validated whole by
+    `validate_ina_query` in a worker thread, a refusal one line naming the
+    query (or its position) and the field, never a value; ``enabled`` must
+    be present; a name listed twice is refused; a query the bundle carries
+    unchanged is not written and keeps its ``updated_at``
+    (`agents.db.upsert_ina_query`). An entry without the ``definition`` key
+    keeps the stored description.
+
+    Serialised like a route's write, in the two ways a database offers:
+    every query row is locked by the first read, after the catalogue's (the
+    same order in every import; Postgres, HANA), and ``api_import`` made the
+    whole transaction a writer at its first statement (SQLite,
+    `begin_exclusive_write`). So an update here asks for no write lock of
+    its own (``write_locked``), which in this open transaction could take
+    none.
+    """
+    result = _CatalogueImport()
+    section = _bounded_section(
+        section,
+        key="ina_queries",
+        items="queries",
+        max_count=MAX_IMPORT_INA_QUERIES,
+        max_chars=MAX_IMPORT_INA_CHARS,
+        errors=errors,
+    )
+    if section is None:
+        return result
+    result.carried = True
+    result.existing = {r.name: r for r in await list_ina_queries(session, lock=True)}
+    for position, entry in enumerate(section, start=1):
+        name = entry.get("name") if isinstance(entry, dict) else None
+        if isinstance(name, str) and re.fullmatch(QUERY_NAME_RE, name):
+            label = f"InA query '{name}'"
+            result.named.add(name)
+        else:
+            label = f"InA query #{position}"
+        try:
+            payload = await asyncio.to_thread(validate_ina_query, entry)
+        except ValueError as e:
+            errors.append(f"{label}: {e}")
+            continue
+        if "enabled" not in entry:
+            errors.append(f"{label}: enabled: Field required")
+            continue
+        if payload.name in result.names:
+            errors.append(f"{label}: listed more than once")
+            continue
+        result.names.add(payload.name)
+        row = result.existing.get(payload.name)
+        if row is None:
+            try:
+                await create_ina_query(session, payload, commit=False)
+            except ValueError as e:  # created by someone else since the read
+                errors.append(f"{label}: {e}")
+                continue
+            result.created += 1
+            result.changed.add(payload.name)
+            continue
+        # Read before the write: the update re-reads the same row object.
+        before = {"destination": row.destination, "user_context": bool(row.user_context)}
+        changed = [f for f in _ODATA_SERVICE_IDENTITY_FIELDS if before[f] != getattr(payload, f)]
+        outcome = await upsert_ina_query(
+            session, payload, existing=row, commit=False, write_locked=True
+        )
+        if outcome == "unchanged":
+            continue
+        result.updated += 1
+        result.changed.add(payload.name)
+        if changed:
+            result.identity[payload.name] = changed
+    return result
+
+
+async def _finish_catalogue_import(
+    session: Any,
+    result: _CatalogueImport,
+    *,
+    replace: bool,
+    doomed: set[str],
+    referrers: Any,
+    delete: Any,
+    noun: str,
+    key: str,
+    errors: list[str],
+    warnings: list[str],
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """The replace step and the identity report of one imported section:
+    ``(removed names, identity changes)``.
+
+    ``referrers`` is the section's ``*_referrers`` and ``delete`` its delete
+    function; ``noun`` names a record in a message (``OData service``,
+    ``InA query``) and ``key`` in an identity change (``service``,
+    ``query``). Who names what is read once this import is in: the agents it
+    wrote count, the ones it removes (``doomed``) do not.
+
+    Replace applies only when the bundle carries the section, like skills.
+    Unlike a skill, a record is not detached from its agents: one that lost
+    its only service or query could not run, so a record still in use is an
+    error. An identity change (another destination, or the other identity)
+    of a record in use is allowed, as an admin's own act, but never unseen:
+    field and agent names only.
+    """
+    removed: list[str] = []
+    identity_changes: list[dict[str, Any]] = []
+    if not (result.carried and (replace or result.identity)):
+        return removed, identity_changes
+    await session.flush()
+    used_by = {
+        name: [r["agent"] for r in users if r["agent"] not in doomed]
+        for name, users in (await referrers(session)).items()
+    }
+    if replace:
+        for name, row in sorted(result.existing.items()):
+            if name in result.named:
+                continue
+            if used_by.get(name):
+                agents = ", ".join(f"'{a}'" for a in used_by[name])
+                errors.append(
+                    f"{noun} '{name}' cannot be removed by replace: it is used by "
+                    f"agent(s) {agents}"
+                )
+                continue
+            await delete(session, row, commit=False)
+            removed.append(name)
+        if removed:
+            # A curated record has no undo; say which went.
+            names = ", ".join(f"'{n}'" for n in removed)
+            warnings.append(f"{noun}(s) removed by replace: {names}")
+    for name in sorted(result.identity):
+        if not used_by.get(name):
+            continue
+        changed = result.identity[name]
+        identity_changes.append({key: name, "changed": changed, "agents": used_by[name]})
+        agents = ", ".join(f"'{a}'" for a in used_by[name])
+        warnings.append(f"{noun} '{name}': {', '.join(changed)} changed; used by agent(s) {agents}")
+    return removed, identity_changes
+
+
 def _checked_odata_entry(entry: Any) -> tuple[dict[str, Any], dict[str, Any]]:
     """One bundle entry as ``(validated data, column values)``, or the
     ``ValueError`` of `validate_odata_service`. Pure and CPU-bound (up to a
@@ -2501,14 +2913,29 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
     not written and keeps its ``updated_at`` (`odata_service_unchanged`): it
     is in ``imported_odata_services`` but in neither ``created_`` nor
     ``updated_odata_services``.
+
+    ``ina_queries`` (the InA analytical queries) is taken the same way, right
+    after the catalogue (`_import_ina_queries`), with the same replace rule
+    and the ``imported_/created_/updated_/removed_ina_queries``,
+    ``removed_ina_query_names`` and ``ina_identity_changes`` keys; a changed
+    or removed query in use rebuilds the running agents too
+    (`agents.ina.admin_routes.reload_if_in_use`).
     """
     errors: list[str] = []
     warnings: list[str] = []
     removed = removed_skills = removed_workflows = 0
     removed_services: list[str] = []
     identity_changes: list[dict[str, Any]] = []
+    removed_queries: list[str] = []
+    ina_identity_changes: list[dict[str, Any]] = []
     async with SessionLocal() as session:
         try:
+            # On SQLite, which has no row locks, the whole import is one
+            # writer from its first statement: what it reads (the catalogue,
+            # the queries, the agents) cannot change before it writes. On
+            # Postgres and HANA this does nothing; the row locks of the
+            # sections' first reads serialise it there.
+            await begin_exclusive_write(session)
             existing_agents = {r.name: r for r in await list_agents(session)}
             # Taken now: the rows are changed in place by the loop below.
             odata_before = _entry_signatures(existing_agents.values())
@@ -2534,10 +2961,12 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
                 )
                 imported_skill_names.add(skill.name)
 
-            # The catalogue before the agents, for the same reason.
+            # The catalogue and the InA queries before the agents, for the
+            # same reason; always in this order, which is the lock order.
             odata = await _import_odata_services(
                 session, payload.odata_services, errors
             )
+            ina = await _import_ina_queries(session, payload.ina_queries, errors)
 
             # Agents this bundle still writes: their stored peer lists are
             # about to be replaced, so they do not decide whether an agent
@@ -2581,6 +3010,9 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
                         ignore_peer_lists_of=doomed | rewrites_peers,
                         # A bundle without these keys keeps what is stored.
                         **agent.invoke_kwargs(),
+                        **agent.tier_kwargs(),
+                        # Only the JSON boolean true shares.
+                        **agent.share_tools_kwargs(strict=True),
                     )
                 except ValueError as e:
                     errors.append(f"Agent '{agent.name}': {e}")
@@ -2653,50 +3085,30 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
                             await session.delete(srow)
                             removed_skills += 1
 
-            if odata.carried and (payload.replace or odata.identity):
-                # Who attaches what once this import is in: the agents it
-                # wrote count, the ones it removes do not.
-                await session.flush()
-                used_by = {
-                    name: [r["agent"] for r in users if r["agent"] not in doomed]
-                    for name, users in (await odata_service_referrers(session)).items()
-                }
-                # Replace applies to the catalogue only when the bundle
-                # carries one, like skills. Unlike a skill, a service is not
-                # detached from its agents: one that lost its only service
-                # could not run, so a service still in use is an error.
-                if payload.replace:
-                    for name, srow in sorted(odata.existing.items()):
-                        if name in odata.named:
-                            continue
-                        if used_by.get(name):
-                            agents = ", ".join(f"'{a}'" for a in used_by[name])
-                            errors.append(
-                                f"OData service '{name}' cannot be removed by replace: "
-                                f"it is used by agent(s) {agents}"
-                            )
-                            continue
-                        await delete_odata_service(session, srow, commit=False)
-                        removed_services.append(name)
-                    if removed_services:
-                        # A curated definition has no undo; say which went.
-                        names = ", ".join(f"'{n}'" for n in removed_services)
-                        warnings.append(f"OData service(s) removed by replace: {names}")
-                # Allowed, as an admin's own act, but never unseen: an agent
-                # whose service now runs as another identity or reaches
-                # another system. Field and agent names only.
-                for name in sorted(odata.identity):
-                    if not used_by.get(name):
-                        continue
-                    changed = odata.identity[name]
-                    identity_changes.append(
-                        {"service": name, "changed": changed, "agents": used_by[name]}
-                    )
-                    agents = ", ".join(f"'{a}'" for a in used_by[name])
-                    warnings.append(
-                        f"OData service '{name}': {', '.join(changed)} changed; "
-                        f"used by agent(s) {agents}"
-                    )
+            removed_services, identity_changes = await _finish_catalogue_import(
+                session,
+                odata,
+                replace=payload.replace,
+                doomed=doomed,
+                referrers=odata_service_referrers,
+                delete=delete_odata_service,
+                noun="OData service",
+                key="service",
+                errors=errors,
+                warnings=warnings,
+            )
+            removed_queries, ina_identity_changes = await _finish_catalogue_import(
+                session,
+                ina,
+                replace=payload.replace,
+                doomed=doomed,
+                referrers=ina_query_referrers,
+                delete=delete_ina_query,
+                noun="InA query",
+                key="query",
+                errors=errors,
+                warnings=warnings,
+            )
 
             if errors:
                 await session.rollback()
@@ -2716,6 +3128,14 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
         reload_outcome = await reload_after_catalogue_change(
             touched, referrers, f"import changed {len(touched)} service(s)"
         )
+    touched_queries = sorted(ina.changed | set(removed_queries))
+    if touched_queries and not (reload_outcome["reloaded"] or reload_outcome["reload_failed"]):
+        # The same rule for an InA query in use; one rebuild at most.
+        async with SessionLocal() as session:
+            ina_referrers = await ina_query_referrers(session)
+        reload_outcome = await reload_ina_if_in_use(
+            touched_queries, ina_referrers, f"import changed {len(touched_queries)} InA query(s)"
+        )
     if not (reload_outcome["reloaded"] or reload_outcome["reload_failed"]):
         # The other way an import closes access: an agent's own
         # `builtin:odata` or `builtin:bitbucket` entry changed or went, or
@@ -2728,6 +3148,12 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
             reload_outcome = await reload_running_agents(
                 "import with a changed OData or Bitbucket entry of an agent"
             )
+
+    # An import can attach, detach or change any source: the data catalogue
+    # graph is brought up to date as a whole (rare, and never raises).
+    from agents.data_catalog.importer import rebuild_safely
+
+    await rebuild_safely(None, what="import")
 
     return {
         **reload_outcome,
@@ -2748,6 +3174,13 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
         # Catalogue services in use whose destination or identity
         # (`user_context`) this import changed: [{service, changed, agents}].
         "odata_identity_changes": identity_changes,
+        # The InA queries alike; an identity change is [{query, changed, agents}].
+        "imported_ina_queries": len(ina.names),
+        "created_ina_queries": ina.created,
+        "updated_ina_queries": ina.updated,
+        "removed_ina_queries": len(removed_queries),
+        "removed_ina_query_names": removed_queries,
+        "ina_identity_changes": ina_identity_changes,
         # Model overrides this landscape cannot currently serve are imported
         # rather than rejected, so the operator is told about them here; so
         # is every entry of `odata_identity_changes`, as a line of text.
@@ -2862,6 +3295,8 @@ async def seed_from_file_if_empty(seed_path: Path) -> None:
                     commit=False,
                     deep_json=_deep_json_or_keep(payload.deep),
                     **payload.invoke_kwargs(),
+                    **payload.tier_kwargs(),
+                    **payload.share_tools_kwargs(strict=True),
                 )
             except ValueError as e:
                 logger.warning("Skipping invalid seed entry '%s': %s",
@@ -3094,6 +3529,53 @@ def _validate_odata_entry(cfg: dict[str, Any]) -> None:
         seen.add(name)
 
 
+_INA_MODE_TEXT = (
+    f"{BUILTIN_INA_URL} requires auth_mode=destination: every registered query is "
+    "reached through the BTP destination it names, and the entry holds no "
+    "credential of its own"
+)
+
+
+def _validate_ina_entry(cfg: dict[str, Any]) -> None:
+    """The block of a ``builtin:ina`` entry: exactly ``{queries}``.
+
+    `_validate_odata_entry` for analytical queries: allowed by exact key,
+    the rest refused -- ``user_context`` and ``destination`` too, also with
+    their default values, because the destination and the identity belong
+    to each registered query (design addendum (k), part 2 point 3) and no
+    agent may run a query as someone else by editing its own entry.
+
+    Messages name the field, never the value: a query name is repeated only
+    when it has the slug form, a key only when it is a known field. Storage
+    (`agents.db._clean_ina_entry`) keeps the same one key.
+    """
+    keys = {str(k) for k in cfg}
+    if cfg.get(_ODATA_ECHOED_KEY) is False:
+        keys.discard(_ODATA_ECHOED_KEY)
+    stray = keys - set(INA_ENTRY_KEYS)
+    identity = sorted(stray & _ODATA_IDENTITY_KEYS)
+    if identity:
+        raise ValueError(
+            f"{BUILTIN_INA_URL} takes no oauth.{', oauth.'.join(identity)}: the "
+            "destination and identity belong to each registered query; register "
+            "the query again to run it as another identity"
+        )
+    credential = sorted(stray & _ODATA_CREDENTIAL_KEYS)
+    if credential:
+        raise ValueError(
+            f"{BUILTIN_INA_URL} stores no credential of its own; remove "
+            f"oauth.{', oauth.'.join(credential)} (the credential lives in the "
+            "destination of each registered query)"
+        )
+    if stray:
+        known = sorted(stray & _OAUTH_FIELD_NAMES)
+        named = f"oauth.{', oauth.'.join(known)}" if known else "the unknown keys"
+        raise ValueError(f"a {BUILTIN_INA_URL} entry holds only oauth.queries; remove {named}")
+    # The entry's one slug-list rule; a repeat is refused here, so the admin
+    # learns of it, where storage drops it.
+    check_query_names(cfg.get("queries"), distinct=True)
+
+
 # Built-ins that originate mail through agents/mail_render and so read a
 # `theme`. Mirrors `_MAIL_THEME_URLS` in agents/db.py.
 _MAIL_THEME_URLS = frozenset({BUILTIN_SMTP_URL, BUILTIN_OUTLOOK_URL})
@@ -3156,7 +3638,9 @@ async def _destination_health() -> list[dict[str, Any]]:
     entry per attached service, with that service's destination and identity
     from the catalogue (``service`` and ``service_enabled`` are the extra
     keys). A name the catalogue does not have is a ``missing`` entry with
-    ``service_enabled`` false; see `_odata_destination_health`.
+    ``service_enabled`` false; see `_odata_destination_health`. A
+    ``builtin:ina`` entry likewise, one entry per query it names (``query``
+    and ``query_enabled``; `_ina_destination_health`).
     """
     from agents.destination import (
         MISSING_BINDING_MESSAGE,
@@ -3174,6 +3658,9 @@ async def _destination_health() -> list[dict[str, Any]]:
         if any(r.enabled and odata_entries(r.mcp_servers) for r in rows):
             # One read for every entry of every agent.
             catalogue = {s.name: s for s in await list_odata_services(session)}
+        queries: dict[str, Any] = {}
+        if any(r.enabled and ina_entries(r.mcp_servers) for r in rows):
+            queries = {q.name: q for q in await list_ina_queries(session)}
     config = config_from_environment(os.environ)
     resolvers: dict[str, DestinationResolver] = {}
     out: list[dict[str, Any]] = []
@@ -3189,6 +3676,13 @@ async def _destination_health() -> list[dict[str, Any]]:
                     await _odata_destination_health(
                         row.name, oauth, catalogue, config, resolvers
                     )
+                )
+                continue
+            if _server_key(srv.get("url")) == BUILTIN_INA_URL:
+                # Its entry names no destination either; each registered query
+                # does, and is reported like a catalogue service.
+                out.extend(
+                    await _ina_destination_health(row.name, oauth, queries, config, resolvers)
                 )
                 continue
             name = str(oauth.get("destination") or "").strip()
@@ -3259,6 +3753,22 @@ async def _destination_health() -> list[dict[str, Any]]:
     return out
 
 
+class _HealthKind:
+    """What tells a catalogue service's health entry from an InA query's:
+    the server key, the entry's key for the record (``service`` / ``query``,
+    with ``<key>_enabled``), the name rule and the noun of a message."""
+
+    def __init__(self, server_key: str, key: str, name_re: str, noun: str) -> None:
+        self.server_key = server_key
+        self.key = key
+        self.name_re = name_re
+        self.noun = noun
+
+
+_ODATA_HEALTH = _HealthKind(BUILTIN_ODATA_URL, "service", SERVICE_NAME_RE, "OData service")
+_INA_HEALTH = _HealthKind(BUILTIN_INA_URL, "query", QUERY_NAME_RE, "InA query")
+
+
 async def _odata_destination_health(
     agent: str,
     oauth: dict[str, Any],
@@ -3267,7 +3777,38 @@ async def _odata_destination_health(
     resolvers: dict[str, Any],
 ) -> list[dict[str, Any]]:
     """The `_destination_health` entries of one ``builtin:odata`` entry: one
-    per service it lists.
+    per service it lists (`_record_destination_health`)."""
+    return await _record_destination_health(
+        agent, oauth.get("services"), catalogue, config, resolvers, _ODATA_HEALTH
+    )
+
+
+async def _ina_destination_health(
+    agent: str,
+    oauth: dict[str, Any],
+    queries: dict[str, Any],
+    config: Any,
+    resolvers: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """The `_destination_health` entries of one ``builtin:ina`` entry: one
+    per query it names, each with that query's destination and identity
+    (``query``, ``query_enabled``; `_record_destination_health`)."""
+    return await _record_destination_health(
+        agent, oauth.get("queries"), queries, config, resolvers, _INA_HEALTH
+    )
+
+
+async def _record_destination_health(
+    agent: str,
+    names: Any,
+    records: dict[str, Any],
+    config: Any,
+    resolvers: dict[str, Any],
+    kind: _HealthKind,
+) -> list[dict[str, Any]]:
+    """One health entry per name an entry lists, checked through the
+    destination of the record of that name (a catalogue service, an InA
+    query; ``records`` by name). Written for the catalogue, in its words:
 
     ``{agent, server_key, service, service_enabled, destination,
     user_context, state, auth_type, error}`` plus ``warning`` on an identity
@@ -3302,14 +3843,14 @@ async def _odata_destination_health(
     from agents.odata.destinations import destination_failure
     from agents.odata.preview import plain
 
-    services = oauth.get("services")
+    enabled_key = f"{kind.key}_enabled"
     out: list[dict[str, Any]] = []
-    for name in services if isinstance(services, list) else []:
+    for name in names if isinstance(names, list) else []:
         entry: dict[str, Any] = {
             "agent": agent,
-            "server_key": BUILTIN_ODATA_URL,
-            "service": "",
-            "service_enabled": False,
+            "server_key": kind.server_key,
+            kind.key: "",
+            enabled_key: False,
             "destination": "",
             "user_context": False,
             "state": "error",
@@ -3317,19 +3858,19 @@ async def _odata_destination_health(
             "error": None,
         }
         out.append(entry)
-        if not isinstance(name, str) or not re.fullmatch(SERVICE_NAME_RE, name):
+        if not isinstance(name, str) or not re.fullmatch(kind.name_re, name):
             # A row written around the save gate; the value is not repeated.
-            entry["error"] = "invalid service name"
+            entry["error"] = f"invalid {kind.key} name"
             continue
-        entry["service"] = name
-        service = catalogue.get(name)
-        if service is None:
+        entry[kind.key] = name
+        record = records.get(name)
+        if record is None:
             entry["state"] = "missing"
-            entry["error"] = "unknown OData service"
+            entry["error"] = f"unknown {kind.noun}"
             continue
-        entry["service_enabled"] = bool(service.enabled)
-        destination = str(service.destination or "").strip()
-        user_context = bool(service.user_context)
+        entry[enabled_key] = bool(record.enabled)
+        destination = str(record.destination or "").strip()
+        user_context = bool(record.user_context)
         entry["destination"] = destination
         entry["user_context"] = user_context
         if not destination:
@@ -3363,8 +3904,9 @@ async def _odata_destination_health(
             # logged with URLs masked.
             code, entry["error"] = destination_failure(str(e))
             logger.warning(
-                "credential health: destination '%s' of OData service '%s' failed (%s): %s",
+                "credential health: destination '%s' of %s '%s' failed (%s): %s",
                 destination,
+                kind.noun,
                 name,
                 code,
                 plain(str(e), 400),
@@ -3372,15 +3914,16 @@ async def _odata_destination_health(
         except Exception as e:  # noqa: BLE001 - a health check must not 500
             entry["error"] = f"the destination could not be checked ({type(e).__name__})"
             logger.warning(
-                "credential health: destination '%s' of OData service '%s' failed (%s)",
+                "credential health: destination '%s' of %s '%s' failed (%s)",
                 destination,
+                kind.noun,
                 name,
                 type(e).__name__,
             )
         auth_type = str(entry["auth_type"] or "")
         if user_context and auth_type and auth_type not in USER_PROPAGATING_AUTH_TYPES:
             entry["warning"] = (
-                f"the service runs as the signed-in user, but the destination's "
+                f"the {kind.key} runs as the signed-in user, but the destination's "
                 f"Authentication is {auth_type}, an app-level type; every user "
                 f"would share one credential. Use PrincipalPropagation (on-premise), "
                 f"OAuth2UserTokenExchange, OAuth2JWTBearer or OAuth2SAMLBearerAssertion"
@@ -3407,3 +3950,19 @@ router.include_router(_odata_router)
 from agents.notifications import router as _notifications_router  # noqa: E402
 
 router.include_router(_notifications_router)
+
+# The data catalogue graph (/admin/api/data-catalog), included the same way.
+from agents.data_catalog.embedding_routes import (  # noqa: E402
+    router as _data_catalog_embeddings_router,
+)
+from agents.data_catalog.routes import router as _data_catalog_router  # noqa: E402
+
+router.include_router(_data_catalog_router)
+# Its embeddings (/admin/api/data-catalog/embeddings, design addendum (l)).
+router.include_router(_data_catalog_embeddings_router)
+
+# The InA analytical queries (/admin/api/ina), included the same way.
+from agents.ina.admin_routes import reload_if_in_use as reload_ina_if_in_use  # noqa: E402
+from agents.ina.admin_routes import router as _ina_router  # noqa: E402
+
+router.include_router(_ina_router)

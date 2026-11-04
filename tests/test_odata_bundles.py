@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -165,6 +166,8 @@ async def test_export_carries_the_full_service_payloads(client):
         "agents",
         "workflows",
         "odata_services",
+        # The InA queries travel the same way (tests/test_ina_bundles.py).
+        "ina_queries",
     }
 
 
@@ -203,6 +206,37 @@ async def test_export_wipe_import_export_is_byte_stable(client):
     assert r.json()["odata_identity_changes"] == []
     third = (await client.get(EXPORT)).json()
     assert json.dumps(third, sort_keys=True) == json.dumps(first, sort_keys=True)
+
+
+async def test_the_kind_of_a_service_goes_with_the_bundle(client, caplog):
+    """A generic source stays generic through export, wipe and import, and a
+    bundle that changes only the kind updates the service. Every write that
+    makes a service generic is one WARNING naming it (`_warn_generic_kind`)."""
+    caplog.set_level(logging.WARNING, logger="agents.db")
+
+    def made_generic() -> list[str]:
+        names = [r.getMessage().split("'")[1] for r in caplog.records
+                 if r.name == "agents.db" and "kind generic" in r.getMessage()]
+        caplog.clear()
+        return names
+
+    await create(client, svc("zagent-data", kind="generic"), svc())
+    first = (await client.get(EXPORT)).json()
+    kinds = {s["name"]: s["kind"] for s in first["odata_services"]}
+    assert kinds == {"zagent-data": "generic", "purchase-requisitions": "odata"}
+
+    await wipe()
+    made_generic()
+    r = await client.post(IMPORT, json=first)
+    assert r.status_code == 200, r.text
+    assert {n: s["kind"] for n, s in (await catalogue()).items()} == kinds
+    assert made_generic() == ["zagent-data"]
+
+    r = await client.post(IMPORT, json={"odata_services": [svc(kind="generic")]})
+    assert r.status_code == 200, r.text
+    assert (r.json()["created_odata_services"], r.json()["updated_odata_services"]) == (0, 1)
+    assert (await catalogue())["purchase-requisitions"]["kind"] == "generic"
+    assert made_generic() == ["purchase-requisitions"]
 
 
 async def test_a_bundle_carries_the_service_its_agent_attaches(client):

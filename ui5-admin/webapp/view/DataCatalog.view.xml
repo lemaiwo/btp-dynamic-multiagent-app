@@ -1,0 +1,147 @@
+<mvc:View
+    controllerName="com.agent.admin.controller.DataCatalog"
+    xmlns="sap.m"
+    xmlns:mvc="sap.ui.core.mvc"
+    xmlns:core="sap.ui.core">
+    <Page id="dataCatalogPage" title="{i18n>navDataCatalog}">
+        <headerContent>
+            <Button
+                id="dcGraphButton"
+                icon="sap-icon://overview-chart"
+                text="{i18n>dcShowGraph}"
+                press=".onShowGraph" />
+        </headerContent>
+        <content>
+            <!-- A failed load is said here, with a retry, so that the empty
+                 table cannot be read as an empty catalogue. -->
+            <MessageStrip
+                id="dcLoadFailed"
+                visible="{view>/loadFailed}"
+                type="Error"
+                showIcon="true"
+                class="sapUiSmallMargin"
+                text="{view>/loadError}">
+                <link>
+                    <Link id="dcRetry" text="{i18n>odataRetry}" press=".onRetry" />
+                </link>
+            </MessageStrip>
+            <Table
+                id="dcSourcesTable"
+                items="{dc>/items}"
+                mode="SingleSelectLeft"
+                selectionChange=".onSelectionChange"
+                growing="true"
+                growingThreshold="50"
+                sticky="ColumnHeaders"
+                popinLayout="GridSmall"
+                contextualWidth="Auto"
+                autoPopinMode="true"
+                noDataText="{ parts: ['view>/loadFailed', 'view>/query', 'view>/kind'], formatter: '.formatNoData' }">
+                <headerToolbar>
+                    <OverflowToolbar>
+                        <SearchField
+                            id="dcSearch"
+                            placeholder="{i18n>dcSearch}"
+                            liveChange=".onSearch"
+                            search=".onSearch">
+                            <layoutData>
+                                <OverflowToolbarLayoutData priority="NeverOverflow" shrinkable="true" minWidth="8rem" maxWidth="18rem" />
+                            </layoutData>
+                        </SearchField>
+                        <!-- One kind of source, or all; applied together with the search.
+                             On a narrow screen it goes into the overflow before the
+                             rebuild buttons do. -->
+                        <Select
+                            id="dcKindFilter"
+                            selectedKey="{view>/kind}"
+                            tooltip="{i18n>dcKindFilter}"
+                            ariaLabelledBy="dcKindFilterText"
+                            change=".onKindFilter">
+                            <layoutData>
+                                <OverflowToolbarLayoutData priority="Low" />
+                            </layoutData>
+                            <core:Item key="" text="{i18n>dcKindAll}" />
+                            <core:Item key="odata" text="{i18n>dcKind_odata}" />
+                            <core:Item key="ina" text="{i18n>dcKind_ina}" />
+                            <core:Item key="generic" text="{i18n>dcKind_generic}" />
+                        </Select>
+                        <core:InvisibleText id="dcKindFilterText" text="{i18n>dcKindFilter}" />
+                        <ToolbarSpacer />
+                        <Button
+                            id="dcRebuildSelected"
+                            icon="sap-icon://synchronize"
+                            text="{i18n>dcRebuildSelected}"
+                            tooltip="{i18n>dcRebuildSelectedTooltip}"
+                            enabled="{= ${view>/selected} &amp;&amp; !${view>/busy} }"
+                            press=".onRebuildSelected" />
+                        <Button
+                            id="dcRebuildAll"
+                            icon="sap-icon://refresh"
+                            text="{i18n>dcRebuildAll}"
+                            tooltip="{i18n>dcRebuildAllTooltip}"
+                            enabled="{= !${view>/busy} }"
+                            press=".onRebuildAll" />
+                    </OverflowToolbar>
+                </headerToolbar>
+                <columns>
+                    <!-- autoPopinMode: the Source column has no width of its own and
+                         would collapse to nothing behind fixed widths, so the control
+                         moves columns into the row by importance, keeping autoPopinWidth
+                         (rem) free for it. Breakpoints by hand did not hold: they missed
+                         at a narrower window. -->
+                    <!-- Wide enough for "InA query" on one line. -->
+                    <Column width="7rem" importance="High"><Text text="{i18n>dcColKind}" /></Column>
+                    <Column autoPopinWidth="12" importance="High"><Text text="{i18n>dcColSource}" /></Column>
+                    <Column width="9rem" importance="Medium"><Text text="{i18n>odataColDestination}" /></Column>
+                    <Column width="8rem" importance="Medium"><Text text="{i18n>odataColRunsAs}" /></Column>
+                    <Column width="5rem" importance="Low"><Text text="{i18n>dcColEnabled}" /></Column>
+                    <Column width="6rem" importance="Medium"><Text text="{i18n>odataColUsedBy}" /></Column>
+                    <Column width="4rem" importance="Low" hAlign="End"><Text text="{i18n>dcColNodes}" /></Column>
+                    <Column width="10rem" importance="Low"><Text text="{i18n>dcColLastImport}" /></Column>
+                    <Column width="7rem" importance="High"><Text text="{i18n>dcColCompleteness}" /></Column>
+                </columns>
+                <items>
+                    <ColumnListItem type="Navigation" press=".onOpen">
+                        <cells>
+                            <ObjectStatus
+                                text="{ path: 'dc>kind', formatter: '.formatKind' }"
+                                state="Information"
+                                inverted="true" />
+                            <ObjectIdentifier title="{= ${dc>title} || ${dc>name} }" text="{dc>name}" />
+                            <Text text="{dc>destination}" />
+                            <ObjectStatus
+                                text="{ path: 'dc>user_context', formatter: '.formatRunsAs' }"
+                                state="{= ${dc>user_context} ? 'Information' : 'None' }" />
+                            <ObjectStatus
+                                text="{= ${dc>enabled} ? ${i18n>dcEnabled} : ${i18n>dcDisabled} }"
+                                state="{= ${dc>enabled} ? 'Success' : 'Error' }"
+                                icon="{= ${dc>enabled} ? 'sap-icon://accept' : 'sap-icon://decline' }" />
+                            <!-- The count opens the names; with none there is
+                                 nothing to open. -->
+                            <Link
+                                text="{ path: 'dc>used_by', formatter: '.formatUsedBy' }"
+                                enabled="{= ${dc>used_by}.length > 0 }"
+                                press=".onUsedByPress" />
+                            <Text text="{dc>nodes}" />
+                            <Text text="{ path: 'dc>last_import', formatter: '.formatDate' }" />
+                            <ProgressIndicator
+                                percentValue="{ path: 'dc>hint_completeness', formatter: '.formatPercent' }"
+                                displayValue="{ path: 'dc>hint_completeness', formatter: '.formatPercentText' }"
+                                state="{ path: 'dc>hint_completeness', formatter: '.formatPercentState' }"
+                                tooltip="{i18n>dcCompletenessTooltip}"
+                                showValue="true"
+                                height="1.25rem" />
+                        </cells>
+                    </ColumnListItem>
+                </items>
+            </Table>
+        </content>
+        <dependents>
+            <Popover id="dcUsedByPopover" title="{i18n>odataColUsedBy}" placement="Auto" contentMinWidth="12rem">
+                <List id="dcUsedByList" items="{usedBy>/names}" showNoData="false">
+                    <StandardListItem title="{usedBy>}" icon="sap-icon://person-placeholder" />
+                </List>
+            </Popover>
+        </dependents>
+    </Page>
+</mvc:View>

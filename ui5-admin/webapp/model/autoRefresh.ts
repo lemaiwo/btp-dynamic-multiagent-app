@@ -102,10 +102,12 @@ export default class Poller {
     private active = false;
     private inFlight = false;
 
-    public constructor(private readonly tick: () => Promise<PollOutcome>) {}
+    /** `own`: intervals of this poller in place of the defaults (the
+     * embeddings panel polls every 2 s). */
+    public constructor(private readonly tick: () => Promise<PollOutcome>, private readonly own?: PollIntervals) {}
 
     public get intervals(): PollIntervals {
-        return { intervalMs: Poller.intervalMs, slowIntervalMs: Poller.slowIntervalMs };
+        return this.own ?? { intervalMs: Poller.intervalMs, slowIntervalMs: Poller.slowIntervalMs };
     }
 
     public isActive(): boolean {

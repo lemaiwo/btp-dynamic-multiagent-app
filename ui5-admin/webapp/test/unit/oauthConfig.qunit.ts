@@ -118,6 +118,18 @@ QUnit.test("destination keeps the Confluence space pin and api base, nothing of 
     assert.notOk("spaces" in blank, "a blank pin is not sent as an empty string");
 });
 
+QUnit.test("destination for builtin:git keeps only the Git entry's keys, nothing of Jira's", function (assert) {
+    const out = oauthConfig.cleanOAuth(fullForm({
+        provider: "gitlab", repositories: ["grp/proj"], base_branch: "", branch_prefix: "agent/",
+        allow_push: true, allow_pull_request: false
+    }), "destination", "builtin:git") as Record<string, unknown>;
+    assert.deepEqual(out, {
+        destination: "DEST", provider: "gitlab", repositories: ["grp/proj"], branch_prefix: "agent/", allow_push: true
+    });
+    assert.deepEqual(oauthConfig.destinationBuiltinKeys("builtin:git"), undefined,
+        "not one of the generic destination built-ins: gitEntry builds the block");
+});
+
 QUnit.test("blank values are dropped, not stored as empty strings", function (assert) {
     const out = oauthConfig.cleanOAuth(fullForm({ scope: "  ", recipients: "" }), "oauth2", "builtin:outlook") as Record<string, unknown>;
     assert.notOk("scope" in out);

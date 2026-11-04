@@ -4,6 +4,8 @@ import { findBuiltin } from "./builtins";
 import { isRemoteUrl } from "./remoteUrl";
 import odataEntry from "./odataEntry";
 import bitbucketEntry from "./bitbucketEntry";
+import gitEntry from "./gitEntry";
+import inaEntry from "./inaEntry";
 
 /**
  * Turns the server dialog's flat form model into the config block the API
@@ -280,6 +282,11 @@ export default {
             // destination, no user_context, nothing left from another type.
             return odataEntry.clean(raw) as McpServer["oauth"];
         }
+        if (key === inaEntry.INA_URL) {
+            // --- ina --- As for OData, first and whatever the mode: exactly
+            // the queries; no destination, no user_context.
+            return inaEntry.clean(raw) as McpServer["oauth"];
+        }
         if (key === SHAREPOINT_URL) {
             // --- sharepoint --- Before the generic branches: an app-only
             // block would otherwise keep a mailbox and a send switch this
@@ -291,6 +298,12 @@ export default {
             // default below would send project, status and a false
             // allow_comment, all of which the server refuses for this entry.
             return bitbucketEntry.clean(raw) as McpServer["oauth"];
+        }
+        if (key === gitEntry.GIT_URL) {
+            // --- git --- Before the generic branches, as for Bitbucket: the
+            // Jira-shaped default would send project, status and a false
+            // allow_comment, all of which the server refuses for this entry.
+            return gitEntry.clean(raw) as McpServer["oauth"];
         }
         if (authMode === "none") {
             // Whitelisted, not "everything that isn't blank": this block goes

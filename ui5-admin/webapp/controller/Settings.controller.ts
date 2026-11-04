@@ -8,6 +8,8 @@ import ErrorHandler from "../service/ErrorHandler";
 import importBundle, { type BundleOpens } from "../model/importBundle";
 import bitbucketEntry from "../model/bitbucketEntry";
 import type { ImportPayload, ImportResult } from "../service/types";
+import type { Router$RouteMatchedEvent } from "sap/ui/core/routing/Router";
+import Embeddings from "./settings/Embeddings";
 
 /** How an import names the fields of `odata_identity_changes`. */
 const IDENTITY_FIELD_TEXT: Record<string, string> = {
@@ -29,6 +31,9 @@ export default class Settings extends BaseController {
 
     private importDialog?: Dialog;
 
+    /** The "Data catalogue embeddings" panel. */
+    private embeddings!: Embeddings;
+
     /** An import is being asked about or sent: no second one meanwhile. */
     private importing = false;
 
@@ -39,9 +44,37 @@ export default class Settings extends BaseController {
         }), "settings");
         this.setModel(new JSONModel({ text: "", replace: false }), "import");
 
+        this.embeddings = new Embeddings({
+            view: () => this.getView()!,
+            service: () => this.getAdminService(),
+            text: (key, args) => this.text(key, args)
+        });
+        this.setModel(this.embeddings.model, "emb");
+
         this.getRouter().getRoute("settings")?.attachPatternMatched(() => {
             void this.load();
+            void this.embeddings.show();
         });
+        // Another page, by a route or by an address that matches none
+        // (`bypassed`): the embeddings panel stops polling.
+        this.getRouter().attachRouteMatched(this.onAnyRouteMatched, this);
+        this.getRouter().attachBypassed(this.onLeft, this);
+    }
+
+    public onExit(): void {
+        this.onLeft();
+        this.getRouter().detachRouteMatched(this.onAnyRouteMatched, this);
+        this.getRouter().detachBypassed(this.onLeft, this);
+    }
+
+    private onAnyRouteMatched(event: Router$RouteMatchedEvent): void {
+        if (event.getParameter("name") !== "settings") {
+            this.onLeft();
+        }
+    }
+
+    private onLeft(): void {
+        this.embeddings.hide();
     }
 
     private load(): Promise<void> {
@@ -76,6 +109,28 @@ export default class Settings extends BaseController {
         if (saved) {
             MessageToast.show(this.text("modelSaved"));
         }
+    }
+
+    // --- data catalogue embeddings (controller/settings/Embeddings.ts) ---
+
+    public onSaveEmbeddings(): void {
+        void this.embeddings.save();
+    }
+
+    public onRunEmbeddings(): void {
+        void this.embeddings.compute();
+    }
+
+    public onOpenEmbeddingsDeploy(): void {
+        void this.embeddings.openDeploy();
+    }
+
+    public onEmbeddingsModelChange(): void {
+        this.embeddings.clearModelError();
+    }
+
+    public onRetryEmbeddings(): void {
+        void this.embeddings.retry();
     }
 
     public async onSaveOrchestrator(): Promise<void> {

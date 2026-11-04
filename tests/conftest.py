@@ -32,6 +32,10 @@ from tests.testdb import use_test_database  # noqa: E402
 os.environ.pop("VCAP_SERVICES", None)
 os.environ.pop("VCAP_APPLICATION", None)
 SESSION_DB = use_test_database()
+# No embedding calls to SAP AI Core from the suite: a developer's `.env` may
+# hold real credentials (agents/data_catalog/embeddings.py). Tests that need
+# vectors patch the embedding call.
+os.environ["DATA_CATALOG_EMBEDDINGS"] = "0"
 
 # Bind the engine now. A module that still set DATABASE_URL in its header
 # would otherwise decide the database for the whole process whenever it is

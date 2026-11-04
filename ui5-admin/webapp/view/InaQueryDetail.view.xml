@@ -1,0 +1,354 @@
+<mvc:View
+    controllerName="com.agent.admin.controller.InaQueryDetail"
+    xmlns="sap.m"
+    xmlns:mvc="sap.ui.core.mvc"
+    xmlns:core="sap.ui.core"
+    xmlns:f="sap.ui.layout.form">
+    <Page
+        id="inaQueryDetailPage"
+        title="{qry>/title}"
+        showNavButton="true"
+        class="odataDetailPage"
+        navButtonPress=".onBack">
+        <!-- Tags and actions in a toolbar of their own, as on the OData
+             service page: the secondary actions move into the overflow
+             menu on a narrow window and Save always stays. -->
+        <subHeader>
+            <OverflowToolbar id="inaDetailToolbar">
+                <!-- The tags describe the query as it is SAVED. -->
+                <ObjectStatus
+                    id="inaTagRunsAs"
+                    visible="{qry>/exists}"
+                    text="{ path: 'qry>/stored/user_context', formatter: '.formatRunsAs' }"
+                    state="{= ${qry>/stored/user_context} ? 'Information' : 'None' }"
+                    inverted="true" />
+                <ObjectStatus
+                    id="inaTagDisabled"
+                    visible="{= ${qry>/exists} &amp;&amp; !${qry>/stored/enabled} }"
+                    text="{i18n>odataTagDisabled}"
+                    state="Error"
+                    inverted="true" />
+                <ToolbarSpacer />
+                <Button
+                    id="inaDescribeButton"
+                    icon="sap-icon://download"
+                    text="{i18n>inaDescribe}"
+                    tooltip="{i18n>inaDescribeTooltip}"
+                    enabled="{= ${qry>/exists} &amp;&amp; !${qry>/busy} &amp;&amp; !${qry>/asking} }"
+                    press=".onDescribe">
+                    <layoutData>
+                        <OverflowToolbarLayoutData priority="Low" />
+                    </layoutData>
+                </Button>
+                <Button
+                    id="inaTestButton"
+                    icon="sap-icon://lab"
+                    text="{i18n>inaTest}"
+                    tooltip="{i18n>inaTestTooltip}"
+                    enabled="{= ${qry>/exists} &amp;&amp; !${qry>/busy} &amp;&amp; !${qry>/asking} }"
+                    press=".onTest">
+                    <layoutData>
+                        <OverflowToolbarLayoutData priority="Low" />
+                    </layoutData>
+                </Button>
+                <Button
+                    id="inaDeleteButton"
+                    icon="sap-icon://delete"
+                    text="{i18n>delete}"
+                    enabled="{= ${qry>/exists} &amp;&amp; !${qry>/busy} &amp;&amp; !${qry>/asking} }"
+                    press=".onDelete">
+                    <layoutData>
+                        <OverflowToolbarLayoutData priority="Low" />
+                    </layoutData>
+                </Button>
+                <Button
+                    id="inaSaveButton"
+                    text="{i18n>save}"
+                    type="Emphasized"
+                    enabled="{= ${qry>/loaded} &amp;&amp; ${qry>/exists} &amp;&amp; !${qry>/busy} &amp;&amp; !${qry>/asking} }"
+                    press=".onSave">
+                    <layoutData>
+                        <OverflowToolbarLayoutData priority="NeverOverflow" />
+                    </layoutData>
+                </Button>
+            </OverflowToolbar>
+        </subHeader>
+        <content>
+            <MessageStrip
+                id="inaDetailLoadFailed"
+                visible="{qry>/loadFailed}"
+                type="Error"
+                showIcon="true"
+                class="sapUiSmallMargin"
+                text="{qry>/loadError}">
+                <link>
+                    <Link id="inaDetailRetry" text="{i18n>inaRetry}" press=".onRetry" />
+                </link>
+            </MessageStrip>
+            <!-- Saved elsewhere since the form loaded it: nothing is sent
+                 over it. The input stays until the admin reloads. -->
+            <MessageStrip
+                id="inaChangedElsewhere"
+                visible="{qry>/changedElsewhere}"
+                type="Warning"
+                showIcon="true"
+                class="sapUiSmallMarginBeginEnd sapUiSmallMarginTop"
+                text="{i18n>inaChangedElsewhere}">
+                <link>
+                    <Link id="inaReload" text="{i18n>odataReload}" press=".onReload" />
+                </link>
+            </MessageStrip>
+            <MessageStrip
+                id="inaDeletedElsewhere"
+                visible="{qry>/deletedElsewhere}"
+                type="Warning"
+                showIcon="true"
+                class="sapUiSmallMarginBeginEnd sapUiSmallMarginTop"
+                text="{i18n>inaDeletedElsewhere}" />
+            <!-- What a refused save says about anything without a field of
+                 its own below: the server's words, as plain text. -->
+            <MessageStrip
+                id="inaSaveError"
+                visible="{= !!${qry>/saveError} }"
+                type="Error"
+                showIcon="true"
+                class="sapUiSmallMarginBeginEnd sapUiSmallMarginTop"
+                text="{qry>/saveError}" />
+            <!-- The answer of Test (outcome, status, duration and the
+                 column names, never a value that was read) and what
+                 Describe or Test have to say beside it. -->
+            <MessageStrip
+                id="inaResultStrip"
+                visible="{= !!${qry>/test} }"
+                type="{= ${qry>/test/type} || 'Information' }"
+                showIcon="true"
+                class="sapUiSmallMarginBeginEnd sapUiSmallMarginTop"
+                text="{qry>/test/text}" />
+            <Panel
+                id="inaGeneralPanel"
+                visible="{qry>/loaded}"
+                class="sapUiResponsiveMargin"
+                width="auto">
+                <headerToolbar>
+                    <Toolbar>
+                        <Title text="{i18n>odataGeneral}" level="H2" />
+                        <ToolbarSpacer />
+                        <Label id="inaEnabledLabel" text="{i18n>odataEnabled}" labelFor="inaEnabledSwitch" />
+                        <Switch
+                            id="inaEnabledSwitch"
+                            state="{qry>/data/enabled}"
+                            change=".onEdited"
+                            ariaLabelledBy="inaEnabledLabel" />
+                    </Toolbar>
+                </headerToolbar>
+                <!-- Left: what the query is for (what an agent reads).
+                     Right: where it is and whom SAP sees. -->
+                <f:SimpleForm
+                    id="inaGeneralForm"
+                    editable="true"
+                    layout="ResponsiveGridLayout"
+                    columnsM="1"
+                    columnsL="2"
+                    columnsXL="2"
+                    labelSpanS="12"
+                    labelSpanM="12"
+                    labelSpanL="12"
+                    labelSpanXL="12"
+                    singleContainerFullSize="false">
+                    <core:Title text="{i18n>odataGroupPurpose}" level="H3" />
+
+                    <Label text="{i18n>inaTitle}" required="true" labelFor="inaDetailTitle" />
+                    <Input
+                        id="inaDetailTitle"
+                        value="{qry>/data/title}"
+                        valueState="{ path: 'qry>/errors/title', formatter: '.formatErrorState' }"
+                        valueStateText="{qry>/errors/title}"
+                        liveChange=".onFieldEdit">
+                        <customData><core:CustomData key="field" value="title" /></customData>
+                    </Input>
+
+                    <Label text="{i18n>inaName}" labelFor="inaDetailName" />
+                    <VBox>
+                        <Input id="inaDetailName" value="{qry>/data/name}" editable="false" class="odataTechnical"
+                            ariaDescribedBy="inaDetailNameHint" />
+                        <Text id="inaDetailNameHint" text="{i18n>inaNameImmutable}" class="odataHint" />
+                    </VBox>
+
+                    <Label text="{i18n>inaPurpose}" required="true" labelFor="inaDetailPurpose" />
+                    <Input
+                        id="inaDetailPurpose"
+                        value="{qry>/data/purpose}"
+                        valueState="{ path: 'qry>/errors/purpose', formatter: '.formatErrorState' }"
+                        valueStateText="{qry>/errors/purpose}"
+                        liveChange=".onFieldEdit">
+                        <customData><core:CustomData key="field" value="purpose" /></customData>
+                    </Input>
+
+                    <Label text="{i18n>odataNotFor}" labelFor="inaDetailNotFor" />
+                    <Input
+                        id="inaDetailNotFor"
+                        value="{qry>/data/not_for}"
+                        valueState="{ path: 'qry>/errors/not_for', formatter: '.formatErrorState' }"
+                        valueStateText="{qry>/errors/not_for}"
+                        liveChange=".onFieldEdit">
+                        <customData><core:CustomData key="field" value="not_for" /></customData>
+                    </Input>
+
+                    <Label text="{i18n>inaColUsedBy}" labelFor="inaDetailUsedBy" />
+                    <Text id="inaDetailUsedBy" text="{ path: 'qry>/usedBy', formatter: '.formatUsedBy' }" />
+
+                    <core:Title text="{i18n>inaGroupIdentity}" level="H3" />
+
+                    <Label text="{i18n>inaDestination}" required="true" labelFor="inaDetailDestination" />
+                    <!-- The destination field of the OData service page
+                         (DestinationField), judged against "Runs as". -->
+                    <VBox>
+                        <Input
+                            id="inaDetailDestination"
+                            value="{qry>/data/destination}"
+                            showSuggestion="{= !${device>/system/phone} }"
+                            autocomplete="false"
+                            showValueHelp="{= ${dest>/items}.length > 0 }"
+                            suggestionItems="{ path: 'dest>/items', templateShareable: false }"
+                            valueState="{ parts: ['qry>/errors/destination', 'dest>/page/notice'], formatter: '.formatDestinationState' }"
+                            valueStateText="{ parts: ['qry>/errors/destination', 'dest>/page/noticeText'], formatter: '.formatDestinationStateText' }"
+                            class="odataTechnical"
+                            ariaDescribedBy="inaDetailDestinationHint">
+                            <suggestionItems>
+                                <core:ListItem text="{dest>name}" additionalText="{dest>info}" />
+                            </suggestionItems>
+                        </Input>
+                        <Text
+                            id="inaDetailDestinationHint"
+                            text="{dest>/hint}"
+                            visible="{= !!${dest>/hint} }"
+                            class="odataHint" />
+                    </VBox>
+
+                    <Label id="inaDetailRunsAsLabel" text="{i18n>inaRunsAs}" labelFor="inaDetailRunsAs" />
+                    <VBox>
+                        <SegmentedButton
+                            id="inaDetailRunsAs"
+                            selectedKey="{= ${qry>/data/user_context} ? 'user' : 'technical' }"
+                            selectionChange=".onRunsAsChange"
+                            ariaLabelledBy="inaDetailRunsAsLabel"
+                            ariaDescribedBy="inaDetailRunsAsHint">
+                            <items>
+                                <SegmentedButtonItem key="user" text="{i18n>odataRunsAsUser}" />
+                                <SegmentedButtonItem key="technical" text="{i18n>odataRunsAsTechnical}" />
+                            </items>
+                        </SegmentedButton>
+                        <Text
+                            id="inaDetailRunsAsHint"
+                            text="{= ${qry>/data/user_context} ? ${i18n>odataRunsAsUserHint} : ${i18n>odataRunsAsTechnicalHint} }"
+                            class="odataHint" />
+                    </VBox>
+
+                    <Label text="{i18n>inaQuery}" required="true" labelFor="inaDetailQuery" />
+                    <VBox>
+                        <Input
+                            id="inaDetailQuery"
+                            value="{qry>/data/query}"
+                            valueState="{ path: 'qry>/errors/query', formatter: '.formatErrorState' }"
+                            valueStateText="{qry>/errors/query}"
+                            class="odataTechnical"
+                            ariaDescribedBy="inaDetailQueryHint"
+                            liveChange=".onFieldEdit">
+                            <customData><core:CustomData key="field" value="query" /></customData>
+                        </Input>
+                        <Text id="inaDetailQueryHint" text="{i18n>inaQueryHint}" class="odataHint" />
+                    </VBox>
+
+                    <Label text="{i18n>inaPackage}" labelFor="inaDetailPackage" />
+                    <Input
+                        id="inaDetailPackage"
+                        value="{qry>/data/package}"
+                        valueState="{ path: 'qry>/errors/package', formatter: '.formatErrorState' }"
+                        valueStateText="{qry>/errors/package}"
+                        class="odataTechnical"
+                        liveChange=".onFieldEdit">
+                        <customData><core:CustomData key="field" value="package" /></customData>
+                    </Input>
+                </f:SimpleForm>
+            </Panel>
+            <!-- What Describe read from SAP. Read-only: only Describe
+                 writes it, and a save never sends it. -->
+            <Panel
+                id="inaDescribedPanel"
+                visible="{qry>/loaded}"
+                class="sapUiResponsiveMargin"
+                width="auto">
+                <headerToolbar>
+                    <Toolbar>
+                        <Title text="{i18n>inaDescribedTitle}" level="H2" />
+                        <ToolbarSpacer />
+                        <Text id="inaDescribedAt" text="{ path: 'qry>/describedAt', formatter: '.formatDescribedAt' }" />
+                    </Toolbar>
+                </headerToolbar>
+                <Text id="inaDescribedText" text="{qry>/describedText}" class="sapUiSmallMarginBottom" />
+                <Table id="inaDimensionsTable" items="{qry>/definition/dimensions}" noDataText="{i18n>inaNoDimensions}"
+                    popinLayout="GridSmall">
+                    <headerToolbar>
+                        <Toolbar><Title text="{i18n>inaDimensions}" level="H3" /></Toolbar>
+                    </headerToolbar>
+                    <columns>
+                        <Column><Text text="{i18n>inaColName}" /></Column>
+                        <Column><Text text="{i18n>inaColLabel}" /></Column>
+                        <Column minScreenWidth="Tablet" demandPopin="true"><Text text="{i18n>inaColKeyField}" /></Column>
+                    </columns>
+                    <items>
+                        <ColumnListItem>
+                            <cells>
+                                <Text text="{qry>name}" />
+                                <Text text="{qry>label}" />
+                                <Text text="{qry>key_field}" />
+                            </cells>
+                        </ColumnListItem>
+                    </items>
+                </Table>
+                <Table id="inaMeasuresTable" items="{qry>/definition/measures}" noDataText="{i18n>inaNoMeasures}"
+                    popinLayout="GridSmall" class="sapUiSmallMarginTop">
+                    <headerToolbar>
+                        <Toolbar><Title text="{i18n>inaMeasures}" level="H3" /></Toolbar>
+                    </headerToolbar>
+                    <columns>
+                        <Column><Text text="{i18n>inaColName}" /></Column>
+                        <Column><Text text="{i18n>inaColLabel}" /></Column>
+                        <Column minScreenWidth="Tablet" demandPopin="true"><Text text="{i18n>inaColUnit}" /></Column>
+                    </columns>
+                    <items>
+                        <ColumnListItem>
+                            <cells>
+                                <Text text="{qry>name}" />
+                                <Text text="{qry>label}" />
+                                <Text text="{qry>unit}" />
+                            </cells>
+                        </ColumnListItem>
+                    </items>
+                </Table>
+                <Table id="inaVariablesTable" items="{qry>/definition/variables}" noDataText="{i18n>inaNoVariables}"
+                    popinLayout="GridSmall" class="sapUiSmallMarginTop">
+                    <headerToolbar>
+                        <Toolbar><Title text="{i18n>inaVariables}" level="H3" /></Toolbar>
+                    </headerToolbar>
+                    <columns>
+                        <Column><Text text="{i18n>inaColName}" /></Column>
+                        <Column><Text text="{i18n>inaColLabel}" /></Column>
+                        <Column minScreenWidth="Tablet" demandPopin="true"><Text text="{i18n>inaColMandatory}" /></Column>
+                        <Column minScreenWidth="Tablet" demandPopin="true"><Text text="{i18n>inaColType}" /></Column>
+                    </columns>
+                    <items>
+                        <ColumnListItem>
+                            <cells>
+                                <Text text="{qry>name}" />
+                                <Text text="{qry>label}" />
+                                <Text text="{= ${qry>mandatory} === true ? ${i18n>inaYes} : ${i18n>inaNo} }" />
+                                <Text text="{ path: 'qry>type', formatter: '.formatVariableType' }" />
+                            </cells>
+                        </ColumnListItem>
+                    </items>
+                </Table>
+            </Panel>
+        </content>
+    </Page>
+</mvc:View>

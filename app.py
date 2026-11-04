@@ -54,6 +54,10 @@ from agents.auth import (  # noqa: E402
     public_base_url,
 )
 from agents.chat_app import dynamic_chat_app  # noqa: E402
+from agents.data_catalog import embedding_run  # noqa: E402
+from agents.data_catalog.embedding_routes import (  # noqa: E402
+    drain_deploys as drain_embedding_deploys,
+)
 from agents.db import (  # noqa: E402
     SessionLocal,
     init_db,
@@ -85,6 +89,11 @@ from agents.oauth_routes import router as oauth_router  # noqa: E402
 from agents.odata import audit as odata_audit  # noqa: E402
 from agents.odata.audit import ODATA_AUDIT_RETENTION_DAYS  # noqa: E402
 from agents.registry import registry  # noqa: E402
+from agents.webchat import run as webchat_run  # noqa: E402
+from agents.webchat import store as webchat_store  # noqa: E402
+from agents.webchat.my_routes import router as webchat_my_router  # noqa: E402
+from agents.webchat.routes import page_router as webchat_page_router  # noqa: E402
+from agents.webchat.routes import router as webchat_router  # noqa: E402
 from agents.workflow_runner import cancel_all_workflow_runs  # noqa: E402
 
 SEED_FILE = Path(__file__).resolve().parent / "agents.seed.json"
@@ -229,6 +238,13 @@ async def _purge_ide_sessions() -> int:
         ODATA_AUDIT_RETENTION_DAYS >= 1,
         lambda s: purge_odata_audit(s, ODATA_AUDIT_RETENTION_DAYS),
     )
+    # Web chat conversations (agents/webchat), aged from their last
+    # activity; their messages and files go with them. 0 keeps them.
+    await _pass(
+        "chat conversations purged",
+        webchat_store.CHAT_RETENTION_DAYS >= 1,
+        lambda s: webchat_store.purge_older_than(s, webchat_store.CHAT_RETENTION_DAYS),
+    )
     return purged
 
 
@@ -306,6 +322,10 @@ async def lifespan(app: FastAPI):
         ide_reset = await reset_running_ide_sessions(
             session, min_age_s=ide_runner.ghost_age()
         )
+        # Web chat turns live in one process: any `running` one is a ghost.
+        chat_reset = await webchat_store.reset_running(session)
+    if chat_reset:
+        logger.info("Reset %d ghost web chat conversation(s) to idle", chat_reset)
     if ide_reset:
         logger.info("Reset %d ghost IDE session(s) to idle", ide_reset)
     if IDE_DIAGNOSE_RETENTION_DAYS < 1:
@@ -350,11 +370,17 @@ async def lifespan(app: FastAPI):
     if TOKEN_KEEPWARM_SECONDS > 0:
         keepwarm = asyncio.create_task(_token_keepwarm(TOKEN_KEEPWARM_SECONDS))
     ide_purge = asyncio.create_task(_ide_purge_loop(86400))
+    # The data catalogue graph follows the stored catalogue and agents
+    # (agents/data_catalog). In the background: embedding calls may take
+    # longer than a start is allowed to; rebuild_safely never raises.
+    from agents.data_catalog.importer import rebuild_safely
+
+    catalog_rebuild = asyncio.create_task(rebuild_safely(None, what="startup"))
     logger.info("Application startup complete")
     yield
     # Shutdown: cancel in-flight runs so each finalizes as `interrupted`
     # rather than being killed mid-await and leaving its row `running`.
-    for task in (heartbeat, keepwarm, ide_purge):
+    for task in (heartbeat, keepwarm, ide_purge, catalog_rebuild):
         if task is not None:
             task.cancel()
             with suppress(asyncio.CancelledError):
@@ -363,19 +389,28 @@ async def lifespan(app: FastAPI):
     await cancel_all_invoke_runs()
     await cancel_all_workflow_runs()
     await ide_runner.cancel_all()
+    await webchat_run.cancel_all_chat_runs()
+    await embedding_run.cancel_all()
+
     # An approved trace whose ARC-1 call is in flight runs in its own task,
     # not in a run: let it record its outcome (armed / failed) rather than
     # leave the approval `approved` with nothing behind it. Each call is
     # bounded by ARM_TIMEOUT_S, so this wait is too.
-    try:
-        await asyncio.wait_for(
-            ide_approvals.drain(), ide_approvals.ARM_TIMEOUT_S + 5
-        )
-    except TimeoutError:
-        logger.warning(
-            "IDE approval call(s) still running at shutdown; the next start "
-            "closes them as interrupted"
-        )
+    async def drain_ide_approvals() -> None:
+        try:
+            await asyncio.wait_for(
+                ide_approvals.drain(), ide_approvals.ARM_TIMEOUT_S + 5
+            )
+        except TimeoutError:
+            logger.warning(
+                "IDE approval call(s) still running at shutdown; the next start "
+                "closes them as interrupted"
+            )
+
+    # Side by side, not one after the other: Cloud Foundry kills the app 10 s
+    # after SIGTERM. An AI Core deploy in flight is waited for, never
+    # cancelled (drain_embedding_deploys, bounded, never raises).
+    await asyncio.gather(drain_embedding_deploys(), drain_ide_approvals())
     # A write whose run was cancelled above still has its result to store
     # (its own shielded task). Bounded: `drain` gives up after its timeout
     # and never raises; a row left `intent` is explained in agents.odata.audit.
@@ -508,13 +543,15 @@ class JWTBindingMiddleware:
             elif fwd_origin:
                 base_url = fwd_origin
 
-        # CSRF guard for the admin API. The approuter routes run with
-        # csrfProtection off, so a state-changing admin request that the
-        # browser attributes to another site is refused here. Browsers send
-        # Origin on every cross-site POST/PUT/PATCH/DELETE; server-to-server
-        # callers (the job scheduler on /api/*/run) send none and are not
-        # affected, and /admin is the only prefix checked.
-        if is_admin and method in _STATE_CHANGING:
+        # CSRF guard for the admin API and the web chat API. The approuter
+        # routes run with csrfProtection off, so a state-changing request
+        # under /admin or /chat/api that the browser attributes to another
+        # site is refused here. Browsers send Origin on every cross-site
+        # POST/PUT/PATCH/DELETE; server-to-server callers (the job scheduler
+        # on /api/*/run) send none and are not affected, and these two are
+        # the only prefixes checked.
+        is_chat_api = path == "/chat/api" or path.startswith("/chat/api/")
+        if (is_admin or is_chat_api) and method in _STATE_CHANGING:
             fetch_site = (hdrs.get(b"sec-fetch-site") or b"").decode("latin-1").strip().lower()
             origin_h = hdrs.get(b"origin")
             if fetch_site not in ("same-origin", "none") and origin_h:
@@ -602,6 +639,11 @@ app.include_router(runs_router)
 # Invoke API (POST /api/invoke/{slug}, GET /api/invoke/runs/{id}), `invoke`
 # scope; before the chat mount for the same reason.
 app.include_router(invoke_router)
+# Web chat (GET /chat and /chat/api/...), any signed-in user; before the
+# chat mount, which would otherwise answer every path.
+app.include_router(webchat_page_router)
+app.include_router(webchat_router)
+app.include_router(webchat_my_router)
 # ABAP IDE API (/ide/api/...), developer scope; before the chat mount.
 # The two routers share no path, so their order does not matter.
 app.include_router(ide_review_router)
@@ -637,5 +679,6 @@ if __name__ == "__main__":
     host, port = serve_address()
     print(f"Starting SAP BTP Management app on http://{host}:{port}")
     print(f"  Chat:  http://{host}:{port}/")
+    print(f"  Web chat: http://{host}:{port}/chat")
     print(f"  Admin: http://{host}:{port}/admin")
     uvicorn.run(app, host=host, port=port)

@@ -230,3 +230,46 @@ html.sapUiTheme-sap_horizon .odataFieldConfirm.sapMFlexBox {
         padding-left: 3.25rem;
     }
 }
+/* Data catalogue detail (DataCatalogDetail.view.xml), the Name cell of the
+   entities table: the name stays on one line and the type name sits below
+   it, both cut with an ellipsis (the whole text is the tooltip), so a long
+   type name no longer squeezes the name or runs under the Label column. The
+   text column may shrink (min-width 0) so the ellipsis applies. */
+.dcNameCell {
+    width: 100%;
+}
+.dcNameCell[data-level="field"] {
+    padding-left: 1rem;
+}
+.dcNameCell .dcNameIcon {
+    flex: none;
+    line-height: 1.375rem;
+}
+.dcNameCell .dcNameText {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+.dcNameCell .dcNodeName.sapMText {
+    line-height: 1.375rem;
+}
+/* font-weight, not var(--sapFontBoldFamily): this UI5 version serves no
+   theme CSS variables unless they are switched on, and the 72 font has a
+   bold face of its own. */
+.dcNameCell[data-level="entity"] .dcNodeName.sapMText {
+    font-weight: bold;
+}
+.dcNameCell .dcNodeType.sapMText {
+    font-size: 0.75rem;
+    color: var(--sapContent_LabelColor);
+}
+
+/* The 3D overview of the data catalogue graph (DataCatalogGraph): the
+   canvas takes the network graph's place; the controller sizes its pixels
+   to this box. No touch scrolling on it: a drag turns the view. */
+.dcCanvas3d {
+    width: 100%;
+    height: calc(100% - 1rem);
+    display: block;
+    touch-action: none;
+    cursor: grab;
+}

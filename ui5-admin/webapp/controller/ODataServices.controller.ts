@@ -17,9 +17,10 @@ import type { ODataServiceInput, ODataServiceSummary, ODataUsedBy } from "../ser
 
 /** The fields of an exported service (`to_export()`), which are exactly what
  *  a create accepts. Anything else in a file (an id, counts, `used_by` of a
- *  copied API answer) is left out, because the server refuses unknown keys. */
+ *  copied API answer) is left out, because the server refuses unknown keys.
+ *  A file without `kind` is an OData service, the server's default. */
 const CONFIG_FIELDS: readonly (keyof ODataServiceInput)[] = [
-    "name", "title", "purpose", "not_for", "destination", "user_context", "odata_version",
+    "name", "kind", "title", "purpose", "not_for", "destination", "user_context", "odata_version",
     "service_path", "enabled", "definition", "metadata_fetched_at"
 ];
 
@@ -316,10 +317,13 @@ export default class ODataServices extends ODataController {
         let writes: string;
         let reads: string;
         try {
-            const pending = odataCatalog.pendingWrites(undefined, input.definition);
-            writes = odataCatalog.hasWrite(input.definition) || odataCatalog.pendingCount(pending) > 0
+            // Judged by the file's own kind: a generic service's GET
+            // function imports are reads, and are asked about as such.
+            const kinds = { current: input.kind };
+            const pending = odataCatalog.pendingWrites(undefined, input.definition, false, kinds);
+            writes = odataCatalog.hasWrite(input.definition, input.kind) || odataCatalog.pendingCount(pending) > 0
                 ? this.writeList({ ...pending, fields: [] }) : "";
-            reads = this.operationList(odataCatalog.pendingReads(undefined, input.definition));
+            reads = this.operationList(odataCatalog.pendingReads(undefined, input.definition, kinds));
         } catch {
             return this.text("odataConfigAskUnknown");
         }

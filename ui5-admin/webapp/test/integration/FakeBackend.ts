@@ -4,6 +4,9 @@ import type {
     ODataServiceInput, ODataServiceSummary, ODataTestResult, ODataUsedBy, Skill, WorkflowDetail, WorkflowRunDetail
 } from "com/agent/admin/service/types";
 import { DEEP_DEFAULTS } from "com/agent/admin/service/types";
+import FakeDataCatalog from "./FakeDataCatalog";
+import FakeEmbeddings from "./FakeEmbeddings";
+import FakeIna from "./FakeIna";
 
 /** What `FakeBackend#failNext` accepts: the next call to `path` answers with `body`/`status` instead. */
 export interface FailNext {
@@ -40,6 +43,13 @@ export default class FakeBackend {
      * definition on every answer, as the server does; `used_by` is kept on
      * the row, and a non-empty one refuses a delete. */
     public odataServices: ODataService[] = [];
+    /** The data catalogue routes (`data-catalog/...`), in a file of their own. */
+    public dataCatalog = new FakeDataCatalog();
+    /** The embeddings of the catalogue (`data-catalog/embeddings...`): the
+     *  setting, a scripted run and the AI Core deployments. */
+    public embeddings = new FakeEmbeddings();
+    /** The `ina/...` routes: the analytical queries of `builtin:ina`. */
+    public ina = new FakeIna();
     /** What POST odata/metadata answers, whatever the request names. */
     public metadataPreview!: ODataMetadataPreview;
     /** What POST odata/services/{name}/test answers. */
@@ -141,6 +151,9 @@ export default class FakeBackend {
         // that opens a fixture by a hardcoded id/hash, and `this.runs` below
         // already assumes btp-agent is id 100.
         this.nextId = 100;
+        this.dataCatalog.reset();
+        this.embeddings.reset();
+        this.ina.reset();
         this.requests = [];
         this.bodies = {};
         this.runNowCalls = [];
@@ -177,6 +190,9 @@ export default class FakeBackend {
             url: "https://arc1.example.com/mcp", auth_mode: "destination",
             oauth: { destination: "arc1-abap-readonly", user_context: true }
         }]);
+        // --- tier --- gmail-agent is an advanced (developer-only) agent,
+        // btp-agent keeps the default basic.
+        this.agents[1].tier = "advanced";
         // --- deep agents --- btp-agent carries a non-default config so a
         // journey can check it is shown and resent unchanged; gmail-agent
         // keeps the defaults (GET always returns the object).
@@ -403,7 +419,7 @@ export default class FakeBackend {
             id: this.nextId++, name, description: `${name} description`,
             instructions: "Do the thing.",
             mcp_servers: [{ url: "https://x.hana.ondemand.com/mcp", auth_mode: "jwt" }],
-            skills: [], enabled: true, expose_chat: true, expose_api: false,
+            skills: [], enabled: true, expose_chat: true, tier: "basic", share_tools: false, expose_api: false,
             api_slug: "", run_as_principal: "", run_prompt: "",
             run_timeout_seconds: 1800, peers: [], model_name: "",
             deep: { ...DEEP_DEFAULTS },
@@ -537,23 +553,28 @@ export default class FakeBackend {
         input: ODataServiceInput, usedBy: ODataUsedBy[] = []
     ): ODataService {
         return {
-            ...input, id: this.nextId++, created_at: "2026-10-05T08:00:00+00:00",
+            ...input, kind: input.kind ?? "odata", id: this.nextId++, created_at: "2026-10-05T08:00:00+00:00",
             updated_at: "2026-10-05T08:00:00+00:00",
             counts: { entity_sets: 0, operations: 0 }, has_write: false, used_by: usedBy
         };
     }
 
-    /** `ODataService.to_dict()`: counts and has_write follow the definition. */
+    /** `ODataService.to_dict()`: counts and has_write follow the definition,
+     *  and `kind` is always there (`odata` for a row stored without one). */
     private static odataDict(service: ODataService): ODataService {
         const definition: ODataDefinition = service.definition;
         const writes: ODataEntityOp[] = ["create", "update", "delete"];
+        const kind = service.kind ?? "odata";
         return {
             ...service,
+            kind,
             counts: { entity_sets: definition.entity_sets.length, operations: definition.operations.length },
             has_write: definition.entity_sets.some((e) => e.operations.some((op) => writes.indexOf(op) !== -1))
                 // `operation_is_write` in agents/odata/models.py: a read is
-                // only `changes_data: false` (exactly) sent with GET.
+                // `changes_data: false` (exactly) sent with GET, or a GET
+                // function import of a generic service, whatever its flag.
                 || definition.operations.some((o) => o.enabled === true
+                    && !(kind === "generic" && o.kind === "function_import" && o.http_method === "GET")
                     && !(o.changes_data === false && o.http_method === "GET")),
             uncallable_operations: FakeBackend.odataUncallable(service)
         };
@@ -613,7 +634,7 @@ export default class FakeBackend {
     private static readonly ODATA_NAME_MSG = "String should match pattern '^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$'";
     private static readonly ODATA_DESTINATION_MSG = "String should match pattern '^[A-Za-z0-9_.-]{1,200}$'";
     private static readonly ODATA_PAYLOAD_KEYS = [
-        "name", "title", "purpose", "not_for", "destination", "user_context", "odata_version",
+        "name", "kind", "title", "purpose", "not_for", "destination", "user_context", "odata_version",
         "service_path", "enabled", "definition", "metadata_fetched_at"
     ];
     private static readonly ODATA_DUPLICATE_KEYS = ["name", "title", "destination", "user_context"];
@@ -945,6 +966,10 @@ export default class FakeBackend {
         FakeBackend.odataText(data, "name", true, (v) => (
             FakeBackend.ODATA_NAME_RE.test(v) ? "" : FakeBackend.ODATA_NAME_MSG
         ), problems);
+        // `Literal["odata", "generic"] = "odata"`: left out is odata.
+        if (data.kind !== undefined && data.kind !== "odata" && data.kind !== "generic") {
+            problems.push("kind: Input should be 'odata' or 'generic'");
+        }
         // Stripped, measured, and only then held to one line: what
         // surrounds a title or purpose is gone before `_one_line` runs.
         FakeBackend.odataText(data, "title", true, (v) => (
@@ -972,6 +997,11 @@ export default class FakeBackend {
         flag("enabled");
         FakeBackend.odataDefinitionProblems(data.definition).forEach((problem) => problems.push(problem));
         FakeBackend.odataExtras(data, FakeBackend.ODATA_PAYLOAD_KEYS, problems);
+        // `_kinds_match_version`, an after-validator: it runs only on a
+        // payload whose fields all passed, and says it at `kind`.
+        if (!problems.length && data.kind === "generic" && data.odata_version !== "v2") {
+            problems.push("kind: a generic service is OData V2");
+        }
         return problems;
     }
 
@@ -1010,7 +1040,8 @@ export default class FakeBackend {
     private static odataInput(body: Record<string, unknown> | undefined): ODataServiceInput {
         const input = (body ?? {}) as Partial<ODataServiceInput>;
         return {
-            name: String(input.name), title: FakeBackend.odataStrip(String(input.title)),
+            name: String(input.name), kind: input.kind === "generic" ? "generic" : "odata",
+            title: FakeBackend.odataStrip(String(input.title)),
             purpose: FakeBackend.odataStrip(String(input.purpose)), not_for: input.not_for ?? "",
             destination: String(input.destination), user_context: input.user_context === true,
             odata_version: input.odata_version === "v4" ? "v4" : "v2",
@@ -1133,6 +1164,16 @@ export default class FakeBackend {
      * the block in every answer. Returns the refusal, or "" after rewriting
      * the entries in `body` to what is stored.
      */
+    /** Whether the agent being saved has a builtin:bitbucket entry with
+     *  `allow_approve: true` (the body's servers, else the stored ones). */
+    private approvesPullRequests(body: Record<string, unknown>, path: string): boolean {
+        const stored = /^agents\/\d+$/.test(path)
+            ? this.agents.find((a) => a.id === Number(path.split("/")[1]))?.mcp_servers : undefined;
+        const servers = (body.mcp_servers ?? stored ?? []) as { url: string; oauth?: Record<string, unknown> | null }[];
+        return servers.some((server) => String(server.url).trim().toLowerCase() === "builtin:bitbucket"
+            && server.oauth?.allow_approve === true);
+    }
+
     private storeODataEntries(body: Record<string, unknown> | undefined): string {
         const servers = (body?.mcp_servers ?? []) as { url: string; oauth?: Record<string, unknown> }[];
         const entries = servers.filter((server) => String(server.url).trim().toLowerCase() === "builtin:odata");
@@ -1633,6 +1674,20 @@ export default class FakeBackend {
             return this.json(failure.body, failure.status, failure.headers);
         }
 
+        // Before the catalogue, which answers every other `data-catalog/...` path.
+        const embeddings = this.embeddings.handle(path, method, body, (b, s, h) => this.json(b, s, h));
+        if (embeddings) {
+            return embeddings;
+        }
+        const catalogue = this.dataCatalog.handle(path, method, body, query, (b, s) => this.json(b, s),
+            this.agents.map((agent) => agent.name));
+        if (catalogue) {
+            return catalogue;
+        }
+        const ina = this.ina.handle(path, method, body, (b, s, h) => this.json(b, s, h), this.reloadKeys());
+        if (ina) {
+            return ina;
+        }
         if (path === "whoami") {
             return this.json({ principal: "uuid-1234", label: "tester@example.com" });
         }
@@ -1655,6 +1710,28 @@ export default class FakeBackend {
             return this.json(this.agents);
         }
         if ((path === "agents" && method === "POST") || (/^agents\/\d+$/.test(path) && method === "PUT")) {
+            // `AgentPayload.tier` (agents/admin.py): absent keeps what is
+            // stored, anything but basic / advanced is a 422 naming the field.
+            if (body && "tier" in body && body.tier !== "basic" && body.tier !== "advanced") {
+                return this.json({ detail: [{ loc: ["body", "tier"], msg: "Input should be 'basic' or 'advanced'",
+                    type: "literal_error" }] }, 422);
+            }
+            // `AgentPayload.share_tools` (addendum g of the web chat design):
+            // an agent whose builtin:bitbucket entry approves never shares.
+            if (body && body.share_tools === true && this.approvesPullRequests(body, path)) {
+                return this.json({ detail: [{ loc: ["body", "share_tools"],
+                    msg: "Value error, share_tools: an agent that approves pull requests cannot share its tools",
+                    type: "value_error" }] }, 422);
+            }
+            // `builtin:git` (addendum h of the web chat design): at most one
+            // entry per agent, refused at `mcp_servers` like the server's gate.
+            const gitEntries = ((body?.mcp_servers ?? []) as { url: string }[])
+                .filter((server) => String(server.url).trim().replace(/\/+$/, "").toLowerCase() === "builtin:git");
+            if (gitEntries.length > 1) {
+                return this.json({ detail: [{ loc: ["body", "mcp_servers"],
+                    msg: "Value error, mcp_servers: an agent may have at most one builtin:git entry",
+                    type: "value_error" }] }, 422);
+            }
             const refusal = this.storeODataEntries(body);
             if (refusal) {
                 return this.json({ detail: refusal }, 422);

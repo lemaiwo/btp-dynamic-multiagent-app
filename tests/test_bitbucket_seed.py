@@ -32,6 +32,8 @@ SEED = json.loads(SEED_FILE.read_text(encoding="utf-8"))
 TOOLS = ("list_pull_requests", "get_pull_request", "get_diff", "get_file",
          "add_inline_comment", "submit_review", "complete_approval")
 ENTRY = {"destination": "BITBUCKET", "workspace": "replace-me"}
+DEVELOPER_AGENTS = ("abap-developer-deep", "ui5-fiori-developer-deep", "cap-developer-deep")
+DEVELOPER_SKILLS = ("ui5-freestyle-conventions", "fiori-elements-guidance", "cap-cds-modeling")
 
 
 def _agent() -> dict:
@@ -89,8 +91,13 @@ def test_storage_accepts_the_seed_entry_unchanged():
 
 
 def test_only_the_reviewer_has_the_skill_and_the_rest_of_the_file_is_as_it_was():
-    assert [s["name"] for s in SEED["skills"]] == ["pull-request-review"]
-    assert [a["name"] for a in SEED["agents"]] == ["ABAP Development Agent", "pr-reviewer"]
+    # The developer agents and their skills (tests/test_access_tier.py) follow.
+    assert [s["name"] for s in SEED["skills"]] == [
+        "pull-request-review", *DEVELOPER_SKILLS]
+    assert [a["name"] for a in SEED["agents"]] == [
+        "ABAP Development Agent", "pr-reviewer", *DEVELOPER_AGENTS]
+    assert not any("pull-request-review" in a.get("skills", []) for a in SEED["agents"]
+                   if a["name"] != "pr-reviewer")
     assert SEED["version"] == 1 and SEED["orchestrator_instructions"].startswith(
         "You are an orchestration agent")
     assert "skills" not in SEED["agents"][0]
@@ -131,7 +138,7 @@ async def test_the_seed_loader_stores_the_reviewer_disabled_with_its_skill(caplo
         async with SessionLocal() as s:
             rows = {row.name: row for row in await list_agents(s)}
             skills = {row.name: row for row in await list_skills(s)}
-        assert set(rows) == {"ABAP Development Agent", "pr-reviewer"}
+        assert set(rows) == {"ABAP Development Agent", "pr-reviewer", *DEVELOPER_AGENTS}
         row = rows["pr-reviewer"]
         # The columns are integers.
         assert (row.enabled, row.expose_chat, row.expose_api) == (0, 0, 1)
@@ -141,7 +148,7 @@ async def test_the_seed_loader_stores_the_reviewer_disabled_with_its_skill(caplo
             {"url": "builtin:bitbucket", "auth_mode": "destination", "oauth": ENTRY}]
         assert row.instructions == _agent()["instructions"]
         assert row.run_prompt == _agent()["run_prompt"] and row.run_timeout_seconds == 1800
-        assert set(skills) == {"pull-request-review"}
+        assert set(skills) == {"pull-request-review", *DEVELOPER_SKILLS}
         assert skills["pull-request-review"].content == _skill()["content"]
         assert rows["ABAP Development Agent"].skills == []
     finally:

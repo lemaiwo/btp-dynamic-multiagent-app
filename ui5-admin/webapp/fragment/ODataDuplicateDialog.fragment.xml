@@ -81,6 +81,11 @@
                         class="odataHint" />
                 </VBox>
 
+                <!-- The copy keeps the kind (the server copies it whole):
+                     said, not offered. -->
+                <Label text="{i18n>odataKind}" labelFor="odataDuplicateKind" />
+                <Text id="odataDuplicateKind" text="{ path: 'svc>/duplicate/kind', formatter: '.formatKind' }" />
+
                 <Label id="odataDuplicateRunsAsLabel" text="{i18n>odataRunsAs}" labelFor="odataDuplicateRunsAs" />
                 <VBox>
                     <SegmentedButton

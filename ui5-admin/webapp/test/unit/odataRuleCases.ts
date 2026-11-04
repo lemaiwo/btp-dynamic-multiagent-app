@@ -9,11 +9,13 @@ import type { ODataDefinition, ODataEntitySet, ODataOperation, ODataServiceInput
  */
 export interface RuleCase {
     rule: string;
-    field: "name" | "title" | "purpose" | "not_for" | "destination" | "service_path"
+    field: "name" | "kind" | "title" | "purpose" | "not_for" | "destination" | "service_path"
         | "user_context" | "enabled" | "definition";
     /** What the field is set to. `undefined` leaves the key out of the JSON
      *  body, which is how a missing field reaches the server. */
     value: unknown;
+    /** Other fields the rule needs set (a rule across two fields). */
+    also?: Partial<ODataServiceInput>;
     clientKey: string;
     server: string;
 }
@@ -178,10 +180,26 @@ export const DEFINITION_CASES: RuleCase[] = [{
     clientKey: "odataErrDefinitionRequired", server: "definition: Field required"
 }];
 
-export const RULE_CASES: RuleCase[] = GENERAL_CASES.concat(PATH_CASES, ONE_LINE_CASES, BOOLEAN_CASES, DEFINITION_CASES);
+const KIND_LITERAL = "kind: Input should be 'odata' or 'generic'";
+
+/** `kind: Literal["odata", "generic"]` (default `odata`), and
+ *  `_kinds_match_version`: a generic service is OData V2, said at `kind`. */
+export const KIND_CASES: RuleCase[] = [
+    { rule: "kind: unknown", field: "kind", value: "other", clientKey: "odataErrKind", server: KIND_LITERAL },
+    { rule: "kind: another case", field: "kind", value: "Generic", clientKey: "odataErrKind", server: KIND_LITERAL },
+    { rule: "kind: null", field: "kind", value: null, clientKey: "odataErrKind", server: KIND_LITERAL },
+    {
+        rule: "kind: generic on V4", field: "kind", value: "generic", also: { odata_version: "v4" },
+        clientKey: "odataErrKindGenericV2", server: "kind: a generic service is OData V2"
+    }
+];
+
+export const RULE_CASES: RuleCase[] = GENERAL_CASES.concat(
+    PATH_CASES, ONE_LINE_CASES, BOOLEAN_CASES, DEFINITION_CASES, KIND_CASES
+);
 
 export function withField(testCase: RuleCase): ODataServiceInput {
-    return { ...VALID_INPUT, [testCase.field]: testCase.value } as ODataServiceInput;
+    return { ...VALID_INPUT, ...testCase.also, [testCase.field]: testCase.value } as ODataServiceInput;
 }
 
 // --- one entity set ----------------------------------------------------------

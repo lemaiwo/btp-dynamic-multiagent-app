@@ -1,0 +1,35 @@
+{
+  "Cube": {
+    "DataSource": {"ObjectName": "ZQ_SALES_01", "Type": "Query"},
+    "Dimensions": [
+      {
+        "Name": "0CALMONTH",
+        "Description": "Calendar Year/Month",
+        "AxisDefault": "Rows",
+        "KeyAttribute": "0CALMONTH.KEY"
+      },
+      {
+        "Name": "ZREGION",
+        "Description": "Sales region",
+        "AxisDefault": "Free",
+        "KeyAttribute": "ZREGION.KEY"
+      },
+      {
+        "Name": "Measures",
+        "Description": "Key Figures",
+        "AxisDefault": "Columns",
+        "DimensionType": 2,
+        "Members": [
+          {"Measures.KEY": "0AMOUNT", "Measures.LONG_TEXT": "Net amount", "Unit": "EUR"},
+          {"Measures.KEY": "0QUANTITY", "Measures.LONG_TEXT": "Quantity", "Unit": "PC"}
+        ]
+      }
+    ],
+    "Variables": [
+      {"Name": "0P_CALYEAR", "Description": "Calendar year", "Mandatory": true, "SelectionType": "Single"},
+      {"Name": "ZV_REGION", "Description": "Regions", "Mandatory": false, "SelectionType": "Multiple"},
+      {"Name": "ZV_PERIOD", "Description": "Period range", "Mandatory": false, "SelectionType": "Interval"}
+    ]
+  },
+  "Messages": []
+}

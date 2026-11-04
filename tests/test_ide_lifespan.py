@@ -309,6 +309,32 @@ async def test_shutdown_does_not_wait_forever_for_an_approval_call(
     await asyncio.gather(task, return_exceptions=True)
 
 
+async def test_shutdown_drains_deploys_and_approval_calls_at_once(monkeypatch):
+    """Cloud Foundry stops the app 10 s after SIGTERM: the wait for an AI
+    Core deploy in flight and the wait for an approved trace's ARC-1 call run
+    side by side, not one after the other. Each fake waits until the other
+    has started; one after the other, the first would give up."""
+    started = {"deploys": asyncio.Event(), "approvals": asyncio.Event()}
+    saw: dict[str, bool] = {}
+
+    def drain(mine: str, other: str):
+        async def waiting(*_a, **_k):
+            started[mine].set()
+            try:
+                await asyncio.wait_for(started[other].wait(), 1)
+                saw[mine] = True
+            except TimeoutError:
+                saw[mine] = False
+            return 0
+        return waiting
+
+    monkeypatch.setattr(app_module, "drain_embedding_deploys", drain("deploys", "approvals"))
+    monkeypatch.setattr(app_module.ide_approvals, "drain", drain("approvals", "deploys"))
+    async with app_module.lifespan(app_module.app):
+        pass
+    assert saw == {"deploys": True, "approvals": True}
+
+
 # --- startup says when diagnose data is kept forever ------------------------------
 
 

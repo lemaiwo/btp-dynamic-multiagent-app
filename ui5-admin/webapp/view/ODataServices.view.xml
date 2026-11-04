@@ -77,6 +77,13 @@
                                 <Text text="{odata>purpose}" maxLines="2" />
                                 <HBox>
                                     <ObjectStatus
+                                        text="{i18n>odataTagGeneric}"
+                                        tooltip="{i18n>odataKindGeneric}"
+                                        state="Information"
+                                        inverted="true"
+                                        visible="{= ${odata>kind} === 'generic' }"
+                                        class="sapUiTinyMarginEnd sapUiTinyMarginTop" />
+                                    <ObjectStatus
                                         text="{i18n>odataTagWrite}"
                                         state="Warning"
                                         inverted="true"

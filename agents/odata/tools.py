@@ -32,7 +32,9 @@ one WARNING line on the ``agents.odata.audit`` logger.
 
 Calling an operation (``operation="call"``: V2 function imports, V4 actions
 and functions) is a write too, unless the catalogue marks it
-``changes_data: false`` and it is a ``GET`` (``client.call_changes_data``):
+``changes_data: false`` and it is a ``GET`` (``client.call_changes_data``),
+or it is a ``GET`` function import of a service of kind ``generic`` (SAP's
+own allow-list, whose owner vouches that a listed module only reads):
 in SAP, release, approve, post and cancel are function imports and actions,
 and a V4 action -- a ``POST`` -- is therefore always a write. A call that
 changes data therefore passes the same two switches, needs the same
@@ -974,7 +976,9 @@ def odata_toolset(
             definition is not None
             and getattr(dialect, "supports_call", False) is True
             and any(
-                op.enabled and op.bound_to == entity_set.name and call_changes_data(op)
+                op.enabled
+                and op.bound_to == entity_set.name
+                and call_changes_data(op, entry.raw.get("kind", "odata"))
                 for op in definition.operations
             )
         )
@@ -1474,8 +1478,9 @@ def odata_toolset(
                     "unknown_target",
                     f"service {entry.raw['name']!r} has no operation {_shown(target)}",
                 )
-            # A write unless the catalogue says "only reads" AND it is a GET.
-            changing = call_changes_data(called)
+            # A write unless the catalogue says "only reads" AND it is a GET
+            # (or it is a GET function import of a generic service).
+            changing = call_changes_data(called, entry.raw.get("kind", "odata"))
             args["write_attempt"] = changing
             if called.enabled is not True:
                 raise ODataError(
@@ -1604,9 +1609,13 @@ def odata_toolset(
         when the result shows 'bound_to'). A call answers {"ok": true,
         "status", "returned", "result", "truncated"}: 'returned' is 'entity'
         or 'entities' (readable fields of the 'bound_to' entity set),
-        'value' (one number, boolean or short line of text, only from an
-        operation that does not change data; a long, multi-line or
-        structured text such as JSON or XML is withheld), 'nothing', or
+        'structure' or 'collection' (one object, or a list of objects, with
+        every field: the whole answer of some operations that do not
+        change data; one too large for a tool result is refused with
+        'result_too_large', never cut), 'value' (one number, boolean or
+        short line of text, only from an operation that does not change
+        data; a long, multi-line or structured text such as JSON or XML is
+        withheld), 'nothing', or
         'withheld' -- SAP answered with data this tool may not show; the
         call still worked, read the record to see its state. A call whose
         'changes_data' is true is carried out in SAP for real and CANNOT BE

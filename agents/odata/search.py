@@ -17,7 +17,8 @@ this module decides what exists for it. Three rules hold for every result:
   ``call_versions`` only for services of a version whose operations it can
   run: a search must never offer what the execute tool would refuse. An
   operation is a write unless it is marked ``changes_data: false`` AND is
-  a ``GET`` (``operation_changes_data``); a write is listed only with
+  a ``GET``, or is a ``GET`` function import of a service of kind
+  ``generic`` (``operation_changes_data``); a write is listed only with
   ``allow_write``.
 * Results are built key by key from the definition, never by copying a
   catalogue dict, so a UI-only flag (``personal_data``) or a future key
@@ -134,15 +135,18 @@ def _visible_fields(entity_set: dict[str, Any], allow_write: bool) -> list[dict[
     ]
 
 
-def operation_changes_data(operation: dict[str, Any]) -> bool:
-    """Whether calling this operation is a write.
+def operation_changes_data(operation: dict[str, Any], kind: Any = "odata") -> bool:
+    """Whether calling this operation of a service of ``kind`` is a write.
 
     ``models.operation_is_write`` on the stored dict: a read is only what is
-    marked ``changes_data: false`` (exactly) AND is sent with ``GET``. A
-    missing key must not read as "only reads", and a ``POST`` is a write
-    whatever the flag says.
+    marked ``changes_data: false`` (exactly) AND is sent with ``GET``, or,
+    on a ``generic`` service, a function import sent with ``GET``. A missing
+    key must not read as "only reads", and a ``POST`` is a write whatever
+    the flag says.
     """
-    return operation_is_write(operation.get("changes_data"), operation.get("http_method"))
+    return operation_is_write(
+        operation.get("changes_data"), operation.get("http_method"), kind, operation.get("kind")
+    )
 
 
 def _field_out(field: dict[str, Any], allow_write: bool) -> dict[str, Any]:
@@ -266,7 +270,10 @@ def _entity_set_detail(
 
 
 def _operation_detail(
-    operation: dict[str, Any], readable: dict[str, list[str]], keys: dict[str, list[str]]
+    operation: dict[str, Any],
+    readable: dict[str, list[str]],
+    keys: dict[str, list[str]],
+    kind: Any,
 ) -> dict[str, Any]:
     bound_to = operation.get("bound_to")
     # The names of the key a bound call takes in 'key': always said (a key
@@ -293,7 +300,7 @@ def _operation_detail(
         "key": key,
         "bound_to": bound_to,
         # What a call of it IS for this tool, not merely what is stored.
-        "changes_data": operation_changes_data(operation),
+        "changes_data": operation_changes_data(operation, kind),
     }
 
 
@@ -354,7 +361,11 @@ class _Candidate:
             if self.kind == "entity_set":
                 out.update(_entity_set_detail(self.raw, self.readable, allow_write))
             else:
-                out.update(_operation_detail(self.raw, self.readable, self.keys))
+                out.update(
+                    _operation_detail(
+                        self.raw, self.readable, self.keys, self.service.get("kind", "odata")
+                    )
+                )
             out.update(_service_out(self.service))
         return out
 
@@ -378,6 +389,7 @@ def _candidates(
         return []
     service_score = _W_SERVICE * _hits(tokens, service.get("title"), service.get("purpose"))
     version = service.get("odata_version")
+    kind = service.get("kind", "odata")  # which write rule (`operation_changes_data`)
     # An entity set whose key cannot be written into a URL is seen without
     # its by-key operations from here on -- by everything below: the
     # operations listed, the fields shown as writable, the navigations that
@@ -439,7 +451,9 @@ def _candidates(
         if not target or operation.get("enabled") is not True:
             continue
         if (
-            stored_call_refusal(operation, keys, version, allow_write=call_write, types=types)
+            stored_call_refusal(
+                operation, keys, version, allow_write=call_write, types=types, kind=kind
+            )
             is not None
         ):
             continue
@@ -484,10 +498,11 @@ def search_catalogue(
     can be called (``client.call_refusal``, the rule ``execute_operation``
     refuses by): it is enabled, the service's version is one whose
     operations can be called, it either only reads
-    (``operation_changes_data``) or ``allow_write`` is on -- the entry's
-    switch as it is, since what a call needs is the switch and the version
-    in ``call_versions``, not entity writes of that version -- and nothing
-    in the catalogue makes every call of it fail (a bound operation whose
+    (``operation_changes_data``, by the service's ``kind``) or
+    ``allow_write`` is on -- the entry's switch as it is, since what a call
+    needs is the switch and the version in ``call_versions``, not entity
+    writes of that version -- and nothing in the catalogue makes every call
+    of it fail (a bound operation whose
     key fields are not all parameters, an always-sent parameter of a type
     that is not written).
 

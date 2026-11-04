@@ -1,0 +1,384 @@
+<mvc:View
+    controllerName="com.agent.admin.controller.DataCatalogDetail"
+    xmlns="sap.m"
+    xmlns:mvc="sap.ui.core.mvc"
+    xmlns:core="sap.ui.core"
+    xmlns:f="sap.ui.layout.form">
+    <Page
+        id="dcDetailPage"
+        title="{= ${src>/source/label} || ${src>/name} }"
+        showNavButton="true"
+        navButtonPress=".onBack">
+        <subHeader>
+            <OverflowToolbar id="dcDetailToolbar">
+                <ObjectStatus
+                    id="dcDetailKind"
+                    text="{ path: 'src>/kind', formatter: '.formatKind' }"
+                    state="Information"
+                    inverted="true" />
+                <Text id="dcDetailName" text="{src>/name}" />
+                <ToolbarSpacer />
+                <Button
+                    id="dcDetailGraph"
+                    icon="sap-icon://overview-chart"
+                    text="{i18n>dcShowGraph}"
+                    press=".onShowGraph">
+                    <layoutData>
+                        <OverflowToolbarLayoutData priority="Low" />
+                    </layoutData>
+                </Button>
+            </OverflowToolbar>
+        </subHeader>
+        <content>
+            <MessageStrip
+                id="dcDetailLoadFailed"
+                visible="{src>/loadFailed}"
+                type="Error"
+                showIcon="true"
+                class="sapUiSmallMargin"
+                text="{src>/loadError}" />
+
+            <!-- A catalogue service that was never imported has no nodes yet. -->
+            <MessageStrip
+                id="dcNotImported"
+                visible="{= ${src>/loaded} &amp;&amp; !${src>/imported} }"
+                type="Warning"
+                showIcon="true"
+                class="sapUiSmallMargin"
+                text="{i18n>dcNotImported}">
+                <link>
+                    <Link id="dcImportNow" text="{i18n>dcImportNow}" press=".onImportNow" />
+                </link>
+            </MessageStrip>
+
+            <!-- The source's own hints. Saved together, and only what changed
+                 is sent; a refused value is shown at its field. -->
+            <Panel id="dcHintsPanel" headerText="{i18n>dcHintsPanel}" visible="{src>/imported}" class="sapUiSmallMarginTop">
+                <headerToolbar>
+                    <OverflowToolbar>
+                        <Title text="{i18n>dcHintsPanel}" level="H2" />
+                        <ToolbarSpacer />
+                        <Button
+                            id="dcHintsReset"
+                            text="{i18n>dcHintsReset}"
+                            enabled="{= ${src>/dirty} &amp;&amp; !${src>/saving} }"
+                            press=".onResetHints" />
+                        <Button
+                            id="dcHintsSave"
+                            type="Emphasized"
+                            text="{i18n>save}"
+                            enabled="{= ${src>/dirty} &amp;&amp; !${src>/saving} }"
+                            press=".onSaveHints" />
+                    </OverflowToolbar>
+                </headerToolbar>
+                <f:SimpleForm id="dcHintsForm" layout="ResponsiveGridLayout" editable="true"
+                    labelSpanL="2" labelSpanM="3" columnsL="1" columnsM="1">
+                    <Label text="{i18n>dcHintLabel}" labelFor="dcHintLabel" />
+                    <Input
+                        id="dcHintLabel"
+                        value="{src>/hints/label}"
+                        placeholder="{src>/source/name}"
+                        valueState="{= ${src>/errors/label} ? 'Error' : 'None' }"
+                        valueStateText="{src>/errors/label}"
+                        valueLiveUpdate="true"
+                        liveChange=".onHintChange"
+                        change=".onHintChange" />
+                    <Label text="{i18n>dcHintPurpose}" labelFor="dcHintPurpose" />
+                    <Input
+                        id="dcHintPurpose"
+                        value="{src>/hints/purpose}"
+                        valueState="{= ${src>/errors/purpose} ? 'Error' : 'None' }"
+                        valueStateText="{src>/errors/purpose}"
+                        valueLiveUpdate="true"
+                        liveChange=".onHintChange"
+                        change=".onHintChange" />
+                    <Label text="{i18n>dcHintNotFor}" labelFor="dcHintNotFor" />
+                    <Input
+                        id="dcHintNotFor"
+                        value="{src>/hints/not_for}"
+                        valueState="{= ${src>/errors/not_for} ? 'Error' : 'None' }"
+                        valueStateText="{src>/errors/not_for}"
+                        valueLiveUpdate="true"
+                        liveChange=".onHintChange"
+                        change=".onHintChange" />
+                    <Label text="{i18n>dcHintSynonyms}" labelFor="dcHintSynonyms" />
+                    <MultiInput
+                        id="dcHintSynonyms"
+                        showValueHelp="false"
+                        placeholder="{i18n>dcHintSynonymsPlaceholder}"
+                        tokens="{ path: 'src>/hints/synonyms', templateShareable: false }"
+                        valueState="{= ${src>/errors/synonyms} ? 'Error' : 'None' }"
+                        valueStateText="{src>/errors/synonyms}"
+                        submit=".onAddSynonym"
+                        change=".onAddSynonym"
+                        tokenUpdate=".onSynonymTokenUpdate">
+                        <tokens>
+                            <Token key="{src>}" text="{src>}" />
+                        </tokens>
+                    </MultiInput>
+                </f:SimpleForm>
+                <!-- Outside the form: a VBox is no valid form content. -->
+                <VBox id="dcHintExamplesBox" class="sapUiSmallMarginBeginEnd sapUiSmallMarginBottom">
+                    <Label text="{i18n>dcHintExamples}" labelFor="dcHintExamples" />
+                    <List
+                        id="dcHintExamples"
+                        items="{ path: 'src>/hints/exampleRows', templateShareable: false }"
+                        noDataText="{i18n>dcHintExamplesNone}"
+                        mode="Delete"
+                        delete=".onDeleteExample"
+                        showSeparators="Inner">
+                        <CustomListItem>
+                            <Input
+                                value="{src>text}"
+                                placeholder="{i18n>dcHintExamplePlaceholder}"
+                                ariaLabelledBy="dcExamplesLabelText"
+                                valueLiveUpdate="true"
+                    liveChange=".onHintChange"
+                    change=".onHintChange" />
+                        </CustomListItem>
+                    </List>
+                    <Button
+                        id="dcHintAddExample"
+                        icon="sap-icon://add"
+                        text="{i18n>dcHintAddExample}"
+                        type="Transparent"
+                        press=".onAddExample" />
+                    <ObjectStatus
+                        id="dcHintExamplesError"
+                        text="{src>/errors/examples}"
+                        state="Error"
+                        visible="{= !!${src>/errors/examples} }" />
+                    <core:InvisibleText id="dcExamplesLabelText" text="{i18n>dcHintExamples}" />
+                </VBox>
+            </Panel>
+
+            <!-- Entities with their fields, one level deep; for an InA source
+                 its query with the dimensions and measures below it. A label
+                 edit and the readable switch are saved when they change. -->
+            <Panel
+                id="dcEntitiesPanel"
+                headerText="{= ${src>/kind} === 'ina' ? ${i18n>dcQueryPanel} : ${i18n>dcEntitiesPanel} }"
+                visible="{src>/imported}"
+                class="sapUiSmallMarginTop">
+                <Table
+                    id="dcEntitiesTable"
+                    items="{src>/rows}"
+                    sticky="ColumnHeaders"
+                    popinLayout="GridSmall"
+                    contextualWidth="Auto"
+                    autoPopinMode="true"
+                    noDataText="{= ${src>/kind} === 'ina' ? ${i18n>dcNoQuery} : ${i18n>dcNoEntities} }">
+                    <columns>
+                        <!-- Wide enough for an entity set name on one line; a longer
+                             name is cut with an ellipsis, never wrapped mid-word. -->
+                        <Column width="20rem" importance="High"><Text text="{i18n>dcColName}" /></Column>
+                        <Column width="14rem" importance="High"><Text text="{i18n>dcColLabel}" /></Column>
+                        <Column autoPopinWidth="14" importance="Low"><Text text="{i18n>dcHintPurpose}" /></Column>
+                        <Column width="5rem" hAlign="Center" importance="High"><Text text="{i18n>dcColReadable}" /></Column>
+                        <Column width="5rem" hAlign="Center" importance="High"><Text text="{i18n>dcColWritable}" /></Column>
+                    </columns>
+                    <items>
+                        <ColumnListItem highlight="{= ${src>depth} === 0 ? 'Information' : 'None' }">
+                            <cells>
+                                <!-- The name on one line, the type name below it; both
+                                     are cut with an ellipsis (the whole text is the
+                                     tooltip), so nothing runs under the Label column.
+                                     `data-level` indents a field and sets an entity's
+                                     name in bold (css/style.css, .dcNameCell). -->
+                                <HBox alignItems="Start" renderType="Bare" class="dcNameCell">
+                                    <customData>
+                                        <core:CustomData key="level" value="{= ${src>depth} === 0 ? 'entity' : 'field' }" writeToDom="true" />
+                                    </customData>
+                                    <core:Icon
+                                        src="{src>icon}"
+                                        class="sapUiTinyMarginEnd dcNameIcon"
+                                        tooltip="{ path: 'src>kind', formatter: '.formatNodeKind' }"
+                                        alt="{ path: 'src>kind', formatter: '.formatNodeKind' }"
+                                        decorative="false" />
+                                    <VBox renderType="Bare" class="dcNameText">
+                                        <HBox alignItems="Center" renderType="Bare">
+                                            <Text
+                                                text="{= ${src>unit} ? ${src>name} + ' (' + ${src>unit} + ')' : ${src>name} }"
+                                                tooltip="{= ${src>unit} ? ${src>name} + ' (' + ${src>unit} + ')' : ${src>name} }"
+                                                wrapping="false"
+                                                class="dcNodeName" />
+                                            <core:Icon
+                                                src="sap-icon://key"
+                                                visible="{src>isKey}"
+                                                tooltip="{i18n>dcKeyField}"
+                                                class="sapUiTinyMarginBegin dcNameIcon" />
+                                        </HBox>
+                                        <Text
+                                            text="{src>typeName}"
+                                            tooltip="{src>typeName}"
+                                            wrapping="false"
+                                            visible="{= !!${src>typeName} }"
+                                            class="dcNodeType" />
+                                    </VBox>
+                                </HBox>
+                                <Input
+                                    value="{src>label}"
+                                    placeholder="{src>name}"
+                                    valueState="{src>labelState}"
+                                    valueStateText="{src>labelError}"
+                                    ariaLabelledBy="dcLabelColumnText"
+                                    change=".onRowLabelChange" />
+                                <Text text="{src>purpose}" maxLines="2" />
+                                <Switch
+                                    state="{src>readable}"
+                                    customTextOn=" "
+                                    customTextOff=" "
+                                    tooltip="{= ${src>readable} ? ${i18n>dcReadableOn} : ${i18n>dcReadableOff} }"
+                                    change=".onRowReadableChange" />
+                                <core:Icon
+                                    src="{= ${src>writable} ? 'sap-icon://edit' : 'sap-icon://locked' }"
+                                    color="{= ${src>writable} ? 'Critical' : 'Neutral' }"
+                                    tooltip="{= ${src>writable} ? ${i18n>dcWritableOn} : ${i18n>dcWritableOff} }" />
+                            </cells>
+                        </ColumnListItem>
+                    </items>
+                </Table>
+                <core:InvisibleText id="dcLabelColumnText" text="{i18n>dcColLabel}" />
+            </Panel>
+
+            <!-- The relations of the source's nodes, in either direction: what
+                 an import found and what an admin drew. Only a drawn link can
+                 be removed; Add link draws one to another source
+                 (fragment/DataCatalogLinkDialog). -->
+            <Panel id="dcLinksPanel" headerText="{i18n>dcLinksPanel}" visible="{src>/imported}" class="sapUiSmallMarginTop">
+                <headerToolbar>
+                    <OverflowToolbar>
+                        <Title id="dcLinksTitle" text="{i18n>dcLinksPanel}" level="H2" />
+                        <ToolbarSpacer />
+                        <Button
+                            id="dcAddLink"
+                            icon="sap-icon://add"
+                            text="{i18n>dcAddLink}"
+                            tooltip="{i18n>dcAddLinkTooltip}"
+                            enabled="{= ${src>/linkStarts}.length > 0 }"
+                            press=".onAddLink" />
+                    </OverflowToolbar>
+                </headerToolbar>
+                <Table
+                    id="dcLinksTable"
+                    items="{src>/relations}"
+                    ariaLabelledBy="dcLinksTitle"
+                    popinLayout="GridSmall"
+                    contextualWidth="Auto"
+                    autoPopinMode="true"
+                    noDataText="{i18n>dcNoLinks}">
+                    <columns>
+                        <Column autoPopinWidth="12" importance="High"><Text text="{i18n>dcColFrom}" /></Column>
+                        <Column width="10rem" importance="High"><Text text="{i18n>dcColRelation}" /></Column>
+                        <Column autoPopinWidth="12" importance="High"><Text text="{i18n>dcColTo}" /></Column>
+                        <Column width="10rem" importance="Medium"><Text text="{i18n>dcColOrigin}" /></Column>
+                        <Column width="3.5rem" hAlign="End" importance="High">
+                            <core:InvisibleText text="{i18n>dcLinkRemove}" />
+                        </Column>
+                    </columns>
+                    <items>
+                        <ColumnListItem>
+                            <cells>
+                                <Text text="{src>from}" />
+                                <ObjectIdentifier
+                                    title="{ path: 'src>kind', formatter: '.formatRelationKind' }"
+                                    text="{src>label}" />
+                                <Text text="{src>to}" />
+                                <ObjectStatus
+                                    text="{src>origin}"
+                                    state="{= ${src>curated} ? 'Information' : 'None' }" />
+                                <Button
+                                    icon="sap-icon://delete"
+                                    type="Transparent"
+                                    tooltip="{i18n>dcLinkRemove}"
+                                    visible="{src>curated}"
+                                    press=".onRemoveLink" />
+                            </cells>
+                        </ColumnListItem>
+                    </items>
+                </Table>
+            </Panel>
+
+            <Panel id="dcUsedByPanel" headerText="{i18n>odataColUsedBy}" visible="{src>/loaded}" class="sapUiSmallMarginTop">
+                <List id="dcUsedBy" items="{src>/usedBy}" noDataText="{i18n>dcNotUsed}">
+                    <StandardListItem title="{src>}" icon="sap-icon://person-placeholder" />
+                </List>
+            </Panel>
+
+            <!-- Runs the agents' retrieval for a typed question; stores nothing. -->
+            <Panel id="dcTestSearchPanel" headerText="{i18n>dcTestSearch}" visible="{src>/loaded}" class="sapUiSmallMarginTop sapUiMediumMarginBottom">
+                <OverflowToolbar style="Clear">
+                    <Input
+                        id="dcSearchQuestion"
+                        value="{search>/question}"
+                        placeholder="{i18n>dcSearchQuestion}"
+                        ariaLabelledBy="dcSearchQuestionText"
+                        submit=".onRunSearch">
+                        <layoutData>
+                            <OverflowToolbarLayoutData priority="NeverOverflow" shrinkable="true" minWidth="12rem" />
+                        </layoutData>
+                    </Input>
+                    <Select
+                        id="dcSearchAgent"
+                        selectedKey="{search>/agent}"
+                        items="{ path: 'search>/agents', templateShareable: false }"
+                        tooltip="{i18n>dcSearchAgent}">
+                        <core:Item key="{search>key}" text="{search>text}" />
+                        <layoutData>
+                            <OverflowToolbarLayoutData priority="NeverOverflow" />
+                        </layoutData>
+                    </Select>
+                    <Button
+                        id="dcSearchRun"
+                        type="Emphasized"
+                        icon="sap-icon://search"
+                        text="{i18n>dcSearchRun}"
+                        enabled="{= !!${search>/question} &amp;&amp; !${search>/running} }"
+                        press=".onRunSearch">
+                        <layoutData>
+                            <OverflowToolbarLayoutData priority="NeverOverflow" />
+                        </layoutData>
+                    </Button>
+                </OverflowToolbar>
+                <core:InvisibleText id="dcSearchQuestionText" text="{i18n>dcSearchQuestion}" />
+                <MessageStrip
+                    id="dcSearchScope"
+                    visible="{search>/ran}"
+                    type="Information"
+                    showIcon="true"
+                    class="sapUiTinyMarginTopBottom"
+                    text="{= ${search>/scope} === 'agent' ? ${i18n>dcSearchScopeAgent} : ${i18n>dcSearchScopeAll} }" />
+                <!-- How the answer was ranked (design addendum (l)); absent from a server before 2.36.0. -->
+                <Text
+                    id="dcSearchMode"
+                    visible="{= ${search>/ran} &amp;&amp; !!${search>/mode} }"
+                    class="sapUiTinyMarginBottom"
+                    text="{= ${search>/mode} === 'vector' ? ${i18n>dcSearchModeVector} : ${i18n>dcSearchModeLexical} }" />
+                <List
+                    id="dcSearchResults"
+                    items="{search>/candidates}"
+                    visible="{search>/ran}"
+                    noDataText="{i18n>dcSearchNoCandidates}">
+                    <CustomListItem>
+                        <VBox class="sapUiSmallMargin">
+                            <HBox justifyContent="SpaceBetween" alignItems="Center">
+                                <ObjectIdentifier title="{search>title}" text="{search>subtitle}" />
+                                <ObjectNumber number="{search>score}" unit="{i18n>dcScore}" />
+                            </HBox>
+                            <Text text="{search>purpose}" visible="{= !!${search>purpose} }" />
+                            <Text
+                                text="{i18n>dcNotForPrefix} {search>notFor}"
+                                visible="{= !!${search>notFor} }" />
+                            <Text
+                                text="{i18n>dcKeysPrefix} {search>keys}"
+                                visible="{= !!${search>keys} }" />
+                            <VBox items="{ path: 'search>relations', templateShareable: false }">
+                                <ObjectStatus icon="sap-icon://chain-link" text="{search>}" />
+                            </VBox>
+                        </VBox>
+                    </CustomListItem>
+                </List>
+            </Panel>
+        </content>
+    </Page>
+</mvc:View>

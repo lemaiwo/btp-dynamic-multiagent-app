@@ -26,3 +26,7 @@ pyjwt[crypto]==2.15.0
 # parses no DTD; tests/test_sharepoint_requirements.py asserts that it does.
 openpyxl==3.1.5
 defusedxml==0.7.1
+# The web chat's PDF documents (agents/webchat/docgen.py). Its Word documents
+# are written with the standard library: python-docx needs lxml, which must
+# not be installed (see the openpyxl note above).
+reportlab==5.1.0

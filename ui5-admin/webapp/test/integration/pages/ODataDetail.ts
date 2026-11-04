@@ -82,7 +82,7 @@ export function formOf(element: UI5Element): FormTexts {
 
 /** The texts of the header tags that are visible, in order. */
 export function tagsOf(element: UI5Element): string[] {
-    return ["odataTagVersion", "odataTagRunsAs", "odataTagWrite", "odataTagDisabled"]
+    return ["odataTagVersion", "odataTagKind", "odataTagRunsAs", "odataTagWrite", "odataTagDisabled"]
         .map((id) => control<ObjectStatus>(element, id))
         .filter((tag) => tag.getVisible())
         .map((tag) => tag.getText());

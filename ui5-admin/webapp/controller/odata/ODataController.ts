@@ -5,7 +5,7 @@ import BaseController from "../BaseController";
 import ErrorHandler from "../../service/ErrorHandler";
 import { AdminError } from "../../service/AdminService";
 import type { ODataPending, ODataNewOperation } from "../../model/odataCatalog";
-import type { ODataEntityOp, ODataVersion } from "../../service/types";
+import type { ODataEntityOp, ODataServiceKind, ODataVersion } from "../../service/types";
 
 /** How many field names one capped entry of a write list spells out. */
 const FIELD_CAP = 3;
@@ -42,6 +42,12 @@ export default abstract class ODataController extends BaseController {
     /** "V2" or "V4". */
     public formatVersion(version: ODataVersion | undefined): string {
         return this.text(version === "v4" ? "odataVersionV4" : "odataVersionV2");
+    }
+
+    /** "OData service" or "Generic (ZAGENT_DATA)"; a service that does not
+     *  say is an OData service, the server's default. */
+    public formatKind(kind: ODataServiceKind | undefined): string {
+        return this.text(kind === "generic" ? "odataKindGeneric" : "odataKindOData");
     }
 
     public formatRunsAs(userContext: boolean | undefined): string {

@@ -514,6 +514,15 @@
             <fieldset class="exposure">
                 <legend>Availability</legend>
                 <label><input type="checkbox" id="agent-expose-chat" checked> Available in chat</label>
+                <label><input type="checkbox" id="agent-share-tools"> Tools usable by personal agents</label>
+                <p class="hint" id="agent-share-tools-hint">A personal agent in the web chat may attach this agent's MCP servers and built-ins; not for an agent that approves pull requests</p>
+                <label>Tier
+                    <select id="agent-tier">
+                        <option value="basic">Basic</option>
+                        <option value="advanced">Advanced</option>
+                    </select>
+                </label>
+                <p class="hint" id="agent-tier-hint">Advanced agents are reachable only by users with the developer role (advanced access in the web chat)</p>
                 <label><input type="checkbox" id="agent-expose-api" onchange="updateEndpointHint()"> Available via API (schedulable)</label>
                 <label>API slug
                     <input type="text" id="agent-api-slug" placeholder="daily-check" oninput="updateEndpointHint()">
@@ -750,7 +759,7 @@ async function loadAgents() {
                 <td style="max-width:280px">${escapeHtml(a.description)}${skillChips ? `<div style="margin-top:4px">${skillChips}</div>` : ''}</td>
                 <td style="max-width:260px;word-break:break-all">${urlCell}</td>
                 <td>${authCell}</td>
-                <td><span class="status-badge ${a.enabled ? 'on' : 'off'}">${a.enabled ? 'enabled' : 'disabled'}</span>${a.expose_invoke === true ? ' <span class="status-badge on invoke-tag" title="Exposed to the invoke API">Invoke</span>' : ''}</td>
+                <td><span class="status-badge ${a.enabled ? 'on' : 'off'}">${a.enabled ? 'enabled' : 'disabled'}</span>${a.expose_invoke === true ? ' <span class="status-badge on invoke-tag" title="Exposed to the invoke API">Invoke</span>' : ''}${a.tier === 'advanced' ? ' <span class="status-badge on tier-tag" title="Reachable only by users with the developer role">Advanced</span>' : ''}${a.share_tools === true ? ' <span class="status-badge on share-tools-tag" title="Tools usable by personal agents in the web chat">Shared tools</span>' : ''}</td>
                 <td class="row-actions">
                     <button class="small secondary" onclick="editAgent(${a.id})">Edit</button>
                     ${a.expose_api ? `<button class="small secondary" onclick="runAgentNow(${a.id})">Run now</button>` : ''}
@@ -880,6 +889,15 @@ function addMcpServerRow(server) {
             + 'edit this server in the UI5 admin.';
     }
     modeSelect.value = storedMode;
+    // A stored builtin:ina entry (made in the UI5 admin; its destination mode
+    // is an option here, so the branch above does not see it). The block is
+    // kept on the row and sent back as loaded while the row stays an ina row
+    // on that mode; nothing on this page edits or creates one.
+    if (!isNewServer && storedMode === 'destination' && destinationBuiltinOf(row) === INA_BUILTIN) {
+        const keptIna = Object.assign({}, oauth);
+        delete keptIna.has_client_secret;
+        row.dataset.keptIna = JSON.stringify(keptIna);
+    }
     row.querySelector('.oauth-dcr').checked = !!oauth.dcr;
     row.querySelector('.oauth-uaa').value = oauth.uaa_url || '';
     row.querySelector('.oauth-client-id').value = oauth.client_id || '';
@@ -921,6 +939,9 @@ function collectMcpServers() {
     if (rows.filter(r => destinationBuiltinOf(r) === BITBUCKET_BUILTIN).length > 1) {
         throw new Error('Two builtin:bitbucket rows: an agent takes one. Keep one and remove the other.');
     }
+    if (rows.filter(r => destinationBuiltinOf(r) === GIT_BUILTIN).length > 1) {
+        throw new Error('Two builtin:git rows: an agent takes one. Keep one, with all its repositories, and remove the other.');
+    }
     rows.forEach(r => {
         const url = r.querySelector('.mcp-url').value.trim();
         if (!url) {
@@ -939,10 +960,18 @@ function collectMcpServers() {
             // The server would answer 422, naming the other mode's fields.
             throw new Error('builtin:odata needs the auth mode "BTP destination".');
         }
+        if (destinationBuiltinOf(r) === GIT_BUILTIN && mode !== 'destination') {
+            throw new Error('builtin:git needs the auth mode "BTP destination".');
+        }
         if (r.dataset.keptMode && mode === r.dataset.keptMode) {
             // A mode this page does not edit: the block as it was loaded.
             const kept = JSON.parse(r.dataset.keptOauth || '{}');
             if (Object.keys(kept).length) server.oauth = kept;
+        } else if (destinationBuiltinOf(r) === INA_BUILTIN) {
+            // The stored entry as loaded; any other builtin:ina row (typed by
+            // hand, or left on another mode) is refused before the save.
+            if (mode !== 'destination' || !r.dataset.keptIna) throw new Error(INA_REFUSAL);
+            server.oauth = JSON.parse(r.dataset.keptIna);
         } else if (mode === 'oauth2') {
             const scope = r.querySelector('.oauth-scope').value.trim();
             if (r.querySelector('.oauth-dcr').checked) {
@@ -2024,6 +2053,8 @@ async function openAgentModal() {
     setDeepForm(null);
     document.getElementById('agent-enabled').checked = true;
     document.getElementById('agent-expose-chat').checked = true;
+    document.getElementById('agent-tier').value = 'basic';
+    setShareToolsField(false);
     document.getElementById('agent-expose-api').checked = false;
     document.getElementById('agent-api-slug').value = '';
     setInvokeForm(null);
@@ -2165,6 +2196,8 @@ async function editAgent(id) {
     setDeepForm(a.deep || null);
     document.getElementById('agent-enabled').checked = a.enabled;
     document.getElementById('agent-expose-chat').checked = a.expose_chat !== false;
+    document.getElementById('agent-tier').value = a.tier === 'advanced' ? 'advanced' : 'basic';
+    setShareToolsField(a.share_tools === true);
     document.getElementById('agent-expose-api').checked = !!a.expose_api;
     document.getElementById('agent-api-slug').value = a.api_slug || '';
     setInvokeForm(a);
@@ -2204,6 +2237,10 @@ async function saveAgent() {
         deep: collectDeep(),
         enabled: document.getElementById('agent-enabled').checked,
         expose_chat: document.getElementById('agent-expose-chat').checked,
+        // Always sent: an absent key keeps what is stored on the server.
+        tier: document.getElementById('agent-tier').value === 'advanced' ? 'advanced' : 'basic',
+        // Always sent as a boolean: an absent key keeps what is stored.
+        share_tools: readShareToolsField(),
         expose_api: document.getElementById('agent-expose-api').checked,
         api_slug: document.getElementById('agent-api-slug').value.trim(),
         // Always sent: the server keeps a stored value for an absent key, so
@@ -2625,13 +2662,31 @@ const DESTINATION_FIELDS = {
     // Reviews pull requests as the destination's technical user: no
     // user_context. The server refuses any other key (agents/bitbucket_config.py).
     'builtin:bitbucket':     ['workspace', 'repositories', 'branch', 'allow_comment', 'allow_approve', 'require_green_builds'],
+    // Git repositories (GitHub, Bitbucket, GitLab) as the destination's
+    // technical user: no user_context. Collected by `collectGitConfig`, which
+    // builds the block from these fields only (agents/git_config.py refuses
+    // any other key).
+    'builtin:git':           ['provider', 'repositories', 'base_branch', 'branch_prefix', 'allow_push', 'allow_pull_request'],
     // No destination name and no user_context: both belong to each catalogue
     // service (`_validate_odata_entry` in agents/admin.py refuses any key but
     // these two). Collected by `collectODataConfig`, not the generic branch.
     'builtin:odata':         ['services', 'allow_write'],
+    // Analytical queries (InA). Made and edited in the UI5 admin only: this
+    // page knows the key so that a STORED row is kept, shown and posted back
+    // as it was loaded (`addMcpServerRow` / `collectMcpServers`). The entry
+    // is {queries: [...]} and nothing else, and no field here edits it.
+    'builtin:ina':           ['queries'],
 };
 const ODATA_BUILTIN = 'builtin:odata';
+const INA_BUILTIN = 'builtin:ina';
+const INA_NOTE = 'Edited in the UI5 admin (Analytical queries)';
+// Fixed text: a row typed by hand, or a kept row left on another auth mode.
+const INA_REFUSAL = 'builtin:ina is edited in the UI5 admin (Analytical queries); this page only keeps a stored entry.';
 const BITBUCKET_BUILTIN = 'builtin:bitbucket';
+const GIT_BUILTIN = 'builtin:git';
+// The toolset's name, as the UI5 admin's dropdown shows it.
+const GIT_TOOLSET_LABEL = 'Git repositories (GitHub, Bitbucket, GitLab)';
+const GIT_PROVIDERS = ['github', 'bitbucket', 'gitlab'];
 // A remote MCP server (an http(s) url) through a destination: the destination
 // names the host and holds the credential, so its name and `user_context` are
 // all that is stored (the remote branch of `_clean_destination`). Dropping
@@ -2670,6 +2725,9 @@ function destinationFieldsHtml() {
                     <div class="dest-services" role="group" style="margin:4px 0;max-height:220px;overflow-y:auto"></div>
                     <div class="dest-services-note" style="color:var(--muted);font-size:12px"></div>
                     <div class="dest-odata-warning" role="status" style="color:var(--warn);font-size:12px"></div>
+                </div>
+                <div class="dest-field-queries" style="grid-column:1 / -1">
+                    <div class="dest-queries" style="font-weight:600"></div>
                 </div>
                 <div class="dest-field-allow_write" style="grid-column:1 / -1">
                     <label style="font-weight:600"><input type="checkbox" class="dest-allow_write"> Allow writes</label>
@@ -2763,6 +2821,25 @@ function destinationFieldsHtml() {
                 <label class="full dest-field-require_green_builds">
                     <input type="checkbox" class="dest-require_green_builds" checked> Approve only when all builds are successful
                 </label>
+                <label class="dest-field-provider">Provider
+                    <select class="dest-provider">
+                        <option value="github">GitHub</option>
+                        <option value="bitbucket">Bitbucket Cloud</option>
+                        <option value="gitlab">GitLab</option>
+                    </select>
+                </label>
+                <label class="dest-field-base_branch">Base branch
+                    <input type="text" class="dest-base_branch" placeholder="main">
+                </label>
+                <label class="dest-field-branch_prefix">Branch prefix
+                    <input type="text" class="dest-branch_prefix" placeholder="agent/">
+                </label>
+                <label class="full dest-field-allow_push">
+                    <input type="checkbox" class="dest-allow_push"> Allow pushing to agent branches
+                </label>
+                <label class="full dest-field-allow_pull_request">
+                    <input type="checkbox" class="dest-allow_pull_request"> Allow opening pull requests
+                </label>
             </div>
             <p class="hint dest-hint" style="margin:8px 0 0"></p>
         </div>
@@ -2791,8 +2868,19 @@ function fillDestinationFields(row, oauth) {
         row.querySelector('.dest-workspace').value = '';
         row.querySelector('.dest-branch').value = '';
     }
+    // builtin:git. Its fields are filled for a git row only, from the stored
+    // block as it is (never trimmed); a switch only when stored as true.
+    const isGit = destinationBuiltinOf(row) === GIT_BUILTIN;
     row.querySelector('.dest-repositories').value =
-        isBitbucket && Array.isArray(oauth.repositories) ? oauth.repositories.join(', ') : '';
+        (isBitbucket || isGit) && Array.isArray(oauth.repositories) ? oauth.repositories.join(', ') : '';
+    // A new row (or a stored provider this page does not know: then the
+    // select is blank and the save names it) starts on GitHub.
+    row.querySelector('.dest-provider').value = isGit && typeof oauth.provider === 'string'
+        ? (GIT_PROVIDERS.includes(oauth.provider) ? oauth.provider : '') : 'github';
+    row.querySelector('.dest-base_branch').value = isGit && typeof oauth.base_branch === 'string' ? oauth.base_branch : '';
+    row.querySelector('.dest-branch_prefix').value = isGit && typeof oauth.branch_prefix === 'string' ? oauth.branch_prefix : '';
+    row.querySelector('.dest-allow_push').checked = isGit && oauth.allow_push === true;
+    row.querySelector('.dest-allow_pull_request').checked = isGit && oauth.allow_pull_request === true;
     row.querySelector('.dest-allow_approve').checked = isBitbucket && oauth.allow_approve === true;
     row.querySelector('.dest-require_green_builds').checked = !(isBitbucket && oauth.require_green_builds === false);
     // builtin:odata. What a stored block of ANOTHER type holds under these
@@ -2811,6 +2899,11 @@ function fillDestinationFields(row, oauth) {
     row.dataset.odataServices = JSON.stringify(stored);
     wireODataFields(row);
     renderODataServiceChecks(row, stored);
+    // builtin:ina. A read-only line of the stored query names, as text (they
+    // are data); only an ina row shows what a block of another type holds.
+    const inaQueries = destinationBuiltinOf(row) === INA_BUILTIN && Array.isArray(oauth.queries)
+        ? oauth.queries.filter(n => typeof n === 'string') : [];
+    row.querySelector('.dest-queries').textContent = inaQueries.length ? 'Queries: ' + inaQueries.join(', ') : '';
     const theme = oauth.theme;
     row.querySelector('.dest-theme').value =
         theme && typeof theme === 'object' && Object.keys(theme).length ? JSON.stringify(theme, null, 2) : '';
@@ -2849,6 +2942,10 @@ function syncDestinationFields(row) {
         row.dataset.commentType = commentType;
     }
     row.dataset.destBuiltin = builtin;
+    // One repositories field for two toolsets with two shapes.
+    row.querySelector('.dest-repositories').placeholder = builtin === GIT_BUILTIN
+        ? 'comma-separated paths: owner/name, workspace/slug or group/project (1 to 50)'
+        : 'comma-separated slugs; blank = every repository of the workspace';
     // One API base field for two toolsets with two defaults.
     row.querySelector('.dest-api_base').placeholder =
         builtin === 'builtin:confluence' ? 'blank means /wiki/rest/api' : 'blank means /rest/api/2';
@@ -2863,9 +2960,10 @@ function syncDestinationFields(row) {
     box.querySelectorAll('[class*="dest-field-"]').forEach(label => {
         const key = [...label.classList].find(c => c.startsWith('dest-field-')).slice('dest-field-'.length);
         let show = wanted.includes(key);
-        // Every type names its destination, except builtin:odata: there the
-        // destination belongs to each catalogue service.
-        if (key === 'destination') show = builtin !== ODATA_BUILTIN;
+        // Every type names its destination, except builtin:odata and
+        // builtin:ina: there the destination belongs to each catalogue
+        // service or registered query.
+        if (key === 'destination') show = builtin !== ODATA_BUILTIN && builtin !== INA_BUILTIN;
         // A destination resolved as the user reads /me: no mailbox to name.
         if (key === 'mailbox' && userContext) show = false;
         // Graph refuses application posts, so Teams posts only as the user.
@@ -2875,9 +2973,11 @@ function syncDestinationFields(row) {
     let hint = '';
     if (!known) {
         hint = 'A destination works with an https MCP server or a built-in toolset (builtin:gmail, builtin:outlook, '
-            + 'builtin:teams, builtin:slack, builtin:jira, builtin:confluence, builtin:smtp, builtin:sharepoint, builtin:bitbucket, builtin:sapnotes, builtin:sapnotedetail, builtin:odata).';
+            + 'builtin:teams, builtin:slack, builtin:jira, builtin:confluence, builtin:smtp, builtin:sharepoint, builtin:bitbucket, builtin:git, builtin:sapnotes, builtin:sapnotedetail, builtin:odata).';
     } else if (builtin === ODATA_BUILTIN) {
         hint = 'Destination and identity come from each catalogue service. Edit services in the UI5 admin (OData services).';
+    } else if (builtin === INA_BUILTIN) {
+        hint = INA_NOTE;
     } else if (isRemoteMcpUrl(builtin)) {
         hint = 'The destination names the MCP server\'s host and holds its credential; the URL above contributes only its path. '
             + (userContext
@@ -2885,6 +2985,8 @@ function syncDestinationFields(row) {
                 : 'It holds an app-level credential: every caller reaches the server as the destination\'s technical user.');
     } else if (builtin === 'builtin:sharepoint') {
         hint = 'The destination reaches Microsoft Graph with an application credential (OAuth2ClientCredentials) that is granted read on the one site. The agent can only name a view; site, file and views are pinned here. Site, library and file path are stored exactly as typed.';
+    } else if (builtin === GIT_BUILTIN) {
+        hint = GIT_TOOLSET_LABEL + '. The destination\'s URL is the provider\'s API base (https://api.github.com, https://api.bitbucket.org/2.0, https://gitlab.com/api/v4 or a self-hosted GitLab\'s /api/v4) and its credential the technical user\'s token. The agent reads the listed repositories; with the switches it pushes only to branches that carry the prefix (never to the base branch) and opens pull requests against the base branch. Blank base branch and prefix mean main and agent/. Paths, base branch and prefix are stored exactly as typed.';
     } else if (builtin === BITBUCKET_BUILTIN) {
         hint = 'The destination reaches Bitbucket Cloud as a technical user (BasicAuthentication: e-mail and API token). The agent reviews open pull requests to the target branch of this workspace; it can only name a repository and a pull request. Commenting and approving are separate switches; an approval is sent only after the review comment, and only with successful builds unless that check is switched off. Workspace and target branch are stored exactly as typed.';
     } else if (builtin === 'builtin:smtp') {
@@ -3186,12 +3288,40 @@ function collectODataConfig(row) {
     return oauth;
 }
 
+/**
+ * The builtin:git block, built from its own fields only: destination,
+ * provider, repositories (a list), and the base branch and prefix when typed.
+ * The switches are sent only as the JSON boolean true. Paths, base branch and
+ * prefix go out as typed (the server refuses edge whitespace instead of
+ * repairing it); the repositories field is split on commas, the blank around
+ * a comma being the separator's, and empty parts dropped.
+ */
+function collectGitConfig(row) {
+    const oauth = {destination: row.querySelector('.dest-destination').value.trim()};
+    const provider = row.querySelector('.dest-provider').value;
+    if (!provider) throw new Error('Git: choose a provider (GitHub, Bitbucket Cloud or GitLab).');
+    oauth.provider = provider;
+    const repositories = row.querySelector('.dest-repositories').value
+        .split(',').map(s => s.trim()).filter(Boolean);
+    if (!repositories.length) throw new Error('Git: list at least one repository.');
+    oauth.repositories = repositories;
+    const baseBranch = row.querySelector('.dest-base_branch').value;
+    if (baseBranch !== '') oauth.base_branch = baseBranch;
+    const prefix = row.querySelector('.dest-branch_prefix').value;
+    if (prefix !== '') oauth.branch_prefix = prefix;
+    if (row.querySelector('.dest-allow_push').checked) oauth.allow_push = true;
+    if (row.querySelector('.dest-allow_pull_request').checked) oauth.allow_pull_request = true;
+    return oauth;
+}
+
 /** The config block for a destination server, shaped as the API stores it. */
 function collectDestinationConfig(row) {
     const builtin = destinationBuiltinOf(row);
     // Before the generic branch: this entry has no destination name, and a
     // leftover field of another built-in in the block is a 422.
     if (builtin === ODATA_BUILTIN) return collectODataConfig(row);
+    // Likewise: nothing of another built-in's block may ride along.
+    if (builtin === GIT_BUILTIN) return collectGitConfig(row);
     const wanted = destinationFieldsFor(builtin) || [];
     const oauth = {destination: row.querySelector('.dest-destination').value.trim()};
     DESTINATION_TEXT_KEYS.forEach(k => {
@@ -3416,6 +3546,17 @@ function setDetailRunsMode(kind, id) {
     if (existing) loadDetailRuns(kind, id);
 }
 
+// "Tools usable by personal agents" (agents/webchat, addendum g). Null-safe:
+// a page fragment without the checkbox reads as off.
+function setShareToolsField(on) {
+    const el = document.getElementById('agent-share-tools');
+    if (el) el.checked = on === true;
+}
+function readShareToolsField() {
+    const el = document.getElementById('agent-share-tools');
+    return !!(el && el.checked);
+}
+
 // The same fields saveAgent()/saveWorkflow() send, read the same way; kept
 // separate because those bodies are contract-checked by the test suite.
 function detailFormSnapshot(kind) {
@@ -3429,6 +3570,7 @@ function detailFormSnapshot(kind) {
                 skills: collectAgentSkills(), peers: collectAgentPeers(),
                 model_name: v('agent-model-name'), deep: collectDeep(),
                 enabled: c('agent-enabled'), expose_chat: c('agent-expose-chat'),
+                tier: v('agent-tier'), share_tools: readShareToolsField(),
                 expose_api: c('agent-expose-api'), api_slug: v('agent-api-slug'),
                 expose_invoke: c('agent-expose-invoke'), result_schema: v('agent-result-schema'),
                 invoke_limits: [v('agent-invoke-media-types'), v('agent-invoke-max-mb'),

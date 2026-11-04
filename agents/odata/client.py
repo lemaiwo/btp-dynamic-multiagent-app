@@ -75,18 +75,29 @@ their own gate, ``check_call``. In SAP the real business steps -- release,
 approve, post, cancel -- are function imports and actions, so a call is a
 WRITE unless the catalogue says otherwise in so many words: only an
 operation marked ``changes_data: false`` that is also a ``GET`` is sent as a
-read (``call_changes_data``); a V4 action is a ``POST`` and therefore always
-a write. Every other call, a ``GET`` included, goes out exactly like an
-entity write: the caller's own CSRF session, one repeat after a 403
-``Required``, never a repeat after a failure, success recognised
-positively. How a call is addressed is the dialect's (``call_request``): V2
-sends the parameters and the key of a bound entity in the query string, V4
-puts the key in the path, a function's parameters behind its name and an
-action's parameters in a JSON body. What comes back is shown only when
-it can be tied to a catalogue entity set -- the one the operation's
-``returns`` names, else the one it is ``bound_to`` -- so that the field
-allowlist applies; otherwise the answer is a confirmation and nothing else
-(``ODataClient.call``, ``_returned``).
+read (``call_changes_data``), and on a service of kind ``generic`` (SAP's
+own allow-list) a ``GET`` function import whatever its flag says; a V4
+action is a ``POST`` and therefore always a write. Every other call, a
+``GET`` included, goes out exactly like an entity write: the caller's own
+CSRF session, one repeat after a 403 ``Required``, never a repeat after a
+failure, success recognised positively. How a call is addressed is the
+dialect's (``call_request``): V2 sends the parameters and the key of a
+bound entity in the query string, V4 puts the key in the path, a
+function's parameters behind its name and an action's parameters in a JSON
+body. What comes back is shown only when it can be tied to a catalogue
+entity set -- the one the operation's ``returns`` names, else the one it is
+``bound_to`` -- so that the field allowlist applies; otherwise the answer
+is a confirmation and nothing else
+(``ODataClient.call``, ``_returned``). One exception, on a service of kind
+``generic`` only: the complex answer of a ``GET`` function import that the
+catalogue does not tie to an entity set -- one structure or a collection of
+them, the module's exporting and table parameters -- is shown with every
+property (``__metadata`` dropped). SAP's allow-list owner decides what a
+listed module exposes, and the app has no field catalogue for a complex type
+to cut by; what is not positively complex data (an entity, a navigation) is
+still withheld, and such an answer over the size cap is refused, never cut
+(``clip_result``), as is one that SAP paged (``__next``: the first page is not
+the whole table).
 """
 
 from __future__ import annotations
@@ -165,6 +176,20 @@ MAX_CALL_PARAMS = 100
 MAX_CALL_VALUE_CHARS = 1000
 # How a serialised JSON or XML document starts, whatever its length.
 _STRUCTURED_STARTS = ("{", "[", "<")
+# How deep the complex answer of a generic service's function import may nest
+# (a value in a structure in a table in a structure ...) to be passed on
+# whole (`_is_structure`); a deeper one is withheld, not walked further.
+MAX_STRUCTURE_DEPTH = 10
+# What `ODataClient.call` passes on whole (a generic service's complex answer,
+# `_returned`): one structure, or a collection of them. Over the cap it is
+# refused, never cut (`clip_result`).
+WHOLE_STRUCTURE = "structure"
+WHOLE_COLLECTION = "collection"
+WHOLE_RETURNS = (WHOLE_STRUCTURE, WHOLE_COLLECTION)
+# The hints of the two refusals of such an answer: no page to continue from,
+# so the model can only ask for less or say so.
+_WHOLE_TOO_LARGE_HINT = "narrow the call, or tell the user the module's answer is too large"
+_WHOLE_PAGED_HINT = "SAP paged the answer; narrow the call"
 
 
 def _outcome_hint(operation: str) -> str:
@@ -201,6 +226,7 @@ def call_refusal(
     *,
     allow_write: bool = True,
     bound_key_types: Sequence[str] | None = None,
+    kind: Any = "odata",
 ) -> str | None:
     """Why ``operation`` cannot be called, or ``None`` when it can. No I/O.
 
@@ -214,8 +240,10 @@ def call_refusal(
     an operation that is not bound; empty when the set has no key, which a
     set with only list or create may -- a call bound to it could name no
     entity). ``dialect`` is the dialect of the
-    service's OData version (``None``: none). First match of
-    ``CALL_REFUSALS``, in that order.
+    service's OData version (``None``: none), ``kind`` the service's kind,
+    which the write rule depends on (``models.operation_is_write``: a
+    ``GET`` function import of a ``generic`` service needs no
+    ``allow_write``). First match of ``CALL_REFUSALS``, in that order.
 
     The dialect says what it can call: ``supports_call`` exactly ``True``,
     and the operation kinds it sends (``call_kinds``; function imports when
@@ -251,7 +279,7 @@ def call_refusal(
         or operation.kind not in kinds
     ):
         return "calls_not_available"
-    if not allow_write and operation.is_write():
+    if not allow_write and operation.is_write(kind):
         return "write_not_allowed"
     always: set[str] = set()
     sends = getattr(dialect, "sends_type", None)
@@ -277,11 +305,12 @@ def call_refusal(
     return None
 
 
-def call_changes_data(operation: OperationDef) -> bool:
-    """Whether calling ``operation`` is a write: the model's own rule
-    (``OperationDef.is_write`` / ``models.operation_is_write``), which is
-    also what ``has_write`` and the search tool go by."""
-    return operation.is_write()
+def call_changes_data(operation: OperationDef, kind: Any = "odata") -> bool:
+    """Whether calling ``operation`` of a service of ``kind`` is a write: the
+    model's own rule (``OperationDef.is_write`` /
+    ``models.operation_is_write``), which is also what ``has_write`` and the
+    search tool go by."""
+    return operation.is_write(kind)
 
 
 # Raised before a connection exists: nothing left this app.
@@ -452,7 +481,11 @@ class CallPlan:
     against and cut to -- the one the catalogue's ``returns`` names, else
     ``bound`` -- and ``many`` what ``returns`` declares (``True`` a
     collection, ``False`` one entity, ``None`` when the catalogue does not
-    say); ``etag`` the validated ``If-Match`` value or ``None``.
+    say); ``etag`` the validated ``If-Match`` value or ``None``;
+    ``whole`` whether a complex answer is passed on with every property
+    (``ODataClient._returned``): a call that only reads, of a function
+    import of a service of kind ``generic``, whose catalogue entry names no
+    entity set it returns.
     ``operation`` and ``body`` make it the plan of a modifying request for
     ``_write``. The ``repr`` shows names only: the path, the query and the
     body carry the parameter and key values.
@@ -471,6 +504,7 @@ class CallPlan:
     etag: str | None = field(default=None, repr=False)
     operation: str = "call"
     body: dict[str, Any] | None = field(default=None, repr=False)
+    whole: bool = False
 
     def __repr__(self) -> str:
         return (
@@ -537,6 +571,91 @@ def _value(value: Any) -> Any:
     return value
 
 
+def _is_edm_name(name: str) -> bool:
+    return re.fullmatch(EDM_NAME_RE, name) is not None
+
+
+def _is_property_key(name: object) -> bool:
+    """Whether a key of a complex answer is a name and nothing but a name.
+
+    A property name reaches the model as SAP wrote it, so it must have the
+    form of an EDM name (``EDM_NAME_RE``: ASCII, at most 128 characters), never
+    of a sentence. An annotation (``Property@term`` or ``@term``) is dropped
+    by ``_value``; it passes only when each of its parts is such a name too.
+    """
+    if not isinstance(name, str):
+        return False
+    prop, at, term = name.partition("@")
+    if at:
+        return (prop == "" or _is_edm_name(prop)) and _is_edm_name(term)
+    return _is_edm_name(prop)
+
+
+def _is_structure(value: Any, entity_types: frozenset[str], depth: int = 0) -> bool:
+    """Whether ``value`` is positively complex-type data, nothing of an entity.
+
+    In V2 an entity carries ``__metadata`` with its ``uri`` (and ``id``,
+    ``etag``, media keys) and its navigations as ``__deferred``; a complex
+    value carries at most ``__metadata.type``. So an object passes only when
+    its ``__metadata``, if any, holds nothing but a ``type`` that is a text
+    and not the entity type of a catalogue entity set (that set's field
+    allowlist decides about such data), it has no other ``__`` key, every
+    other key has the form of a name (``_is_property_key``), and every value
+    passes in turn; a list when every item does; a scalar always. A value
+    nested deeper than ``MAX_STRUCTURE_DEPTH`` does not.
+    """
+    if depth > MAX_STRUCTURE_DEPTH:
+        return False
+    if isinstance(value, dict):
+        meta = value.get("__metadata", {})
+        if not isinstance(meta, dict) or set(meta) - {"type"}:
+            return False
+        kind = meta.get("type")
+        if kind is not None and (not isinstance(kind, str) or kind in entity_types):
+            return False
+        return all(
+            name == "__metadata"
+            or (
+                _is_property_key(name)
+                and not name.startswith("__")
+                and _is_structure(item, entity_types, depth + 1)
+            )
+            for name, item in value.items()
+        )
+    if isinstance(value, list):
+        return all(_is_structure(item, entity_types, depth + 1) for item in value)
+    return True
+
+
+def _server_paged(payload: Any, name: str) -> bool:
+    """Whether a V2 call answer says SAP holds more of it (``__next``).
+
+    Read where ``V2Dialect.parse_call`` takes a collection from: ``d``, or the
+    ``d.<name>`` wrapper Gateway puts around a function import's result. The
+    key alone counts, whatever its value: the rows that came are then a page.
+    """
+    d = payload.get("d") if isinstance(payload, dict) else None
+    if isinstance(d, dict) and set(d) == {name} and isinstance(d[name], dict):
+        d = d[name]
+    return isinstance(d, dict) and "__next" in d
+
+
+def _paged_refusal() -> ODataError:
+    """The answer to a call whose rows SAP paged: the first page is not the
+    whole table, and a call has no page to continue from."""
+    return ODataError(
+        "result_too_large",
+        "SAP sent only the first part of this operation's answer; nothing of it was returned",
+        hint=_WHOLE_PAGED_HINT,
+    )
+
+
+def _says_its_type(row: dict) -> bool:
+    """Whether a row names its type (a non-empty ``__metadata.type``)."""
+    meta = row.get("__metadata")
+    return isinstance(meta, dict) and isinstance(meta.get("type"), str) and meta["type"] != ""
+
+
 class ODataClient:
     """Reads and writes of one catalogue service through its destination."""
 
@@ -563,6 +682,10 @@ class ODataClient:
         # settings, never an argument of a call.
         self._destination = service.get("destination")
         self._user_context = service.get("user_context")
+        # Which write rule applies (`models.operation_is_write`): the stored
+        # kind as it is; anything but exactly "generic" keeps the rule of
+        # `odata`.
+        self._kind = service.get("kind", "odata")
         # For log lines only: the catalogue name, when it has the form of one.
         name = service.get("name")
         self._name = name if isinstance(name, str) and _LOG_NAME.fullmatch(name) else "?"
@@ -1100,6 +1223,7 @@ class ODataClient:
             bound_keys,
             self._dialect,
             bound_key_types=None if bound is None else [k.type for k in bound.keys],
+            kind=self._kind,
         )
         if reason is not None:
             raise self._not_callable(operation, reason, bound_keys or [])
@@ -1140,7 +1264,7 @@ class ODataClient:
                 "invalid_argument",
                 f"operation {operation.name!r} is not bound to an entity; it takes no key",
             )
-        changes = call_changes_data(operation)
+        changes = call_changes_data(operation, self._kind)
         if etag is not None:
             if bound is None or not changes:
                 raise ODataError(
@@ -1196,6 +1320,13 @@ class ODataClient:
             ),
             many=None if returns is None else returns.collection,
             etag=etag,
+            # The generic exception of `_returned`: exact kinds, a read only.
+            whole=(
+                self._kind == "generic"
+                and operation.kind == "function_import"
+                and not changes
+                and returns is None
+            ),
         )
 
     @staticmethod
@@ -2030,6 +2161,24 @@ class ODataClient:
         ``withheld``: the caller learns that the call worked, not what it
         returned.
 
+        Except, for a plan that says ``whole`` (a reading function import of
+        a ``generic`` service that names no entity set it returns): one
+        object, or a list of objects, that is positively complex-type data
+        (``_is_structure``) is ``structure`` / ``collection``
+        (``WHOLE_RETURNS``) with every property, the bookkeeping dropped as
+        for a read (``_value``: no ``__metadata``, no annotation); one object
+        without a property is ``nothing``. An import bound to a catalogue
+        entity set takes this path only for rows that each name their
+        complex type (``_says_its_type``): a row without a type could be one
+        of that set's entities, whose non-selectable fields must not pass.
+        What fails falls to the rule above, which cuts rows of the set to its
+        fields or withholds the answer. Such a collection that SAP paged
+        (``__next``, ``_server_paged``) is the refusal ``result_too_large``:
+        the first page is not the table, and there is no page to continue
+        from. So is a paged collection of catalogue entities on a read of a
+        ``generic`` service (an ``odata`` service keeps its answer). Both
+        refusals are for reads only, so neither ever follows a change.
+
         A single JSON scalar is passed on for a call that only reads (it is
         the whole point of such a function): a number or a boolean as it
         is, a text only when it is one printable line of at most
@@ -2054,6 +2203,23 @@ class ODataClient:
                 ):
                     return "withheld", None
             return "value", value
+        if plan.whole and shape in ("entity", "structure", "collection"):
+            rows = value if shape == "collection" else [value]
+            entity_types = frozenset(
+                e.entity_type for e in self._definition.entity_sets if e.entity_type
+            )
+            if isinstance(rows, list) and all(
+                isinstance(row, dict) and _is_structure(row, entity_types) for row in rows
+            ):
+                whole = [_value(row) for row in rows]
+                if shape != "collection" and whole[0] == {}:
+                    return "nothing", None  # an object without a property carries nothing
+                if plan.result_set is None or all(_says_its_type(row) for row in rows):
+                    if shape == "collection" and _server_paged(payload, plan.name):
+                        raise _paged_refusal()
+                    if shape == "collection":
+                        return WHOLE_COLLECTION, whole
+                    return WHOLE_STRUCTURE, whole[0]
         target = plan.result_set
         if shape not in ("entity", "collection") or target is None or not target.entity_type:
             return "withheld", None
@@ -2070,6 +2236,11 @@ class ODataClient:
         rows = value if many else [value]
         if not self._rows_are_of(payload, rows, target, many):
             return "withheld", None
+        if many and self._kind == "generic" and not plan.changes:
+            # A generic read only: an `odata` service keeps its answer (a
+            # decision of its own), and no refusal may follow a change.
+            if _server_paged(payload, plan.name):
+                raise _paged_refusal()
         cut = [self._row(row, target, names, []) for row in rows]
         return ("entities", cut) if many else ("entity", cut[0])
 
@@ -2085,7 +2256,9 @@ class ODataClient:
 
         ``returned`` says what ``result`` is: ``entity`` / ``entities`` (cut
         to the selectable fields of the entity set the operation returns,
-        or is bound to), ``value`` (one scalar, read-type calls only), ``nothing`` (SAP
+        or is bound to), ``structure`` / ``collection`` (a ``generic``
+        service's reading function import: complex data with every
+        property), ``value`` (one scalar, read-type calls only), ``nothing`` (SAP
         sent no content) or ``withheld`` (SAP sent something that could not
         be tied to a catalogue entity set, so it is not passed on);
         ``result`` is ``None`` for the last two. See ``_returned``.
@@ -2180,12 +2353,25 @@ def clip_result(result: dict, max_chars: int, *, skip: int | None = None) -> dic
     page) the cut page gets one only if the caller passes the ``skip`` it
     asked with. When not even the first row of a page fits, the answer is a
     refusal (``{"error": {code: result_too_large, ...}}``) instead of an
-    empty page that would be asked for again. The input is not changed.
+    empty page that would be asked for again. A call result passed on whole
+    (``returned`` in ``WHOLE_RETURNS``) that does not fit is that refusal at
+    once: it has no field catalogue to cut by and no page to continue from,
+    so a list that ends early or a structure with halved texts would read as
+    SAP's whole answer. The input is not changed.
     """
     out = copy.deepcopy(result)
     out["truncated"] = bool(out.get("truncated", False))
     if _size(out) <= max_chars:
         return out
+    if out.get("returned") in WHOLE_RETURNS:
+        return {
+            "error": ODataError(
+                "result_too_large",
+                "the answer of this operation is larger than a tool result may be; "
+                "nothing of it was returned",
+                hint=_WHOLE_TOO_LARGE_HINT,
+            ).to_dict()
+        }
     out["truncated"] = True
     for key in ("items", "result"):
         if isinstance(out.get(key), list):

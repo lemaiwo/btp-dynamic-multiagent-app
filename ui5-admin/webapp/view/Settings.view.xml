@@ -24,6 +24,86 @@
                 </f:SimpleForm>
             </Panel>
 
+            <!-- Data catalogue embeddings (design addendum (l), point 4):
+                 controller/settings/Embeddings.ts keeps the `emb` model. -->
+            <Panel
+                id="embeddingsPanel"
+                headerText="{i18n>embPanelTitle}"
+                expandable="false"
+                busy="{emb>/loading}"
+                busyIndicatorDelay="200"
+                class="sapUiSmallMarginTop">
+                <Text text="{i18n>embPanelHint}" class="sapUiTinyMarginBottom" />
+                <MessageStrip
+                    id="embLoadError"
+                    type="Error"
+                    showIcon="true"
+                    visible="{= !!${emb>/loadError} }"
+                    text="{emb>/loadError}"
+                    class="sapUiTinyMarginTopBottom">
+                    <link>
+                        <Link id="embRetry" text="{i18n>embRetry}" press=".onRetryEmbeddings" />
+                    </link>
+                </MessageStrip>
+                <MessageStrip
+                    id="embAicoreStrip"
+                    type="Warning"
+                    showIcon="true"
+                    visible="{= !!${emb>/aicoreStrip} }"
+                    text="{emb>/aicoreStrip}"
+                    class="sapUiTinyMarginTopBottom" />
+                <MessageStrip
+                    id="embEnvStrip"
+                    type="Information"
+                    showIcon="true"
+                    visible="{= !!${emb>/envStrip} }"
+                    text="{emb>/envStrip}"
+                    class="sapUiTinyMarginTopBottom" />
+                <f:SimpleForm layout="ResponsiveGridLayout" editable="true" visible="{emb>/loaded}">
+                    <Label text="{i18n>embLineModel}" />
+                    <ObjectStatus id="embModelLine" text="{emb>/lines/embLineModel/text}" state="{emb>/lines/embLineModel/state}" />
+                    <Label text="{i18n>embLineVectors}" />
+                    <ObjectStatus id="embVectorsLine" text="{emb>/lines/embLineVectors/text}" state="{emb>/lines/embLineVectors/state}" />
+                    <Label text="{i18n>embLineStale}" />
+                    <ObjectStatus id="embStaleLine" text="{emb>/lines/embLineStale/text}" state="{emb>/lines/embLineStale/state}" />
+                    <Label text="{i18n>embLineLastRun}" />
+                    <ObjectStatus id="embLastRunLine" text="{emb>/lines/embLineLastRun/text}" state="{emb>/lines/embLineLastRun/state}" />
+                    <Label text="{i18n>embUseLabel}" labelFor="embEnabledSwitch" />
+                    <Switch id="embEnabledSwitch" state="{emb>/form/enabled}" />
+                    <Label text="{i18n>embModelLabel}" labelFor="embModelSelect" />
+                    <Select
+                        id="embModelSelect"
+                        selectedKey="{emb>/form/modelKey}"
+                        items="{ path: 'emb>/options', templateShareable: false }"
+                        valueState="{emb>/modelState}"
+                        valueStateText="{emb>/modelStateText}"
+                        change=".onEmbeddingsModelChange">
+                        <core:Item key="{emb>key}" text="{emb>text}" xmlns:core="sap.ui.core" />
+                    </Select>
+                    <Label text="" />
+                    <HBox wrap="Wrap">
+                        <Button
+                            id="embSaveButton"
+                            text="{i18n>embSave}"
+                            type="Emphasized"
+                            enabled="{= !${emb>/busy} }"
+                            press=".onSaveEmbeddings" />
+                        <Button
+                            id="embRunButton"
+                            text="{i18n>embRun}"
+                            enabled="{= ${emb>/canRun} &amp;&amp; !${emb>/busy} }"
+                            press=".onRunEmbeddings"
+                            class="sapUiTinyMarginBegin" />
+                        <Button
+                            id="embDeployButton"
+                            text="{i18n>embDeployOpen}"
+                            enabled="{= ${emb>/canDeploy} &amp;&amp; !${emb>/busy} }"
+                            press=".onOpenEmbeddingsDeploy"
+                            class="sapUiTinyMarginBegin" />
+                    </HBox>
+                </f:SimpleForm>
+            </Panel>
+
             <Panel headerText="{i18n>orchestratorInstructions}" expandable="false" class="sapUiSmallMarginTop">
                 <f:SimpleForm layout="ResponsiveGridLayout" editable="true">
                     <Label text="{i18n>orchestratorInstructions}" labelFor="orchestratorInstructions" />

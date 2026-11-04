@@ -1,4 +1,4 @@
-import type { McpServer, ODataDefinition, ODataServiceSummary } from "../service/types";
+import type { McpServer, ODataDefinition, ODataServiceKind, ODataServiceSummary } from "../service/types";
 import odataCatalog from "./odataCatalog";
 
 /**
@@ -30,6 +30,10 @@ export interface ODataEntryRow {
     purpose: string;
     userContext: boolean;
     state: ODataEntryState;
+    /** The service's kind as the catalogue says it; `odata` (whose write
+     *  rule makes no exception) when it does not say or holds no such
+     *  service. `opens` judges the service's writes by it. */
+    kind: ODataServiceKind;
 }
 
 /** One choice of the service box. */
@@ -155,7 +159,8 @@ function rows(
             title: (summary?.title ?? "").trim() || name,
             purpose: summary?.purpose ?? "",
             userContext: summary?.user_context === true,
-            state: stateOf(summary, catalogue)
+            state: stateOf(summary, catalogue),
+            kind: summary?.kind === "generic" ? "generic" : "odata"
         };
     });
 }
@@ -184,7 +189,8 @@ function options(
 /**
  * What `allow_write` opens, by service, in the words of the service page
  * (`odataCatalog.writeSummary`: entity create/update/delete and the enabled
- * operations that are writes by `operationIsWrite`). `definitions` holds
+ * operations that are writes by `operationIsWrite` on a service of the
+ * row's kind: a GET function import of a generic service is none). `definitions` holds
  * the definition per name; a name without one (not read, or the read
  * failed) gets `items: null`, never an empty list: "nothing" is only said
  * about a service that was read.
@@ -194,7 +200,9 @@ function opens(
 ): ODataEntryOpens[] {
     return selected.filter((row) => row.state !== "missing").map((row) => {
         const definition = definitions[`=${row.name}`];
-        return { name: row.name, title: row.title, items: definition ? odataCatalog.writeSummary(definition) : null };
+        return {
+            name: row.name, title: row.title, items: definition ? odataCatalog.writeSummary(definition, row.kind) : null
+        };
     });
 }
 

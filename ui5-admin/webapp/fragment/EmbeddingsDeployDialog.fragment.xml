@@ -1,0 +1,33 @@
+<core:FragmentDefinition
+    xmlns="sap.m"
+    xmlns:core="sap.ui.core">
+    <!-- The models AI Core offers for embeddings that have no deployment yet
+         (controller/settings/Embeddings.ts). Picking one and pressing
+         Deploy… asks first: a deployment bills. -->
+    <Dialog id="embDeployDialog" title="{i18n>embDeployTitle}" contentWidth="32rem" ariaDescribedBy="embDeployHintText">
+        <VBox class="sapUiSmallMargin">
+            <Text id="embDeployHintText" text="{i18n>embDeployHint}" />
+            <List
+                id="embDeployList"
+                mode="SingleSelectMaster"
+                items="{ path: 'emb>/deploy/options', templateShareable: false }"
+                noDataText="{emb>/deploy/noData}"
+                ariaLabelledBy="embDeployHintText"
+                selectionChange=".onDeployPick"
+                class="sapUiSmallMarginTop">
+                <StandardListItem title="{emb>model}" description="{emb>versions}" />
+            </List>
+        </VBox>
+        <beginButton>
+            <Button
+                id="embDeployContinue"
+                text="{i18n>embDeployContinue}"
+                type="Emphasized"
+                enabled="{= !!${emb>/deploy/selected} &amp;&amp; !${emb>/busy} }"
+                press=".onDeployConfirm" />
+        </beginButton>
+        <endButton>
+            <Button id="embDeployCancel" text="{i18n>cancel}" press=".onDeployCancel" />
+        </endButton>
+    </Dialog>
+</core:FragmentDefinition>

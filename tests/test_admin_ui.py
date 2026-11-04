@@ -1718,12 +1718,43 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
               "'builtin:confluence':" in html and "['spaces', 'api_base']" in html)
         check("confluence has its spaces field", 'class="dest-spaces"' in html)
         check("the hint list names builtin:confluence", "builtin:jira, builtin:confluence," in html)
+        # builtin:git (addendum h of the web chat design): destination mode
+        # only, as a technical user; provider, repositories, base branch,
+        # prefix and two switches, collected by their own function.
+        check("git is a known destination built-in",
+              "'builtin:git':" in html
+              and "['provider', 'repositories', 'base_branch', 'branch_prefix', 'allow_push', "
+                  "'allow_pull_request']" in html)
+        check("git is offered under its toolset name",
+              "const GIT_TOOLSET_LABEL = 'Git repositories (GitHub, Bitbucket, GitLab)';" in html)
+        check("git has its fields",
+              all(f'class="dest-{k}"' in html for k in
+                  ("provider", "base_branch", "branch_prefix", "allow_push", "allow_pull_request")))
+        check("git provider select offers the three providers",
+              '<option value="github">GitHub</option>' in html
+              and '<option value="bitbucket">Bitbucket Cloud</option>' in html
+              and '<option value="gitlab">GitLab</option>' in html)
+        check("git switches use the approved wording",
+              "Allow pushing to agent branches" in html and "Allow opening pull requests" in html)
+        check("the hint list names builtin:git", "builtin:bitbucket, builtin:git, builtin:sapnotes," in html)
         check("the views placeholder shows a calendar view with its kinds",
               '"kinds": ["Presence", "Guard"]' in html)
         # A stored server on an auth mode this page does not offer (app_only,
         # made in the UI5 admin) is sent back as loaded, and the row says so.
         check("a server on a mode the page does not edit is kept as stored",
               "dataset.keptMode" in html and "It is saved as stored" in html)
+        # builtin:ina (analytical queries): the entry is made in the UI5 admin.
+        # This page knows the key so that a stored row is kept and marked, but
+        # it does not offer the toolset: the hint list of what a new row can
+        # be does not name it, and a row typed by hand is refused at save.
+        check("ina is a known destination built-in, kept as stored",
+              "'builtin:ina':" in html and "['queries']" in html
+              and "Edited in the UI5 admin (Analytical queries)" in html)
+        hint_line = next((ln for ln in js.splitlines()
+                          if "A destination works with an https MCP server" in ln), "")
+        check("a new row is not offered builtin:ina",
+              "builtin:odata)" in js and hint_line != "" and "builtin:ina" not in hint_line
+              and '<option value="builtin:ina"' not in html)
         check("api() call discovered: GET /admin/api/odata/services",
               ("GET", "/admin/api/odata/services") in discovered)
         for opener in ("openAgentModal", "editAgent"):
@@ -1739,6 +1770,8 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
 
         odata_agent_id = None
         odata_names = ["purchase-requisitions", "business-partners"]
+        ina_agent_id = None
+        ina_query_name = "ui-test-sales"
         try:
             # A stored entry, as GET /agents/{id} answers it, for the round trip
             # below: load it into the row, collect it, PUT it back unchanged.
@@ -1776,8 +1809,45 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
                       and stored_odata[0]["oauth"].get("allow_write") is True,
                       str(stored_odata))
 
+            # builtin:ina: a registered query and an agent that names it, made
+            # as the UI5 admin would. Its stored entry, as GET answers it, is
+            # loaded into the row below and must come back unchanged.
+            from agents.db import SessionLocal, create_ina_query
+            async with SessionLocal() as s:
+                await create_ina_query(s, {
+                    "name": ina_query_name, "title": "UI test query", "purpose": "UI test query.",
+                    "not_for": "Nothing else", "destination": "SIA_INA", "user_context": False,
+                    "query": "ZQ_UI_TEST_01", "enabled": True,
+                    "definition": {
+                        "dimensions": [{"name": "0CALMONTH", "label": "Month",
+                                        "key_field": "0CALMONTH.KEY"}],
+                        "measures": [{"name": "0AMOUNT", "label": "Net amount", "unit": "EUR"}],
+                        "variables": []},
+                })
+            ina_entry = {"url": "builtin:ina", "auth_mode": "destination",
+                         "oauth": {"queries": [ina_query_name]}}
+            ina_agent = {
+                "name": "uiina", "description": "UI test agent with an analytical query.",
+                "instructions": "You are a UI test agent.", "enabled": True,
+                "mcp_servers": [ina_entry],
+            }
+            r = await client.post("/admin/api/agents", json=ina_agent)
+            check("fixture agent with a builtin:ina entry created",
+                  r.status_code == 201, r.text[:300])
+            ina_agent_id = r.json().get("id") if r.status_code == 201 else None
+            stored_ina = None
+            if ina_agent_id is not None:
+                r = await client.get(f"/admin/api/agents/{ina_agent_id}")
+                stored_ina = r.json()["mcp_servers"]
+                check("the stored entry is the url, the mode and the query names",
+                      len(stored_ina) == 1 and stored_ina[0]["url"] == "builtin:ina"
+                      and stored_ina[0]["auth_mode"] == "destination"
+                      and stored_ina[0]["oauth"].get("queries") == [ina_query_name],
+                      str(stored_ina))
+
             if shutil.which("node") is not None:
-                dest_harness = "const STORED_ODATA = " + json.dumps(stored_odata) + ";\n" + r"""
+                dest_harness = ("const STORED_ODATA = " + json.dumps(stored_odata) + ";\n"
+                                + "const STORED_INA = " + json.dumps(stored_ina) + ";\n") + r"""
 'use strict';
 const assert = require('node:assert');
 const { JSDOM } = require('jsdom');
@@ -1794,6 +1864,7 @@ const dom = new JSDOM(`<!doctype html><html><body>
   <select id="agent-model-name"><option value="" selected></option></select>
   <input type="checkbox" id="agent-enabled" checked>
   <input type="checkbox" id="agent-expose-chat" checked>
+  <select id="agent-tier"><option value="basic" selected>Basic</option><option value="advanced">Advanced</option></select>
   <input id="agent-run-as" value=""><input id="agent-run-prompt" value="">
   <input id="agent-run-timeout" value="1800">
   <div id="agent-skills"></div><div id="agent-peers"></div>
@@ -2105,6 +2176,167 @@ assert.throws(() => collectMcpServers(), /Two builtin:bitbucket rows/);
              require_green_builds: false } }));
 assert.deepStrictEqual(out.oauth, { destination: 'JIRA', project: 'ABC' });
 assert.strictEqual(row.querySelector('.dest-allow_approve').checked, false);
+// 7e. builtin:git: provider, repositories as a list, base branch, prefix, two switches.
+const GIT_OAUTH = { destination: 'GITLAB_API', provider: 'gitlab', repositories: ['grp/web', 'grp/sub/api'],
+    base_branch: 'develop', branch_prefix: 'bot/', allow_push: true, allow_pull_request: true };
+({ row, out } = addAndCollect({ url: 'builtin:git', auth_mode: 'destination',
+    oauth: { ...GIT_OAUTH, user_context: true, project: 'ABC', lookback: '2d', allow_send: true,
+             workspace: 'ws', branch: 'main', allow_comment: true, allow_approve: true } }));
+for (const k of ['destination', 'provider', 'repositories', 'base_branch', 'branch_prefix',
+                 'allow_push', 'allow_pull_request']) {
+    assert.strictEqual(row.querySelector('.dest-field-' + k).style.display, '', k + ' is shown');
+}
+for (const k of ['user_context', 'project', 'lookback', 'allow_send', 'workspace', 'branch',
+                 'allow_comment', 'allow_approve', 'require_green_builds', 'api_base', 'spaces']) {
+    assert.strictEqual(row.querySelector('.dest-field-' + k).style.display, 'none', k + ' is hidden');
+}
+// The loaded entry fills the fields; the block is built from them only.
+assert.strictEqual(row.querySelector('.dest-provider').value, 'gitlab');
+assert.strictEqual(row.querySelector('.dest-repositories').value, 'grp/web, grp/sub/api');
+assert.strictEqual(row.querySelector('.dest-base_branch').value, 'develop');
+assert.strictEqual(row.querySelector('.dest-branch_prefix').value, 'bot/');
+assert.deepStrictEqual(out, { url: 'builtin:git', auth_mode: 'destination', oauth: GIT_OAUTH });
+assert.ok(row.querySelector('.dest-hint').textContent.startsWith('Git repositories (GitHub, Bitbucket, GitLab).'));
+console.log('GIT:' + JSON.stringify(out));
+// Built from the fields as the admin leaves them: the repositories split on
+// commas with empty parts dropped, base branch and prefix as typed (edge
+// whitespace sent for the server to refuse), blank ones and unticked
+// switches absent.
+row.querySelector('.dest-provider').value = 'github';
+row.querySelector('.dest-repositories').value = ' acme/web, ,acme/api ,';
+row.querySelector('.dest-base_branch').value = '';
+row.querySelector('.dest-branch_prefix').value = ' agent/';
+row.querySelector('.dest-allow_push').checked = false;
+row.querySelector('.dest-allow_pull_request').checked = false;
+assert.deepStrictEqual(collectMcpServers()[0].oauth,
+    { destination: 'GITLAB_API', provider: 'github', repositories: ['acme/web', 'acme/api'],
+      branch_prefix: ' agent/' });
+// No repository is refused before the save, with a fixed text.
+row.querySelector('.dest-repositories').value = ' , ';
+assert.throws(() => collectMcpServers(), e => {
+    assert.strictEqual(e.message, 'Git: list at least one repository.');
+    return true;
+});
+// A new row starts on GitHub with both switches off.
+document.getElementById('agent-mcp-servers').innerHTML = '';
+addMcpServerRow();
+row = document.querySelector('.mcp-server-row');
+row.querySelector('.mcp-url').value = 'builtin:git';
+row.querySelector('.mcp-auth-mode').value = 'destination';
+toggleOauthFields(row.querySelector('.mcp-auth-mode'));
+assert.strictEqual(row.querySelector('.dest-provider').value, 'github');
+assert.strictEqual(row.querySelector('.dest-allow_push').checked, false);
+// A switch stored as anything but the JSON boolean is not loaded as that switch;
+// a provider this page does not know leaves the select blank and is refused.
+({ row, out } = addAndCollect({ url: 'builtin:git', auth_mode: 'destination',
+    oauth: { destination: 'GH', provider: 'github', repositories: ['a/b'], allow_push: 'true',
+             allow_pull_request: 1 } }));
+assert.deepStrictEqual(out.oauth, { destination: 'GH', provider: 'github', repositories: ['a/b'] });
+document.getElementById('agent-mcp-servers').innerHTML = '';
+addMcpServerRow({ url: 'builtin:git', auth_mode: 'destination',
+    oauth: { destination: 'GH', provider: 'SECRETVALUE', repositories: ['a/b'] } });
+assert.throws(() => collectMcpServers(), e => {
+    assert.ok(/choose a provider/.test(e.message));
+    assert.ok(!e.message.includes('SECRETVALUE'));
+    return true;
+});
+// Only the destination mode.
+({ row } = addAndCollect({ url: 'builtin:git', auth_mode: 'destination',
+    oauth: { destination: 'GH', provider: 'github', repositories: ['a/b'] } }));
+row.querySelector('.mcp-auth-mode').value = 'jwt';
+assert.throws(() => collectMcpServers(), /builtin:git needs the auth mode "BTP destination"/);
+// An agent takes one git entry: two rows (in any spelling) are refused here, not posted.
+row.querySelector('.mcp-auth-mode').value = 'destination';
+addMcpServerRow({ url: 'Builtin:Git/', auth_mode: 'destination',
+    oauth: { destination: 'GH2', provider: 'github', repositories: ['c/d'] } });
+assert.throws(() => collectMcpServers(), /Two builtin:git rows/);
+// A Bitbucket row loads none of the git fields from a stored block.
+({ row, out } = addAndCollect({ url: 'builtin:bitbucket', auth_mode: 'destination',
+    oauth: { destination: 'BITBUCKET', workspace: 'acme-ws', provider: 'gitlab', base_branch: 'dev',
+             branch_prefix: 'bot/', allow_push: true, allow_pull_request: true } }));
+assert.deepStrictEqual(out.oauth, { destination: 'BITBUCKET', workspace: 'acme-ws' });
+assert.strictEqual(row.querySelector('.dest-allow_push').checked, false);
+assert.strictEqual(row.querySelector('.dest-base_branch').value, '');
+// 7f. builtin:ina (analytical queries) is edited in the UI5 admin. A stored
+//     row is shown with the destination option, its queries as a read-only
+//     line and a fixed note, and goes back as it was loaded; a NEW row cannot
+//     be made here.
+const INA_NOTE_TEXT = 'Edited in the UI5 admin (Analytical queries)';
+const INA_ENTRY = { url: 'builtin:ina', auth_mode: 'destination',
+    oauth: { queries: ['sales-by-month', 'stock-levels'] } };
+({ row, out } = addAndCollect(JSON.parse(JSON.stringify(INA_ENTRY))));
+assert.deepStrictEqual(out, INA_ENTRY, 'sent back exactly as loaded');
+assert.strictEqual(row.querySelector('.mcp-auth-mode').value, 'destination',
+    'the destination option, not a blank select');
+assert.strictEqual(row.querySelectorAll('.mcp-auth-mode option').length, 5, 'no option of its own');
+assert.strictEqual(row.querySelector('.mcp-destination').style.display, 'block');
+assert.strictEqual(row.querySelector('.dest-field-queries').style.display, '');
+assert.strictEqual(row.querySelector('.dest-queries').textContent,
+    'Queries: sales-by-month, stock-levels');
+assert.strictEqual(row.querySelector('.dest-hint').textContent, INA_NOTE_TEXT);
+// Read-only and nothing else of the form: no destination name (each query
+// names its own), no identity switch, none of another built-in's fields.
+assert.strictEqual(row.querySelector('.dest-field-queries input'), null,
+    'no input to edit the queries');
+assert.strictEqual(row.querySelector('.dest-field-queries textarea'), null);
+for (const k of ['destination', 'user_context', 'services', 'allow_write', 'project', 'workspace',
+                 'repositories', 'views', 'site', 'allow_send']) {
+    assert.strictEqual(row.querySelector('.dest-field-' + k).style.display, 'none',
+        k + ' is hidden');
+}
+console.log('INA:' + JSON.stringify(out));
+// Query names are data: the line is text, never markup.
+({ row, out } = addAndCollect({ url: 'builtin:ina', auth_mode: 'destination',
+    oauth: { queries: ['<img src=x onerror=alert(1)>'] } }));
+assert.strictEqual(row.querySelector('.dest-field-queries img'), null);
+assert.strictEqual(row.querySelector('.dest-queries').textContent,
+    'Queries: <img src=x onerror=alert(1)>');
+assert.deepStrictEqual(out.oauth, { queries: ['<img src=x onerror=alert(1)>'] });
+// The API's read-only marker is not part of the block and is not sent back.
+({ row, out } = addAndCollect({ url: 'builtin:ina', auth_mode: 'destination',
+    oauth: { queries: ['sales-by-month'], has_client_secret: false } }));
+assert.deepStrictEqual(out, { url: 'builtin:ina', auth_mode: 'destination',
+    oauth: { queries: ['sales-by-month'] } });
+// Another spelling of the url is the same entry; the url goes out as loaded.
+({ row, out } = addAndCollect({ url: 'Builtin:INA/', auth_mode: 'destination',
+    oauth: { queries: ['sales-by-month'] } }));
+assert.deepStrictEqual(out, { url: 'Builtin:INA/', auth_mode: 'destination',
+    oauth: { queries: ['sales-by-month'] } });
+// A row that is made another built-in is an ordinary row: nothing of the
+// kept block rides along (a deliberate edit of the url).
+({ row } = addAndCollect(JSON.parse(JSON.stringify(INA_ENTRY))));
+row.querySelector('.mcp-url').value = 'builtin:jira';
+syncDestinationFields(row);
+row.querySelector('.dest-destination').value = 'JIRA';
+row.querySelector('.dest-project').value = 'ABC';
+assert.deepStrictEqual(collectMcpServers()[0], { url: 'builtin:jira', auth_mode: 'destination',
+    oauth: { destination: 'JIRA', project: 'ABC' } });
+// Another auth mode on the kept row is refused, not posted with the queries
+// of the stored mode.
+({ row } = addAndCollect(JSON.parse(JSON.stringify(INA_ENTRY))));
+row.querySelector('.mcp-auth-mode').value = 'jwt';
+assert.throws(() => collectMcpServers(), e => {
+    assert.ok(/builtin:ina is edited in the UI5 admin \(Analytical queries\)/.test(e.message));
+    return true;
+});
+// A new row cannot be made here: the dropdown has no such toolset and a url
+// typed by hand is refused before the save, with a fixed text.
+document.getElementById('agent-mcp-servers').innerHTML = '';
+addMcpServerRow();
+row = document.querySelector('.mcp-server-row');
+const optionText = [...row.querySelectorAll('option')].map(o => o.value + o.textContent).join();
+assert.ok(!/builtin:ina/i.test(optionText), 'no option of a new row names builtin:ina');
+row.querySelector('.mcp-url').value = 'builtin:ina';
+row.querySelector('.mcp-auth-mode').value = 'destination';
+toggleOauthFields(row.querySelector('.mcp-auth-mode'));
+assert.throws(() => collectMcpServers(), e => {
+    assert.strictEqual(e.message, 'builtin:ina is edited in the UI5 admin (Analytical queries); '
+        + 'this page only keeps a stored entry.');
+    return true;
+});
+// ... also with a stored row next to it: the typed one is not a stored one.
+addMcpServerRow(JSON.parse(JSON.stringify(INA_ENTRY)));
+assert.throws(() => collectMcpServers(), /builtin:ina is edited in the UI5 admin/);
 // 4b. Confluence keeps its space pin and api_base; nothing of Jira's, no user switch.
 ({ row, out } = addAndCollect({
     url: 'builtin:confluence', auth_mode: 'destination',
@@ -2697,6 +2929,17 @@ assert.ok(errText({ detail: [{ loc: ['body', 'mcp_servers', 0], type: 'value_err
     assert.deepStrictEqual(calls, [], 'no request for an entry without services');
     assert.strictEqual(toastEl.textContent, 'Select at least one OData service');
 
+    // 24b. saveAgent() with a kept builtin:ina row posts the entry as loaded.
+    document.getElementById('agent-mcp-servers').innerHTML = '';
+    renderMcpServers(JSON.parse(JSON.stringify([INA_ENTRY])));
+    calls = [];
+    answer = () => ({ ok: false, status: 422, statusText: 'Unprocessable Entity',
+                      json: async () => ({ detail: 'refused for the test' }) });
+    await saveAgent();
+    assert.deepStrictEqual(calls.map(c => c.slice(0, 2)), [['/admin/api/agents/7', 'PUT']]);
+    assert.deepStrictEqual(JSON.parse(calls[0][2]).mcp_servers, [INA_ENTRY],
+        'the posted entry is the loaded one');
+
     // 25. The entry as the live API stored it: load, collect, same entry. The
     //     catalogue here lists by name, the stored entry does not.
     if (STORED_ODATA) {
@@ -2708,6 +2951,14 @@ assert.ok(errText({ detail: [{ loc: ['body', 'mcp_servers', 0], type: 'value_err
         const again = collectMcpServers();
         assert.deepStrictEqual(Object.keys(again[0].oauth).sort(), ['allow_write', 'services']);
         console.log('ROUNDTRIP:' + JSON.stringify(again));
+    }
+    // 25b. The builtin:ina entry as the live API stored it: load, collect, same entry.
+    if (STORED_INA) {
+        document.getElementById('agent-mcp-servers').innerHTML = '';
+        renderMcpServers(STORED_INA);
+        const inaAgain = collectMcpServers();
+        assert.ok(!('has_client_secret' in inaAgain[0].oauth));
+        console.log('INAROUNDTRIP:' + JSON.stringify(inaAgain));
     }
     console.log('destination server round-trip scenarios passed');
 })().catch(e => { console.error(e && e.stack || e); process.exit(1); });
@@ -2849,6 +3100,25 @@ assert.ok(errText({ detail: [{ loc: ['body', 'mcp_servers', 0], type: 'value_err
                                       str(after)[:420])
                             finally:
                                 await client.delete(f"/admin/api/agents/{app_id}")
+                    # builtin:ina (kept as stored): what the form posts for the
+                    # untouched row is accepted and leaves the stored entry as it was.
+                    ina_collected = next((json.loads(line[len("INAROUNDTRIP:"):])
+                                          for line in result.stdout.splitlines()
+                                          if line.startswith("INAROUNDTRIP:")), None)
+                    check("the form collected the stored builtin:ina entry",
+                          ina_collected == [ina_entry], str(ina_collected))
+                    if ina_collected is not None and ina_agent_id is not None:
+                        before = (await client.get(f"/admin/api/agents/{ina_agent_id}")).json()
+                        r = await client.put(f"/admin/api/agents/{ina_agent_id}",
+                                             json={**ina_agent, "mcp_servers": ina_collected})
+                        check("saving the collected builtin:ina entry is accepted",
+                              r.status_code == 200, r.text[:300])
+                        after = (await client.get(f"/admin/api/agents/{ina_agent_id}")).json()
+                        check("load, save without changes: the same stored builtin:ina entry",
+                              after["mcp_servers"] == before["mcp_servers"]
+                              and after["mcp_servers"][0]["oauth"].get("queries")
+                              == [ina_query_name],
+                              str(after["mcp_servers"]))
                     if collected is not None and odata_agent_id is not None:
                         r = await client.put(f"/admin/api/agents/{odata_agent_id}",
                                              json={**odata_agent, "mcp_servers": collected})
@@ -2878,6 +3148,13 @@ assert.ok(errText({ detail: [{ loc: ['body', 'mcp_servers', 0], type: 'value_err
             # Whatever failed above, the fixtures do not outlive this section.
             if odata_agent_id is not None:
                 await client.delete(f"/admin/api/agents/{odata_agent_id}")
+            if ina_agent_id is not None:
+                await client.delete(f"/admin/api/agents/{ina_agent_id}")
+            from agents.db import SessionLocal, delete_ina_query, get_ina_query
+            async with SessionLocal() as s_ina:
+                ina_row = await get_ina_query(s_ina, ina_query_name)
+                if ina_row is not None:
+                    await delete_ina_query(s_ina, ina_row)
             for svc_name in odata_names:
                 r = await client.delete(f"/admin/api/odata/services/{svc_name}")
                 check(f"fixture OData service {svc_name} removed", r.status_code == 204,
@@ -2930,7 +3207,32 @@ assert.ok(errText({ detail: [{ loc: ['body', 'mcp_servers', 0], type: 'value_err
                 e[1].get("id") == fid for e in coll.elements
                 if e[0] in ("input", "textarea")))
         check("editAgent() fills the invoke fields", "setInvokeForm(a)" in js)
+
+        print("\n== agent tier (Basic / Advanced) ==")
+        check("saveAgent() sends tier",
+              re.search(r"\btier\s*:", save_agent_body) is not None,
+              "tier: not found as an object key in saveAgent()")
+        check("tier form field select#agent-tier", find(coll, "select", id="agent-tier") is not None)
+        check("tier select offers basic and advanced",
+              find(coll, "option", value="basic") is not None
+              and find(coll, "option", value="advanced") is not None)
+        tier_hint = find(coll, "p", id="agent-tier-hint")
+        check("tier hint names the developer role",
+              tier_hint is not None and "developer role" in tier_hint[2],
+              repr(tier_hint))
         check("openAgentModal() resets the invoke fields", "setInvokeForm(null)" in js)
+
+        print("\n== agent share_tools (Tools usable by personal agents) ==")
+        check("saveAgent() sends share_tools",
+              re.search(r"\bshare_tools\s*:", save_agent_body) is not None,
+              "share_tools: not found as an object key in saveAgent()")
+        check("share_tools checkbox input#agent-share-tools",
+              find(coll, "input", id="agent-share-tools") is not None)
+        share_hint = find(coll, "p", id="agent-share-tools-hint")
+        check("share_tools hint names personal agents and approving",
+              share_hint is not None and "personal agent" in share_hint[2]
+              and "approves pull requests" in share_hint[2],
+              repr(share_hint))
 
         print("\n== saveAgent() sends peers and model_name (clearing depends on it) ==")
         for field in ("peers", "model_name"):
@@ -3583,7 +3885,7 @@ const SCHEMA = { type: 'object', properties: { amount: { type: 'number' } },
     collectMcpServers = () => [{ url: 'https://x.example.com/mcp', auth_mode: 'none' }];
     const fields = ['agent-id', 'agent-name', 'agent-description', 'agent-instructions',
         'agent-model-name', 'agent-api-slug', 'agent-run-as', 'agent-run-prompt',
-        'agent-run-timeout'];
+        'agent-run-timeout', 'agent-tier'];
     for (const id of fields) {
         const el = document.createElement('input'); el.id = id; document.body.appendChild(el);
     }
@@ -3668,6 +3970,147 @@ const SCHEMA = { type: 'object', properties: { amount: { type: 'number' } },
                 )
             finally:
                 os.unlink(invoke_harness_path)
+
+            # --- tier --- the agent dialog's Tier select under jsdom: an
+            # advanced agent loads into the select and its row gets the
+            # "Advanced" tag; a save always sends tier; a new agent sends basic.
+            tier_harness = r"""
+'use strict';
+const assert = require('node:assert');
+const { JSDOM } = require('jsdom');
+
+const dom = new JSDOM(`<!doctype html><html><body>
+  <div id="toast"></div><div id="agent-modal"></div><h2 id="modal-title"></h2>
+  <input id="agent-id"><input id="agent-name"><input id="agent-description">
+  <textarea id="agent-instructions"></textarea><select id="agent-model-name"></select>
+  <input type="checkbox" id="agent-enabled"><input type="checkbox" id="agent-expose-chat">
+  <select id="agent-tier"><option value="basic">Basic</option>
+    <option value="advanced">Advanced</option></select>
+  <input type="checkbox" id="agent-share-tools">
+  <input type="checkbox" id="agent-expose-api"><input id="agent-api-slug">
+  <input id="agent-run-as"><input id="agent-run-prompt"><input id="agent-run-timeout">
+  <table><tbody id="agents-tbody"></tbody></table>
+</body></html>`, { url: 'https://admin.example/admin' });
+global.window = dom.window;
+global.document = dom.window.document;
+global.location = dom.window.location;
+
+""" + js_no_autoinvoke + r"""
+
+const byId = id => document.getElementById(id);
+const AGENT = { id: 9, name: 'abap-dev', description: 'x', instructions: 'y',
+    mcp_servers: [{ url: 'https://x.example.com/mcp', auth_mode: 'none' }], skills: [],
+    enabled: true, expose_chat: true, tier: 'advanced' };
+
+(async () => {
+    // The rest of the dialog is not under test: the page's own functions
+    // are replaced in the scope they were declared in.
+    for (const name of ['renderMcpServers', 'loadODataCatalogue', 'renderAgentSkillChecks',
+        'renderAgentPeerChecks', 'loadAgentWhereUsed', 'renderAgentWhereUsed', 'setDeepForm',
+        'setInvokeForm', 'refreshCredentials', 'updateEndpointHint', 'setDetailRunsMode',
+        'closeAgentModal', 'renderSkillsTable']) {
+        eval(name + ' = () => {}');
+    }
+    renderAgentModelOptions = async () => {};
+    collectMcpServers = () => [{ url: 'https://x.example.com/mcp', auth_mode: 'none' }];
+    collectAgentSkills = () => [];
+    collectAgentPeers = () => [];
+    collectDeep = () => ({});
+    collectInvoke = () => ({ expose_invoke: false, result_schema: null, invoke_limits: null });
+    const realLoadAgents = loadAgents;
+    loadAgents = () => {};
+
+    // 1. Load: an advanced agent shows Advanced in the select.
+    let calls = [];
+    global.fetch = async (url, opts) => { calls.push([url, opts && opts.method, opts && opts.body]);
+        return { ok: true, status: 200, json: async () => AGENT }; };
+    assert.strictEqual(await editAgent(9), true);
+    assert.strictEqual(byId('agent-tier').value, 'advanced');
+    // 2. Save sends tier as loaded.
+    calls = [];
+    await saveAgent();
+    assert.strictEqual(calls.length, 1, 'one request');
+    assert.deepStrictEqual(calls[0].slice(0, 2), ['/admin/api/agents/9', 'PUT']);
+    assert.strictEqual(JSON.parse(calls[0][2]).tier, 'advanced');
+    // share_tools is always sent as a boolean: off as loaded (absent)...
+    assert.strictEqual(JSON.parse(calls[0][2]).share_tools, false);
+    // ... and true once the admin ticks the checkbox.
+    byId('agent-share-tools').checked = true;
+    calls = [];
+    await saveAgent();
+    assert.strictEqual(JSON.parse(calls[0][2]).share_tools, true);
+    // A sharing agent loads with the box ticked.
+    global.fetch = async (url, opts) => { calls.push([url, opts && opts.method, opts && opts.body]);
+        return { ok: true, status: 200, json: async () => Object.assign({}, AGENT, { share_tools: true }) }; };
+    byId('agent-share-tools').checked = false;
+    await editAgent(9);
+    assert.strictEqual(byId('agent-share-tools').checked, true);
+    global.fetch = async (url, opts) => { calls.push([url, opts && opts.method, opts && opts.body]);
+        return { ok: true, status: 200, json: async () => AGENT }; };
+    await editAgent(9);
+    assert.strictEqual(byId('agent-share-tools').checked, false);
+    // ... and the changed value when the admin picks Basic.
+    byId('agent-tier').value = 'basic';
+    calls = [];
+    await saveAgent();
+    assert.strictEqual(JSON.parse(calls[0][2]).tier, 'basic');
+    // An agent without the key (older server) loads as Basic.
+    global.fetch = async () => ({ ok: true, status: 200,
+        json: async () => Object.assign({}, AGENT, { tier: undefined }) });
+    byId('agent-tier').value = 'advanced';
+    await editAgent(9);
+    assert.strictEqual(byId('agent-tier').value, 'basic');
+
+    // 3. New agent: the select is reset and the POST sends basic.
+    byId('agent-tier').value = 'advanced';
+    byId('agent-share-tools').checked = true;
+    await openAgentModal();
+    assert.strictEqual(byId('agent-tier').value, 'basic');
+    assert.strictEqual(byId('agent-share-tools').checked, false);
+    byId('agent-name').value = 'new-one';
+    calls = [];
+    global.fetch = async (url, opts) => { calls.push([url, opts && opts.method, opts && opts.body]);
+        return { ok: true, status: 200, json: async () => ({}) }; };
+    await saveAgent();
+    assert.deepStrictEqual(calls[0].slice(0, 2), ['/admin/api/agents', 'POST']);
+    const sent = JSON.parse(calls[0][2]);
+    assert.ok('tier' in sent);
+    assert.strictEqual(sent.tier, 'basic');
+    assert.strictEqual(sent.share_tools, false);
+
+    // 4. The list row shows an "Advanced" tag only for an advanced agent.
+    global.fetch = async () => ({ ok: true, json: async () => ([
+        AGENT, Object.assign({}, AGENT, { id: 10, name: 'b', tier: 'basic', share_tools: true }),
+        Object.assign({}, AGENT, { id: 11, name: 'c', tier: undefined }),
+    ]) });
+    await realLoadAgents();
+    const rows = byId('agents-tbody').querySelectorAll('tr');
+    assert.strictEqual(rows.length, 3);
+    assert.strictEqual(rows[0].querySelectorAll('.tier-tag').length, 1);
+    assert.strictEqual(rows[0].querySelector('.tier-tag').textContent, 'Advanced');
+    assert.strictEqual(rows[1].querySelectorAll('.tier-tag').length, 0);
+    assert.strictEqual(rows[2].querySelectorAll('.tier-tag').length, 0);
+    // ... and a "Shared tools" tag only for an agent with share_tools true.
+    assert.strictEqual(rows[0].querySelectorAll('.share-tools-tag').length, 0);
+    assert.strictEqual(rows[1].querySelector('.share-tools-tag').textContent, 'Shared tools');
+    assert.strictEqual(rows[2].querySelectorAll('.share-tools-tag').length, 0);
+    console.log('tier field scenarios passed');
+})().catch(e => { console.error(e && e.stack || e); process.exit(1); });
+"""
+            with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, dir=ROOT) as f:
+                f.write(tier_harness)
+                tier_harness_path = f.name
+            try:
+                result = subprocess.run(
+                    ["node", tier_harness_path], capture_output=True, text=True, timeout=30,
+                )
+                check(
+                    "tier + share_tools fields: load, tags, save sends both, new agent sends basic / false",
+                    result.returncode == 0 and "tier field scenarios passed" in result.stdout,
+                    (result.stdout + result.stderr).strip()[:800],
+                )
+            finally:
+                os.unlink(tier_harness_path)
 
     # Shutdown lifespan
     lifespan_incoming.append({"type": "lifespan.shutdown"})

@@ -39,6 +39,7 @@ QUnit.test("restricted built-ins offer only what the server accepts", function (
     assert.deepEqual(authModesFor("builtin:sharepoint"), ["app_only", "destination"]);
     assert.deepEqual(authModesFor("builtin:bitbucket"), ["destination"]);
     assert.deepEqual(authModesFor("builtin:confluence"), ["destination"]);
+    assert.deepEqual(authModesFor("builtin:git"), ["destination"]);
 });
 
 // --- destinations ---
@@ -65,4 +66,16 @@ QUnit.test("every built-in restricts its auth modes to what its factory builds",
 QUnit.test("builtin:odata offers only destination", function (assert) {
     assert.deepEqual(authModesFor("builtin:odata"), ["destination"]);
     assert.strictEqual(findBuiltin("builtin:odata")?.defaultAuthMode, "destination");
+});
+
+// --- ina ---
+QUnit.test("builtin:ina is the toolset \"Analytical queries (InA)\" and offers only destination", function (assert) {
+    const ina = findBuiltin("builtin:ina");
+    assert.ok(ina, "listed");
+    assert.deepEqual(authModesFor("builtin:ina"), ["destination"], "one auth mode");
+    assert.strictEqual(ina?.defaultAuthMode, "destination");
+    assert.strictEqual(ina?.titleKey, "builtinIna");
+    assert.strictEqual(ina?.descriptionKey, "builtinInaDesc");
+    assert.strictEqual(findBuiltin(" BUILTIN:InA/ ")?.url, "builtin:ina", "in any spelling");
+    assert.strictEqual(BUILTINS.filter((b) => b.url === "builtin:ina").length, 1, "once");
 });

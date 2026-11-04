@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Annotated, Any, Literal, TypeVar
 
@@ -56,16 +57,17 @@ from agents.db import (
     list_odata_audit,
     list_odata_services,
     odata_service_referrers,
+    stamp_moved,
     update_odata_service,
     validate_odata_service,
 )
+from agents.loc_fields import loc_path, refusal_text
 from agents.odata import destinations, preview, testcall
 from agents.odata.models import (
     DESTINATION_NAME_RE,
     EDM_NAME_RE,
     MAX_DEFINITION_BYTES,
     SERVICE_NAME_RE,
-    loc_path,
 )
 from agents.odata.urls import confine_service_path
 
@@ -78,7 +80,6 @@ router = APIRouter(prefix="/api/odata", tags=["odata"])
 _NOT_FOUND = "Service not found"
 _TITLE_MAX = 120  # ODataServicePayload.title
 _COPY_SUFFIX = " (copy)"
-_MAX_REPORTED_ERRORS = 20
 # The largest definition the gate accepts plus room for the other fields.
 # Checked before anything is parsed: without it an admin token could make the
 # worker buffer and parse a body of any size.
@@ -240,10 +241,8 @@ def _model_body(model: type[_Body], data: dict[str, Any]) -> _Body:
     try:
         return model.model_validate(data)
     except ValidationError as exc:
-        errors = exc.errors(include_url=False, include_context=False, include_input=False)
-        lines = [f"{_body_loc(err['loc'])}: {err['msg']}" for err in errors[:_MAX_REPORTED_ERRORS]]
         # `from None`: the ValidationError carries the input in its repr.
-        raise _refuse("; ".join(lines)) from None
+        raise _refuse(refusal_text(exc, "body")) from None
 
 
 def _duplicate_body(data: dict[str, Any]) -> DuplicateBody:
@@ -256,13 +255,14 @@ def _stale_write(name: str) -> str:
     return f"Service '{name}' was changed since it was loaded; reload it and save again"
 
 
-def _expected_updated_at(value: Any) -> datetime | None:
+def _expected_updated_at(value: Any, rule: str = _EXPECTED_RULE) -> datetime | None:
     """A given ``expected_updated_at`` as an aware UTC instant, or a 422.
 
     ``None`` (the field missing, or JSON ``null``) means the client asks for
     no check. Otherwise only a string in the format the API emits
     ``updated_at`` in; the refusal names the field and the rule, never the
-    value.
+    value. ``rule`` is the text of a malformed value, for a caller whose
+    records are not services (the InA queries' routes).
 
     A value without an offset is UTC, as the stored timestamps are (SQLite
     hands them back naive, and the API emits them that way).
@@ -272,32 +272,20 @@ def _expected_updated_at(value: Any) -> datetime | None:
     if not isinstance(value, str):
         raise _refuse(_EXPECTED_NO_STRING)
     if not _EXPECTED_RE.fullmatch(value):
-        raise _refuse(_EXPECTED_RULE)
+        raise _refuse(rule)
     try:
         moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
         if moment.tzinfo is None:
             moment = moment.replace(tzinfo=timezone.utc)
         return moment.astimezone(timezone.utc)
     except (ValueError, OverflowError):  # month 13, offset +99:00, year 1 minus an offset
-        raise _refuse(_EXPECTED_RULE) from None
+        raise _refuse(rule) from None
 
 
 def _is_stale(row: ODataService, expected: datetime | None) -> bool:
-    """Whether ``row`` moved on since the client loaded it.
-
-    Instants are compared, not texts: the same moment is written with an
-    offset by Postgres and without one by SQLite, and a client may hand back
-    either. ``expected`` None means the client did not ask for the check.
-    Only meaningful on a row read under the lock that the write then keeps.
-    """
-    if expected is None:
-        return False
-    stored = row.updated_at
-    if stored is None:
-        return True
-    if stored.tzinfo is None:
-        stored = stored.replace(tzinfo=timezone.utc)
-    return stored.astimezone(timezone.utc) != expected
+    """Whether ``row`` moved on since the client loaded it (`stamp_moved`:
+    instants, not texts; ``expected`` None asks for no check)."""
+    return stamp_moved(row.updated_at, expected)
 
 
 def _locked_service_query(name: str) -> Select[tuple[ODataService]]:
@@ -386,10 +374,32 @@ async def reload_after_catalogue_change(
     one app instance, or restart all instances after an edit that closes
     access: another instance keeps its build until it is reloaded.
     """
+    outcome = await _reload_if_in_use(names, referrers, what)
+    # The data catalogue graph follows the changed services (imported, or
+    # dropped when no enabled agent attaches them any more); never raises.
+    from agents.data_catalog.importer import rebuild_safely
+
+    await rebuild_safely([("odata", name) for name in names], what=what)
+    return outcome
+
+
+def _holds_odata_service(live: Any, name: str) -> bool:
+    return live.holds_odata_service(name)
+
+
+async def _reload_if_in_use(
+    names: Any,
+    referrers: dict[str, Any],
+    what: str,
+    holds: Callable[[Any, str], bool] = _holds_odata_service,
+) -> dict[str, bool]:
+    """Rebuild when one of ``names`` is in use: an agent row names it
+    (``referrers``) or the running build holds a copy of it (``holds(live,
+    name)``; the InA queries' routes pass ``holds_ina_query``)."""
     live = _live_registry()
     if live is None:
         return dict(NOT_RELOADED)
-    if not any(referrers.get(name) or live.holds_odata_service(name) for name in names):
+    if not any(referrers.get(name) or holds(live, name) for name in names):
         return dict(NOT_RELOADED)
     return await reload_running_agents(what)
 

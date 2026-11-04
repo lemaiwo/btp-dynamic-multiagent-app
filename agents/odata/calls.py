@@ -100,11 +100,14 @@ def stored_call_refusal(
     *,
     allow_write: bool = True,
     types: dict[str, list[str]] | None = None,
+    kind: Any = "odata",
 ) -> str | None:
     """``client.call_refusal`` for one stored operation: ``None`` or a reason.
 
     ``keys`` is ``key_names`` and ``types`` ``key_types`` of the same
-    definition; ``version`` the service's ``odata_version``.
+    definition; ``version`` the service's ``odata_version`` and ``kind`` its
+    kind, which decides whether a call is a write and so whether
+    ``allow_write`` matters (``models.operation_is_write``).
     """
     try:
         model = OperationDef.model_validate(operation)
@@ -116,15 +119,22 @@ def stored_call_refusal(
     )
     dialect = DIALECTS.get(version) if isinstance(version, str) else None
     return call_refusal(
-        model, bound_keys, dialect, allow_write=allow_write, bound_key_types=bound_types
+        model,
+        bound_keys,
+        dialect,
+        allow_write=allow_write,
+        bound_key_types=bound_types,
+        kind=kind,
     )
 
 
 def uncallable_operations(definition: Any, version: Any) -> list[dict[str, str]]:
     """The ENABLED operations no agent can ever call: ``[{name, reason}]``.
 
-    Whatever an agent's switches are (``allow_write`` is taken as on), so
-    what is listed is a property of the catalogue: a bound operation whose
+    Whatever an agent's switches are (``allow_write`` is taken as on, so the
+    write rule -- and with it the service's ``kind`` -- does not enter: no
+    reason here is ever ``write_not_allowed``, which depends on the agent),
+    so what is listed is a property of the catalogue: a bound operation whose
     entity set is missing, has no key or has a key of a type no literal is
     written for, or (V2, where the key travels as parameters) whose key
     fields are not all parameters, a parameter that

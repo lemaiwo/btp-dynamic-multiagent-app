@@ -110,6 +110,20 @@ def test_timestamps_identity_and_lobs_are_written_the_way_hdi_takes_them():
     assert "non_production BOOLEAN" in FILES["src/ide_conventions.hdbtable"]
 
 
+def test_generation_10_appends_the_embedding_setting_to_the_orchestrator_row():
+    """Addendum (l): two columns appended to ``orchestrator_config`` (HDI
+    alters the table in place), the NOT NULL one with its default for the
+    row that is already there."""
+    assert GEN >= 10
+    lines = [line.strip().rstrip(",")
+             for line in FILES["src/orchestrator_config.hdbtable"].splitlines()[1:-1]]
+    assert lines[-3:] == [
+        "embeddings_enabled INTEGER DEFAULT '1' NOT NULL",
+        "embedding_model NVARCHAR(128)",
+        "PRIMARY KEY (id)",
+    ]
+
+
 def test_a_unique_constraint_and_a_partial_index_are_plain_unique_indexes():
     assert FILES["src/uq_agent_configs_name.hdbindex"] == (
         "UNIQUE INDEX uq_agent_configs_name ON agent_configs (name)\n"

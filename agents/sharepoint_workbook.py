@@ -243,6 +243,14 @@ def _open(data: bytes, *, data_only: bool) -> Any:
     return book
 
 
+def open_workbook(data: bytes) -> Any:
+    """A workbook opened read-only on the guarded archive, cached values
+    only; for another reader of untrusted workbooks (the web chat's
+    uploads, ``agents/webchat/uploads.py``). Call :func:`check_archive`
+    first, and close the book when done."""
+    return _open(data, data_only=True)
+
+
 def _plain(cell: Any) -> Any:
     """A cell's stored value as plain data; :data:`_ERROR` for an error value."""
     if getattr(cell, "data_type", "n") == "e":

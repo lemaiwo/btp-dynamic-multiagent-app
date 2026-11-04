@@ -42,7 +42,7 @@ const READ_ONLY: ODataDefinition = {
 
 function input(over: Partial<ODataServiceInput> = {}): ODataServiceInput {
     return {
-        name: "purchase-requisitions", title: "Purchase requisitions",
+        name: "purchase-requisitions", kind: "odata", title: "Purchase requisitions",
         purpose: "Read requisitions and their items to judge an approval", not_for: "",
         destination: "S4_ODATA_USER", user_context: true, odata_version: "v2",
         service_path: "/sap/opu/odata/sap/SRV", enabled: true,
@@ -103,7 +103,7 @@ QUnit.test("titleOf is the title, or the name when there is none", function (ass
 
 QUnit.test("emptyService has every field of ODataServiceInput", function (assert) {
     assert.deepEqual(odataCatalog.emptyService(), {
-        name: "", title: "", purpose: "", not_for: "", destination: "", user_context: false,
+        name: "", kind: "odata", title: "", purpose: "", not_for: "", destination: "", user_context: false,
         odata_version: "v2", service_path: "", enabled: true,
         definition: { entity_sets: [], operations: [] }, metadata_fetched_at: null
     });
@@ -730,12 +730,13 @@ QUnit.test("operationRow: what the operations table shows of an operation", func
     assert.deepEqual(rows[0], {
         index: 0, name: "Release", title: "Release item", technical: "Release · POST", description: "Releases it.",
         boundTo: "Item", parameters: "Item, [Note]", enabled: true,
-        write: true, post: true, uncallable: "odataUncallableKeyNotDeclared", note: "", label: "Release item (Release)"
+        write: true, post: true, readByKind: false, uncallable: "odataUncallableKeyNotDeclared", note: "",
+        label: "Release item (Release)"
     }, "a POST is a write whatever its flag says; the bound entity set by its title; an optional parameter in brackets");
     assert.deepEqual(rows[1], {
         index: 1, name: "Probe", title: "Probe", technical: "Probe · GET", description: "",
         boundTo: "A_Gone", parameters: "", enabled: false,
-        write: false, post: false, uncallable: "", note: "", label: "Probe"
+        write: false, post: false, readByKind: false, uncallable: "", note: "", label: "Probe"
     }, "a GET marked as only reading is a read; an entity set the definition lacks by its name; no reason while it is off");
     assert.deepEqual(odataCatalog.operationRows(undefined), [], "no definition, no rows");
 });

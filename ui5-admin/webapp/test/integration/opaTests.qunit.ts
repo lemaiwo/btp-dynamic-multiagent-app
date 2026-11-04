@@ -14,15 +14,21 @@ Opa5.extendConfig({
 
 import "./AgentJourney";
 import "./AgentODataJourney";
+import "./AgentInaJourney";
 import "./SkillJourney";
 import "./ODataListJourney";
 import "./ODataDetailJourney";
 import "./ODataEntityJourney";
 import "./ODataImportJourney";
 import "./ODataDestinationJourney";
+import "./InaJourney";
+import "./DataCatalogJourney";
+import "./DataCatalogLinkJourney";
+import "./DataCatalogGraph3dJourney";
 import "./RunReportJourney";
 import "./RunAutoRefreshJourney";
 import "./ReloadJourney";
+import "./EmbeddingsJourney";
 import "./ImportJourney";
 import "./SessionExpiredJourney";
 import "./WorkflowJourney";

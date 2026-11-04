@@ -10,6 +10,7 @@ import type ColumnListItem from "sap/m/ColumnListItem";
 import type CustomListItem from "sap/m/CustomListItem";
 import type HBox from "sap/m/HBox";
 import type Input from "sap/m/Input";
+import type Item from "sap/ui/core/Item";
 import type Link from "sap/m/Link";
 import type List from "sap/m/List";
 import type JSONModel from "sap/ui/model/json/JSONModel";
@@ -26,6 +27,7 @@ import type UI5Element from "sap/ui/core/Element";
 import type StepInput from "sap/m/StepInput";
 import type Switch from "sap/m/Switch";
 import Common, { backend } from "./pages/Common";
+import type { McpServer } from "../../service/types";
 
 Opa5.extendConfig({ viewNamespace: "com.agent.admin.view.", autoWait: true });
 
@@ -68,6 +70,8 @@ opaTest("creating an agent with two toolsets adds it to the list", function (Giv
                 backend.agents.some((a) => a.name === "new-agent" && a.mcp_servers.length === 2),
                 "the agent reached the backend with both toolsets"
             );
+            Opa5.assert.strictEqual((backend.bodies["POST agents"] ?? {}).tier, "basic",
+                "a new agent is sent with tier basic");
         }
     });
 
@@ -842,6 +846,102 @@ opaTest("a SharePoint server stores the pins and the views", function (Given: Co
     Then.iStopTheApp();
 });
 
+// --- git ---
+opaTest("a Git server stores exactly the cleaned block and is read back into the dialog", function (Given: Common, When: Common, Then: Common) {
+    const expected = {
+        destination: "GITLAB_API", provider: "gitlab" as const, repositories: ["grp/web", "grp/sub/api"],
+        branch_prefix: "bot/", allow_push: true
+    };
+    Given.iStartTheApp("agents/101");
+    When.waitFor({ id: "addServerButton", viewName: "AgentDetail", actions: new Press() });
+    When.waitFor({
+        id: "serverKind",
+        viewName: "AgentDetail",
+        searchOpenDialogs: true,
+        actions: function (element: UI5Element | null) {
+            const select = element as Select;
+            const item = select.getItems().find((i) => i.getText() === "Git repositories (GitHub, Bitbucket, GitLab)");
+            Opa5.assert.ok(item, "the toolset is offered under its name");
+            select.setSelectedKey("builtin:git");
+            select.fireChange({ selectedItem: select.getSelectedItem() ?? undefined });
+        }
+    });
+    Then.waitFor({
+        id: "serverAuthMode",
+        viewName: "AgentDetail",
+        searchOpenDialogs: true,
+        success: function (element: UI5Element) {
+            const select = element as Select;
+            Opa5.assert.deepEqual(select.getItems().map((i) => i.getKey()), ["destination"], "destination mode only");
+            Opa5.assert.strictEqual(
+                dialogControl<Select>(element, "serverAuthMode", "oauthGitProvider")?.getSelectedKey(), "github",
+                "a new entry starts on GitHub");
+            Opa5.assert.notOk(dialogControl<Input>(element, "serverAuthMode", "oauthLookback")?.getVisible(),
+                "no look-back window");
+            Opa5.assert.notOk(dialogControl<CheckBox>(element, "serverAuthMode", "oauthUserContext")?.getVisible(),
+                "no signed-in-user switch");
+        }
+    });
+    When.waitFor({
+        id: "oauthGitProvider",
+        viewName: "AgentDetail",
+        searchOpenDialogs: true,
+        actions: function (element: UI5Element | null) {
+            const select = element as Select;
+            select.setSelectedKey("gitlab");
+            select.fireChange({ selectedItem: select.getSelectedItem() ?? undefined });
+        }
+    });
+    iTypeInTheServerDialog(When, "oauthDestination", "GITLAB_API");
+    iTypeInTheServerDialog(When, "oauthGitRepositories", " grp/web, ,grp/sub/api ");
+    iTypeInTheServerDialog(When, "oauthGitBranchPrefix", "bot/");
+    When.waitFor({ id: "oauthGitAllowPush", viewName: "AgentDetail", searchOpenDialogs: true, actions: new Press() });
+    When.waitFor({ id: "serverConfirm", viewName: "AgentDetail", searchOpenDialogs: true, actions: new Press() });
+    When.waitFor({ id: "saveAgentButton", viewName: "AgentDetail", actions: new Press() });
+
+    Then.waitFor({
+        id: "agentsTable",
+        viewName: "Agents",
+        success: function () {
+            const sent = ((backend.bodies["PUT agents/101"] ?? {}).mcp_servers ?? []) as McpServer[];
+            Opa5.assert.deepEqual(sent[2], { url: "builtin:git", auth_mode: "destination", oauth: expected },
+                "posted exactly the cleaned block: no default base branch, no switch that is off");
+            HashChanger.getInstance().setHash("agents/101");
+        }
+    });
+
+    When.waitFor({
+        id: "serversTable",
+        viewName: "AgentDetail",
+        matchers: function (element: UI5Element) {
+            return ((element as Table).getItems() as ColumnListItem[]).length === 3;
+        },
+        actions: function (element: UI5Element | null) {
+            const row = (element as Table).getItems()[2] as ColumnListItem;
+            ((row.getCells()[2] as HBox).getItems()[0] as Button).firePress();
+        }
+    });
+    Then.waitFor({
+        id: "oauthGitRepositories",
+        viewName: "AgentDetail",
+        searchOpenDialogs: true,
+        success: function (element: UI5Element) {
+            const control = function <T extends UI5Element>(id: string): T | undefined {
+                return dialogControl<T>(element, "oauthGitRepositories", id);
+            };
+            Opa5.assert.strictEqual((element as Input).getValue(), "grp/web, grp/sub/api", "the repositories are read back");
+            Opa5.assert.strictEqual(control<Select>("oauthGitProvider")?.getSelectedKey(), "gitlab", "the provider");
+            Opa5.assert.strictEqual(control<Input>("oauthDestination")?.getValue(), "GITLAB_API", "the destination");
+            Opa5.assert.strictEqual(control<Input>("oauthGitBaseBranch")?.getValue(), "", "no base branch: the default");
+            Opa5.assert.strictEqual(control<Input>("oauthGitBranchPrefix")?.getValue(), "bot/", "the prefix");
+            Opa5.assert.strictEqual(control<CheckBox>("oauthGitAllowPush")?.getSelected(), true, "pushing is on");
+            Opa5.assert.strictEqual(control<CheckBox>("oauthGitAllowPullRequest")?.getSelected(), false,
+                "pull requests are off");
+        }
+    });
+    Then.iStopTheApp();
+});
+
 opaTest("invalid JSON in the SharePoint views field is refused inline and the dialog stays open", function (Given: Common, When: Common, Then: Common) {
     iAddASharePointServer(Given, When);
 
@@ -1369,6 +1469,205 @@ opaTest("the server's refusal of the invoke limits lands on the limit its messag
         success: function (element: UI5Element) {
             Opa5.assert.strictEqual((element as Input).getValueState(), "None", "the other limits are not marked");
         }
+    });
+
+    Then.iStopTheApp();
+});
+
+// --- tier ---------------------------------------------------------------------
+// FakeBackend.reset() makes gmail-agent (id 101) advanced; btp-agent (id 100)
+// keeps the default basic.
+
+opaTest("an advanced agent shows Advanced in the tier select and an untouched save sends it back", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("agents/101");
+
+    Then.waitFor({
+        id: "agentTier",
+        viewName: "AgentDetail",
+        success: function (element: UI5Element) {
+            Opa5.assert.strictEqual((element as Select).getSelectedKey(), "advanced", "the stored tier is selected");
+        }
+    });
+    Then.waitFor({
+        id: "agentTierHint",
+        viewName: "AgentDetail",
+        success: function (element: UI5Element) {
+            Opa5.assert.strictEqual((element as Text).getText(false),
+                "Advanced agents are reachable only by users with the developer role (advanced access in the web chat)",
+                "the hint explains who reaches an advanced agent");
+        }
+    });
+
+    When.waitFor({ id: "saveAgentButton", viewName: "AgentDetail", actions: new Press() });
+
+    Then.waitFor({
+        id: "agentsTable",
+        viewName: "Agents",
+        success: function () {
+            Opa5.assert.strictEqual((backend.bodies["PUT agents/101"] ?? {}).tier, "advanced", "tier is sent as stored");
+        }
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("choosing Advanced for a basic agent sends tier advanced", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("agents/100");
+
+    Then.waitFor({
+        id: "agentTier",
+        viewName: "AgentDetail",
+        success: function (element: UI5Element) {
+            Opa5.assert.strictEqual((element as Select).getSelectedKey(), "basic", "a basic agent shows Basic");
+        }
+    });
+    When.waitFor({ id: "agentTier", viewName: "AgentDetail", actions: new Press() });
+    When.waitFor({
+        controlType: "sap.ui.core.Item",
+        matchers: function (element: UI5Element) {
+            return (element as Item).getKey() === "advanced";
+        },
+        searchOpenDialogs: true,
+        actions: new Press()
+    });
+    When.waitFor({ id: "saveAgentButton", viewName: "AgentDetail", actions: new Press() });
+
+    Then.waitFor({
+        id: "agentsTable",
+        viewName: "Agents",
+        success: function () {
+            Opa5.assert.strictEqual((backend.bodies["PUT agents/100"] ?? {}).tier, "advanced", "the chosen tier is sent");
+        }
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("the agent list tags the advanced agent", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("agents");
+
+    Then.waitFor({
+        controlType: "sap.m.ObjectStatus",
+        viewName: "Agents",
+        matchers: function (element: UI5Element) {
+            return (element as ObjectStatus).getText() === "Advanced";
+        },
+        visible: false,
+        success: function (tags: UI5Element[]) {
+            const shown = tags.filter((tag) => (tag as ObjectStatus).getVisible())
+                .map((tag) => ((tag.getBindingContext("agents")?.getObject() ?? {}) as { name?: string }).name);
+            Opa5.assert.deepEqual(shown, ["gmail-agent"], "only gmail-agent carries the tag");
+        }
+    });
+
+    Then.iStopTheApp();
+});
+
+// --- share_tools ----------------------------------------------------------------
+// "Tools usable by personal agents" (addendum g of the web chat design).
+
+opaTest("switching on Tools usable by personal agents is saved, read back and tagged in the list", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("agents/100");
+
+    Then.waitFor({
+        id: "agentShareToolsHint",
+        viewName: "AgentDetail",
+        success: function (element: UI5Element) {
+            Opa5.assert.strictEqual((element as Text).getText(false),
+                "A personal agent in the web chat may attach this agent's MCP servers and built-ins; not for an agent that approves pull requests",
+                "the hint explains what sharing means");
+        }
+    });
+    When.waitFor({
+        id: "agentShareTools",
+        viewName: "AgentDetail",
+        actions: function (element: UI5Element | null) {
+            const toggle = element as Switch;
+            Opa5.assert.strictEqual(toggle.getState(), false, "an agent loaded without share_tools shows it off");
+            toggle.setState(true);
+        }
+    });
+    When.waitFor({ id: "saveAgentButton", viewName: "AgentDetail", actions: new Press() });
+
+    Then.waitFor({
+        controlType: "sap.m.ObjectStatus",
+        viewName: "Agents",
+        matchers: function (element: UI5Element) {
+            return (element as ObjectStatus).getText() === "Shared tools";
+        },
+        visible: false,
+        success: function (tags: UI5Element[]) {
+            Opa5.assert.strictEqual((backend.bodies["PUT agents/100"] ?? {}).share_tools, true, "share_tools is sent");
+            const shown = tags.filter((tag) => (tag as ObjectStatus).getVisible())
+                .map((tag) => ((tag.getBindingContext("agents")?.getObject() ?? {}) as { name?: string }).name);
+            Opa5.assert.deepEqual(shown, ["btp-agent"], "only btp-agent carries the tag");
+            HashChanger.getInstance().setHash("agents/100");
+        }
+    });
+
+    Then.waitFor({
+        id: "agentShareTools",
+        viewName: "AgentDetail",
+        matchers: function (element: UI5Element) {
+            return (element as Switch).getState() === true;
+        },
+        success: function () {
+            Opa5.assert.ok(true, "the stored value is read back on the detail page");
+        },
+        errorMessage: "share_tools was not read back"
+    });
+    When.waitFor({ id: "saveAgentButton", viewName: "AgentDetail", actions: new Press() });
+    Then.waitFor({
+        id: "agentsTable",
+        viewName: "Agents",
+        success: function () {
+            Opa5.assert.strictEqual((backend.bodies["PUT agents/100"] ?? {}).share_tools, true,
+                "an untouched save sends it back");
+        }
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("the server's refusal of share_tools for an approving agent is shown under the switch", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("agents");
+    // reset() runs when the app starts, so give the stored agent an approving
+    // Bitbucket entry after it, then open it.
+    When.waitFor({
+        id: "agentsTable",
+        viewName: "Agents",
+        success: function () {
+            const agent = backend.agents.find((a) => a.id === 100)!;
+            agent.mcp_servers = agent.mcp_servers.concat([{
+                url: "builtin:bitbucket", auth_mode: "destination",
+                oauth: { destination: "bitbucket", workspace: "acme", allow_comment: true, allow_approve: true }
+            }]);
+            agent.expose_chat = false;
+            HashChanger.getInstance().setHash("agents/100");
+        }
+    });
+    When.waitFor({
+        id: "agentShareTools",
+        viewName: "AgentDetail",
+        actions: function (element: UI5Element | null) {
+            (element as Switch).setState(true);
+        }
+    });
+    When.waitFor({ id: "saveAgentButton", viewName: "AgentDetail", actions: new Press() });
+
+    Then.waitFor({
+        id: "agentShareToolsError",
+        viewName: "AgentDetail",
+        matchers: function (element: UI5Element) {
+            return (element as MessageStrip).getVisible();
+        },
+        success: function (element: UI5Element) {
+            Opa5.assert.ok((element as MessageStrip).getText().indexOf("approves pull requests") !== -1,
+                "the server's rule is shown at the field");
+            Opa5.assert.strictEqual((backend.bodies["PUT agents/100"] ?? {}).share_tools, true, "share_tools was sent");
+            Opa5.assert.ok(backend.agents.find((a) => a.id === 100)!.share_tools !== true, "nothing was stored");
+        },
+        errorMessage: "The refusal of share_tools was not shown"
     });
 
     Then.iStopTheApp();

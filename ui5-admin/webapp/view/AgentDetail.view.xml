@@ -67,6 +67,34 @@
 
                         <Label text="{i18n>exposeChat}" />
                         <Switch id="agentExposeChat" state="{agent>/data/expose_chat}" />
+
+                        <Label text="{i18n>tier}" labelFor="agentTier" />
+                        <VBox>
+                            <Select
+                                id="agentTier"
+                                selectedKey="{agent>/data/tier}"
+                                ariaDescribedBy="agentTierHint">
+                                <core:Item key="basic" text="{i18n>tierBasic}" />
+                                <core:Item key="advanced" text="{i18n>tierAdvanced}" />
+                            </Select>
+                            <Text id="agentTierHint" text="{i18n>tierHint}" class="sapUiTinyMarginTop" />
+                        </VBox>
+
+                        <Label text="{i18n>shareTools}" labelFor="agentShareTools" />
+                        <VBox>
+                            <Switch
+                                id="agentShareTools"
+                                state="{agent>/data/share_tools}"
+                                ariaDescribedBy="agentShareToolsHint" />
+                            <Text id="agentShareToolsHint" text="{i18n>shareToolsHint}" class="sapUiTinyMarginTop" />
+                            <MessageStrip
+                                id="agentShareToolsError"
+                                type="Error"
+                                showIcon="true"
+                                text="{agent>/errors/share_tools}"
+                                visible="{= !!${agent>/errors/share_tools} }"
+                                class="sapUiTinyMarginTop" />
+                        </VBox>
                     </f:SimpleForm>
                 </Panel>
 

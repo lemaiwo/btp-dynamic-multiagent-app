@@ -6,6 +6,13 @@ import type {
     OrchestratorInfo, ReloadOutcome, ReloadResult, Skill, SkillInput, WhoAmI,
     Workflow, WorkflowDetail, WorkflowInput, WorkflowRun, WorkflowRunDetail
 } from "./types";
+import type {
+    DataEdge, DataEdgeInput, DataGraph, DataHintsUpdate, DataNode, DataRebuildResult, DataSearchResult, DataSourceDetail,
+    DataSourceKind, DataSourceSummary, EmbeddingDeployResult, EmbeddingSetting, EmbeddingsRunStarted, EmbeddingsStatus
+} from "./dataCatalogTypes";
+import type {
+    InaDescribeResult, InaQuery, InaQueryInput, InaQuerySummary, InaQueryUpdate, InaTestResult
+} from "./inaTypes";
 
 /**
  * A non-2xx response from the admin API.
@@ -18,7 +25,8 @@ export class AdminError extends Error {
     public readonly detail: string;
     public readonly fieldErrors: Record<string, string>;
     /** The stable code of a refusal, from the `X-OData-Error` header of the
-     *  OData routes (`busy`, `user_token_required`, ...); "" without one. */
+     *  OData routes (`busy`, `user_token_required`, ...) or the `X-Ina-Error`
+     *  header of the InA routes (`query_unknown`, ...); "" without one. */
     public readonly code: string;
     /** True when the refused call was a "Run now" trigger (agent or
      *  workflow), where a 409 only says a run is already in flight. */
@@ -110,19 +118,20 @@ export default class AdminService {
         } catch {
             detail = response.statusText;
         }
-        return new AdminError(
-            response.status, detail, fieldErrors, response.headers?.get("X-OData-Error") ?? "", runTrigger
-        );
+        const code = response.headers?.get("X-OData-Error") ?? response.headers?.get("X-Ina-Error") ?? "";
+        return new AdminError(response.status, detail, fieldErrors, code, runTrigger);
     }
 
     /**
      * A DELETE whose 204 says in two headers whether the running agents were
-     * reloaded. A header that is missing (an older server) reads as false.
+     * reloaded: `<prefix>-Reloaded` and `<prefix>-Reload-Failed` (`X-OData`
+     * for agents and OData services, `X-Ina` for InA queries). A header that
+     * is missing (an older server) reads as false.
      */
-    private async remove(path: string): Promise<ReloadOutcome> {
+    private async remove(path: string, prefix = "X-OData"): Promise<ReloadOutcome> {
         const response = await this.send(path, { method: "DELETE" });
         const flag = (name: string) => (response.headers?.get(name) ?? "").trim().toLowerCase() === "true";
-        return { reloaded: flag("X-OData-Reloaded"), reload_failed: flag("X-OData-Reload-Failed") };
+        return { reloaded: flag(`${prefix}-Reloaded`), reload_failed: flag(`${prefix}-Reload-Failed`) };
     }
 
     private static json(body: unknown): RequestInit {
@@ -372,6 +381,149 @@ export default class AdminService {
     public testODataService(name: string): Promise<ODataTestResult> {
         return this.request<ODataTestResult>(`${AdminService.odataServicePath(name)}/test`, {
             method: "POST", ...AdminService.json({})
+        });
+    }
+
+    // --- InA queries ---
+    // The analytical queries agents read through `builtin:ina`
+    // (`/admin/api/ina/...`). A query is addressed by its name, the slug
+    // agents use, not by an id. The destination list is the OData one
+    // (`listODataDestinations`).
+    private static inaQueryPath(name: string): string {
+        return `ina/queries/${encodeURIComponent(name)}`;
+    }
+
+    /** The list carries no definitions; `getInaQuery` does. */
+    public listInaQueries(): Promise<InaQuerySummary[]> {
+        return this.request<InaQuerySummary[]>("ina/queries");
+    }
+
+    public getInaQuery(name: string): Promise<InaQuery> {
+        return this.request<InaQuery>(AdminService.inaQueryPath(name));
+    }
+
+    /** A taken name is a 409; a refused field a 422 that names it. */
+    public createInaQuery(input: InaQueryInput): Promise<InaQuery> {
+        return this.request<InaQuery>("ina/queries", { method: "POST", ...AdminService.json(input) });
+    }
+
+    /** The name is immutable (409). With `expected_updated_at`, a query
+     *  saved since that moment is not overwritten: 409. Without a
+     *  `definition`, the stored description stays. */
+    public updateInaQuery(name: string, input: InaQueryUpdate): Promise<InaQuery> {
+        return this.request<InaQuery>(AdminService.inaQueryPath(name), {
+            method: "PUT", ...AdminService.json(input)
+        });
+    }
+
+    /** Rejects with a 409 while an agent, enabled or not, names the query.
+     *  Resolves with what the 204 says about the reload of the running agents. */
+    public deleteInaQuery(name: string): Promise<ReloadOutcome> {
+        return this.remove(AdminService.inaQueryPath(name), "X-Ina");
+    }
+
+    /** Reads the query's dimensions, measures and variables from SAP and
+     *  stores them. A refusal carries its code (`AdminError.code`). */
+    public describeInaQuery(name: string): Promise<InaDescribeResult> {
+        return this.request<InaDescribeResult>(`${AdminService.inaQueryPath(name)}/describe`, {
+            method: "POST", ...AdminService.json({})
+        });
+    }
+
+    /** One read of the first measure; the answer says whether it worked and
+     *  which columns came back, never a value. */
+    public testInaQuery(name: string): Promise<InaTestResult> {
+        return this.request<InaTestResult>(`${AdminService.inaQueryPath(name)}/test`, {
+            method: "POST", ...AdminService.json({})
+        });
+    }
+
+    // --- data catalogue ---
+    // The catalogue graph of every data source agents reach
+    // (`/admin/api/data-catalog/...`). A source is addressed by its kind and
+    // name, a node by its id.
+
+    public listDataSources(): Promise<DataSourceSummary[]> {
+        return this.request<{ sources: DataSourceSummary[] }>("data-catalog/sources")
+            .then((answer) => answer.sources ?? []);
+    }
+
+    public getDataSource(kind: DataSourceKind | string, name: string): Promise<DataSourceDetail> {
+        return this.request<DataSourceDetail>(
+            `data-catalog/sources/${encodeURIComponent(kind)}/${encodeURIComponent(name)}`);
+    }
+
+    /** Sends only the hints that change; answers the node as stored. A
+     *  refused value is a 422 whose `fieldErrors` name the field. */
+    public updateDataHints(id: number | string, body: DataHintsUpdate): Promise<DataNode> {
+        return this.request<DataNode>(`data-catalog/nodes/${encodeURIComponent(String(id))}/hints`, {
+            method: "PUT", ...AdminService.json(body)
+        });
+    }
+
+    /** The agents' retrieval for `question`, limited to `agent`'s sources when one is given. */
+    public searchDataCatalog(question: string, agent?: string): Promise<DataSearchResult> {
+        return this.request<DataSearchResult>("data-catalog/search", {
+            method: "POST", ...AdminService.json(agent ? { question, agent } : { question })
+        });
+    }
+
+    /** `query`: what `dataCatalog.graphQuery` builds ("" or "?agent=..."). */
+    public getDataGraph(query = ""): Promise<DataGraph> {
+        return this.request<DataGraph>(`data-catalog/graph${query}`);
+    }
+
+    /** Draws a link between two nodes of different sources (an entity, an
+     *  InA query or a function at each end); answers the stored edge. A pair
+     *  that is linked already by the same kind, in either direction, is a 409. */
+    public createDataEdge(body: DataEdgeInput): Promise<DataEdge> {
+        return this.request<DataEdge>("data-catalog/edges", { method: "POST", ...AdminService.json(body) });
+    }
+
+    /** Removes a link an admin drew; an imported one is a 409. */
+    public deleteDataEdge(id: number | string): Promise<void> {
+        return this.request<void>(`data-catalog/edges/${encodeURIComponent(String(id))}`, { method: "DELETE" });
+    }
+
+    /** Imports again every attached source, or the one named. */
+    public rebuildDataCatalog(source?: { kind: string; name: string }): Promise<DataRebuildResult> {
+        return this.request<DataRebuildResult>("data-catalog/rebuild", {
+            method: "POST", ...AdminService.json(source ? { source } : {})
+        });
+    }
+
+    // --- data catalogue embeddings ---
+    // The setting, the vectors and the AI Core deployments of the embedding
+    // models (`/admin/api/data-catalog/embeddings`, design addendum (l)).
+
+    /** The setting, the model in effect and where it comes from, the counts and the run. */
+    public getEmbeddings(): Promise<EmbeddingsStatus> {
+        return this.request<EmbeddingsStatus>("data-catalog/embeddings");
+    }
+
+    /** Saves `{enabled, model}` (`model` null: automatic) and answers the
+     *  status. A model that is not a deployed embedding model is a 422
+     *  whose `detail` names the field. */
+    public setEmbeddings(setting: EmbeddingSetting): Promise<EmbeddingsStatus> {
+        return this.request<EmbeddingsStatus>("data-catalog/embeddings", {
+            method: "PUT", ...AdminService.json({ enabled: setting.enabled, model: setting.model })
+        });
+    }
+
+    /** Starts the background run (202); a 409 while one is in flight. The
+     *  status says how far it is (`running`, `progress`, `last_run`). */
+    public runEmbeddings(): Promise<EmbeddingsRunStarted> {
+        return this.request<EmbeddingsRunStarted>("data-catalog/embeddings/run", {
+            method: "POST", ...AdminService.json({})
+        });
+    }
+
+    /** Asks AI Core for a deployment of `model` (202; it bills). An existing
+     *  RUNNING or PENDING deployment of it is answered and nothing is made;
+     *  a model the scenario does not offer is a 422. */
+    public deployEmbeddingModel(model: string): Promise<EmbeddingDeployResult> {
+        return this.request<EmbeddingDeployResult>("data-catalog/embeddings/deploy", {
+            method: "POST", ...AdminService.json({ model })
         });
     }
 }

@@ -21,7 +21,8 @@ and admin UI are both protected by XSUAA.
 ```
 User  -->  Approuter (XSUAA)  -->  FastAPI app
                                        |
-                                       +-- /chat  --> Dynamic Orchestrator Agent
+                                       +-- /      --> stock pydantic-ai chat UI
+                                       +-- /chat  --> web chat (agents/webchat) --> Dynamic Orchestrator Agent
                                        |                |
                                        |                +-- Specialist A --> MCP server A
                                        |                +-- Specialist B --> MCP server B
@@ -98,7 +99,8 @@ python app.py
 
 Open:
 
-- **Chat:** <http://127.0.0.1:7932/chat>
+- **Chat (stock pydantic-ai UI):** <http://127.0.0.1:7932/>
+- **Web chat (conversations, uploads, Word/PDF/Excel output):** <http://127.0.0.1:7932/chat>
 - **Admin:** <http://127.0.0.1:7932/admin>
 - **Health check:** <http://127.0.0.1:7932/healthz>
 

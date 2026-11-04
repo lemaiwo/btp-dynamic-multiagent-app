@@ -80,6 +80,15 @@ export const BUILTINS: BuiltinToolset[] = [
         url: "builtin:odata", titleKey: "builtinOData", descriptionKey: "builtinODataDesc",
         defaultAuthMode: "destination", authModes: ["destination"]
     },
+    // --- ina --- ina_toolset builds with nothing else either: the entry
+    // names the registered analytical queries and holds no destination, no
+    // identity and no credential (each query names its destination) -- see
+    // agents/ina/tools.py, `_validate_ina_entry` in agents/admin.py and
+    // model/inaEntry.ts.
+    {
+        url: "builtin:ina", titleKey: "builtinIna", descriptionKey: "builtinInaDesc",
+        defaultAuthMode: "destination", authModes: ["destination"]
+    },
     // sharepoint_toolset reads one pinned workbook as the application: a
     // destination's credential or client credentials, never a signed-in
     // user -- see agents/sharepoint_tools.py and `_validate_sharepoint`
@@ -101,6 +110,14 @@ export const BUILTINS: BuiltinToolset[] = [
     // and `_validate_destination_config` in agents/admin.py.
     {
         url: "builtin:confluence", titleKey: "builtinConfluence", descriptionKey: "builtinConfluenceDesc",
+        defaultAuthMode: "destination", authModes: ["destination"]
+    },
+    // --- git --- git_toolset reads and writes repositories of GitHub,
+    // Bitbucket Cloud or GitLab as the technical user of a destination and
+    // has no other way to authenticate -- see agents/git_config.py
+    // (addendum h of the web chat design) and model/gitEntry.ts.
+    {
+        url: "builtin:git", titleKey: "builtinGit", descriptionKey: "builtinGitDesc",
         defaultAuthMode: "destination", authModes: ["destination"]
     }
 ];
