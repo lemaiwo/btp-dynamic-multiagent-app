@@ -190,6 +190,8 @@ class RunPlan:
     sort: list[dict[str, Any]]
     variables: list[dict[str, Any]]
     top: int
+    # The measure structure the measures are members of, on Columns.
+    structure: str = MEASURES_DIMENSION
 
 
 def _refuse(field_name: str, rule: str, code: str = "invalid_filter") -> InaError:
@@ -311,6 +313,7 @@ def plan_run(
     filters, order, variables = filters or [], order or [], variables or {}
     dimensions = {d.name: d for d in definition.dimensions}
     known_measures = {m.name: m for m in definition.measures}
+    structure = definition.measure_structure or MEASURES_DIMENSION
     chosen_measures = _names(measures, "measures", known_measures, "measure")
     chosen_dimensions = _names(group_by, "group_by", dimensions, "dimension")
 
@@ -350,7 +353,7 @@ def plan_run(
         if by in chosen_measures:
             sort.append(
                 {
-                    "Dimension": MEASURES_DIMENSION,
+                    "Dimension": structure,
                     "SortType": "Measure",
                     "MeasureName": by,
                     "Direction": wire_direction,
@@ -388,8 +391,15 @@ def plan_run(
             if not isinstance(value, list):
                 raise _refuse(where, f"a list of 1 to {MAX_IN_VALUES} values")
             elements = _elements("in", value, where)
+        # SIA's form (recorded run 5): the value named by its dimension's
+        # key, each element marked inclusive.
+        for element in elements:
+            element["IsExcluding"] = False  # type: ignore[assignment]
         wire_variables.append(
-            {"Name": variable.name, "Values": {"Selection": _selection(variable.name, elements)}}
+            {
+                "Name": variable.name,
+                "Values": {"Selection": _selection(variable.key_field or variable.name, elements)},
+            }
         )
     return RunPlan(
         measures=chosen_measures,
@@ -398,18 +408,22 @@ def plan_run(
         sort=sort,
         variables=wire_variables,
         top=top,
+        structure=structure,
     )
 
 
 # -- the requests -----------------------------------------------------------
 
 
-def data_source(query: str, package: str) -> dict[str, str]:
+def data_source(query: str, package: str, instance_id: str = "") -> dict[str, str]:
     """``DataSource`` of a request; ``PackageName`` is left out when blank,
-    as in the request SIA accepted."""
+    as in the request SIA accepted. ``InstanceId`` names the query instance
+    a run's VariableSubmit, read and Close share in the SAP session."""
     source = {"ObjectName": query, "Type": "Query"}
     if package:
         source["PackageName"] = package
+    if instance_id:
+        source["InstanceId"] = instance_id
     return source
 
 
@@ -436,7 +450,7 @@ def analytics_request(
         "Dimensions": [
             *({"Name": name, "Axis": "Rows"} for name in plan.group_by),
             {
-                "Name": MEASURES_DIMENSION,
+                "Name": plan.structure,
                 "Axis": "Columns",
                 "Members": [{"Name": m, "Visibility": "Visible"} for m in plan.measures],
             },
@@ -472,6 +486,32 @@ def analytics_request(
             "Definition": definition,
             "Language": "EN",
         },
+        "Options": list(_OPTIONS),
+    }
+
+
+def variable_submit_request(
+    capabilities: list[str], source: dict[str, str], plan: RunPlan
+) -> dict[str, Any]:
+    """The VariableSubmit SIA needs before a read with variables: the read's
+    body with ``ProcessingDirectives.ProcessingStep``, sent as a request of
+    its own on the read's ``InstanceId`` (SIA has no
+    ``DirectVariableTransfer``: values in the read alone are not taken; a
+    ``Batch`` of the two was answered with the submit's ``Cube`` alone).
+    SAP's own InA client does the same (SAPUI5 ``sap/sac/df/firefly``,
+    ``ff4400.olap.providers.js``, ``InAQMgrVarAction`` /
+    ``ProcessingStep.VARIABLE_SUBMIT``)."""
+    body = analytics_request(capabilities, source, plan)
+    body["Analytics"]["ProcessingDirectives"] = {"ProcessingStep": "VariableSubmit"}
+    return body
+
+
+def close_request(instance_id: str) -> dict[str, Any]:
+    """Release a run's query instance in the SAP session, as firefly's
+    ``InAQMgrShutdownAction`` does (``Actions: [{Type: Close, DataSources:
+    [<InstanceId>]}]``): the session outlives the run, the instance need not."""
+    return {
+        "Analytics": {"Actions": [{"Type": "Close", "DataSources": [instance_id]}]},
         "Options": list(_OPTIONS),
     }
 
@@ -695,6 +735,7 @@ __all__ = [
     "analytics_capabilities",
     "analytics_request",
     "check_caps",
+    "close_request",
     "data_source",
     "describe_request",
     "fits_name",
@@ -703,4 +744,5 @@ __all__ = [
     "read_grid",
     "sap_message_error",
     "shown_name",
+    "variable_submit_request",
 ]

@@ -597,3 +597,114 @@ def test_the_cell_cap_counts_what_is_returned_not_the_extra_row():
 def test_more_rows_than_top_plus_one_is_result_too_large():
     error = unreadable(fixture("run_ok.json"), ["0AMOUNT", "0QUANTITY"], ["0CALMONTH"], top=1)
     assert error.code == "result_too_large"
+
+
+# ------------------------------------------------ the run SIA answered (run 5)
+# Recorded 2026-11-04: SIA refuses a read whose variables travel in its own
+# ``Definition`` (no ``DirectVariableTransfer``). It answered with a grid only
+# when a ``VariableSubmit`` (a copy of the read with
+# ``ProcessingDirectives.ProcessingStep``) came first, as a request of its own,
+# on the ``InstanceId`` the read then used, with each value named by the key
+# of its variable's dimension and the measure structure by its real name.
+
+from agents.ina.protocol import (  # noqa: E402
+    analytics_request,
+    close_request,
+    data_source,
+    variable_submit_request,
+)
+
+SIA_VALUES = {"!CDS_P_P_DISPLAYCURRENCY": "EUR", "!CDS_P_P_DATEFUNCTION": "YEARTODATE"}
+
+
+def test_the_sia_describe_names_the_measure_structure_and_each_variables_key():
+    d = read_description(sia_cube()).definition
+    assert d.measure_structure == "ELTUIDSTRCMMPURORDQUERY"
+    assert [(v.name, v.key_field) for v in d.variables] == [
+        ("!CDS_P_P_DISPLAYCURRENCY", "2CH0Y9FATWMXU07PABNUMVE2HHX.KEY"),
+        ("!CDS_P_P_DATEFUNCTION", "2CCGCALDFVH.KEY"),
+        ("!CDS_P_P_STARTDATE", "2CQVA05CB3RQ8IWG16R9ADB9KSB.KEY"),
+        ("!CDS_P_P_ENDDATE", "2CHZY5N72NNDJ2R09JG98XXDF7M.KEY"),
+        ("!CDS_S_SYSTEM_LANGUAGE", "1TEXT.KEY"),
+    ]
+
+
+def test_a_variable_without_a_usable_dimension_reference_has_no_key_field():
+    cube = sia_cube()
+    cube["Variables"][0]["DimensionReference"] = {"Name": "A\nB"}
+    del cube["Variables"][1]["DimensionReference"]
+    d = read_description(cube).definition
+    assert d.variables[0].key_field is None and d.variables[1].key_field is None
+
+
+def test_the_synthetic_describe_keeps_the_measures_structure():
+    assert read_description(fixture("describe_ok.json")["Cube"]).definition.measure_structure == (
+        "Measures"
+    )
+
+
+def sia_plan(**args: Any) -> RunPlan:
+    call = {"measures": ["ELTUIDCMP1"], "group_by": [], "filters": None, "top": 1,
+            "order": None, "variables": dict(SIA_VALUES), **args}
+    return plan_run(read_description(sia_cube()).definition, **call)
+
+
+def test_the_run_names_values_by_the_dimension_key_and_the_real_structure():
+    source = data_source("2CCMMPURORDQUERY", "", instance_id="ina0123456789abcdef")
+    body = analytics_request(["C"], source, sia_plan())
+    analytics = body["Analytics"]
+    assert analytics["DataSource"] == {"ObjectName": "2CCMMPURORDQUERY", "Type": "Query",
+                                       "InstanceId": "ina0123456789abcdef"}
+    assert "ProcessingDirectives" not in analytics
+    definition = analytics["Definition"]
+    assert definition["Dimensions"] == [{
+        "Name": "ELTUIDSTRCMMPURORDQUERY", "Axis": "Columns",
+        "Members": [{"Name": "ELTUIDCMP1", "Visibility": "Visible"}],
+    }]
+    assert definition["Variables"] == [
+        {"Name": "!CDS_P_P_DISPLAYCURRENCY", "Values": {"Selection": {"SetOperand": {
+            "FieldName": "2CH0Y9FATWMXU07PABNUMVE2HHX.KEY",
+            "Elements": [{"Comparison": "=", "Low": "EUR", "IsExcluding": False}]}}}},
+        {"Name": "!CDS_P_P_DATEFUNCTION", "Values": {"Selection": {"SetOperand": {
+            "FieldName": "2CCGCALDFVH.KEY",
+            "Elements": [{"Comparison": "=", "Low": "YEARTODATE", "IsExcluding": False}]}}}},
+    ]
+
+
+def test_the_submit_is_the_read_with_the_processing_step():
+    source = data_source("2CCMMPURORDQUERY", "", instance_id="ina0123456789abcdef")
+    plan = sia_plan()
+    read = analytics_request(["C"], source, plan)
+    submit = variable_submit_request(["C"], source, plan)
+    assert submit["Analytics"].pop("ProcessingDirectives") == {"ProcessingStep": "VariableSubmit"}
+    assert submit == read
+
+
+def test_a_sort_on_a_measure_names_the_real_structure():
+    plan = sia_plan(group_by=["2CIMMPURGORG"],
+                    order=[{"by": "ELTUIDCMP1", "direction": "desc"}])
+    assert analytics_request(["C"], data_source("Q", ""), plan)["Analytics"]["Definition"][
+        "Sort"] == [{"Dimension": "ELTUIDSTRCMMPURORDQUERY", "SortType": "Measure",
+                     "MeasureName": "ELTUIDCMP1", "Direction": "Desc"}]
+
+
+def test_an_older_description_falls_back_to_measures_and_the_variable_name():
+    """A row described before 2.37.1 holds neither name: the request keeps
+    the form it had (which SIA refuses; Describe again to fix it)."""
+    d = InaDefinition.model_validate({
+        "measures": [{"name": "M"}],
+        "variables": [{"name": "!V", "mandatory": True}],
+    })
+    plan = plan_run(d, measures=["M"], group_by=[], filters=None, top=1, order=None,
+                    variables={"!V": "EUR"})
+    definition = analytics_request(["C"], data_source("Q", ""), plan)["Analytics"]["Definition"]
+    assert definition["Dimensions"][0]["Name"] == "Measures"
+    assert definition["Variables"][0]["Values"]["Selection"]["SetOperand"] == {
+        "FieldName": "!V", "Elements": [{"Comparison": "=", "Low": "EUR", "IsExcluding": False}]}
+
+
+def test_the_close_names_the_instance_only():
+    assert close_request("ina0123456789abcdef") == {
+        "Analytics": {"Actions": [{"Type": "Close", "DataSources": ["ina0123456789abcdef"]}]},
+        "Options": ["StatefulServer"],
+    }

@@ -505,3 +505,37 @@ def test_the_gate_never_imports_the_database_module():
         "assert 'agents.db' not in sys.modules, sorted(sys.modules)"
     )
     subprocess.run([sys.executable, "-c", code], cwd=ROOT, check=True)
+
+
+# ------------------------------------- what SIA's run needs from the description
+# The measure structure's real name (SIA's is generated, ``ELTUID...``) and,
+# per variable, the key of the dimension its values belong to: SIA accepted
+# a VariableSubmit only in that form (recorded 2026-11-04, run 5).
+
+
+def test_the_measure_structure_and_a_variables_key_field_are_optional():
+    d = InaDefinition.model_validate({"measures": [{"name": "M"}], "variables": [{"name": "V"}]})
+    assert d.measure_structure is None and d.variables[0].key_field is None
+    d = InaDefinition.model_validate(
+        {
+            "measure_structure": "ELTUIDSTRCMMPURORDQUERY",
+            "variables": [{"name": "!V", "key_field": "2CH0Y9FATWMXU07PABNUMVE2HHX.KEY"}],
+        }
+    )
+    assert d.measure_structure == "ELTUIDSTRCMMPURORDQUERY"
+    assert d.variables[0].key_field == "2CH0Y9FATWMXU07PABNUMVE2HHX.KEY"
+    # The stored JSON comes back as it was written (export, import, reload).
+    assert InaDefinition.model_validate_json(d.model_dump_json()) == d
+
+
+@pytest.mark.parametrize("value", ["", "x" * 129, "A\nB", "A‮B", 7, ["M"]])
+def test_a_bad_measure_structure_or_key_field_is_refused_by_field(value):
+    for definition, where in (
+        ({"measure_structure": value}, "definition.measure_structure"),
+        ({"variables": [{"name": "V", "key_field": value}]}, "definition.variables.0.key_field"),
+    ):
+        with pytest.raises(ValueError) as info:
+            validate_ina_query({**good(), "definition": definition})
+        assert where in str(info.value)
+        if isinstance(value, str) and value:
+            assert value not in str(info.value)

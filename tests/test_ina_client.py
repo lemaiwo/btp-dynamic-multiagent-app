@@ -75,6 +75,7 @@ def definition() -> InaDefinition:
     """The definition ``describe`` reads from ``describe_ok.json``."""
     return InaDefinition.model_validate(
         {
+            "measure_structure": "Measures",
             "dimensions": [
                 {"name": "0CALMONTH", "label": "Calendar Year/Month", "key_field": "0CALMONTH.KEY"},
                 {"name": "ZREGION", "label": "Sales region", "key_field": "ZREGION.KEY"},
@@ -432,7 +433,7 @@ async def test_run_sends_the_analytics_request_exactly():
                             "Selection": {
                                 "SetOperand": {
                                     "FieldName": "0P_CALYEAR",
-                                    "Elements": [{"Comparison": "=", "Low": "2026"}],
+                                    "Elements": [{"Comparison": "=", "Low": "2026", "IsExcluding": False}],
                                 }
                             }
                         },
@@ -443,7 +444,7 @@ async def test_run_sends_the_analytics_request_exactly():
                             "Selection": {
                                 "SetOperand": {
                                     "FieldName": "ZV_REGION",
-                                    "Elements": [{"Comparison": "=", "Low": "NORTH"}],
+                                    "Elements": [{"Comparison": "=", "Low": "NORTH", "IsExcluding": False}],
                                 }
                             }
                         },
@@ -455,7 +456,7 @@ async def test_run_sends_the_analytics_request_exactly():
                                 "SetOperand": {
                                     "FieldName": "ZV_PERIOD",
                                     "Elements": [
-                                        {"Comparison": "BETWEEN", "Low": "01", "High": "06"}
+                                        {"Comparison": "BETWEEN", "Low": "01", "High": "06", "IsExcluding": False}
                                     ],
                                 }
                             }

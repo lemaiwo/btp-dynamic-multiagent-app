@@ -188,6 +188,17 @@ def _variable_is_mandatory(raw: dict[str, Any], position: int) -> bool:
     return True
 
 
+def _variable_key_field(raw: dict[str, Any]) -> str | None:
+    """``<DimensionReference.Name>.KEY``: the field SIA's describe names a
+    variable's value by, and the only one its VariableSubmit took (recorded
+    run 5). None when the reference is missing or the name would not pass
+    the gate."""
+    reference = raw.get("DimensionReference")
+    name = reference.get("Name") if isinstance(reference, dict) else None
+    field_name = f"{name}.KEY" if isinstance(name, str) and name else None
+    return field_name if fits_name(field_name) else None
+
+
 def _is_measure_structure(raw: dict[str, Any]) -> bool:
     kind = raw.get("DimensionType")
     return (
@@ -227,12 +238,17 @@ def read_description(cube: object) -> InaDescription:
         bucket.append(kind(name=name, **values))
 
     structures = 0
+    measure_structure: str | None = None
     for raw in cube["Dimensions"][:_MAX_SCANNED]:
         if not isinstance(raw, dict):
             continue
         if _is_measure_structure(raw):
             structures += 1
             structure = raw.get("Name") if isinstance(raw.get("Name"), str) else ""
+            if structures == 1 and fits_name(structure):
+                # The run puts this one on Columns; a second structure's
+                # members are listed but would be sent under the first's name.
+                measure_structure = structure
             for member in raw["Members"][:_MAX_SCANNED]:
                 if not isinstance(member, dict):
                     continue
@@ -285,8 +301,14 @@ def read_description(cube: object) -> InaDescription:
             label=_label(raw.get("Description") or raw.get("Text"), 120),
             mandatory=_variable_is_mandatory(raw, position),
             type=_variable_type(raw),
+            key_field=_variable_key_field(raw),
         )
-    out.definition = InaDefinition(dimensions=dimensions, measures=measures, variables=variables)
+    out.definition = InaDefinition(
+        measure_structure=measure_structure,
+        dimensions=dimensions,
+        measures=measures,
+        variables=variables,
+    )
     return out
 
 
