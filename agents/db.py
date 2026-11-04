@@ -21,6 +21,7 @@ import os
 import re
 import ssl
 import uuid
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -32,7 +33,9 @@ from sqlalchemy import (
     Index,
     Integer,
     LargeBinary,
+    MetaData,
     String,
+    Table,
     Text,
     UniqueConstraint,
     delete,
@@ -2292,6 +2295,79 @@ async def _resync_ide_revisions(conn) -> None:
             "IDE file %s: proposal changed outside revisions; added revision %d",
             fid, number,
         )
+
+
+# ---------------------------------------------------------------------------
+# PG_SCHEMA: adopting this app's tables from ``public`` into its own schema
+# ---------------------------------------------------------------------------
+OURS = "ours"
+FOREIGN = "foreign"
+REFUSED = "refused"
+
+
+def required_columns(table: Table) -> list[str]:
+    """The columns a table of ours always has: NOT NULL without a server
+    default. Every column ``_ensure_column`` added later as NOT NULL carries
+    a ``server_default`` on the model (the HANA rule), so an older table of
+    ours still holds all of these."""
+    return [c.name for c in table.columns if not c.nullable and c.server_default is None]
+
+
+def classify_table(table: Table, columns: Collection[str]) -> tuple[str, str | None]:
+    """Is the ``public`` table named like ``table`` ours?
+
+    ``(FOREIGN, column)`` when a required column is missing (another app's
+    table of that name); ``(REFUSED, column)`` when every required column is
+    there but the table holds a column our model does not have (moving it
+    could adopt what we do not own, leaving it would put an empty copy of
+    ours beside it: an operator must look); ``(OURS, None)`` otherwise.
+    """
+    present = set(columns)
+    for name in required_columns(table):
+        if name not in present:
+            return FOREIGN, name
+    known = {c.name for c in table.columns}
+    for name in sorted(present - known):
+        return REFUSED, name
+    return OURS, None
+
+
+@dataclass
+class AdoptionPlan:
+    moves: list[str]
+    foreign: list[tuple[str, str]]
+    refused: list[tuple[str, str]]
+    duplicates: list[str]
+
+
+def plan_schema_adoption(
+    metadata: MetaData,
+    in_schema: Collection[str],
+    in_source: Mapping[str, Collection[str]],
+) -> AdoptionPlan:
+    """What :func:`_adopt_schema` does, decided on names alone.
+
+    ``in_schema``: the tables already in our schema; ``in_source``: the
+    tables of the source schema (``public``) with their columns. Walks our
+    tables parents first, so a move never precedes its parent's."""
+    plan = AdoptionPlan([], [], [], [])
+    have = set(in_schema)
+    for table in metadata.sorted_tables:
+        name = table.name
+        if name in have:
+            if name in in_source:
+                plan.duplicates.append(name)
+            continue
+        if name not in in_source:
+            continue
+        verdict, column = classify_table(table, in_source[name])
+        if verdict == OURS:
+            plan.moves.append(name)
+        elif verdict == FOREIGN:
+            plan.foreign.append((name, column or ""))
+        else:
+            plan.refused.append((name, column or ""))
+    return plan
 
 
 async def _ensure_column(conn, table: str, column: str, ddl_type: str) -> None:

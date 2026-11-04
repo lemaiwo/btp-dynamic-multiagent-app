@@ -106,3 +106,80 @@ def test_the_copy_script_sides_follow_the_rule(env):
 def test_a_postgres_database_url_follows_it_too(env):
     env(DATABASE_URL="postgresql://u:p@h/d", PG_SCHEMA="pydantic_agent")
     assert agents_db._resolve_database().schema == "pydantic_agent"
+
+
+# --- the ownership rule and the planner ------------------------------------------
+
+# The other app's two tables on EC, as recorded by the probe of 2026-11-04
+# (after our failed starts had added agent_ref and access to the first one).
+THEIR_CHAT_CONVERSATIONS = {"id", "user_id", "title", "created_at", "updated_at", "agent_ref", "access"}
+THEIR_CHAT_MESSAGES = {"id", "conversation_id", "role", "content", "created_at"}
+# Columns of agent_configs that 2.22.0 (EC's version) did not have yet.
+LATER_AGENT_COLUMNS = {"tier", "share_tools", "expose_invoke", "result_schema_json", "invoke_limits_json"}
+
+
+def _table(name):
+    return agents_db.Base.metadata.tables[name]
+
+
+def _model_columns(name):
+    return {c.name for c in _table(name).columns}
+
+
+def test_the_other_apps_tables_are_foreign():
+    assert agents_db.classify_table(_table("chat_conversations"), THEIR_CHAT_CONVERSATIONS) == ("foreign", "principal")
+    assert agents_db.classify_table(_table("chat_messages"), THEIR_CHAT_MESSAGES) == ("foreign", "position")
+
+
+def test_a_2_22_0_shaped_table_of_ours_is_ours():
+    columns = _model_columns("agent_configs") - LATER_AGENT_COLUMNS
+    assert agents_db.classify_table(_table("agent_configs"), columns) == ("ours", None)
+
+
+def test_an_identical_shape_is_ours():
+    assert agents_db.classify_table(_table("skill_configs"), _model_columns("skill_configs")) == ("ours", None)
+
+
+def test_a_widened_table_refuses():
+    columns = _model_columns("skill_configs") | {"legacy_col"}
+    assert agents_db.classify_table(_table("skill_configs"), columns) == ("refused", "legacy_col")
+
+
+def test_every_later_not_null_column_has_a_server_default():
+    # The rule relies on it: a column _ensure_column adds as NOT NULL must not be "required".
+    ensured = {
+        ("agent_configs", "tier"), ("agent_configs", "share_tools"), ("agent_configs", "expose_invoke"),
+        ("agent_configs", "expose_api"), ("agent_configs", "expose_chat"),
+        ("chat_conversations", "access"), ("chat_user_agents", "deep"),
+        ("ide_conventions", "non_production"), ("ide_sessions", "session_type"),
+        ("ide_workspace_files", "revision"), ("odata_services", "kind"),
+        ("orchestrator_config", "embeddings_enabled"), ("workflow_steps", "kind"),
+    }
+    for table, column in ensured:
+        assert column not in agents_db.required_columns(_table(table)), (table, column)
+
+
+def test_the_planner_moves_ours_skips_the_rest_and_is_empty_afterwards():
+    md = agents_db.Base.metadata
+    in_source = {
+        "agent_configs": _model_columns("agent_configs") - LATER_AGENT_COLUMNS,
+        "chat_conversations": THEIR_CHAT_CONVERSATIONS,
+        "skill_configs": _model_columns("skill_configs"),
+    }
+    plan = agents_db.plan_schema_adoption(md, in_schema={"skill_configs"}, in_source=in_source)
+    assert plan.moves == ["agent_configs"]
+    assert plan.foreign == [("chat_conversations", "principal")]
+    assert plan.refused == [] and plan.duplicates == ["skill_configs"]
+    done = agents_db.plan_schema_adoption(md, in_schema=set(in_source) | {"job_runs"}, in_source={})
+    assert done == agents_db.AdoptionPlan([], [], [], [])
+
+
+def test_moves_follow_dependency_order():
+    # ide_messages references ide_sessions by foreign key (workflow_steps
+    # names its workflow by id only, so that pair has no order to follow).
+    md = agents_db.Base.metadata
+    plan = agents_db.plan_schema_adoption(md, in_schema=set(), in_source={
+        "ide_messages": _model_columns("ide_messages"),
+        "ide_sessions": _model_columns("ide_sessions"),
+    })
+    assert plan.moves == ["ide_sessions", "ide_messages"]
