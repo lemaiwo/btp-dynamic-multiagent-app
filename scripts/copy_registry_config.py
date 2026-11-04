@@ -40,10 +40,35 @@ Where the two databases come from, without a URL on the command line:
 
 Both go through the resolver of ``agents/db.py`` (same drivers, same TLS
 rules). ``DB_KIND`` does not choose either side. (``agents.db`` refuses to
-be imported with two bound services and no ``DB_KIND``, so for ITS OWN
-process this script sets ``DB_KIND=postgres`` when the variable is unset;
+be imported with two bound services and no ``DB_KIND``, and refuses
+``PG_SCHEMA`` while ``DB_KIND`` names HANA, so for ITS OWN process this
+script sets ``DB_KIND=postgres`` whenever a PostgreSQL service is bound;
 that only decides the engine ``agents.db`` builds for itself, through which
-this script reads and writes nothing.) Without ``--apply`` nothing is written:
+this script reads and writes nothing.) The Postgres side follows
+``PG_SCHEMA`` (its ``search_path``), the HANA side ignores it.
+
+Switching a landscape whose Postgres side uses ``PG_SCHEMA`` to HANA, in
+this order:
+
+1. bind the HDI container next to Postgres and, in the same deploy, set
+   ``DB_KIND=hana`` and remove ``PG_SCHEMA`` / ``PG_SCHEMA_ADOPT`` from the
+   app (the app refuses ``PG_SCHEMA`` on HANA); its start deploys the HANA
+   tables;
+2. run the copy as a task with the schema on its command line, a dry run
+   first, then ``--apply``::
+
+       PG_SCHEMA=<schema> python scripts/copy_registry_config.py --from postgres --to hana
+
+   Without ``PG_SCHEMA`` the Postgres side is read from ``public``: the
+   output names the schema each Postgres side reads (``postgres (schema
+   public) -> hana``), and the dry run shows the wrong rows (or fails on a
+   missing table);
+3. restart the app.
+
+Back to Postgres: set ``DB_KIND=postgres`` with ``PG_SCHEMA`` (and
+``PG_SCHEMA_ADOPT`` when ``public`` holds tables of this app), start the
+app once, then copy ``--from hana --to postgres`` in the app's own
+environment. Without ``--apply`` nothing is written:
 the default is a dry run that prints, per table, how many rows would be
 inserted, replaced or are equal already, and the NAMES concerned (for the
 OAuth tables counts only). No other column value is ever printed or logged,
@@ -93,25 +118,26 @@ class CopyRefused(RuntimeError):
     """The copy cannot run as asked; the message is safe to print."""
 
 
-def _importable_with_two_bindings() -> None:
-    """``agents.db`` chooses the app's database while it is imported and
-    refuses to choose between two bound services without ``DB_KIND``. This
-    script names both itself, so for its own process any bound kind will do
-    as the app's; nothing is read or written through that engine."""
-    if os.environ.get("DB_KIND", "").strip():
-        return
+def _import_agents_db_as_postgres() -> None:
+    """``agents.db`` chooses the app's database while it is imported: it
+    refuses to choose between two bound services without ``DB_KIND``, and
+    refuses ``PG_SCHEMA`` when ``DB_KIND=hana`` chose HANA (the app's
+    environment after a switch, plus the schema the copy task names). This
+    script names both sides itself, so whenever a PostgreSQL service is
+    bound its own process takes that one as the app's; nothing is read or
+    written through that engine."""
     try:
         services = json.loads(os.environ.get("VCAP_SERVICES") or "{}")
     except ValueError:
         return
-    if isinstance(services, dict) and services.get("hana") and any(
+    if isinstance(services, dict) and any(
         services.get(label)
         for label in ("postgresql-db", "postgresql", "hyperscaler-option-postgresql")
     ):
         os.environ["DB_KIND"] = "postgres"
 
 
-_importable_with_two_bindings()
+_import_agents_db_as_postgres()
 
 from sqlalchemy import DateTime, delete, insert, select, update  # noqa: E402
 from sqlalchemy.engine import make_url  # noqa: E402
@@ -473,6 +499,16 @@ def _target(kind: str | None, env: str | None, side: str) -> DatabaseTarget:
     return agents_db._target_from_url(url)
 
 
+def _side(target: DatabaseTarget) -> str:
+    """A side as the output names it: the kind, and for Postgres the schema
+    it reads (``PG_SCHEMA``, else ``public``), so a ``PG_SCHEMA=`` forgotten
+    on the task's command line shows. A schema name is an identifier, never
+    a credential."""
+    if target.kind != "postgres":
+        return target.kind
+    return f"postgres (schema {target.schema or 'public'})"
+
+
 def _identity(target: DatabaseTarget) -> tuple[Any, ...]:
     """What makes two targets the same database (never shown)."""
     url = make_url(target.url)
@@ -541,20 +577,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--apply", action="store_true",
                         help="write to the target (default: dry run)")
     args = parser.parse_args(argv)
+    sides = ""
     try:
         source = _target(getattr(args, "from"), args.from_env, "from")
         target = _target(args.to, args.to_env, "to")
+        sides = f"{_side(source)} -> {_side(target)}"
         plans = asyncio.run(run(source, target, apply=args.apply))
     except (CopyRefused, DatabaseConfigError) as refused:
         print(f"refused: {refused}", file=sys.stderr)
         return 2
     except Exception as failed:  # noqa: BLE001 -- its text may quote a row
+        # A Postgres side names its schema: reading the wrong one (``public``
+        # for a forgotten PG_SCHEMA) typically fails here, on a missing table.
+        where = f"; {sides}" if "postgres" in sides else ""
         print(
-            f"copy failed ({type(failed).__name__}); nothing was written to the target",
+            f"copy failed ({type(failed).__name__}); nothing was written to the target{where}",
             file=sys.stderr,
         )
         return 1
-    print(f"{source.kind} -> {target.kind}: " + ("APPLIED" if args.apply else "dry run"))
+    print(f"{sides}: " + ("APPLIED" if args.apply else "dry run"))
     for plan in plans:
         print("  " + plan.line())
     print("  not copied: " + ", ".join(NOT_COPIED))

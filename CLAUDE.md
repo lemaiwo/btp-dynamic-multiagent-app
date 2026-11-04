@@ -131,40 +131,21 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   with `DatabaseConfigError` unless `DB_KIND` (`postgres` | `hana`) names
   one, and a `DB_KIND` naming a kind that is not bound fails too (never
   answered with the other one; `DB_KIND` is ignored when nothing is bound).
-  **`PG_SCHEMA`** (Postgres only; `^[a-z][a-z0-9_]{0,62}$`, not `public`,
-  `pg_*` or `information_schema`, never trimmed or lower-cased; a bad value is
-  refused without being repeated; refused by `_resolve_database` on a HANA
-  binding, a HANA or SQLite URL and the local fallback, while
-  `bound_target("hana")` and a HANA URL in the copy script ignore it) names a
-  schema of our own: `DatabaseTarget.schema`, attached by `_postgres_target`
-  and the Postgres branch of `_target_from_url`, becomes the connection's
-  whole `search_path` in `_engine_settings` (the schema alone, never
-  `schema, public`). `_create_and_migrate` then first runs `_adopt_schema`:
-  `CREATE SCHEMA IF NOT EXISTS`, two reads of `pg_catalog` (base tables and
-  columns of both schemas; the foreign keys of `public`'s tables; not
-  `information_schema`, which hides what the role has no privilege on, so a
-  table owned by another role would get an empty copy instead of a loud
-  "must be owner"), and for each table of `Base.metadata` that is in `public`
-  and not in the schema the rule `classify_table`: ours (every `public` column
-  a model column AND every required column, NOT NULL without `server_default`,
-  present; `test_every_later_not_null_column_has_a_server_default` pins that
-  the `_ensure_column` chain never adds a required one) is moved with `ALTER
-  TABLE ... SET SCHEMA` under `SET LOCAL lock_timeout = '10s'`, rows, indexes
-  and sequences along; a required column missing is a foreign table, left with
-  one WARNING, ours created in the schema; all required present but an unknown
-  column is a refused start, before any move; so is a move whose foreign key
-  points at a table that will not be in the schema afterwards (`dangling`; a
-  constraint keeps its target through `SET SCHEMA`, and EC's failed 2.36.0
-  start had created our empty `chat_files` referencing the OTHER app's
-  `chat_conversations`: the operator drops the empty table first); a name in
-  both schemas keeps the schema's (one WARNING when the `public` twin is
-  ours-shaped, INFO when it is foreign: EC's two every start). Idempotent,
-  Postgres dialect only (`plan_schema_adoption` is the pure planner;
-  `tests/test_pg_schema.py`, and `tests/test_pg_schema_postgres.py` against a
-  real Postgres, opt-in). Why: EC shares its one free Postgres with
-  `sap-mcp-server-BC`, which owns `chat_conversations` and `chat_messages`;
-  only `ec.mtaext` sets it. A version before 2.36.1 does not know the variable
-  and would not find the moved tables.
+  **`PG_SCHEMA`** and **`PG_SCHEMA_ADOPT`** (Postgres only; read and checked
+  by `agents/pg_schema.py`, below) are checked FIRST in `_resolve_database`,
+  before any binding is read (inside the guard around the bound service a bad
+  value was answered as "could not be read"); `PG_SCHEMA` is refused there on
+  a HANA binding, a HANA or SQLite URL and the local fallback, while
+  `bound_target("hana")` and a HANA URL in the copy script ignore it.
+  `DatabaseTarget.schema` / `schema_adopt`, attached by `_postgres_target`
+  and the Postgres branch of `_target_from_url`: the schema becomes the
+  connection's whole `search_path` in `_engine_settings` (the schema alone,
+  never `schema, public`), and `_create_and_migrate` first runs
+  `_adopt_schema` (`pg_schema.adopt_schema` on `Base.metadata`) in its
+  transaction. `DatabaseConfigError` lives in `agents/db_errors.py` (so both
+  modules raise it without importing each other) and is re-exported here, as
+  are the names of `agents/pg_schema.py` that lived here (`classify_table`,
+  `plan_schema_adoption`, `AdoptionPlan`, `required_columns`, ...).
   **On Cloud Foundry (`VCAP_APPLICATION` set) the app never ends on
   SQLite**: unparseable `VCAP_SERVICES`, a database binding whose
   `credentials` is not an object, no database binding and no `DATABASE_URL`,
@@ -289,6 +270,65 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   and the container schema name replaced) or the driver's error code, never
   the driver's text, a password, the certificate or a URL. No `schema` plan
   (no design-time user)
+- `agents/pg_schema.py` — `PG_SCHEMA`: this app's tables in a Postgres
+  schema of their own, for an instance shared with another application whose
+  table names collide with ours. Standard library and SQLAlchemy only; never
+  imports `agents.db` (it gets the metadata as an argument, like
+  `agents/hana_hdi.py`). **The settings** (`settings()`): `PG_SCHEMA`
+  `^[a-z][a-z0-9_]{0,62}$`, not `public`, `pg_*` or `information_schema`,
+  never trimmed or lower-cased (the validated name is the only text
+  interpolated into DDL); `PG_SCHEMA_ADOPT` exactly `true` or `false`, blank
+  is unset, only together with `PG_SCHEMA`; a bad value is refused without
+  being repeated. **Ownership** (`classify_table`): a `public` table named
+  like one of ours is ours when it has every required column (NOT NULL
+  without `server_default`) and no column the model lacks; a required column
+  missing is a foreign table; all required present plus an unknown column is
+  `refused`. `tests/test_pg_schema.py` runs the real `_ensure_column` chain
+  with a recorder and holds every column it adds to "not required" (else an
+  older table of ours would look foreign). **The move is never automatic**,
+  because another deployment of this very app in `public` has our shape:
+  `adopt_schema` takes `pg_advisory_xact_lock(ADVISORY_LOCK_KEY)` (one fixed
+  key, held to the commit of `init_db`'s schema step, so two starting
+  instances take turns; waited for at most 30 s, `ADVISORY_LOCK_WAIT`, inside
+  CF's 60 s start timeout, then the start is refused with the fixed
+  `LOCK_WAIT_REFUSAL` (SQLSTATE 55P03), and the lock timeout is back at
+  `DEFAULT` before anything else), reads `pg_catalog` once (base tables and columns of
+  both schemas; every foreign key that starts or ends in `public`, from any
+  schema; not `information_schema`, which hides what the role has no
+  privilege on), plans (`plan_schema_adoption`, pure), then by
+  `PG_SCHEMA_ADOPT`: **unset** and anything to move (`AdoptionPlan.pending`:
+  ours, held or refused) refuses the start with the count, nothing changed
+  (nothing to move: the start goes on, a new install or every later start);
+  **`true`** refuses before any change on a refused table, a `dangling` key
+  (a move whose key would point at a table outside the schema: `SET SCHEMA`
+  keeps a constraint by identity) or a `shared` table (a table that stays
+  outside the schema has a key into one that would move), else moves each
+  table with `ALTER TABLE ... SET SCHEMA` (rows, indexes, owned sequences)
+  under `SET LOCAL lock_timeout = '10s'`, reset to `DEFAULT` after the last
+  move; **`false`** leaves every `public` table alone, one WARNING per table
+  name, and `create_all` makes ours in the schema. **`true` is for the one
+  deploy that moves the tables**: remove it (or set `false`) in the next
+  deploy, since a later start with it still `true` moves any table of our
+  names that reappears in `public` (the automatic move the switch exists to
+  prevent). The schema is looked up in
+  `pg_namespace` and created only when missing, after the decisions
+  (`CREATE SCHEMA IF NOT EXISTS` needs CREATE on the database even for an
+  existing schema). A foreign table of one of our names is left with one
+  WARNING; a twin of a table already in the schema is one WARNING when it is
+  ours-shaped (INFO under `false`), INFO when foreign. Idempotent, Postgres
+  dialect only. `tests/test_pg_schema.py` (fake connection: statement order,
+  every state of the switch, the refusals) and `tests/test_pg_schema_postgres.py`
+  (opt-in, PostgreSQL 16): unset refuses with nothing changed; `true` refuses
+  a real dangling key, moves rows and an owned sequence, holds the lock with
+  the timeout back at its default, a second start changes nothing; a key from
+  a table that stays refuses; `false` leaves the source alone; an existing
+  schema needs no CREATE on the database; two connections take the lock in
+  turn. It cannot prove `_engine_settings` / `_create_and_migrate` on a moved
+  table (its engines set `search_path` themselves), the real `public` schema
+  (a schema of its own stands in), two app instances, or the privileges of a
+  BTP binding's role. A version before 2.36.1 does not know the variables
+  and would not find the moved tables. Landscape notes: `docs/PG_SCHEMA.md`
+  (local, not in repo)
 - `agents/auth.py` — `current_jwt`/`current_principal`/`current_base_url`
   contextvars, `principal_from_token`, `XsuaaValidator`,
   `require_user`/`require_admin`/`require_developer` FastAPI dependencies
@@ -3071,10 +3111,18 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   is logged as one WARNING naming the principal and the resource group; no undeploy
   from the UI. Unverified on a landscape: every AI Core call of the panel (the lists,
   the names of the paging parameters, the deploy) and the embedding itself; 2.36.1
-  adds `PG_SCHEMA` (optional, not in the descriptor; `ec.mtaext` sets it because EC
-  shares its free Postgres with another app): no new resource, table, column or HANA
-  generation; the first start on a landscape that sets it moves the app's tables out
-  of `public` into the schema
+  adds `PG_SCHEMA` (optional, not in the descriptor; set in the `.mtaext` of a
+  landscape whose Postgres instance is shared with another application): no new
+  resource, table, column or HANA generation; the first start on a landscape that sets
+  it moves the app's tables out of `public` into the schema; 2.37.0 adds
+  `PG_SCHEMA_ADOPT` (optional, not in the descriptor: the move out of `public` happens
+  only with `true`, unset refuses a start that would move anything, `false` leaves
+  `public` alone), the schema lookup and the advisory lock, the fixed opt-in test and
+  `agents/pg_schema.py` (the adoption moved out of `agents/db.py`); no new resource,
+  table, column or HANA generation. A landscape that sets `PG_SCHEMA` and still has
+  this app's tables in `public` needs `PG_SCHEMA_ADOPT: true` (or `false`) in its
+  `.mtaext` before deploying 2.37.0, and `true` removed again (or set `false`) in
+  the deploy after the one that moved the tables
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets
@@ -3101,10 +3149,21 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   hold the URLs (never a URL as an argument). Both go through the resolver
   of `agents/db.py` (a refused `--from` / `--to` value is not echoed).
   `DB_KIND` chooses neither side; because `agents.db` refuses to be imported
-  with two bound services and no `DB_KIND`, the script sets
-  `DB_KIND=postgres` for its own process when the variable is unset, which
-  only decides the engine `agents.db` builds for itself and through which
-  the script reads and writes nothing. Dry run by default (`--apply`
+  with two bound services and no `DB_KIND`, and refuses `PG_SCHEMA` while
+  `DB_KIND=hana`, the script sets `DB_KIND=postgres` for its own process
+  whenever a PostgreSQL service is bound, which only decides the engine
+  `agents.db` builds for itself and through which the script reads and
+  writes nothing. The Postgres side follows `PG_SCHEMA`, the HANA side
+  ignores it. Switch order for a Postgres side on `PG_SCHEMA` (docstring):
+  bind HANA and, in the same deploy, set `DB_KIND=hana` and remove
+  `PG_SCHEMA` / `PG_SCHEMA_ADOPT` from the app (which refuses `PG_SCHEMA` on
+  HANA) so its start deploys the HANA tables; then run the task with the
+  schema on its command line, `PG_SCHEMA=<schema> python
+  scripts/copy_registry_config.py --from postgres --to hana` (dry run, then
+  `--apply`; without it the Postgres side is read from `public`; the output's
+  first line, and a failure line, name the schema each Postgres side reads:
+  `postgres (schema public) -> hana: dry run`); then
+  restart. Dry run by default (`--apply`
   writes): per table the counts to insert / replace / unchanged and the
   names concerned (counts only for the OAuth tables); no other column value
   is printed or logged, and a failure is reported by its class only.
@@ -3268,8 +3327,10 @@ bump a pin, rerun the suites, then deploy.
 - `pyjwt[crypto]` — XSUAA JWT validation
 - Database-specific suites are opt-in and SKIPPED without their variable:
   `TEST_POSTGRES_URL` (`tests/pg.py`, a schema per test:
-  `tests/test_odata_postgres.py`, `tests/test_ide_postgres.py` and one case
-  of `tests/test_copy_registry_config.py`) and
+  `tests/test_odata_postgres.py`, `tests/test_ide_postgres.py`,
+  `tests/test_pg_schema_postgres.py` (two schemas per test, and one role in
+  one test, skipped when the user may not create roles) and one case of
+  `tests/test_copy_registry_config.py`) and
   `TEST_HANA_SERVICE_KEY` (`tests/hana.py`: the JSON of a service key of a
   throw-away `hdi-shared` container, in the environment only;
   `tests/test_hana_integration.py` deploys through `init_db`, empties every

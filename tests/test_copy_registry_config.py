@@ -717,6 +717,66 @@ def test_the_script_can_be_imported_with_both_services_bound():
         assert secret not in result.stdout + result.stderr
 
 
+@pytest.mark.parametrize("schema, shown", [("pydantic_agent", "pydantic_agent"),
+                                           ("", "public")])
+def test_the_postgres_side_names_the_schema_it_reads(monkeypatch, capsys, schema, shown):
+    """A ``PG_SCHEMA=`` forgotten on the task's command line must be visible
+    in the dry run: the Postgres side then reads ``public``."""
+    monkeypatch.setenv("VCAP_SERVICES", json.dumps(BOTH))
+    monkeypatch.setenv("PG_SCHEMA", schema)
+    monkeypatch.delenv("PG_SCHEMA_ADOPT", raising=False)
+
+    async def planned(source, target, *, apply):
+        return copy_script.Plans()
+
+    monkeypatch.setattr(copy_script, "run", planned)
+    for argv, header in (
+        (["--from", "postgres", "--to", "hana"],
+         f"postgres (schema {shown}) -> hana: dry run"),
+        (["--from", "hana", "--to", "postgres", "--apply"],
+         f"hana -> postgres (schema {shown}): APPLIED"),
+    ):
+        assert copy_script.main(argv) == 0
+        out = capsys.readouterr().out
+        assert out.splitlines()[0] == header
+        assert "pg-pass" not in out
+
+
+def test_a_failure_names_the_schema_the_postgres_side_reads(monkeypatch, capsys):
+    monkeypatch.setenv("VCAP_SERVICES", json.dumps(BOTH))
+    monkeypatch.delenv("PG_SCHEMA", raising=False)
+
+    async def breaks(source, target, *, apply):
+        raise RuntimeError("relation \"agent_configs\" does not exist")
+
+    monkeypatch.setattr(copy_script, "run", breaks)
+    assert copy_script.main(["--from", "postgres", "--to", "hana"]) == 1
+    err = capsys.readouterr().err
+    assert err == ("copy failed (RuntimeError); nothing was written to the target; "
+                   "postgres (schema public) -> hana\n")
+
+
+def test_the_script_runs_as_postgres_while_the_app_runs_on_hana():
+    """The task of an app switched to HANA (``DB_KIND=hana``) with the
+    Postgres side's ``PG_SCHEMA`` on its command line: ``agents.db`` alone
+    refuses PG_SCHEMA on HANA, so the script imports it as Postgres."""
+    import os
+    import subprocess
+
+    environment = {"PATH": os.environ.get("PATH", ""), "VCAP_SERVICES": json.dumps(BOTH),
+                   "VCAP_APPLICATION": "{\"application_name\": \"app\"}",
+                   "DB_KIND": "hana", "PG_SCHEMA": "pydantic_agent"}
+    result = subprocess.run(
+        [sys.executable, "scripts/copy_registry_config.py", "--from", "postgres",
+         "--to", "postgres"],
+        cwd=ROOT, env=environment, capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 2, result.stderr[-400:]
+    assert result.stderr.endswith("refused: Source and target are the same database\n")
+    for secret in ("pg-pass", "rt-pass", "dt-pass"):
+        assert secret not in result.stdout + result.stderr
+
+
 # --- from a real Postgres (opt-in) ------------------------------------------------------
 
 
