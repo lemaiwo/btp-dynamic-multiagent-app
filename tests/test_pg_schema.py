@@ -12,8 +12,11 @@ Run:  python -m pytest tests/test_pg_schema.py -q
 
 from __future__ import annotations
 
+import dataclasses
 import json
+import logging
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -183,3 +186,87 @@ def test_moves_follow_dependency_order():
         "ide_sessions": _model_columns("ide_sessions"),
     })
     assert plan.moves == ["ide_sessions", "ide_messages"]
+
+
+# --- the startup step -------------------------------------------------------------
+
+class _Result:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def fetchall(self):
+        return list(self._rows)
+
+
+class FakeConn:
+    """Records every statement; answers the catalogue read from ``rows``."""
+
+    def __init__(self, rows):
+        self.rows, self.statements = rows, []
+        self.dialect = types.SimpleNamespace(name="postgresql")
+
+    async def execute(self, stmt, params=None):
+        self.statements.append((str(stmt), dict(params or {})))
+        if "information_schema.columns" in str(stmt):
+            return _Result(self.rows)
+        return _Result([])
+
+
+CATALOGUE = (
+    [("public", "agent_configs", c) for c in sorted(_model_columns("agent_configs") - LATER_AGENT_COLUMNS)]
+    + [("public", "chat_conversations", c) for c in sorted(THEIR_CHAT_CONVERSATIONS)]
+    + [("public", "skill_configs", c) for c in sorted(_model_columns("skill_configs"))]
+    + [("pydantic_agent", "skill_configs", c) for c in sorted(_model_columns("skill_configs"))]
+)
+
+
+async def test_the_step_creates_the_schema_reads_once_and_moves_ours(caplog):
+    conn = FakeConn(CATALOGUE)
+    with caplog.at_level(logging.INFO, logger="agents.db"):
+        plan = await agents_db._adopt_schema(conn, "pydantic_agent")
+    texts = [s for s, _ in conn.statements]
+    assert texts[0] == 'CREATE SCHEMA IF NOT EXISTS "pydantic_agent"'
+    assert sum("information_schema.columns" in s for s in texts) == 1
+    assert texts[-1] == 'ALTER TABLE "public"."agent_configs" SET SCHEMA "pydantic_agent"'
+    assert plan.moves == ["agent_configs"] and plan.duplicates == ["skill_configs"]
+    assert "chat_conversations" in caplog.text and "principal" in caplog.text
+    assert "skill_configs" in caplog.text and "also exists" in caplog.text
+
+
+async def test_the_read_filters_base_tables_and_both_schemas():
+    conn = FakeConn([])
+    await agents_db._adopt_schema(conn, "pydantic_agent", source_schema="src")
+    stmt, params = next((s, p) for s, p in conn.statements if "information_schema.columns" in s)
+    assert "table_type = 'BASE TABLE'" in stmt
+    assert params == {"schema": "pydantic_agent", "source": "src"}
+
+
+async def test_a_refused_table_stops_the_start_before_any_move():
+    rows = CATALOGUE + [("public", "workflows", c) for c in sorted(_model_columns("workflows") | {"legacy_col"})]
+    conn = FakeConn(rows)
+    with pytest.raises(DatabaseConfigError, match="legacy_col"):
+        await agents_db._adopt_schema(conn, "pydantic_agent")
+    assert not any(s.startswith("ALTER TABLE") for s, _ in conn.statements)
+
+
+async def test_nothing_runs_on_sqlite():
+    async with agents_db.engine.begin() as conn:  # the suite's SQLite engine
+        plan = await agents_db._adopt_schema(conn, "pydantic_agent")
+    assert plan == agents_db.AdoptionPlan([], [], [], [])
+
+
+async def test_create_and_migrate_runs_the_step_only_with_a_schema(monkeypatch):
+    calls = []
+
+    async def fake(conn, schema, *, source_schema="public"):
+        calls.append(schema)
+        return agents_db.AdoptionPlan([], [], [], [])
+
+    monkeypatch.setattr(agents_db, "_adopt_schema", fake)
+    monkeypatch.setattr(agents_db, "_target", dataclasses.replace(agents_db._target, schema="pydantic_agent"))
+    await agents_db._create_and_migrate()
+    assert calls == ["pydantic_agent"]
+    calls.clear()
+    monkeypatch.setattr(agents_db, "_target", dataclasses.replace(agents_db._target, schema=None))
+    await agents_db._create_and_migrate()
+    assert calls == []

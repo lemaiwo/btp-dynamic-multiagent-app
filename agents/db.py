@@ -51,7 +51,12 @@ from sqlalchemy import (
 )
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncConnection,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import TypeDecorator
 
@@ -2008,6 +2013,8 @@ async def _deploy_hana_schema() -> None:
 async def _create_and_migrate() -> None:
     """The schema step of :func:`init_db` on Postgres and SQLite."""
     async with engine.begin() as conn:
+        if _target.schema:
+            await _adopt_schema(conn, _target.schema)
         await conn.run_sync(Base.metadata.create_all)
         # Lightweight migrations: SQLAlchemy create_all doesn't add columns
         # to existing tables.
@@ -2367,6 +2374,69 @@ def plan_schema_adoption(
             plan.foreign.append((name, column or ""))
         else:
             plan.refused.append((name, column or ""))
+    return plan
+
+
+_CATALOGUE_COLUMNS = text(
+    "SELECT c.table_schema, c.table_name, c.column_name "
+    "FROM information_schema.columns c "
+    "JOIN information_schema.tables t "
+    "ON t.table_schema = c.table_schema AND t.table_name = c.table_name "
+    "WHERE t.table_type = 'BASE TABLE' AND c.table_schema IN (:schema, :source)"
+)
+
+
+async def _adopt_schema(
+    conn: AsyncConnection, schema: str, *, source_schema: str = "public"
+) -> AdoptionPlan:
+    """The first step of :func:`_create_and_migrate` under ``PG_SCHEMA``.
+
+    Creates the schema if needed, then moves each table of ours that still
+    sits in ``source_schema`` into it (``ALTER TABLE ... SET SCHEMA``: rows,
+    indexes, sequences and constraints go along), leaves a foreign table of
+    one of our names where it is with one WARNING, and refuses the start,
+    before any move, on a table that is neither (``classify_table``). Only
+    views are skipped by the catalogue read. Postgres only; on any other
+    dialect nothing is executed. Idempotent: once moved, a table is found
+    in the schema and skipped.
+    """
+    if conn.dialect.name != "postgresql":
+        return AdoptionPlan([], [], [], [])
+    await conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
+    result = await conn.execute(
+        _CATALOGUE_COLUMNS, {"schema": schema, "source": source_schema}
+    )
+    in_schema: set[str] = set()
+    in_source: dict[str, set[str]] = {}
+    for table_schema, table_name, column_name in result.fetchall():
+        if table_schema == schema:
+            in_schema.add(table_name)
+        else:
+            in_source.setdefault(table_name, set()).add(column_name)
+    plan = plan_schema_adoption(Base.metadata, in_schema, in_source)
+    if plan.refused:
+        table, column = plan.refused[0]
+        raise DatabaseConfigError(
+            f"PG_SCHEMA: {source_schema}.{table} holds the column {column}, which "
+            "this app's table does not have; it was not moved and nothing else "
+            "was. Drop the column or move the table by hand"
+        )
+    for name in plan.duplicates:
+        logger.warning(
+            "PG_SCHEMA: %s.%s also exists in %s; the one in %s is used, the other left alone",
+            source_schema, name, schema, schema,
+        )
+    for name, column in plan.foreign:
+        logger.warning(
+            "PG_SCHEMA: %s.%s is not this app's table (no column %s); left alone, "
+            "ours is created in %s",
+            source_schema, name, column, schema,
+        )
+    for name in plan.moves:
+        await conn.execute(
+            text(f'ALTER TABLE "{source_schema}"."{name}" SET SCHEMA "{schema}"')
+        )
+        logger.info("PG_SCHEMA: moved %s.%s to %s", source_schema, name, schema)
     return plan
 
 
