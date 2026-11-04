@@ -3,16 +3,56 @@
 Run inside the app container (it needs the destination and connectivity
 bindings), as the technical user of the destination:
 
-    cf ssh pydantic-agent -c '/tmp/lifecycle/launcher /home/vcap/app \\
-        "python scripts/probe_ina.py --destination saperp-sia-100" ""'
+    cf ssh pydantic-agent -c 'cd /home/vcap/app; unset PYTHONHOME; \\
+        export LD_LIBRARY_PATH=/home/vcap/deps/0/lib:/home/vcap/deps/0/python/lib \\
+        PYTHONPATH=/home/vcap/deps/0/lib/python3.13/site-packages; \\
+        /home/vcap/deps/0/bin/python3 scripts/probe_ina.py --destination saperp-sia-100'
+
+(the buildpack's profile script does not work in an ssh shell; a version of
+this file that is not in the droplet yet is piped in with ``cf ssh
+pydantic-agent -c 'cat > /home/vcap/app/scripts/probe_ina_x.py' <
+scripts/probe_ina.py`` and removed afterwards).
 
 Three steps, one line each: ``GetServerInfo`` (is InA there, which services
 and how many capabilities it reports), a metadata catalogue request (how many
-queries it lists and the first names), and a metadata request for one query
-when ``--query`` names it (how many dimensions and measures). Prints statuses,
-counts, keys and object NAMES, never a credential, a token, a URL or a value
-of the data. Reuses the binding, destination and proxy helpers of
-``probe_odata_connectivity.py``; nothing of the app is imported.
+queries it lists and the first names; ``--skip-catalog`` leaves it out), and a
+metadata request for one query when ``--query`` names it (how many dimensions
+and measures). Prints statuses, counts, keys and object NAMES, never a
+credential, a token, a URL or a value of the data. Reuses the binding,
+destination and proxy helpers of ``probe_odata_connectivity.py``; nothing of
+the app is imported.
+
+Recording an exchange (``--dump DIR``, added 2026-11-04 for the first real
+SIA exchange): the RAW JSON of ``GetServerInfo`` (``server_info.json``), of
+the query's describe answer (``describe.json``) and, with ``--run``, of one
+``Analytics`` read (``<label>.request.json`` and ``<label>.response.json``,
+``--label`` defaults to ``run``) is written to DIR; stdout still shows only
+statuses, sizes and counts. ``--run`` sends the body the app's
+``agents.ina.protocol.analytics_request`` builds (mirrored here, not
+imported): the first measure of the describe answer (or ``--measure``), no
+grouping, no filter, ``top=1`` (``MaxResultRecords`` 2), and every
+``--variable NAME=VALUE`` (repeatable) as a single-value variable in the
+form ``plan_run`` sends. Three switches try what SAP's own InA client does
+instead: ``--variable-form sap`` names each value by the key of the
+variable's dimension (as the describe answer states a value),
+``--structure NAME`` puts the real measure structure on Columns, and
+``--submit batch|separate`` sends a ``VariableSubmit`` (a copy of the read
+with ``ProcessingDirectives.ProcessingStep``) before the read, on one
+``InstanceId``. On SIA (2026-11-04) the plain run, also with both mandatory
+variables and in either variable form, was refused ("all mandatory
+variables need values"); the batch was answered with the submit's
+``Cube`` alone (``ServerState`` 0, the derived variables filled), no grid.
+
+A run answer holds DATA: DIR is a scratch directory in the container
+(``/tmp/...``); copy the files back with ``cf ssh pydantic-agent -c 'cat
+/tmp/<dir>/<file>'`` into the local, gitignored ``docs/evidence/`` and
+delete them in the container. A fixture made from a dump is sanitised first
+(session ids, and every data value and member text of a grid, replaced), as
+``tests/fixtures/ina/describe_sia.json`` is. Example::
+
+    python scripts/probe_ina.py --destination saperp-sia-100 --skip-catalog \\
+        --query 2CCMMPURORDQUERY --dump /tmp/ina --run \\
+        --variable '!CDS_P_P_DISPLAYCURRENCY=EUR' --label run-1
 """
 from __future__ import annotations
 
@@ -138,7 +178,7 @@ def _count(payload: Any, key: str) -> int:
 async def _send(
     client: httpx.AsyncClient, method: str, url: str, headers: dict[str, str],
     body: Any | None, csrf: dict[str, str],
-) -> tuple[int, str, Any]:
+) -> tuple[int, str, Any, bytes]:
     """One call through the proxy client. ICF wants a CSRF token on a POST:
     the GET fetches it (``X-CSRF-Token: Fetch``, the session cookie stays in
     the client), the POST sends it back; ``csrf`` carries it between calls."""
@@ -160,7 +200,142 @@ async def _send(
             payload = response.json()
         except ValueError:
             payload = None
-    return response.status_code, ctype, payload
+    return response.status_code, ctype, payload, response.content
+
+
+def _dump(directory: str, name: str, raw: bytes) -> None:
+    """Write ``raw`` as it came to ``directory/name``; print name and size only."""
+    if not directory:
+        return
+    target = Path(directory)
+    target.mkdir(parents=True, exist_ok=True)
+    (target / name).write_bytes(raw)
+    print(f"DUMP {name} bytes={len(raw)}")
+
+
+def _first_measure(cube: Any) -> str:
+    """The first measure of a describe answer's ``Cube``, read as the app's
+    ``read_description`` reads it: the members of the measure structure
+    (``DimensionType`` 2 or the name ``Measures``), ``<structure>.KEY`` else
+    ``Name``."""
+    dimensions = cube.get("Dimensions") if isinstance(cube, dict) else None
+    for raw in dimensions if isinstance(dimensions, list) else []:
+        if not isinstance(raw, dict) or not isinstance(raw.get("Members"), list):
+            continue
+        kind = raw.get("DimensionType")
+        if not ((isinstance(kind, int) and not isinstance(kind, bool) and kind == 2)
+                or raw.get("Name") == "Measures"):
+            continue
+        structure = raw.get("Name") if isinstance(raw.get("Name"), str) else ""
+        for member in raw["Members"]:
+            if isinstance(member, dict):
+                name = member.get(f"{structure}.KEY", member.get("Name"))
+                if isinstance(name, str) and name:
+                    return name
+    return ""
+
+
+def _variable_entry(name: str, value: str, field: str = "") -> dict[str, Any]:
+    """One single-value variable as ``plan_run`` sends it (``FieldName`` the
+    variable's name), or with ``field`` in the form SAP's describe answer
+    states a variable's value (``FieldName`` the key of the variable's
+    dimension, ``IsExcluding`` false)."""
+    element: dict[str, Any] = {"Comparison": "=", "Low": value}
+    if field:
+        element["IsExcluding"] = False
+    return {"Name": name, "Values": {"Selection": {"SetOperand": {
+        "FieldName": field or name, "Elements": [element]}}}}
+
+
+def _variable_fields(cube: Any) -> dict[str, str]:
+    """``<DimensionReference.Name>.KEY`` per variable of a describe answer."""
+    raw = cube.get("Variables") if isinstance(cube, dict) else None
+    out: dict[str, str] = {}
+    for variable in raw if isinstance(raw, list) else []:
+        ref = variable.get("DimensionReference") if isinstance(variable, dict) else None
+        if isinstance(ref, dict) and isinstance(ref.get("Name"), str):
+            out[str(variable.get("Name"))] = f"{ref['Name']}.KEY"
+    return out
+
+
+def _run_request(capabilities: list[str], query: str, measure: str,
+                 variables: list[tuple[str, str]], top: int = 1,
+                 structure: str = "Measures",
+                 fields: dict[str, str] | None = None) -> dict[str, Any]:
+    """The body ``analytics_request`` builds for one measure, no grouping, no
+    filter, no sort (mirrored from ``agents/ina/protocol.py``)."""
+    definition: dict[str, Any] = {
+        "Dimensions": [{
+            "Name": structure,
+            "Axis": "Columns",
+            "Members": [{"Name": measure, "Visibility": "Visible"}],
+        }],
+        "ResultSetFeatureRequest": {
+            "ResultFormat": "Version2",
+            "ResultEncoding": "None",
+            "MaxResultRecords": top + 1,
+            "SubSetDescription": {"RowFrom": 0, "RowTo": top + 1,
+                                  "ColumnFrom": 0, "ColumnTo": -1},
+            "UseDefaultAttributeKey": False,
+        },
+    }
+    if variables:
+        definition["Variables"] = [_variable_entry(n, v, (fields or {}).get(n, ""))
+                                   for n, v in variables]
+    return {
+        "ClientInfo": CLIENT_INFO,
+        "Analytics": {
+            "Capabilities": capabilities,
+            "DataSource": {"ObjectName": query, "Type": "Query"},
+            "Definition": definition,
+            "Language": "EN",
+        },
+        "Options": ["StatefulServer"],
+    }
+
+
+def _batch_with_submit(body: dict[str, Any], instance: str) -> dict[str, Any]:
+    """``{"Batch": [submit, read]}``: a copy of the read with
+    ``ProcessingDirectives.ProcessingStep = VariableSubmit`` first, then the
+    read, both on one ``InstanceId`` -- the stateful BW variable flow of SAP's
+    own InA client (firefly, ``sap/sac/df/firefly/ff4400.olap.providers``)."""
+    read = json.loads(json.dumps(body))
+    read["Analytics"]["DataSource"]["InstanceId"] = instance
+    submit = json.loads(json.dumps(read))
+    submit["Analytics"]["ProcessingDirectives"] = {"ProcessingStep": "VariableSubmit"}
+    return {"Batch": [submit, read]}
+
+
+def _grids(payload: Any) -> list[int]:
+    """Grids per answer: one entry, or one per element of a ``Batch``."""
+    answers = payload.get("Batch") if isinstance(payload, dict) and "Batch" in payload \
+        else [payload]
+    out = []
+    for answer in answers if isinstance(answers, list) else []:
+        grids = answer.get("Grids") if isinstance(answer, dict) else None
+        out.append(len(grids) if isinstance(grids, list) else 0)
+    return out
+
+
+def _parse_variables(values: list[str]) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+    for item in values:
+        name, sep, value = item.partition("=")
+        if not sep or not name:
+            raise ProbeError("--variable takes NAME=VALUE")
+        out.append((name, value))
+    return out
+
+
+def _messages(payload: Any) -> str:
+    """Number and type of an answer's messages (the texts are in the dump)."""
+    if isinstance(payload, dict) and isinstance(payload.get("Batch"), list):
+        return "|".join(_messages(a) for a in payload["Batch"])
+    raw = payload.get("Messages") if isinstance(payload, dict) else None
+    if not isinstance(raw, list):
+        return "none"
+    return ";".join(f"{_name(m.get('Number'))}/{_name(m.get('Type'))}"
+                    for m in raw[:10] if isinstance(m, dict)) or "none"
 
 
 def _top_keys(payload: Any) -> str:
@@ -199,7 +374,8 @@ async def run(args: argparse.Namespace, environ: dict[str, str]) -> int:
         }
         # 1. GetServerInfo
         url = build_request_url(dest.url, INA_INFO, dest.queries)
-        status, ctype, payload = await _send(proxied, "GET", url, headers, None, csrf)
+        status, ctype, payload, raw = await _send(proxied, "GET", url, headers, None, csrf)
+        _dump(args.dump, "server_info.json", raw)
         services = payload.get("Services") if isinstance(payload, dict) else None
         names = [_name(s.get("Service")) for s in services if isinstance(s, dict)] \
             if isinstance(services, list) else []
@@ -215,38 +391,56 @@ async def run(args: argparse.Namespace, environ: dict[str, str]) -> int:
               f"services={names} capabilities={caps} csrf={'yes' if csrf.get('token') else 'no'}")
         if verdict == "FAIL":
             return 1
-        # 1b. GetCatalog: the catalogue endpoint next to GetResponse
-        url = build_request_url(dest.url, "/sap/bw/ina/GetCatalog", dest.queries)
-        status, ctype, payload = await _send(proxied, "GET", url, headers, None, csrf)
-        cat_cubes = _cubes(payload)
-        print(f"{'PASS' if status == 200 else 'FAIL'} GetCatalog: HTTP {status} {ctype} "
-              f"keys={_top_keys(payload)} cubes={len(cat_cubes)} first={cat_cubes[:MAX_NAMES]}"
-              f" size={len(json.dumps(payload)) if payload is not None else 0}")
-        # 2. catalogue of queries: the first shape that lists something wins
+        if not args.skip_catalog:
+            await _catalogue(proxied, dest, headers, csrf, capabilities)
         url = build_request_url(dest.url, INA_RESPONSE, dest.queries)
-        for label, body in _catalog_requests(capabilities):
-            status, ctype, payload = await _send(proxied, "POST", url, headers, body, csrf)
-            cubes = _cubes(payload)
-            ok = status == 200 and isinstance(payload, dict) and bool(cubes)
-            verdict = "PASS" if ok else "FAIL"
-            print(f"{verdict} catalogue[{label}]: HTTP {status} {ctype} "
-                  f"keys={_top_keys(payload)} queries={len(cubes)} first={cubes[:MAX_NAMES]}")
-            if isinstance(payload, dict) and payload.get("Messages"):
-                for m in payload["Messages"][:3]:
-                    if isinstance(m, dict):
-                        print(f"  message number={_name(m.get('Number'))} "
-                              f"type={_name(m.get('Type'))} "
-                              f"text={_name(m.get('Text'))[:300]}")
-            if ok:
-                break
         # 3. one query's metadata
-        if args.query:
-            status, ctype, payload = await _send(
+        cube: Any = None
+        if args.query and not args.no_describe:
+            status, ctype, payload, raw = await _send(
                 proxied, "POST", url, headers, _query_request(args.query, capabilities), csrf)
+            _dump(args.dump, "describe.json", raw)
             verdict = "PASS" if status == 200 and isinstance(payload, dict) else "FAIL"
             print(f"{verdict} query {_name(args.query)}: HTTP {status} {ctype} "
                   f"keys={_top_keys(payload)} dimensions={_count(payload, 'Dimensions')} "
-                  f"measures={_count(payload, 'Members')} variables={_count(payload, 'Variables')}")
+                  f"measures={_count(payload, 'Members')} variables={_count(payload, 'Variables')}"
+                  f" messages={_messages(payload)}")
+            cube = payload.get("Cube") if isinstance(payload, dict) else None
+        # 4. one Analytics read, as the app's run sends it
+        if args.query and args.run:
+            measure = args.measure or _first_measure(cube)
+            if not measure:
+                raise ProbeError("no measure: describe the query or pass --measure")
+            body = _run_request(
+                capabilities, args.query, measure, _parse_variables(args.variable or []),
+                structure=args.structure or "Measures",
+                fields=_variable_fields(cube) if args.variable_form == "sap" else None,
+            )
+            if args.submit == "batch":
+                body = _batch_with_submit(body, "probe" + os.urandom(8).hex())
+            elif args.submit == "separate":
+                # The submit alone first, on the InstanceId the read then uses.
+                submit, body = _batch_with_submit(body, "probe" + os.urandom(8).hex())["Batch"]
+                _dump(args.dump, f"{args.label}.submit.request.json",
+                      json.dumps(submit, indent=1).encode("utf-8"))
+                status, ctype, payload, raw = await _send(
+                    proxied, "POST", url, headers, submit, csrf)
+                _dump(args.dump, f"{args.label}.submit.response.json", raw)
+                cube_out = payload.get("Cube") if isinstance(payload, dict) else None
+                state = cube_out.get("ServerState") if isinstance(cube_out, dict) else None
+                shown = _name(state.get("State")) if isinstance(state, dict) else "-"
+                print(f"{'PASS' if status == 200 else 'FAIL'} submit {_name(args.label)}: "
+                      f"HTTP {status} {ctype} bytes={len(raw)} keys={_top_keys(payload)} "
+                      f"server_state={shown} messages={_messages(payload)}")
+            _dump(args.dump, f"{args.label}.request.json",
+                  json.dumps(body, indent=1).encode("utf-8"))
+            status, ctype, payload, raw = await _send(proxied, "POST", url, headers, body, csrf)
+            _dump(args.dump, f"{args.label}.response.json", raw)
+            grids = _grids(payload)
+            ok = status == 200 and bool(grids) and grids[-1] > 0
+            print(f"{'PASS' if ok else 'FAIL'} run {_name(args.label)}: HTTP {status} {ctype} "
+                  f"bytes={len(raw)} keys={_top_keys(payload)} grids={grids} "
+                  f"variables={len(args.variable or [])} messages={_messages(payload)}")
         await proxied.aclose()
         return 0
     except ProbeError as exc:
@@ -257,12 +451,64 @@ async def run(args: argparse.Namespace, environ: dict[str, str]) -> int:
         return 2
 
 
+async def _catalogue(
+    proxied: httpx.AsyncClient, dest: Any, headers: dict[str, str], csrf: dict[str, str],
+    capabilities: list[str],
+) -> None:
+    """Steps 1b and 2: GetCatalog and the catalogue requests."""
+    # 1b. GetCatalog: the catalogue endpoint next to GetResponse
+    url = build_request_url(dest.url, "/sap/bw/ina/GetCatalog", dest.queries)
+    status, ctype, payload, _raw = await _send(proxied, "GET", url, headers, None, csrf)
+    cat_cubes = _cubes(payload)
+    print(f"{'PASS' if status == 200 else 'FAIL'} GetCatalog: HTTP {status} {ctype} "
+          f"keys={_top_keys(payload)} cubes={len(cat_cubes)} first={cat_cubes[:MAX_NAMES]}"
+          f" size={len(json.dumps(payload)) if payload is not None else 0}")
+    # 2. catalogue of queries: the first shape that lists something wins
+    url = build_request_url(dest.url, INA_RESPONSE, dest.queries)
+    for label, body in _catalog_requests(capabilities):
+        status, ctype, payload, _raw = await _send(proxied, "POST", url, headers, body, csrf)
+        cubes = _cubes(payload)
+        ok = status == 200 and isinstance(payload, dict) and bool(cubes)
+        verdict = "PASS" if ok else "FAIL"
+        print(f"{verdict} catalogue[{label}]: HTTP {status} {ctype} "
+              f"keys={_top_keys(payload)} queries={len(cubes)} first={cubes[:MAX_NAMES]}")
+        if isinstance(payload, dict) and payload.get("Messages"):
+            for m in payload["Messages"][:3]:
+                if isinstance(m, dict):
+                    print(f"  message number={_name(m.get('Number'))} "
+                          f"type={_name(m.get('Type'))} "
+                          f"text={_name(m.get('Text'))[:300]}")
+        if ok:
+            break
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="probe_ina.py",
                                      description=(__doc__ or "").split("\n\n")[0])
     parser.add_argument("--destination", required=True, help="name of the OnPremise destination")
     parser.add_argument("--query", default="", help="an analytical query name to describe")
     parser.add_argument("--timeout", type=float, default=60.0)
+    parser.add_argument("--skip-catalog", action="store_true",
+                        help="leave out GetCatalog and the catalogue requests")
+    parser.add_argument("--dump", default="",
+                        help="directory for the raw JSON of the answers (holds data: /tmp only)")
+    parser.add_argument("--run", action="store_true",
+                        help="send one Analytics read of --query (first measure, top=1)")
+    parser.add_argument("--no-describe", action="store_true",
+                        help="send the run without the describe first (needs --measure)")
+    parser.add_argument("--measure", default="", help="the measure of the run")
+    parser.add_argument("--variable", action="append", metavar="NAME=VALUE",
+                        help="a single-value variable of the run (repeatable)")
+    parser.add_argument("--label", default="run", help="file name stem of the run's dump")
+    parser.add_argument("--variable-form", choices=("app", "sap"), default="app",
+                        help="app: FieldName the variable name (as plan_run sends it); "
+                        "sap: the key of the variable's dimension, as the describe states it")
+    parser.add_argument("--submit", choices=("none", "batch", "separate"), default="none",
+                        help="batch: send the run as Batch [VariableSubmit, read]; "
+                        "separate: the VariableSubmit, then the read, on one InstanceId")
+    parser.add_argument("--structure", default="",
+                        help="name of the measure structure on Columns (default Measures, "
+                        "as analytics_request sends it)")
     args = parser.parse_args()
     return asyncio.run(run(args, dict(os.environ)))
 
