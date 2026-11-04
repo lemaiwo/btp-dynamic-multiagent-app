@@ -335,11 +335,13 @@ def _refuse_unset(plan: AdoptionPlan, schema: str, source: str) -> None:
         "PG_SCHEMA: %s holds tables of this app's names and columns: %s",
         source, ", ".join(pending),
     )
+    count = "1 table" if len(pending) == 1 else f"{len(pending)} tables"
+    verb = "has" if len(pending) == 1 else "have"
     raise DatabaseConfigError(
-        f"PG_SCHEMA: {len(pending)} tables in {source} have this app's names and "
-        f"columns and would be moved into {schema}. Set PG_SCHEMA_ADOPT to true to "
-        f"move them, or to false to leave {source} as it is and create this app's "
-        f"tables in {schema}; nothing was changed"
+        f"PG_SCHEMA: {count} in {source} {verb} this app's names and columns and "
+        f"would be moved into {schema}. Set PG_SCHEMA_ADOPT to true to move them, "
+        f"or to false to leave {source} as it is and create this app's tables in "
+        f"{schema}; nothing was changed"
     )
 
 

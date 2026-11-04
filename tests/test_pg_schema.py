@@ -438,6 +438,13 @@ async def test_unset_refuses_when_anything_would_move_and_changes_nothing(caplog
     assert conn.ddl() == [] and not any("lock_timeout" in s for s in conn.texts())
 
 
+async def test_unset_counts_one_table_as_one():
+    conn = FakeConn(CATALOGUE)
+    with pytest.raises(DatabaseConfigError) as info:
+        await agents_db._adopt_schema(conn, SCHEMA)
+    assert "1 table in public has" in str(info.value)
+
+
 async def test_unset_starts_when_nothing_would_move(caplog):
     rows = ([("public", "chat_conversations", c) for c in sorted(OTHER_CHAT_CONVERSATIONS)]
             + [(SCHEMA, "skill_configs", c) for c in sorted(_model_columns("skill_configs"))])
