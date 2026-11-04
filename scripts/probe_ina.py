@@ -350,6 +350,33 @@ def _batch_with_submit(body: dict[str, Any], instance: str) -> dict[str, Any]:
     return {"Batch": [submit, read]}
 
 
+HIDE_TOTALS = [{"Result": "Members", "Visibility": "Visible"},
+               {"Result": "Total", "Visibility": "Hidden"}]
+
+
+def _shape_rows(body: dict[str, Any], cube: Any) -> dict[str, Any]:
+    """``--rows-form fields`` (runs 7, 8): each Rows dimension asks for its
+    key and text attribute (``KeyAttribute`` / ``TextAttribute`` of the
+    submit answer's ``Cube``) as ``Attributes`` and hides totals (the shape of
+    SAP's ``DefaultResultStructure``); ``MaxResultRecords`` is left out, so
+    the rows are cut by ``SubSetDescription.RowTo`` alone (firefly sends
+    ``MaxResultRecords`` only when an application set one)."""
+    meta = {d.get("Name"): d for d in (cube or {}).get("Dimensions", []) if isinstance(d, dict)}
+    definition = body["Analytics"]["Definition"]
+    for entry in definition["Dimensions"]:
+        if entry.get("Axis") != "Rows":
+            continue
+        dim = meta.get(entry["Name"], {})
+        fields = [f for f in (dim.get("KeyAttribute") or f"{entry['Name']}.KEY",
+                              dim.get("TextAttribute")) if isinstance(f, str) and f]
+        # firefly's form (QInAField.exportComponentWithStructure); a
+        # dimension's `ResultSetFields` was ignored by SIA (run 7).
+        entry["Attributes"] = [{"Name": f, "Obtainability": "Always"} for f in fields]
+        entry["ResultStructure"] = [dict(x) for x in HIDE_TOTALS]
+    definition["ResultSetFeatureRequest"].pop("MaxResultRecords", None)
+    return body
+
+
 def _close_request(instance: str) -> dict[str, Any]:
     """firefly's ``Close`` of a query instance (``InAQMgrShutdownAction``),
     as ``agents.ina.protocol.close_request`` builds it."""
@@ -483,6 +510,8 @@ async def run(args: argparse.Namespace, environ: dict[str, str]) -> int:
                     proxied, "POST", url, headers, submit, csrf)
                 _dump(args.dump, f"{args.label}.submit.response.json", raw)
                 cube_out = payload.get("Cube") if isinstance(payload, dict) else None
+                if args.rows_form == "fields":
+                    body = _shape_rows(body, cube_out)
                 state = cube_out.get("ServerState") if isinstance(cube_out, dict) else None
                 shown = _name(state.get("State")) if isinstance(state, dict) else "-"
                 print(f"{'PASS' if status == 200 else 'FAIL'} submit {_name(args.label)}: "
@@ -570,6 +599,9 @@ def main() -> int:
     parser.add_argument("--group-by", action="append", metavar="DIMENSION",
                         help="a dimension of the run on Rows (repeatable)")
     parser.add_argument("--top", type=int, default=1, help="rows asked for (default 1)")
+    parser.add_argument("--rows-form", choices=("plain", "fields"), default="plain",
+                        help="fields: Rows ask for key and text, totals hidden, no "
+                        "MaxResultRecords (needs --submit separate)")
     parser.add_argument("--close", action="store_true",
                         help="with --submit separate: release the query instance afterwards")
     parser.add_argument("--variable-form", choices=("app", "sap"), default="app",
