@@ -140,19 +140,28 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   and the Postgres branch of `_target_from_url`, becomes the connection's
   whole `search_path` in `_engine_settings` (the schema alone, never
   `schema, public`). `_create_and_migrate` then first runs `_adopt_schema`:
-  `CREATE SCHEMA IF NOT EXISTS`, one read of `information_schema` (base tables
-  of both schemas), and for each table of `Base.metadata` that is in `public`
+  `CREATE SCHEMA IF NOT EXISTS`, two reads of `pg_catalog` (base tables and
+  columns of both schemas; the foreign keys of `public`'s tables; not
+  `information_schema`, which hides what the role has no privilege on, so a
+  table owned by another role would get an empty copy instead of a loud
+  "must be owner"), and for each table of `Base.metadata` that is in `public`
   and not in the schema the rule `classify_table`: ours (every `public` column
   a model column AND every required column, NOT NULL without `server_default`,
   present; `test_every_later_not_null_column_has_a_server_default` pins that
   the `_ensure_column` chain never adds a required one) is moved with `ALTER
-  TABLE ... SET SCHEMA`, rows, indexes and sequences along; a required column
-  missing is a foreign table, left with one WARNING, ours created in the
-  schema; all required present but an unknown column is a refused start,
-  before any move; a name in both schemas keeps the schema's, one WARNING.
-  Idempotent, Postgres dialect only (`plan_schema_adoption` is the pure
-  planner; `tests/test_pg_schema.py`, and `tests/test_pg_schema_postgres.py`
-  against a real Postgres, opt-in). Why: EC shares its one free Postgres with
+  TABLE ... SET SCHEMA` under `SET LOCAL lock_timeout = '10s'`, rows, indexes
+  and sequences along; a required column missing is a foreign table, left with
+  one WARNING, ours created in the schema; all required present but an unknown
+  column is a refused start, before any move; so is a move whose foreign key
+  points at a table that will not be in the schema afterwards (`dangling`; a
+  constraint keeps its target through `SET SCHEMA`, and EC's failed 2.36.0
+  start had created our empty `chat_files` referencing the OTHER app's
+  `chat_conversations`: the operator drops the empty table first); a name in
+  both schemas keeps the schema's (one WARNING when the `public` twin is
+  ours-shaped, INFO when it is foreign: EC's two every start). Idempotent,
+  Postgres dialect only (`plan_schema_adoption` is the pure planner;
+  `tests/test_pg_schema.py`, and `tests/test_pg_schema_postgres.py` against a
+  real Postgres, opt-in). Why: EC shares its one free Postgres with
   `sap-mcp-server-BC`, which owns `chat_conversations` and `chat_messages`;
   only `ec.mtaext` sets it. A version before 2.36.1 does not know the variable
   and would not find the moved tables.

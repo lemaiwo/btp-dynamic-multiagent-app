@@ -2345,25 +2345,46 @@ class AdoptionPlan:
     foreign: list[tuple[str, str]]
     refused: list[tuple[str, str]]
     duplicates: list[str]
+    # A foreign table of one of our names while ours is already in the schema
+    # (every later start on a shared instance): ``(table, missing column)``.
+    foreign_twins: list[tuple[str, str]] = field(default_factory=list)
+    # A move whose foreign key would keep pointing outside the schema:
+    # ``(table, constraint, "schema.table")``. A refusal, like ``refused``.
+    dangling: list[tuple[str, str, str]] = field(default_factory=list)
 
 
 def plan_schema_adoption(
     metadata: MetaData,
     in_schema: Collection[str],
     in_source: Mapping[str, Collection[str]],
+    *,
+    foreign_keys: Collection[tuple[str, str, str, str]] = (),
+    source: str = "public",
+    target: str | None = None,
 ) -> AdoptionPlan:
     """What :func:`_adopt_schema` does, decided on names alone.
 
     ``in_schema``: the tables already in our schema; ``in_source``: the
-    tables of the source schema (``public``) with their columns. Walks our
-    tables parents first, so a move never precedes its parent's."""
+    tables of the source schema (``public``) with their columns;
+    ``foreign_keys``: ``(table, constraint, referenced schema, referenced
+    table)`` of the source schema's tables. Walks our tables parents first,
+    so a move never precedes its parent's. A move is only a move when every
+    foreign key of the table will still point into the schema afterwards
+    (at a table moved with it, or one already there): ``SET SCHEMA`` keeps a
+    constraint by identity, so one into a foreign table would tie our table
+    to it for good (EC: ``chat_files`` made by a failed start referenced the
+    other app's ``chat_conversations``)."""
     plan = AdoptionPlan([], [], [], [])
     have = set(in_schema)
     for table in metadata.sorted_tables:
         name = table.name
         if name in have:
             if name in in_source:
-                plan.duplicates.append(name)
+                verdict, column = classify_table(table, in_source[name])
+                if verdict == FOREIGN:
+                    plan.foreign_twins.append((name, column or ""))
+                else:
+                    plan.duplicates.append(name)
             continue
         if name not in in_source:
             continue
@@ -2374,16 +2395,47 @@ def plan_schema_adoption(
             plan.foreign.append((name, column or ""))
         else:
             plan.refused.append((name, column or ""))
+    moving = set(plan.moves)
+    for name, constraint, ref_schema, ref_table in foreign_keys:
+        if name not in moving:
+            continue
+        if (ref_schema == source and ref_table in moving) or (
+            target is not None and ref_schema == target
+        ):
+            continue
+        plan.dangling.append((name, constraint, f"{ref_schema}.{ref_table}"))
+    if plan.dangling:
+        held = {name for name, _, _ in plan.dangling}
+        plan.moves = [name for name in plan.moves if name not in held]
     return plan
 
 
+# Read from pg_catalog, not information_schema: the latter lists only what
+# the current role owns or has a privilege on, so a table of ours owned by
+# another role would look absent and get an empty copy in the schema. From
+# pg_catalog it is seen, and the SET SCHEMA then fails loudly ("must be
+# owner"), which is the fail-closed answer.
 _CATALOGUE_COLUMNS = text(
-    "SELECT c.table_schema, c.table_name, c.column_name "
-    "FROM information_schema.columns c "
-    "JOIN information_schema.tables t "
-    "ON t.table_schema = c.table_schema AND t.table_name = c.table_name "
-    "WHERE t.table_type = 'BASE TABLE' AND c.table_schema IN (:schema, :source)"
+    "SELECT n.nspname, c.relname, a.attname "
+    "FROM pg_catalog.pg_class c "
+    "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+    "JOIN pg_catalog.pg_attribute a "
+    "ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped "
+    "WHERE c.relkind IN ('r', 'p') AND n.nspname IN (:schema, :source)"
 )
+_CATALOGUE_FOREIGN_KEYS = text(
+    "SELECT c.relname, con.conname, fn.nspname, fc.relname "
+    "FROM pg_catalog.pg_constraint con "
+    "JOIN pg_catalog.pg_class c ON c.oid = con.conrelid "
+    "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+    "JOIN pg_catalog.pg_class fc ON fc.oid = con.confrelid "
+    "JOIN pg_catalog.pg_namespace fn ON fn.oid = fc.relnamespace "
+    "WHERE con.contype = 'f' AND n.nspname = :source"
+)
+# ALTER TABLE ... SET SCHEMA takes ACCESS EXCLUSIVE: a lock somebody else
+# holds (an old instance mid-deploy, an operator's open transaction) would
+# otherwise block the start until the platform kills it, and again.
+_MOVE_LOCK_TIMEOUT = text("SET LOCAL lock_timeout = '10s'")
 
 
 async def _adopt_schema(
@@ -2413,13 +2465,26 @@ async def _adopt_schema(
             in_schema.add(table_name)
         else:
             in_source.setdefault(table_name, set()).add(column_name)
-    plan = plan_schema_adoption(Base.metadata, in_schema, in_source)
+    result = await conn.execute(_CATALOGUE_FOREIGN_KEYS, {"source": source_schema})
+    foreign_keys = [tuple(row) for row in result.fetchall()]
+    plan = plan_schema_adoption(
+        Base.metadata, in_schema, in_source,
+        foreign_keys=foreign_keys, source=source_schema, target=schema,
+    )
     if plan.refused:
         table, column = plan.refused[0]
         raise DatabaseConfigError(
             f"PG_SCHEMA: {source_schema}.{table} holds the column {column}, which "
             "this app's table does not have; it was not moved and nothing else "
             "was. Drop the column or move the table by hand"
+        )
+    if plan.dangling:
+        table, constraint, target = plan.dangling[0]
+        raise DatabaseConfigError(
+            f"PG_SCHEMA: {source_schema}.{table} has the foreign key {constraint} "
+            f"into {target}, which would stay outside {schema}; it was not moved "
+            "and nothing else was. Drop the constraint or the table (if it is "
+            "empty) by hand"
         )
     for name in plan.duplicates:
         logger.warning(
@@ -2432,6 +2497,13 @@ async def _adopt_schema(
             "ours is created in %s",
             source_schema, name, column, schema,
         )
+    for name, column in plan.foreign_twins:
+        logger.info(
+            "PG_SCHEMA: %s.%s is another app's table (no column %s); ours is in %s",
+            source_schema, name, column, schema,
+        )
+    if plan.moves:
+        await conn.execute(_MOVE_LOCK_TIMEOUT)
     for name in plan.moves:
         await conn.execute(
             text(f'ALTER TABLE "{source_schema}"."{name}" SET SCHEMA "{schema}"')

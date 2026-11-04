@@ -182,8 +182,55 @@ def test_the_planner_moves_ours_skips_the_rest_and_is_empty_afterwards():
     assert plan.moves == ["agent_configs"]
     assert plan.foreign == [("chat_conversations", "principal")]
     assert plan.refused == [] and plan.duplicates == ["skill_configs"]
+    assert plan.foreign_twins == [] and plan.dangling == []
     done = agents_db.plan_schema_adoption(md, in_schema=set(in_source) | {"job_runs"}, in_source={})
     assert done == agents_db.AdoptionPlan([], [], [], [])
+
+
+def test_a_foreign_twin_is_not_a_duplicate():
+    # After the first start on EC: ours lives in the schema, theirs stays in public.
+    md = agents_db.Base.metadata
+    in_schema = {"chat_conversations", "skill_configs"}
+    in_source = {"chat_conversations": THEIR_CHAT_CONVERSATIONS,
+                 "skill_configs": _model_columns("skill_configs")}
+    plan = agents_db.plan_schema_adoption(md, in_schema=in_schema, in_source=in_source)
+    assert plan.foreign_twins == [("chat_conversations", "principal")]
+    assert plan.duplicates == ["skill_configs"]
+    assert plan.foreign == [] and plan.moves == []
+
+
+def test_a_foreign_key_into_a_table_that_will_not_be_in_the_schema_is_dangling():
+    # EC on 2026-11-04: our empty chat_files, made by the failed 2.36.0 start,
+    # references the OTHER app's chat_conversations.
+    md = agents_db.Base.metadata
+    in_source = {"chat_files": _model_columns("chat_files"),
+                 "chat_conversations": THEIR_CHAT_CONVERSATIONS,
+                 "skill_configs": _model_columns("skill_configs")}
+    fks = [("chat_files", "chat_files_conversation_id_fkey", "public", "chat_conversations")]
+    plan = agents_db.plan_schema_adoption(
+        md, in_schema=set(), in_source=in_source, foreign_keys=fks,
+        source="public", target="pydantic_agent",
+    )
+    assert plan.dangling == [
+        ("chat_files", "chat_files_conversation_id_fkey", "public.chat_conversations")
+    ]
+    assert "chat_files" not in plan.moves and "skill_configs" in plan.moves
+
+
+def test_a_foreign_key_into_a_moved_or_adopted_table_is_fine():
+    md = agents_db.Base.metadata
+    in_source = {"ide_messages": _model_columns("ide_messages"),
+                 "ide_sessions": _model_columns("ide_sessions"),
+                 "chat_files": _model_columns("chat_files")}
+    fks = [("ide_messages", "ide_messages_session_id_fkey", "public", "ide_sessions"),
+           ("chat_files", "chat_files_conversation_id_fkey", "pydantic_agent",
+            "chat_conversations")]
+    plan = agents_db.plan_schema_adoption(
+        md, in_schema={"chat_conversations"}, in_source=in_source, foreign_keys=fks,
+        source="public", target="pydantic_agent",
+    )
+    assert plan.dangling == []
+    assert set(plan.moves) == {"ide_sessions", "chat_files", "ide_messages"}
 
 
 def test_moves_follow_dependency_order():
@@ -208,16 +255,20 @@ class _Result:
 
 
 class FakeConn:
-    """Records every statement; answers the catalogue read from ``rows``."""
+    """Records every statement; answers the two catalogue reads from ``rows``
+    (columns: ``(schema, table, column)``) and ``fks`` (``(table, constraint,
+    referenced schema, referenced table)``)."""
 
-    def __init__(self, rows):
-        self.rows, self.statements = rows, []
+    def __init__(self, rows, fks=()):
+        self.rows, self.fks, self.statements = rows, list(fks), []
         self.dialect = types.SimpleNamespace(name="postgresql")
 
     async def execute(self, stmt, params=None):
         self.statements.append((str(stmt), dict(params or {})))
-        if "information_schema.columns" in str(stmt):
+        if "pg_attribute" in str(stmt):
             return _Result(self.rows)
+        if "pg_constraint" in str(stmt):
+            return _Result(self.fks)
         return _Result([])
 
 
@@ -226,8 +277,10 @@ CATALOGUE = (
      for c in sorted(_model_columns("agent_configs") - LATER_AGENT_COLUMNS)]
     + [("public", "chat_conversations", c) for c in sorted(THEIR_CHAT_CONVERSATIONS)]
     + [("public", "skill_configs", c) for c in sorted(_model_columns("skill_configs"))]
-    + [("pydantic_agent", "skill_configs", c) for c in sorted(_model_columns("skill_configs"))]
+    + [("pydantic_agent", "skill_configs", c)
+       for c in sorted(_model_columns("skill_configs"))]
 )
+EC_FKS = [("chat_files", "chat_files_conversation_id_fkey", "public", "chat_conversations")]
 
 
 async def test_the_step_creates_the_schema_reads_once_and_moves_ours(caplog):
@@ -236,19 +289,24 @@ async def test_the_step_creates_the_schema_reads_once_and_moves_ours(caplog):
         plan = await agents_db._adopt_schema(conn, "pydantic_agent")
     texts = [s for s, _ in conn.statements]
     assert texts[0] == 'CREATE SCHEMA IF NOT EXISTS "pydantic_agent"'
-    assert sum("information_schema.columns" in s for s in texts) == 1
+    assert sum("pg_attribute" in s for s in texts) == 1
+    assert sum("pg_constraint" in s for s in texts) == 1
     assert texts[-1] == 'ALTER TABLE "public"."agent_configs" SET SCHEMA "pydantic_agent"'
+    assert texts[-2] == "SET LOCAL lock_timeout = '10s'"
     assert plan.moves == ["agent_configs"] and plan.duplicates == ["skill_configs"]
     assert "chat_conversations" in caplog.text and "principal" in caplog.text
     assert "skill_configs" in caplog.text and "also exists" in caplog.text
 
 
-async def test_the_read_filters_base_tables_and_both_schemas():
+async def test_the_reads_use_pg_catalog_for_base_tables_of_both_schemas():
     conn = FakeConn([])
     await agents_db._adopt_schema(conn, "pydantic_agent", source_schema="src")
-    stmt, params = next((s, p) for s, p in conn.statements if "information_schema.columns" in s)
-    assert "table_type = 'BASE TABLE'" in stmt
+    columns, params = next((s, p) for s, p in conn.statements if "pg_attribute" in s)
+    assert "pg_catalog.pg_class" in columns and "relkind IN ('r', 'p')" in columns
+    assert "information_schema" not in columns
     assert params == {"schema": "pydantic_agent", "source": "src"}
+    fks, params = next((s, p) for s, p in conn.statements if "pg_constraint" in s)
+    assert "contype = 'f'" in fks and params == {"source": "src"}
 
 
 async def test_a_refused_table_stops_the_start_before_any_move():
@@ -258,6 +316,36 @@ async def test_a_refused_table_stops_the_start_before_any_move():
     with pytest.raises(DatabaseConfigError, match="legacy_col"):
         await agents_db._adopt_schema(conn, "pydantic_agent")
     assert not any(s.startswith("ALTER TABLE") for s, _ in conn.statements)
+
+
+async def test_a_dangling_foreign_key_stops_the_start_before_any_move():
+    rows = CATALOGUE + [("public", "chat_files", c) for c in sorted(_model_columns("chat_files"))]
+    conn = FakeConn(rows, EC_FKS)
+    with pytest.raises(DatabaseConfigError) as info:
+        await agents_db._adopt_schema(conn, "pydantic_agent")
+    assert "chat_files_conversation_id_fkey" in str(info.value)
+    assert "public.chat_conversations" in str(info.value)
+    assert not any(s.startswith("ALTER TABLE") for s, _ in conn.statements)
+
+
+async def test_no_lock_timeout_is_set_when_nothing_moves():
+    conn = FakeConn([])
+    await agents_db._adopt_schema(conn, "pydantic_agent")
+    assert not any("lock_timeout" in s for s, _ in conn.statements)
+
+
+async def test_a_foreign_twin_is_logged_below_warning(caplog):
+    rows = (
+        [("public", "chat_conversations", c) for c in sorted(THEIR_CHAT_CONVERSATIONS)]
+        + [("pydantic_agent", "chat_conversations", c)
+           for c in sorted(_model_columns("chat_conversations"))]
+    )
+    conn = FakeConn(rows)
+    with caplog.at_level(logging.INFO, logger="agents.db"):
+        plan = await agents_db._adopt_schema(conn, "pydantic_agent")
+    assert plan.foreign_twins == [("chat_conversations", "principal")]
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert "chat_conversations" in caplog.text
 
 
 async def test_nothing_runs_on_sqlite():

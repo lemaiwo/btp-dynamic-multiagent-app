@@ -74,10 +74,34 @@ async def test_adoption_moves_ours_and_leaves_the_foreign_table():
             await c.execute(text(
                 "INSERT INTO skill_configs (name, description, content) VALUES ('s1', 'd', 'c')"
             ))
+            # What EC's failed 2.36.0 start left: our (empty) chat_files whose
+            # foreign key resolved to the OTHER app's chat_conversations.
+            await c.execute(text(
+                "CREATE TABLE chat_files (id varchar(36) primary key, conversation_id varchar(36) "
+                "not null references chat_conversations(id) on delete cascade, "
+                "message_id varchar(36), principal varchar(255) not null)"
+            ))
+        # The dangling key refuses the start, before anything is moved.
+        with pytest.raises(agents_db.DatabaseConfigError, match="chat_files"):
+            async with on_dst.begin() as c:
+                await agents_db._adopt_schema(c, dst, source_schema=src)
+        async with owner.begin() as c:
+            rows = await c.execute(text(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = :s"
+            ), {"s": dst})
+            assert {r[0] for r in rows} == set(), "a refusal must move nothing"
+            await c.execute(text(f'DROP TABLE "{src}".chat_files'))
         for _ in range(2):  # the second run finds everything in place
             async with on_dst.begin() as c:
                 await agents_db._adopt_schema(c, dst, source_schema=src)
                 await c.run_sync(Base.metadata.create_all)
+        async with on_dst.begin() as c:
+            # The owned sequence moved with the table: an insert still gets an id.
+            await c.execute(text(
+                "INSERT INTO skill_configs (name, description, content) VALUES ('s2', 'd', 'c')"
+            ))
+            ids = await c.execute(text("SELECT id FROM skill_configs ORDER BY id"))
+            assert [r[0] for r in ids] == [1, 2]
         async with owner.begin() as c:
             rows = await c.execute(text(
                 "SELECT table_schema, table_name FROM information_schema.tables "
