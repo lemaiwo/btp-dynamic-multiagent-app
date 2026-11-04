@@ -128,14 +128,19 @@ def _variable_type(raw: dict[str, Any]) -> str:
     return "single"
 
 
-def _is_mandatory(value: object) -> bool:
-    """InA says "mandatory" as a JSON boolean, ``1`` or ABAP's ``"X"``;
-    anything else (``"false"``, ``2``, ``None``) is optional."""
+def _is_mandatory(value: object) -> bool | None:
+    """What a ``Mandatory`` value says: True for a JSON ``true``, ``1``,
+    ABAP's ``"X"`` or ``"true"``; False for ``false``, ``0``, ``"false"`` or
+    ABAP's blank ``""``; None for anything else (``2``, ``"yes"``, ``null``,
+    a float or a list), which the caller reads as "could not be read", never
+    as "optional"."""
     if isinstance(value, bool):
         return value
     if isinstance(value, int):
-        return value == 1
-    return isinstance(value, str) and value.strip().lower() in ("x", "true")
+        return {1: True, 0: False}.get(value)
+    if isinstance(value, str):
+        return {"x": True, "true": True, "": False, "false": False}.get(value.strip().lower())
+    return None
 
 
 # SIA's spelling (and SAP's InA client's): ``InputType``.
@@ -145,20 +150,25 @@ _INPUT_TYPES = {"mandatory": True, "mandatorynotinitial": True, "optional": Fals
 def _variable_is_mandatory(raw: dict[str, Any], position: int) -> bool:
     """Whether SAP demands a value for the variable ``raw``.
 
-    Two markers are known: ``Mandatory`` (the boolean, ``1`` or ``"X"`` of
-    :func:`_is_mandatory`; any value of the key is read) and ``InputType``
-    (``Mandatory``, ``MandatoryNotInitial`` or ``Optional``, as SIA sends it).
-    A variable is mandatory when either says so, and optional only when
-    every marker it carries was read and says optional. A variable with no
-    marker, or an ``InputType`` of another value or type, is mandatory, with
-    one WARNING that names its position in SAP's list, not its name: read as
-    optional, a run without it would be sent and refused by SAP, and the
-    Test could not tell the admin beforehand.
+    Two markers are known: ``Mandatory`` (the spellings of
+    :func:`_is_mandatory`) and ``InputType`` (``Mandatory``,
+    ``MandatoryNotInitial`` or ``Optional``, as SIA sends it). A variable is
+    mandatory when either says so, and optional only when every marker it
+    carries was read and says optional. A variable with no marker, or a
+    marker of another value or type (``Mandatory: null``, ``"yes"``, ``2``;
+    an ``InputType`` of another word), is mandatory, with one WARNING that
+    names its position in SAP's list, not its name: read as optional, a run
+    without it would be sent and refused by SAP, and the Test could not tell
+    the admin beforehand.
     """
     verdicts: list[bool] = []
     unreadable = False
     if "Mandatory" in raw:
-        verdicts.append(_is_mandatory(raw["Mandatory"]))
+        said = _is_mandatory(raw["Mandatory"])
+        if said is None:
+            unreadable = True
+        else:
+            verdicts.append(said)
     if "InputType" in raw:
         value = raw["InputType"]
         verdict = _INPUT_TYPES.get(value.strip().lower()) if isinstance(value, str) else None

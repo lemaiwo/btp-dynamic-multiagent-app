@@ -262,17 +262,39 @@ def test_a_measure_structure_without_members_is_read_as_no_measures():
         ("TRUE", True),
         (False, False),
         (0, False),
-        (2, False),
         ("", False),
         ("false", False),
-        ("yes", False),
-        (None, False),
+        (" FALSE ", False),
     ],
 )
-def test_the_spellings_of_mandatory(value, mandatory):
+def test_the_spellings_of_mandatory(value, mandatory, caplog):
     cube = fixture("describe_ok.json")["Cube"]
     cube["Variables"][0]["Mandatory"] = value
-    assert read_description(cube).definition.variables[0].mandatory is mandatory
+    with caplog.at_level("WARNING", logger="agents.ina.description"):
+        assert read_description(cube).definition.variables[0].mandatory is mandatory
+    assert caplog.records == []
+
+
+@pytest.mark.parametrize("value", ["yes", 2, None, -1, 1.0, ["X"], {"X": True}, "no"])
+def test_a_mandatory_value_that_cannot_be_read_is_mandatory_and_logged(value, caplog):
+    """Fail closed (review M1): a ``Mandatory`` that is neither a known yes
+    nor a known no is no "optional", whatever ``InputType`` says."""
+    cube = fixture("describe_ok.json")["Cube"]
+    cube["Variables"][0]["Mandatory"] = value
+    with caplog.at_level("WARNING", logger="agents.ina.description"):
+        assert read_description(cube).definition.variables[0].mandatory is True
+    assert [r.getMessage() for r in caplog.records] == [
+        "ina: variable 1 of the description carries no mandatory marker this "
+        "client reads; read as mandatory"
+    ]
+
+
+def test_an_unreadable_mandatory_value_is_not_made_optional_by_input_type(caplog):
+    cube = sia_cube()
+    cube["Variables"][2]["Mandatory"] = None  # InputType of variable 3 says Optional
+    with caplog.at_level("WARNING", logger="agents.ina.description"):
+        assert read_description(cube).definition.variables[2].mandatory is True
+    assert len(caplog.records) == 1 and "variable 3" in caplog.records[0].getMessage()
 
 
 # -------------------------------------------------- the describe answer of SIA
