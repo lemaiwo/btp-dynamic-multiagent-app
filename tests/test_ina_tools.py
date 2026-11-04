@@ -272,13 +272,13 @@ async def test_run_query_passes_the_clients_answer_through():
     w = world()
     answer = await w.tool("run_query")(SALES, **RUN)
     assert answer == {
-        "columns": ["0CALMONTH", "0CALMONTH.text", "0AMOUNT", "0QUANTITY"],
+        "columns": ["0CALMONTH", "0CALMONTH.text", "0AMOUNT"],
         "rows": [
-            ["202601", "01.2026", 1200.5, 10],
-            ["202602", "02.2026", 980.0, 8],
-            ["202603", "03.2026", 1430.25, 12],
+            ["202601", "01.2026", 1200.5],
+            ["202602", "02.2026", 980.0],
+            ["202603", "03.2026", 1430.25],
         ],
-        "units": {"0AMOUNT": "EUR", "0QUANTITY": "PC"},
+        "units": {"0AMOUNT": "EUR"},
         "row_count": 3,
         "truncated": False,
     }
@@ -332,7 +332,7 @@ async def test_run_query_with_variables_end_to_end_on_the_answers_sia_gave():
 async def test_the_defaults_of_the_optional_arguments():
     w = world(row(definition=definition().model_copy(update={"variables": []})
                   .model_dump(mode="json")))
-    answer = await w.tool("run_query")(SALES, ["0AMOUNT", "0QUANTITY"], ["0CALMONTH"])
+    answer = await w.tool("run_query")(SALES, ["0AMOUNT"], ["0CALMONTH"])
     assert answer["row_count"] == 3
     request = w.sap.read_body()["Analytics"]["Definition"]
     assert "Filter" not in request and "Sort" not in request and "Variables" not in request
@@ -356,7 +356,8 @@ async def test_a_truncated_answer_says_so_with_a_hint():
     "patch, where",
     [
         ({"measures": [PROBE]}, "measures[0]"),
-        ({"measures": ["0AMOUNT", PROBE]}, "measures[1]"),
+        # Two measures are refused as such (one per run), never naming one.
+        ({"measures": ["0AMOUNT", PROBE]}, "measures"),
         ({"group_by": [PROBE]}, "group_by[0]"),
         ({"filters": [{"dimension": PROBE, "operator": "=", "value": "x"}]},
          "filters[0].dimension"),
@@ -374,6 +375,29 @@ async def test_an_unknown_name_is_refused_before_anything_is_sent(patch, where):
     # Refused on the stored description alone: no destination resolved, no
     # client built, nothing sent.
     assert w.sap.requests == [] and w.resolved == [] and w.toolset.http_clients == []
+
+
+async def test_two_measures_are_refused_before_anything_is_sent():
+    """One measure per run until the column order of several is verified on
+    SAP (every recorded grid held one); the model is told to run once per
+    measure."""
+    w = world()
+    answer = await w.tool("run_query")(SALES, **{**RUN, "measures": ["0AMOUNT", "0QUANTITY"]})
+    assert error_of(answer) == {
+        "code": "invalid_filter",
+        "message": "measures: one measure per run until the column order is verified",
+        "hint": "run the query once per measure",
+    }
+    assert w.sap.requests == [] and w.resolved == [] and w.toolset.http_clients == []
+    # One measure runs.
+    assert RUN["measures"] == ["0AMOUNT"]
+    assert (await w.tool("run_query")(SALES, **RUN))["row_count"] == 3
+
+
+def test_the_tool_description_says_one_measure_per_run():
+    description = world().toolset.tools["run_query"].function.__doc__
+    assert "measures: exactly one measure name" in description
+    assert "once per measure" in description
 
 
 async def test_a_missing_mandatory_variable_is_refused_before_anything_is_sent():

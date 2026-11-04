@@ -152,8 +152,10 @@ class signed_in:
         current_principal.reset(self._principal)
 
 
+# One measure per run (``protocol.check_caps``) until the column order of
+# several is verified on SAP.
 RUN = {
-    "measures": ["0AMOUNT", "0QUANTITY"],
+    "measures": ["0AMOUNT"],
     "group_by": ["0CALMONTH"],
     "variables": {"0P_CALYEAR": "2026"},
 }
@@ -450,7 +452,7 @@ async def test_run_without_filters_order_or_variables_sends_none_of_them():
     sap = Sap()
     sap.answers = [fixture("run_ok.json")]
     known = definition().model_copy(update={"variables": []})
-    await make(sap, known=known).run(measures=["0AMOUNT", "0QUANTITY"], group_by=["0CALMONTH"])
+    await make(sap, known=known).run(measures=["0AMOUNT"], group_by=["0CALMONTH"])
     request = sap.read_body()["Analytics"]["Definition"]
     assert "Filter" not in request and "Sort" not in request and "Variables" not in request
     assert "MaxResultRecords" not in request["ResultSetFeatureRequest"]
@@ -464,13 +466,13 @@ async def test_run_reads_rows_and_units_from_the_grid():
     sap.answers = [fixture("run_ok.json")]
     out = await make(sap, known=definition()).run(**RUN)
     assert out == {
-        "columns": ["0CALMONTH", "0CALMONTH.text", "0AMOUNT", "0QUANTITY"],
+        "columns": ["0CALMONTH", "0CALMONTH.text", "0AMOUNT"],
         "rows": [
-            ["202601", "01.2026", 1200.5, 10],
-            ["202602", "02.2026", 980.0, 8],
-            ["202603", "03.2026", 1430.25, 12],
+            ["202601", "01.2026", 1200.5],
+            ["202602", "02.2026", 980.0],
+            ["202603", "03.2026", 1430.25],
         ],
-        "units": {"0AMOUNT": "EUR", "0QUANTITY": "PC"},
+        "units": {"0AMOUNT": "EUR"},
         "row_count": 3,
         "truncated": False,
     }

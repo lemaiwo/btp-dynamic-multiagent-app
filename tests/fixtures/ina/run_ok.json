@@ -79,24 +79,22 @@
        "Attributes": [],
        "MemberTypes": {
         "Encoding": "None",
-        "Size": 2,
+        "Size": 1,
         "Values": [
-         0,
          0
         ]
        }
       }
      ],
-     "TupleCount": 2,
-     "TupleCountTotal": 2,
+     "TupleCount": 1,
+     "TupleCountTotal": 1,
      "Tuples": [
       {
        "MemberIndexes": {
         "Encoding": "None",
-        "Size": 2,
+        "Size": 1,
         "Values": [
-         0,
-         1
+         0
         ]
        }
       }
@@ -106,32 +104,26 @@
    "Cells": {
     "Values": {
      "Encoding": "None",
-     "Size": 6,
+     "Size": 3,
      "Values": [
       1200.5,
-      10,
       980.0,
-      8,
-      1430.25,
-      12
+      1430.25
      ]
     },
     "Units": {
      "Encoding": "None",
-     "Size": 6,
+     "Size": 3,
      "Values": [
       "EUR",
-      "PC",
       "EUR",
-      "PC",
-      "EUR",
-      "PC"
+      "EUR"
      ]
     }
    },
    "CellArraySizes": [
     3,
-    2
+    1
    ]
   }
  ],

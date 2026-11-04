@@ -23,7 +23,9 @@ The form is the one SIA (S/4HANA 2022, SAP_BW 757) answered on 2026-11-04
   1 a total).
 * The measure structure on Columns carries no attributes; a column's member
   index is the measure's place in the request. Seen for ONE measure only:
-  the order of several is inferred, not recorded.
+  the order of several is inferred, not recorded, so ``protocol.check_caps``
+  refuses a run of more than one measure until a probe verifies it (the
+  reader keeps its checks for several).
 * ``Cells``: ``Values.Values`` and ``Units.Values`` row-major, ``rows x
   columns`` as ``CellArraySizes`` says. A list may come wrapped in
   ``{Encoding, Size, Values}``; only ``Encoding`` ``None`` (what the request

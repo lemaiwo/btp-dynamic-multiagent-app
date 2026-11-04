@@ -47,8 +47,10 @@ stateful SAP session (``agents/ina/client.py`` sends them):
 3. :func:`close_request`, which releases the instance (SIA answered
    "Query ... has been closed").
 
-Not seen on SIA: a read of several measures (the column order is inferred),
-and variables of type interval or multiple (their reading is inferred).
+Not seen on SIA: a read of several measures (the column order would be
+inferred, so :func:`check_caps` refuses more than one measure per run until a
+probe verifies it), and variables of type interval or multiple (their
+reading is inferred).
 """
 
 from __future__ import annotations
@@ -247,7 +249,9 @@ def _wire_value(value: object, where: str) -> str:
 def check_caps(
     *, measures: Any, group_by: Any, filters: Any, top: Any, order: Any, variables: Any
 ) -> None:
-    """The checks of a run that need no description: types and caps."""
+    """The checks of a run that need no description: types and caps, one
+    measure per run among them (so the client refuses two before it reads an
+    undescribed query)."""
     for value, where, cap, kind, minimum in (
         (measures, "measures", MAX_MEASURES, "measure", 1),
         (group_by, "group_by", MAX_DIMENSIONS, "dimension", 0),
@@ -258,6 +262,16 @@ def check_caps(
             raise _refuse(where, f"at most {cap} {kind}s", "result_too_large")
         if len(value) < minimum:
             raise _refuse(where, f"at least {minimum} {kind}")
+    if len(measures) > 1:
+        # Every grid SIA answered held one measure. With several, nothing in
+        # the answer names the measure of a column (the structure comes back
+        # without attributes), so a wrong reading of the order would be wrong
+        # numbers under the right names: refused until a probe verifies it.
+        raise InaError(
+            "invalid_filter",
+            "measures: one measure per run until the column order is verified",
+            hint="run the query once per measure",
+        )
     if isinstance(top, bool) or not isinstance(top, int) or top < 1:
         raise _refuse("top", f"a whole number from 1 to {MAX_TOP}")
     if top > MAX_TOP:

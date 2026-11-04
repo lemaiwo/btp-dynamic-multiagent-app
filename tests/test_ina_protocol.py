@@ -147,6 +147,29 @@ def test_a_refused_argument_names_the_argument_and_the_rule(args, code):
         assert sent not in error.message
 
 
+ONE_MEASURE = "measures: one measure per run until the column order is verified"
+
+
+@pytest.mark.parametrize(
+    "measures",
+    [["0AMOUNT", "M1"], ["M1", "0AMOUNT"], [f"M{i}" for i in range(MAX_MEASURES)],
+     ["0AMOUNT", "0AMOUNT"], ["0AMOUNT", "0UNKNOWN"]],
+)
+def test_more_than_one_measure_is_refused_until_the_column_order_is_verified(measures):
+    """Every grid SIA answered held ONE measure; with several, nothing in the
+    answer names the measure of a column, so a wrong guess would be wrong
+    numbers under the right names. Refused until a probe verifies the order;
+    the text is fixed and names no measure."""
+    error = refused(measures=measures)
+    assert (error.code, error.message) == ("invalid_filter", ONE_MEASURE)
+    assert error.hint == "run the query once per measure"
+    assert "0UNKNOWN" not in str(error.to_dict())
+
+
+def test_one_measure_is_planned():
+    assert plan(measures=["0AMOUNT"]).measures == ["0AMOUNT"]
+
+
 def test_a_missing_mandatory_variable_is_named_from_the_definition():
     error = refused(variables={})
     assert error.code == "variable_required"

@@ -87,13 +87,13 @@ async def test_a_run_without_variables_is_the_read_and_the_close():
     sap = Sap()
     sap.answers = [fixture("run_ok.json")]
     known = definition().model_copy(update={"variables": []})
-    out = await make(sap, known=known).run(["0AMOUNT", "0QUANTITY"], ["0CALMONTH"])
+    out = await make(sap, known=known).run(["0AMOUNT"], ["0CALMONTH"])
     assert sap.kinds == ["GET", "read", "close"]
     # No submit answer named a text: the key alone is asked for, and the
     # text SAP sends anyway is not passed on.
     assert rows_of(sap.reads[0])[0]["Attributes"] == [
         {"Name": "0CALMONTH.KEY", "Obtainability": "Always"}]
-    assert out["columns"] == ["0CALMONTH", "0AMOUNT", "0QUANTITY"]
+    assert out["columns"] == ["0CALMONTH", "0AMOUNT"]
 
 
 async def test_each_run_opens_an_instance_of_its_own():

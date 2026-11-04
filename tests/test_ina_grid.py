@@ -112,8 +112,12 @@ def few(measures: int = 1, dimensions: int = 1) -> InaDefinition:
 
 
 def few_plan(measures: int, top: int, group_by: tuple[str, ...] = ("D0",)) -> RunPlan:
-    return plan_run(few(measures), measures=[f"M{i}" for i in range(measures)],
-                    group_by=list(group_by), filters=None, top=top, order=None, variables=None)
+    """``plan_run`` refuses more than one measure per run until the column
+    order is verified; the reader is still checked on several, so a plan of
+    more is made from one of one."""
+    plan = plan_run(few(measures), measures=["M0"], group_by=list(group_by), filters=None,
+                    top=top, order=None, variables=None)
+    return replace(plan, measures=[f"M{i}" for i in range(measures)])
 
 
 # ------------------------------------------------------------------ the recorded grid
@@ -245,12 +249,15 @@ def test_an_older_definition_reads_the_measures_structure():
 
 def test_the_columns_follow_the_member_indexes_of_the_measures():
     """The measure structure carries no attributes: a column's member index
-    is the measure's place in the request (seen for one measure on SIA)."""
+    is the measure's place in the request (seen for one measure on SIA; a
+    run of several is refused by ``plan_run`` until the order is verified,
+    so the plan is made by hand)."""
     payload = grid(["0CALMONTH"], [["202601"]], ["0AMOUNT", "0QUANTITY"],
                    [{"Value": 10, "Unit": "PC"}, {"Value": 1200.5, "Unit": "EUR"}])
     columns_axis(payload)["Tuples"][0]["MemberIndexes"]["Values"] = [1, 0]
-    plan = plan_run(definition(), measures=["0AMOUNT", "0QUANTITY"], group_by=["0CALMONTH"],
+    plan = plan_run(definition(), measures=["0AMOUNT"], group_by=["0CALMONTH"],
                     filters=None, top=5, order=None, variables={"0P_CALYEAR": "2026"})
+    plan = replace(plan, measures=["0AMOUNT", "0QUANTITY"])
     out = read_grid(payload, plan)
     assert out["rows"] == [["202601", 1200.5, 10]]
     assert out["units"] == {"0AMOUNT": "EUR", "0QUANTITY": "PC"}
