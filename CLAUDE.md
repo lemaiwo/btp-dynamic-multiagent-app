@@ -1258,14 +1258,19 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   registers each query (`ina_queries`, page "Analytical queries"); identity is
   per query (`destination` + `user_context`), never per agent; the agent's
   entry only names queries (`agents/db.py`). The tools are denied in ABAP
-  Assistant sessions (not in `READONLY_POLICY`). **Unit-tested only, on
-  synthetic fixtures**: the describe envelope is the one SIA accepted in the
-  2.34.0 probe (`scripts/probe_ina.py`), but the Analytics request and the
-  result grid are a best reading of the design and of a reference
-  implementation, NOT of a recorded SIA exchange (no SIA query was named for
-  this release), so the data read is unverified; the first landscape check is
-  a Describe of a dummy name, which proves transport, CSRF and the message
-  envelope by answering `query_unknown`
+  Assistant sessions (not in `READONLY_POLICY`). **Describe is verified on
+  SIA, the data read is not**: on 2026-11-04 (acc/AI, 2.37.0) two SAP CDS
+  queries on SIA/100 (S/4HANA 2022, SAP_BW 757) were registered and
+  described through an OnPremise destination, and `scripts/probe_ina.py
+  --dump` recorded the exchange (`tests/fixtures/ina/describe_sia.json` is
+  that describe answer with its session ids replaced). Every run sent so far
+  was refused by SIA with "the query can only run once all mandatory
+  variables have values" (`CX_BICS_VARIABLES_EXIST`,
+  `run_sia_variables_missing.json`), also with values for both mandatory
+  variables and with each value named by the dimension's key: the Analytics
+  request (variables, measure structure, the missing `VariableSubmit`, see
+  `protocol.py`) and the result grid are still a best reading of a reference
+  implementation, NOT of a recorded SIA grid
   - `models.py` — the save-time gate, never imports `agents.db`:
     `validate_ina_query(data)` returns the model (`InaQueryPayload`,
     `extra="forbid"`, strict strings and booleans; `definition` and
@@ -1326,7 +1331,18 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     this query`, the name sent never echoed; a mandatory variable left out is
     `variable_required`), `read_description` (labels cut to 120, units to
     32, a name the gate would refuse or a repeat skipped and counted, more
-    than 100/100/50 sets `truncated`) and `read_grid` (`{columns, rows, units,
+    than 100/100/50 sets `truncated`; **a variable is mandatory** when
+    `Mandatory` (boolean, `1`, `"X"`) or `InputType` (`Mandatory`,
+    `MandatoryNotInitial`; SIA's spelling, `Mandatory` is absent there) says
+    so, optional only when every marker it carries was read and says
+    optional; no marker, or an `InputType` of another value or type, is
+    mandatory with one WARNING naming the variable's position, never its
+    name: read as optional, the Test sent a run SIA refused; the selection
+    type comes from `SelectionType`, else `FilterCapability.ComparisonGroup`
+    (`Interval` / `Range`: interval) and `MultipleValues` (exactly `true`:
+    multiple), never from `VariableType`, which on SIA is
+    `DimensionMemberVariable` / `SimpleTypeVariable`) and `read_grid`
+    (`{columns, rows, units,
     row_count, truncated}`; a `<dim>.text` column when SAP sent a text other
     than the key, a `<measure>.unit` column when the unit differs per row).
     **The real SIA grid shape is UNVERIFIED**: `read_grid` reads
@@ -1335,8 +1351,23 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     (`Cells.Values.Values`, `MemberIndexes`) instead. A shape the reader does
     not know is `sap_error` ("a form this client does not read"), and a cell
     without a `Value` key is never read as null: it fails closed, never
-    leaks. Record one describe and one run on SIA (`scripts/probe_ina.py`)
-    before a pilot and adapt `read_grid` / `read_description` then
+    leaks. **What SIA showed (2026-11-04, `docs/evidence/2026-11-04-ina-sia/`,
+    local)**: the measure structure is `DimensionType` 2 under a generated
+    name (`ELTUIDSTRCMMPURORDQUERY`), not `Measures`, which `analytics_request`
+    still sends on `Columns`; a describe states each variable's default as
+    `Values.Selection.SetOperand` with `FieldName` = the key of the variable's
+    dimension (`DimensionReference.Name` + `.KEY`), while `plan_run` names the
+    variable itself; SAP's own InA client (firefly in SAPUI5's
+    `sap/sac/df/firefly`) sends the variables first as a `VariableSubmit` (a
+    copy of the read with `ProcessingDirectives: {ProcessingStep:
+    "VariableSubmit"}`, the same `DataSource.InstanceId`), which SIA accepted
+    (`ServerState` 0, derived variables filled; the `Batch` of submit and read
+    was answered with the submit's `Cube` alone). A default in the describe
+    does not make a run without the submit pass. Next: one authorised probe
+    run with `--submit separate --variable-form sap --structure <name>`
+    (variables named in the `--variable` flags), then adapt
+    `analytics_request` (and store the structure name and each variable's
+    dimension key with the definition) and `read_grid` to the recorded grid
   - `tools.py` — `ina_toolset(...)` (the factory of `agents/builtins.py`,
     `queries=` the snapshot of registered queries the registry loaded;
     `attached_queries` is the one selection; no usable query is
@@ -1421,8 +1452,12 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   Tests: `tests/test_ina_models.py`, `test_ina_client.py`,
   `test_ina_protocol.py`, `test_ina_sessions.py`, `test_ina_tools.py`,
   `test_ina_registration.py`, `test_ina_db.py`, `test_ina_admin.py`,
-  `test_ina_bundles.py` (fixtures in `tests/fixtures/ina/`, synthetic, placeholder
-  names). Never run against a real SIA query
+  `test_ina_bundles.py`, `test_probe_ina.py` (the probe's run body held to
+  `analytics_request`); fixtures in `tests/fixtures/ina/`, synthetic with
+  placeholder names except `describe_sia.json` (SIA's describe of
+  2CCMMPURORDQUERY, session ids replaced) and `run_sia_variables_missing.json`
+  (SIA's refusal of a run). Describe has run against SIA; no run has returned
+  a grid yet
 - `agents/data_catalog/` — the **data catalogue graph** (design addendum j, part 1):
   one graph of every data source attached to at least one enabled agent, built once
   and scoped at query time, so an agent finds the right source without a prompt that
@@ -3122,7 +3157,15 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   table, column or HANA generation. A landscape that sets `PG_SCHEMA` and still has
   this app's tables in `public` needs `PG_SCHEMA_ADOPT: true` (or `false`) in its
   `.mtaext` before deploying 2.37.0, and `true` removed again (or set `false`) in
-  the deploy after the one that moved the tables
+  the deploy after the one that moved the tables; 2.37.1 is the fix of the first
+  real InA exchange on SIA (acc/AI, 2026-11-04): `read_description` reads SIA's
+  mandatory marker (`InputType`) and selection type, so the admin Test of a query
+  with a mandatory variable answers 422 `variable_required` before anything is
+  sent instead of SAP's refusal (an already described query needs one Describe
+  again to store the flags); `scripts/probe_ina.py` records the raw exchange
+  (`--dump`, `--run`, `--variable`); no new resource, environment variable, table,
+  column or HANA generation. The data read on SIA is still not working: a run is
+  refused until the variables are submitted first (see `agents/ina/protocol.py`)
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets
