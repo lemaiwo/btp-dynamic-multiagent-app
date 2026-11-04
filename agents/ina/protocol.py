@@ -49,8 +49,10 @@ stateful SAP session (``agents/ina/client.py`` sends them):
 
 Not seen on SIA: a read of several measures (the column order would be
 inferred, so :func:`check_caps` refuses more than one measure per run until a
-probe verifies it), and variables of type interval or multiple (their
-reading is inferred).
+probe verifies it), a ``Filter`` or a ``Sort`` (no recorded request held
+one; the submit carries them too), and variables of type interval or
+multiple (their reading is inferred). The requests are those the probe
+sent; this module's own sequence has not run against the system yet.
 """
 
 from __future__ import annotations

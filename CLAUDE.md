@@ -1266,12 +1266,24 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   text, amount, count and session id replaced): **verified** are Describe
   (the `InputType` mandatory marker, the generated measure-structure name,
   each variable's dimension key), the three requests of a run on one
-  `InstanceId` (VariableSubmit, read, Close), the grid shape and the Close.
-  **Not seen**: a read of several measures (their column order is
-  inferred), variables of type interval or multiple ("inferred, not seen":
-  every recorded variable was a single value), a query without variables (no
-  submit, so the read asks for keys only), a cell with an exception (refused,
-  not read as null)
+  `InstanceId` (VariableSubmit, read, Close) as the probe sent them, and the
+  grid shape SAP answered them with; the run sequence and the grid reader of
+  the app are built on those recorded answers. **Not seen on the system**:
+  the app's own client end to end (only the probe's sequence ran there; the
+  cookie merge, the 403 redo, the Close and the texts taken from the submit
+  answer are unit-tested only), `filters` and `order` (no recorded request
+  held a `Filter` or a `Sort`; the submit carries them too), a read of
+  several measures (their column order would be inferred, so a run takes
+  ONE measure until a probe verifies it), variables of type interval or
+  multiple ("inferred, not seen": every recorded variable was a single
+  value), a query without variables (no submit, so the read asks for keys
+  only), a value SAP marks (refused, not read as null). The first data read
+  by the app, one filtered and one ordered read among it, is pending on a
+  landscape. **A version before 2.37.1 refuses a definition that holds
+  `measure_structure` or `key_field`** (`extra="forbid"`): after a rollback,
+  or in a database of an older version (`scripts/copy_registry_config.py`),
+  such a row reads back as not described until Describe runs there again,
+  and an HTTP bundle import of it into an older version fails as a whole
   - `models.py` — the save-time gate, never imports `agents.db`:
     `validate_ina_query(data)` returns the model (`InaQueryPayload`,
     `extra="forbid"`, strict strings and booleans; `definition` and
@@ -1332,9 +1344,14 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     deadline of `CALL_DEADLINE_SECONDS` (120, `asyncio.timeout` with
     `expired()`) for a describe and for a run's whole sequence, a 407 body
     never read. **Caps** (refused before anything is sent, never cut): 20
-    dimensions, 20 measures, 30 filters, `top` ≤ 2,000 (default 100), 10
-    order terms, 50 `in` values, 255 characters per value; 5,000 cells
-    counted on what is returned. `RowTo` is `top + 1`: the extra row is not
+    dimensions, ONE measure per run (`check_caps`, also before an
+    undescribed query is read: `invalid_filter` "measures: one measure per
+    run until the column order is verified", hint "run the query once per
+    measure"; every recorded grid held one measure and nothing in the answer
+    names the measure of a column, so a wrong order would be wrong numbers
+    under the right names; `MAX_MEASURES` 20 stays behind it), 30 filters,
+    `top` ≤ 2,000 (default 100), 10 order terms, 50 `in` values, 255
+    characters per value; 5,000 cells counted on what is returned. `RowTo` is `top + 1`: the extra row is not
     returned; `truncated` is `TupleCountTotal > top`; more than `top + 1`
     rows is `result_too_large`. Every failure is an `InaError` from
     the closed `ERROR_CODES` of `errors.py` (`destination_error`,
@@ -1397,14 +1414,23 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     list is read only with `Encoding` `None`. Answers `{columns, rows,
     units, row_count, truncated}` (a `<dim>.text` column when a text that
     differs from the key came back, a `<measure>.unit` column when the unit
-    differs per row). **Fail-closed**, `sap_error` with one fixed text for:
-    axes, dimensions or tuples that do not match the request, a member
-    index out of range, a key that is no string or has an exception, a
-    member of type 1 (a total) or any other type, a structure with
-    attributes, sizes that do not add up, a cell that is not a finite number
-    or carries an exception (never read as null). More than `top + 1` rows
-    or more than 5,000 returned cells is `result_too_large`, never cut. Only
-    the requested key, text, value and unit leave
+    differs per row). **Fail-closed**, `sap_error` with one fixed text
+    (`UNREADABLE`) for a form it does not know, checked on everything SAP
+    sent, the extra row included: axes, dimensions or tuples that do not
+    match the request, a member index out of range, a key that is no string,
+    a member of type 1 (a total) or any other type, a structure with
+    attributes, sizes that do not add up, a cell that is neither a finite
+    number, null nor text. A value SAP marks or sends as no number (a key's
+    `ValuesException` or a cell's `Exceptions` other than 0, a null or a
+    text cell) is `sap_error` with a text of its own (`VALUE_REFUSED`, ending
+    "tell the user instead of retrying"), never read as null, and only in a
+    row that is returned (the `top + 1`-th row is checked for its form
+    alone; a marked member's key and text are not read). More than `top + 1`
+    rows or more than 5,000 returned cells is `result_too_large`, never cut.
+    Every refusal logs ONE WARNING `ina: grid refused: <reason> (count=n)`,
+    a key of the closed list `REFUSAL_REASONS` and a count made by the
+    reader, never a value. Only the requested key, text, value and unit
+    leave
   - `tools.py` — `ina_toolset(...)` (the factory of `agents/builtins.py`,
     `queries=` the snapshot of registered queries the registry loaded;
     `attached_queries` is the one selection; no usable query is
@@ -1413,7 +1439,8 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     ones in entry order; no destination, InA name or member),
     `describe_query(query)` (from the stored description only, never SAP;
     `key_field` left out) and `run_query(query, measures, group_by,
-    filters=None, top=100, order=None, variables=None)` (arguments checked by
+    filters=None, top=100, order=None, variables=None)` (`measures` a list of
+    exactly one, as its description says; arguments checked by
     `plan_run` before a client or resolver is built; `truncated` adds the
     hint to narrow the filters or raise `top`). A name the entry does not
     hold, or holds disabled, is `query_unknown` without the name sent; a
@@ -3205,12 +3232,18 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   sent instead of SAP's refusal (an already described query needs one Describe
   again to store the flags); `scripts/probe_ina.py` records the raw exchange
   (`--dump`, `--run`, `--variable`); no new resource, environment variable, table,
-  column or HANA generation. The same release reads data: a run is the
-  VariableSubmit, the read (each row dimension asks for its key and text and
-  hides its totals) and a Close on one query instance, and the grid is read in the
-  recorded `Version2` columnar form (`agents/ina/grid.py`, fail-closed); a query
-  described before needs one Describe again so its measure structure and its
-  variables' dimension keys are stored
+  column or HANA generation. The same release builds the run sequence and the
+  grid reader on the recorded answers: a run is the VariableSubmit, the read
+  (each row dimension asks for its key and text and hides its totals) and a
+  Close on one query instance, and the grid is read in the recorded `Version2`
+  columnar form (`agents/ina/grid.py`, fail-closed); the first data read by the
+  app itself is pending on the landscape. Not seen on the system: the app's own
+  client end to end (only the probe's sequence ran there), `filters` and
+  `order`, several measures (refused for now: one measure per run), interval
+  and multiple variables. A query described before needs one Describe again so
+  its measure structure and its variables' dimension keys are stored; a version
+  before 2.37.1 refuses a definition that holds them (`extra="forbid"`: a row
+  reads back as not described there, an HTTP bundle import fails as a whole)
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets

@@ -20,15 +20,18 @@ The protocol (design addendum (k), part 2 point 2, and what SIA parsed for
   ``Metadata`` request for :meth:`InaClient.describe`, and for
   :meth:`InaClient.run` three ``Analytics`` requests on one query instance
   (``DataSource.InstanceId``, ``ina`` and 16 random hex digits per run), as
-  SIA answered them on 2026-11-04: a VariableSubmit when the run has
-  variables (SIA takes values only so), the read, and a Close that releases
-  the instance. All carry ``Options: ["StatefulServer"]``: the InA state
+  SIA answered them on 2026-11-04 when ``scripts/probe_ina.py`` sent them
+  (this client's own sequence has not run there yet): a VariableSubmit when
+  the run has variables (SIA takes values only so), the read, and a Close
+  that releases the instance. All carry ``Options: ["StatefulServer"]``: the InA state
   lives in the SAP session the cookie names. The cookies an answer sets join
   the session for the next request of the run and for later calls; the read
   asks for the text attribute of each row dimension the submit answer named
   (``protocol.text_attributes``). The Close is best effort: sent also after
   a failed submit or read, never the run's failure, logged by exception
-  class only, and not sent once the run's deadline is spent.
+  class only, and not sent once the run's deadline is spent or while the
+  caller is being cancelled (the instance then lives until ICF ends the SAP
+  session).
 
 Whose session it is. The token and the cookies ARE a SAP session of the
 identity the destination signed in as, so they live in the
