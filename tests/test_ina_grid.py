@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -345,42 +346,213 @@ MANGLES: dict[str, Callable[[dict], None]] = {
 }
 
 
+# The reason key each refusal logs (``ina: grid refused: <reason> (count=n)``).
+REASON_OF = {
+    "no grids": "grids",
+    "empty grids": "grids",
+    "two grids": "grids",
+    "a grid that is no object": "not_an_object",
+    "one axis": "axes",
+    "a third axis": "axes",
+    "an axis of another type": "axes",
+    "a row dimension missing": "dimensions",
+    "another row dimension": "dimensions",
+    "a row dimension twice": "dimensions",
+    "a tuple list missing": "row_tuples",
+    "tuple count that is no number": "tuple_count",
+    "a negative tuple count": "tuple_count",
+    "a total below the count": "tuple_count",
+    "a total that is text": "tuple_count",
+    "fewer member indexes than tuples": "row_tuples",
+    "a member index out of range": "member_index",
+    "a negative member index": "member_index",
+    "a member index that is text": "member_index",
+    "a member index that is a boolean": "member_index",
+    "an encoded list": "row_tuples",
+    "a size that does not match": "row_tuples",
+    "no key attribute": "key_attribute",
+    "a key that is no string": "key_form",
+    "a key with an exception": "key_exception",
+    "a key without its exceptions": "key_exception_list",
+    "fewer key exceptions than keys": "key_exception_list",
+    "a text that is no string": "text_form",
+    "fewer texts than keys": "text_form",
+    "an attribute twice": "attributes",
+    "a total member": "member_type",
+    "a member of another type": "member_type",
+    "no member types": "member_type_list",
+    "another measure structure": "structure",
+    "a structure with attributes": "structure_attributes",
+    "a total column": "member_type",
+    "more columns than measures": "columns",
+    "a column of no requested measure": "columns",
+    "no cell sizes": "cell_sizes",
+    "cell sizes that do not match": "cell_sizes",
+    "cell sizes of other rows": "cell_sizes",
+    "a cell missing": "cells",
+    "no cell values": "cells",
+    "a null cell": "cell_null",
+    "a cell that is text": "cell_text",
+    "a cell that is a boolean": "cell_form",
+    "a cell that is not a number": "cell_form",
+    "an infinite cell": "cell_form",
+    "a cell with an exception": "cell_exception",
+    "a unit that is no string": "units",
+    "fewer units than cells": "units",
+}
+VALUE_LEVEL = {"cell_exception", "cell_null", "cell_text", "key_exception"}
+LOG_LINE = re.compile(r"ina: grid refused: ([a-z_]+) \(count=(\d+)\)")
+
+
+def logged_refusal(caplog: pytest.LogCaptureFixture) -> tuple[str, int]:
+    """The one WARNING the refusal logged: its reason key and count. The line
+    holds nothing else, so no value of the answer."""
+    (record,) = [r for r in caplog.records if r.name == "agents.ina.grid"]
+    assert record.levelname == "WARNING"
+    match = LOG_LINE.fullmatch(record.getMessage())
+    assert match, record.getMessage()
+    return match.group(1), int(match.group(2))
+
+
+def test_every_mangle_names_a_reason_of_the_closed_list():
+    assert set(REASON_OF) == set(MANGLES)
+    assert set(REASON_OF.values()) <= set(ina_grid.REFUSAL_REASONS)
+    assert VALUE_LEVEL == set(ina_grid.VALUE_REASONS)
+
+
+def test_a_reason_outside_the_list_cannot_be_logged():
+    with pytest.raises(ValueError):
+        ina_grid._refused("not_a_reason")
+
+
 @pytest.mark.parametrize("mangle", list(MANGLES), ids=list(MANGLES))
-def test_a_grid_this_reader_does_not_know_is_sap_error(mangle):
+def test_a_grid_this_reader_does_not_know_is_sap_error(mangle, caplog):
     payload = fixture("run_sia_grid.json")
     MANGLES[mangle](payload)
-    error = refused(payload, sia_plan())
+    with caplog.at_level("INFO", logger="agents.ina.grid"):
+        error = refused(payload, sia_plan())
     assert error.code == "sap_error"
-    shown = json.dumps(error.to_dict())
+    reason, _count = logged_refusal(caplog)
+    assert reason == REASON_OF[mangle]
+    # A value SAP marked or left out has its own text; a form this reader
+    # does not know has the one fixed text.
+    if reason in VALUE_LEVEL:
+        assert error.message == ina_grid.VALUE_REFUSED
+        assert error.message.endswith(f"; {protocol.TELL_THE_USER}")
+    else:
+        assert error.message == protocol.UNREADABLE
+    shown = json.dumps(error.to_dict()) + caplog.text
     for value in DATA:
         assert value not in shown
 
 
 @pytest.mark.parametrize("payload", [None, [], "x", {"Grids": "x"}, {"Grids": [{}]}])
-def test_an_answer_without_a_grid_is_sap_error(payload):
-    assert refused(payload, sia_plan()).code == "sap_error"
+def test_an_answer_without_a_grid_is_sap_error(payload, caplog):
+    with caplog.at_level("INFO", logger="agents.ina.grid"):
+        assert refused(payload, sia_plan()).code == "sap_error"
+    assert logged_refusal(caplog)[0] == ("axes" if payload == {"Grids": [{}]} else "grids")
 
 
-def test_more_rows_than_top_plus_one_is_result_too_large():
-    error = refused(fixture("run_sia_grid.json"), sia_plan(top=2))
+EXTRA = 3  # run_sia_grid.json: RowTo 4 = top 3 + 1; row 4 is not returned
+
+
+@pytest.mark.parametrize(
+    ("mangle", "reason", "count"),
+    [
+        (lambda g: cells(g).__setitem__(
+            "Exceptions", {"Encoding": "None", "Size": 4, "Values": [2, 0, 1, EXTRA]}),
+         "cell_exception", 2),
+        (lambda g: VALUES(g)["Values"].__setitem__(slice(0, 2), [None, None]), "cell_null", 2),
+        (lambda g: VALUES(g)["Values"].__setitem__(1, "n/a"), "cell_text", 1),
+        (lambda g: KEY(g)["ValuesException"].__setitem__(slice(1, 3), [1, 2]),
+         "key_exception", 2),
+    ],
+    ids=["cell exceptions", "null cells", "text cell", "key exceptions"],
+)
+def test_a_value_level_refusal_counts_the_returned_cells_it_found(mangle, reason, count, caplog):
+    payload = fixture("run_sia_grid.json")
+    mangle(payload)
+    with caplog.at_level("INFO", logger="agents.ina.grid"):
+        error = refused(payload, sia_plan())
+    assert (error.code, error.message) == ("sap_error", ina_grid.VALUE_REFUSED)
+    assert logged_refusal(caplog) == (reason, count)
+
+
+@pytest.mark.parametrize(
+    "mangle",
+    [
+        lambda g: cells(g).__setitem__(
+            "Exceptions", {"Encoding": "None", "Size": 4, "Values": [0, 0, 0, 1]}),
+        lambda g: VALUES(g)["Values"].__setitem__(EXTRA, None),
+        lambda g: VALUES(g)["Values"].__setitem__(EXTRA, "n/a"),
+        # The extra row's supplier is a member of its own: marked, no key.
+        lambda g: (KEY(g)["ValuesException"].__setitem__(EXTRA, 1),
+                   KEY(g)["Values"].__setitem__(EXTRA, None),
+                   TEXT(g)["Values"].__setitem__(EXTRA, None)),
+    ],
+    ids=["cell exception", "null cell", "text cell", "key exception"],
+)
+def test_a_value_mark_in_the_row_that_is_not_returned_does_not_refuse(mangle, caplog):
+    """The (top+1)-th row only says "there is more": its values are never
+    returned, so it is checked for its form alone."""
+    payload = fixture("run_sia_grid.json")
+    mangle(payload)
+    with caplog.at_level("INFO", logger="agents.ina.grid"):
+        out = read_grid(payload, sia_plan())
+    assert (out["row_count"], out["truncated"]) == (3, True)
+    assert [row[-1] for row in out["rows"]] == [125.5, 2400.0, 310.25]
+    assert not [r for r in caplog.records if r.name == "agents.ina.grid"]
+
+
+@pytest.mark.parametrize(
+    ("mangle", "reason"),
+    [
+        (lambda g: VALUES(g)["Values"].__setitem__(EXTRA, True), "cell_form"),
+        (lambda g: VALUES(g)["Values"].__setitem__(EXTRA, {"Value": 1}), "cell_form"),
+        (lambda g: KEY(g)["Values"].__setitem__(EXTRA, 104), "key_form"),
+        (lambda g: KEY(g)["ValuesException"].__setitem__(EXTRA, "1"), "key_exception_list"),
+        (lambda g: cells(g).__setitem__(
+            "Exceptions", {"Encoding": "None", "Size": 4, "Values": [0, 0, 0, None]}),
+         "cell_exception_list"),
+    ],
+    ids=["boolean cell", "object cell", "key no text", "exception no number",
+         "cell exception no number"],
+)
+def test_the_row_that_is_not_returned_is_still_checked_for_its_form(mangle, reason, caplog):
+    payload = fixture("run_sia_grid.json")
+    mangle(payload)
+    with caplog.at_level("INFO", logger="agents.ina.grid"):
+        error = refused(payload, sia_plan())
+    assert (error.code, error.message) == ("sap_error", protocol.UNREADABLE)
+    assert logged_refusal(caplog)[0] == reason
+
+
+def test_more_rows_than_top_plus_one_is_result_too_large(caplog):
+    with caplog.at_level("INFO", logger="agents.ina.grid"):
+        error = refused(fixture("run_sia_grid.json"), sia_plan(top=2))
     assert error.code == "result_too_large"
+    assert logged_refusal(caplog) == ("too_many_rows", 4)
 
 
-def test_a_member_table_longer_than_the_rows_asked_for_is_sap_error():
+def test_a_member_table_longer_than_the_rows_asked_for_is_sap_error(caplog):
     payload = fixture("run_sia_grid.json")
     key_attribute(payload)["Values"] += ["X"] * 4
     key_attribute(payload)["ValuesException"] += [0] * 4
     text_attribute(payload)["Values"] += ["X"] * 4
     rows_axis(payload)["Dimensions"][1]["MemberTypes"]["Values"] += [0] * 4
     rows_axis(payload)["Dimensions"][1]["MemberTypes"]["Size"] = 8
-    assert refused(payload, sia_plan()).code == "sap_error"
+    with caplog.at_level("INFO", logger="agents.ina.grid"):
+        assert refused(payload, sia_plan()).code == "sap_error"
+    assert logged_refusal(caplog) == ("members", 8)
 
 
-def test_a_grid_of_more_than_max_cells_is_result_too_large_never_cut():
+def test_a_grid_of_more_than_max_cells_is_result_too_large_never_cut(caplog):
     rows = [[f"R{i}"] for i in range(MAX_CELLS // 3 + 1)]
     payload = grid(["D0"], rows, ["M0", "M1", "M2"],
                    [{"Value": i} for i in range(len(rows) * 3)])
-    assert refused(payload, few_plan(3, top=MAX_TOP)).code == "result_too_large"
+    with caplog.at_level("INFO", logger="agents.ina.grid"):
+        assert refused(payload, few_plan(3, top=MAX_TOP)).code == "result_too_large"
+    assert logged_refusal(caplog) == ("too_many_cells", len(rows) * 3)
 
 
 def test_a_grid_of_exactly_max_cells_is_read():
