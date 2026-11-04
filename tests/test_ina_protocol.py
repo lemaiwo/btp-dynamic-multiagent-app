@@ -330,7 +330,7 @@ def test_the_sia_definition_refuses_a_run_without_the_mandatory_values():
 def test_the_spellings_of_input_type(value, mandatory, caplog):
     cube = sia_cube()
     cube["Variables"][0]["InputType"] = value
-    with caplog.at_level("WARNING", logger="agents.ina.protocol"):
+    with caplog.at_level("WARNING", logger="agents.ina.description"):
         assert read_description(cube).definition.variables[0].mandatory is mandatory
     assert caplog.records == []
 
@@ -339,7 +339,7 @@ def test_the_spellings_of_input_type(value, mandatory, caplog):
 def test_an_input_type_that_cannot_be_read_is_mandatory_and_logged(value, caplog):
     cube = sia_cube()
     cube["Variables"][2]["InputType"] = value  # an optional one: not silently kept so
-    with caplog.at_level("WARNING", logger="agents.ina.protocol"):
+    with caplog.at_level("WARNING", logger="agents.ina.description"):
         variables = read_description(cube).definition.variables
     assert variables[2].mandatory is True
     assert [r.getMessage() for r in caplog.records] == [
@@ -351,7 +351,7 @@ def test_an_input_type_that_cannot_be_read_is_mandatory_and_logged(value, caplog
 def test_a_variable_without_any_marker_is_mandatory_and_named_by_position_only(caplog):
     cube = sia_cube()
     del cube["Variables"][4]["InputType"]
-    with caplog.at_level("WARNING", logger="agents.ina.protocol"):
+    with caplog.at_level("WARNING", logger="agents.ina.description"):
         variables = read_description(cube).definition.variables
     assert variables[4].mandatory is True
     (record,) = caplog.records
