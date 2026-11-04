@@ -193,6 +193,38 @@ class DatabaseTarget:
     ssl_ca: str | None = field(default=None, repr=False)
     # SAP HANA only: the design-time user that deploys the tables.
     hdi: hana_hdi.HdiCredentials | None = field(default=None, repr=False)
+    # PostgreSQL only: the schema of our own (``PG_SCHEMA``), the connection's
+    # whole ``search_path``; ``None`` is ``public`` as before.
+    schema: str | None = None
+
+
+# ``PG_SCHEMA``: the name of a schema this app's tables live in, for a
+# Postgres instance shared with another app whose table names collide with
+# ours (EC shares its one free instance with sap-mcp-server-BC, which owns
+# ``chat_conversations`` and ``chat_messages``). The validated name is the
+# only text ever interpolated into the DDL of ``_adopt_schema``.
+PG_SCHEMA_RE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
+RESERVED_SCHEMAS = frozenset({"public", "pg_catalog", "information_schema"})
+PG_SCHEMA_RULE = (
+    "PG_SCHEMA must be a lower-case name of letters, digits and underscores, "
+    "at most 63 characters, not a reserved schema"
+)
+
+
+def _schema_setting() -> str | None:
+    """The schema ``PG_SCHEMA`` names, ``None`` when blank or unset.
+
+    Refused, without repeating the value, when it is not a plain lower-case
+    identifier (never trimmed or lower-cased: a repaired name would differ
+    from what the operator typed elsewhere) or names a schema of Postgres's
+    own.
+    """
+    value = os.environ.get("PG_SCHEMA", "")
+    if not value.strip():
+        return None
+    if not PG_SCHEMA_RE.fullmatch(value) or value in RESERVED_SCHEMAS or value.startswith("pg_"):
+        raise DatabaseConfigError(PG_SCHEMA_RULE)
+    return value
 
 
 def _on_cloud_foundry() -> bool:
@@ -309,6 +341,7 @@ def _postgres_target(creds: dict[str, Any]) -> DatabaseTarget:
         url.render_as_string(hide_password=False),
         "postgres",
         ssl_ca=ssl_ca,
+        schema=_schema_setting(),
     )
 
 
@@ -401,7 +434,7 @@ def _target_from_url(url: str, *, on_cf: bool = False) -> DatabaseTarget:
     elif url.startswith("postgresql://") and "+asyncpg" not in url:
         url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
     if url.startswith("postgresql"):
-        return DatabaseTarget(url, "postgres")
+        return DatabaseTarget(url, "postgres", schema=_schema_setting())
     if not url.startswith("sqlite"):
         return DatabaseTarget(url, "other")
     if on_cf:
@@ -435,8 +468,19 @@ def _resolve_database() -> DatabaseTarget:
     A bound service wins over ``DATABASE_URL``; which of two bound kinds is
     :func:`_choose_kind`. Locally ``DATABASE_URL`` names PostgreSQL, SAP
     HANA (``hana://`` or ``hana+aiohdbcli://``) or SQLite, and without it a
-    SQLite file is used.
+    SQLite file is used. ``PG_SCHEMA`` set while the choice is not
+    PostgreSQL (a HANA binding, a HANA or SQLite URL, the local fallback) is
+    a ``DatabaseConfigError``: whoever set it meant Postgres.
     """
+    target = _resolve_database_unchecked()
+    if target.kind != "postgres" and _schema_setting():
+        raise DatabaseConfigError(
+            "PG_SCHEMA applies to PostgreSQL only; this process resolved another database"
+        )
+    return target
+
+
+def _resolve_database_unchecked() -> DatabaseTarget:
     on_cf = _on_cloud_foundry()
     vcap = os.environ.get("VCAP_SERVICES")
     if vcap:
@@ -488,6 +532,10 @@ def _engine_settings(target: DatabaseTarget) -> tuple[str, dict[str, Any]]:
         # asyncpg expects ssl via connect_args, not URL; strip & pass through
         url, _, _query = url.partition("?")
         connect_args["ssl"] = _build_ssl_context(target.ssl_ca)
+    if target.kind == "postgres" and target.schema:
+        # The schema alone: with ``public`` behind it a name would resolve
+        # to the other app's table there, the very collision this avoids.
+        connect_args["server_settings"] = {"search_path": target.schema}
     elif target.kind == "hana" and target.ssl_ca:
         # The binding's CA as the trust store, in memory and out of the URL.
         # Encryption and validation themselves are in the URL (_HANA_TLS).

@@ -53,7 +53,7 @@ HANA = {"hana": [{"plan": "hdi-shared", "credentials": {
 def env(monkeypatch):
     """A clean database environment; returns a setter for it."""
     for name in ("VCAP_SERVICES", "VCAP_APPLICATION", "DATABASE_URL", "DB_KIND",
-                 "HANA_HDI_USER", "HANA_HDI_PASSWORD"):
+                 "HANA_HDI_USER", "HANA_HDI_PASSWORD", "PG_SCHEMA"):
         monkeypatch.delenv(name, raising=False)
 
     def set_(**values):
