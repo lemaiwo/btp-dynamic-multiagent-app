@@ -23,14 +23,26 @@ credential-masked (``agents.errors.mask_text``) and cut at 500 characters.
 Every refusal is an ``InaError`` that names the argument and the rule, never
 a value the caller sent.
 
-Not verified against a landscape (the fixtures in ``tests/fixtures/ina/``
-are synthetic): the measure structure's name, the sort, variable and
-comparison forms of the request, and the shape of the result grid. Each is
-built or read in one place here for the first run on SIA to correct.
+The describe side is verified against SIA (S/4HANA 2022, SAP_BW 757;
+``tests/fixtures/ina/describe_sia.json``, recorded 2026-11-04): the
+``Cube`` with its ``Dimensions`` (the measure structure is ``DimensionType``
+2 under a generated name, its members keyed ``<structure>.KEY``), and the
+``Variables``, which say "mandatory" as ``InputType`` and their values as
+``MultipleValues`` / ``FilterCapability.ComparisonGroup``. Not verified
+against a landscape (``describe_ok.json`` and ``run_ok.json`` are
+synthetic): the request of a run and the shape of the result grid. What SIA
+answered to the run as built here, also with values for its mandatory
+variables: "the query can only run once all mandatory variables have
+values" (``run_sia_variables_missing.json``); SAP's own InA client submits
+the variables first (``ProcessingDirectives.ProcessingStep``
+``VariableSubmit`` on one ``InstanceId``), and names each value by the key
+of the variable's dimension, not by the variable. Each is built or read in
+one place here for the next recorded run to correct.
 """
 
 from __future__ import annotations
 
+import logging
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -104,6 +116,8 @@ _UNKNOWN_QUERY = re.compile(
 _DROPPED = frozenset({"Cc", "Cf", "Cs", "Co", "Zl", "Zp"})
 
 _NAME = TypeAdapter(InaName)
+
+logger = logging.getLogger(__name__)
 
 UNREADABLE = "the answer of SAP has a form this client does not read"
 TELL_THE_USER = "tell the user instead of retrying"
@@ -220,11 +234,25 @@ class InaDescription:
 
 
 def _variable_type(raw: dict[str, Any]) -> str:
-    kind = raw.get("SelectionType") or raw.get("VariableType")
-    low = kind.lower() if isinstance(kind, str) else ""
-    if "interval" in low:
+    """The values a variable takes: ``SelectionType`` when the answer has
+    one; else SIA's form, ``FilterCapability.ComparisonGroup`` (``Interval``
+    or ``Range`` is an interval, ``SingleValue`` one value) and
+    ``MultipleValues`` (exactly ``true``: several). ``VariableType`` says what
+    kind of variable it is (``DimensionMemberVariable``,
+    ``SimpleTypeVariable``), not what it takes, and decides nothing."""
+    kind = raw.get("SelectionType")
+    if isinstance(kind, str):
+        low = kind.lower()
+        if "interval" in low:
+            return "interval"
+        if "multi" in low:
+            return "multiple"
+        return "single"
+    capability = raw.get("FilterCapability")
+    group = capability.get("ComparisonGroup") if isinstance(capability, dict) else None
+    if group in ("Interval", "Range"):
         return "interval"
-    if "multi" in low:
+    if raw.get("MultipleValues") is True:
         return "multiple"
     return "single"
 
@@ -237,6 +265,46 @@ def _is_mandatory(value: object) -> bool:
     if isinstance(value, int):
         return value == 1
     return isinstance(value, str) and value.strip().lower() in ("x", "true")
+
+
+# SIA's spelling (and SAP's InA client's): ``InputType``.
+_INPUT_TYPES = {"mandatory": True, "mandatorynotinitial": True, "optional": False}
+
+
+def _variable_is_mandatory(raw: dict[str, Any], position: int) -> bool:
+    """Whether SAP demands a value for the variable ``raw``.
+
+    Two markers are known: ``Mandatory`` (the boolean, ``1`` or ``"X"`` of
+    :func:`_is_mandatory`; any value of the key is read) and ``InputType``
+    (``Mandatory``, ``MandatoryNotInitial`` or ``Optional``, as SIA sends it).
+    A variable is mandatory when either says so, and optional only when
+    every marker it carries was read and says optional. A variable with no
+    marker, or an ``InputType`` of another value or type, is mandatory, with
+    one WARNING that names its position in SAP's list, not its name: read as
+    optional, a run without it would be sent and refused by SAP, and the
+    Test could not tell the admin beforehand.
+    """
+    verdicts: list[bool] = []
+    unreadable = False
+    if "Mandatory" in raw:
+        verdicts.append(_is_mandatory(raw["Mandatory"]))
+    if "InputType" in raw:
+        value = raw["InputType"]
+        verdict = _INPUT_TYPES.get(value.strip().lower()) if isinstance(value, str) else None
+        if verdict is None:
+            unreadable = True
+        else:
+            verdicts.append(verdict)
+    if any(verdicts):
+        return True
+    if verdicts and not unreadable:
+        return False
+    logger.warning(
+        "ina: variable %d of the description carries no mandatory marker this client "
+        "reads; read as mandatory",
+        position,
+    )
+    return True
 
 
 def _is_measure_structure(raw: dict[str, Any]) -> bool:
@@ -252,7 +320,9 @@ def read_description(cube: object) -> InaDescription:
     an ``InaDefinition``.
 
     Never refuses the whole description for one odd entry: labels are cut
-    to 120 characters and units to 32 with dropped characters removed; an
+    to 120 characters and units to 32 with dropped characters removed; a
+    variable is mandatory unless its markers say optional
+    (:func:`_variable_is_mandatory`); an
     entry whose name does not pass the gate's rule, or repeats an earlier
     name, is left out and listed in ``skipped``; beyond 100 dimensions, 100
     measures or 50 variables ``truncated`` is set. A description without a
@@ -322,7 +392,8 @@ def read_description(cube: object) -> InaDescription:
     if not structures:
         raise InaError("sap_error", UNREADABLE)
     raw_variables = cube.get("Variables")
-    for raw in raw_variables[:_MAX_SCANNED] if isinstance(raw_variables, list) else []:
+    listed = raw_variables[:_MAX_SCANNED] if isinstance(raw_variables, list) else []
+    for position, raw in enumerate(listed, start=1):
         if not isinstance(raw, dict):
             continue
         keep(
@@ -331,7 +402,7 @@ def read_description(cube: object) -> InaDescription:
             MAX_DESCRIBED_VARIABLES,
             raw.get("Name"),
             label=_label(raw.get("Description") or raw.get("Text"), 120),
-            mandatory=_is_mandatory(raw.get("Mandatory")),
+            mandatory=_variable_is_mandatory(raw, position),
             type=_variable_type(raw),
         )
     out.definition = InaDefinition(dimensions=dimensions, measures=measures, variables=variables)

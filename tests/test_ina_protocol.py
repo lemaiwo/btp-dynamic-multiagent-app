@@ -275,6 +275,131 @@ def test_the_spellings_of_mandatory(value, mandatory):
     assert read_description(cube).definition.variables[0].mandatory is mandatory
 
 
+# -------------------------------------------------- the describe answer of SIA
+# ``describe_sia.json`` is the describe answer SIA (S/4HANA 2022, SAP_BW 757)
+# gave on 2026-11-04 for the CDS query 2CCMMPURORDQUERY, session ids replaced:
+# SIA marks a mandatory variable with ``InputType`` (``Mandatory``,
+# ``MandatoryNotInitial`` or ``Optional``), never with ``Mandatory``.
+
+SIA_MANDATORY = ["!CDS_P_P_DISPLAYCURRENCY", "!CDS_P_P_DATEFUNCTION"]
+SIA_OPTIONAL = ["!CDS_P_P_STARTDATE", "!CDS_P_P_ENDDATE", "!CDS_S_SYSTEM_LANGUAGE"]
+
+
+def sia_cube() -> dict[str, Any]:
+    return fixture("describe_sia.json")["Cube"]
+
+
+def test_the_sia_describe_marks_the_variables_sap_demands_as_mandatory():
+    described = read_description(sia_cube())
+    d = described.definition
+    assert [(v.name, v.mandatory) for v in d.variables] == [
+        *((name, True) for name in SIA_MANDATORY),
+        *((name, False) for name in SIA_OPTIONAL),
+    ]
+    assert [v.type for v in d.variables] == ["single"] * 5
+    assert d.variables[0].label == "Devise d'affichage"
+    assert len(d.dimensions) == 34 and described.skipped == [] and not described.truncated
+    assert all(x.key_field == f"{x.name}.KEY" for x in d.dimensions)
+    assert [(m.name, m.label, m.unit) for m in d.measures] == [
+        ("ELTUIDCMP1", "Mnt net cde achat", None)
+    ]
+    InaDefinition.model_validate(d.model_dump())
+
+
+def test_the_sia_definition_refuses_a_run_without_the_mandatory_values():
+    d = read_description(sia_cube()).definition
+    with pytest.raises(InaError) as info:
+        plan_run(
+            d, measures=["ELTUIDCMP1"], group_by=[], filters=None, top=1, order=None,
+            variables=None,
+        )
+    assert info.value.code == "variable_required"
+    assert SIA_MANDATORY[0] in info.value.message
+
+
+@pytest.mark.parametrize(
+    ("value", "mandatory"),
+    [
+        ("Mandatory", True),
+        ("MandatoryNotInitial", True),
+        ("mandatory", True),
+        (" Optional ", False),
+        ("Optional", False),
+    ],
+)
+def test_the_spellings_of_input_type(value, mandatory, caplog):
+    cube = sia_cube()
+    cube["Variables"][0]["InputType"] = value
+    with caplog.at_level("WARNING", logger="agents.ina.protocol"):
+        assert read_description(cube).definition.variables[0].mandatory is mandatory
+    assert caplog.records == []
+
+
+@pytest.mark.parametrize("value", ["Hidden", "", None, 1, True, ["Mandatory"]])
+def test_an_input_type_that_cannot_be_read_is_mandatory_and_logged(value, caplog):
+    cube = sia_cube()
+    cube["Variables"][2]["InputType"] = value  # an optional one: not silently kept so
+    with caplog.at_level("WARNING", logger="agents.ina.protocol"):
+        variables = read_description(cube).definition.variables
+    assert variables[2].mandatory is True
+    assert [r.getMessage() for r in caplog.records] == [
+        "ina: variable 3 of the description carries no mandatory marker this "
+        "client reads; read as mandatory"
+    ]
+
+
+def test_a_variable_without_any_marker_is_mandatory_and_named_by_position_only(caplog):
+    cube = sia_cube()
+    del cube["Variables"][4]["InputType"]
+    with caplog.at_level("WARNING", logger="agents.ina.protocol"):
+        variables = read_description(cube).definition.variables
+    assert variables[4].mandatory is True
+    (record,) = caplog.records
+    assert "variable 5" in record.getMessage()
+    assert "SYSTEM_LANGUAGE" not in record.getMessage()
+
+
+@pytest.mark.parametrize(
+    ("flag", "input_type"),
+    [(False, "Mandatory"), (True, "Optional"), ("X", "Optional")],
+)
+def test_any_marker_that_says_mandatory_wins(flag, input_type):
+    cube = sia_cube()
+    cube["Variables"][2].update({"Mandatory": flag, "InputType": input_type})
+    assert read_description(cube).definition.variables[2].mandatory is True
+
+
+def test_two_markers_that_say_optional_are_optional():
+    cube = sia_cube()
+    cube["Variables"][0].update({"Mandatory": False, "InputType": "Optional"})
+    assert read_description(cube).definition.variables[0].mandatory is False
+
+
+@pytest.mark.parametrize(
+    ("patch", "kind"),
+    [
+        ({}, "single"),
+        ({"FilterCapability": {"ComparisonGroup": "Interval"}}, "interval"),
+        ({"FilterCapability": {"ComparisonGroup": "Range"}}, "interval"),
+        ({"MultipleValues": True}, "multiple"),
+        ({"MultipleValues": "true"}, "single"),
+        ({"FilterCapability": "Interval"}, "single"),
+        # What kind of variable it is says nothing about its values.
+        ({"VariableType": "MultipleIntervalVariable"}, "single"),
+    ],
+)
+def test_the_selection_type_of_a_sia_variable(patch, kind):
+    cube = sia_cube()
+    cube["Variables"][0].update(patch)
+    assert read_description(cube).definition.variables[0].type == kind
+
+
+def test_the_sia_refusal_of_a_run_without_its_variables_is_sap_error_with_its_text():
+    error = sap_message_error(fixture("run_sia_variables_missing.json"))
+    assert error is not None and error.code == "sap_error"
+    assert error.message.startswith("Query kann nur dann ausgeführt werden")
+
+
 @pytest.mark.parametrize(
     ("text", "code"),
     [

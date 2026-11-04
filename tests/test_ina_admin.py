@@ -579,6 +579,24 @@ async def test_a_mandatory_variable_is_a_refusal_before_the_run_is_sent(client, 
     assert remote.sap.posts == []
 
 
+async def test_a_sia_description_makes_the_test_refuse_before_the_run_is_sent(client, remote):
+    # SIA's describe answer (2026-11-04) marks its mandatory variables with
+    # ``InputType``; a Test of the described query sent a run without them,
+    # and SAP refused it (``run_sia_variables_missing.json``).
+    remote.sap.answers = [fixture("describe_sia.json"), fixture("run_sia_variables_missing.json")]
+    assert (await client.post(BASE, json=query())).status_code == 201
+    assert (await client.post(f"{ONE}/describe")).status_code == 200
+    stored = (await client.get(ONE)).json()["definition"]["variables"]
+    assert [v["name"] for v in stored if v["mandatory"]] == [
+        "!CDS_P_P_DISPLAYCURRENCY",
+        "!CDS_P_P_DATEFUNCTION",
+    ]
+    r = await client.post(f"{ONE}/test")
+    assert r.status_code == 422 and r.headers["x-ina-error"] == "variable_required"
+    assert r.json() == {"detail": admin_calls.VARIABLE_REQUIRED_TEXT}
+    assert len(remote.sap.posts) == 1  # the describe; no run was sent
+
+
 async def test_a_test_sap_refuses_is_the_clients_code(client, remote):
     assert (
         await client.post(BASE, json=query(definition=optional_variables()))
