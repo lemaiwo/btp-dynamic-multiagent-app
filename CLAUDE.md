@@ -131,6 +131,31 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   with `DatabaseConfigError` unless `DB_KIND` (`postgres` | `hana`) names
   one, and a `DB_KIND` naming a kind that is not bound fails too (never
   answered with the other one; `DB_KIND` is ignored when nothing is bound).
+  **`PG_SCHEMA`** (Postgres only; `^[a-z][a-z0-9_]{0,62}$`, not `public`,
+  `pg_*` or `information_schema`, never trimmed or lower-cased; a bad value is
+  refused without being repeated; refused by `_resolve_database` on a HANA
+  binding, a HANA or SQLite URL and the local fallback, while
+  `bound_target("hana")` and a HANA URL in the copy script ignore it) names a
+  schema of our own: `DatabaseTarget.schema`, attached by `_postgres_target`
+  and the Postgres branch of `_target_from_url`, becomes the connection's
+  whole `search_path` in `_engine_settings` (the schema alone, never
+  `schema, public`). `_create_and_migrate` then first runs `_adopt_schema`:
+  `CREATE SCHEMA IF NOT EXISTS`, one read of `information_schema` (base tables
+  of both schemas), and for each table of `Base.metadata` that is in `public`
+  and not in the schema the rule `classify_table`: ours (every `public` column
+  a model column AND every required column, NOT NULL without `server_default`,
+  present; `test_every_later_not_null_column_has_a_server_default` pins that
+  the `_ensure_column` chain never adds a required one) is moved with `ALTER
+  TABLE ... SET SCHEMA`, rows, indexes and sequences along; a required column
+  missing is a foreign table, left with one WARNING, ours created in the
+  schema; all required present but an unknown column is a refused start,
+  before any move; a name in both schemas keeps the schema's, one WARNING.
+  Idempotent, Postgres dialect only (`plan_schema_adoption` is the pure
+  planner; `tests/test_pg_schema.py`, and `tests/test_pg_schema_postgres.py`
+  against a real Postgres, opt-in). Why: EC shares its one free Postgres with
+  `sap-mcp-server-BC`, which owns `chat_conversations` and `chat_messages`;
+  only `ec.mtaext` sets it. A version before 2.36.1 does not know the variable
+  and would not find the moved tables.
   **On Cloud Foundry (`VCAP_APPLICATION` set) the app never ends on
   SQLite**: unparseable `VCAP_SERVICES`, a database binding whose
   `credentials` is not an object, no database binding and no `DATABASE_URL`,
@@ -3036,7 +3061,11 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   binding and `AICORE_RESOURCE_GROUP`); a deployment requested from the UI bills and
   is logged as one WARNING naming the principal and the resource group; no undeploy
   from the UI. Unverified on a landscape: every AI Core call of the panel (the lists,
-  the names of the paging parameters, the deploy) and the embedding itself
+  the names of the paging parameters, the deploy) and the embedding itself; 2.36.1
+  adds `PG_SCHEMA` (optional, not in the descriptor; `ec.mtaext` sets it because EC
+  shares its free Postgres with another app): no new resource, table, column or HANA
+  generation; the first start on a landscape that sets it moves the app's tables out
+  of `public` into the schema
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets

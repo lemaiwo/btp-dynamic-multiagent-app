@@ -115,10 +115,14 @@ def test_a_postgres_database_url_follows_it_too(env):
 
 # The other app's two tables on EC, as recorded by the probe of 2026-11-04
 # (after our failed starts had added agent_ref and access to the first one).
-THEIR_CHAT_CONVERSATIONS = {"id", "user_id", "title", "created_at", "updated_at", "agent_ref", "access"}
+THEIR_CHAT_CONVERSATIONS = {
+    "id", "user_id", "title", "created_at", "updated_at", "agent_ref", "access",
+}
 THEIR_CHAT_MESSAGES = {"id", "conversation_id", "role", "content", "created_at"}
 # Columns of agent_configs that 2.22.0 (EC's version) did not have yet.
-LATER_AGENT_COLUMNS = {"tier", "share_tools", "expose_invoke", "result_schema_json", "invoke_limits_json"}
+LATER_AGENT_COLUMNS = {
+    "tier", "share_tools", "expose_invoke", "result_schema_json", "invoke_limits_json",
+}
 
 
 def _table(name):
@@ -130,8 +134,10 @@ def _model_columns(name):
 
 
 def test_the_other_apps_tables_are_foreign():
-    assert agents_db.classify_table(_table("chat_conversations"), THEIR_CHAT_CONVERSATIONS) == ("foreign", "principal")
-    assert agents_db.classify_table(_table("chat_messages"), THEIR_CHAT_MESSAGES) == ("foreign", "position")
+    conversations = agents_db.classify_table(_table("chat_conversations"), THEIR_CHAT_CONVERSATIONS)
+    assert conversations == ("foreign", "principal")
+    messages = agents_db.classify_table(_table("chat_messages"), THEIR_CHAT_MESSAGES)
+    assert messages == ("foreign", "position")
 
 
 def test_a_2_22_0_shaped_table_of_ours_is_ours():
@@ -140,7 +146,8 @@ def test_a_2_22_0_shaped_table_of_ours_is_ours():
 
 
 def test_an_identical_shape_is_ours():
-    assert agents_db.classify_table(_table("skill_configs"), _model_columns("skill_configs")) == ("ours", None)
+    columns = _model_columns("skill_configs")
+    assert agents_db.classify_table(_table("skill_configs"), columns) == ("ours", None)
 
 
 def test_a_widened_table_refuses():
@@ -149,9 +156,11 @@ def test_a_widened_table_refuses():
 
 
 def test_every_later_not_null_column_has_a_server_default():
-    # The rule relies on it: a column _ensure_column adds as NOT NULL must not be "required".
+    # The rule relies on it: a column _ensure_column adds as NOT NULL must not be
+    # "required".
     ensured = {
-        ("agent_configs", "tier"), ("agent_configs", "share_tools"), ("agent_configs", "expose_invoke"),
+        ("agent_configs", "tier"), ("agent_configs", "share_tools"),
+        ("agent_configs", "expose_invoke"),
         ("agent_configs", "expose_api"), ("agent_configs", "expose_chat"),
         ("chat_conversations", "access"), ("chat_user_agents", "deep"),
         ("ide_conventions", "non_production"), ("ide_sessions", "session_type"),
@@ -213,7 +222,8 @@ class FakeConn:
 
 
 CATALOGUE = (
-    [("public", "agent_configs", c) for c in sorted(_model_columns("agent_configs") - LATER_AGENT_COLUMNS)]
+    [("public", "agent_configs", c)
+     for c in sorted(_model_columns("agent_configs") - LATER_AGENT_COLUMNS)]
     + [("public", "chat_conversations", c) for c in sorted(THEIR_CHAT_CONVERSATIONS)]
     + [("public", "skill_configs", c) for c in sorted(_model_columns("skill_configs"))]
     + [("pydantic_agent", "skill_configs", c) for c in sorted(_model_columns("skill_configs"))]
@@ -242,7 +252,8 @@ async def test_the_read_filters_base_tables_and_both_schemas():
 
 
 async def test_a_refused_table_stops_the_start_before_any_move():
-    rows = CATALOGUE + [("public", "workflows", c) for c in sorted(_model_columns("workflows") | {"legacy_col"})]
+    widened = sorted(_model_columns("workflows") | {"legacy_col"})
+    rows = CATALOGUE + [("public", "workflows", c) for c in widened]
     conn = FakeConn(rows)
     with pytest.raises(DatabaseConfigError, match="legacy_col"):
         await agents_db._adopt_schema(conn, "pydantic_agent")
@@ -263,7 +274,8 @@ async def test_create_and_migrate_runs_the_step_only_with_a_schema(monkeypatch):
         return agents_db.AdoptionPlan([], [], [], [])
 
     monkeypatch.setattr(agents_db, "_adopt_schema", fake)
-    monkeypatch.setattr(agents_db, "_target", dataclasses.replace(agents_db._target, schema="pydantic_agent"))
+    with_schema = dataclasses.replace(agents_db._target, schema="pydantic_agent")
+    monkeypatch.setattr(agents_db, "_target", with_schema)
     await agents_db._create_and_migrate()
     assert calls == ["pydantic_agent"]
     calls.clear()

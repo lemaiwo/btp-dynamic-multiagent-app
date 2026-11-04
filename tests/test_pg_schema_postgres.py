@@ -5,7 +5,8 @@ left where it is, a second run that changes nothing) can only be proven on
 Postgres. SKIPPED unless ``TEST_POSTGRES_URL`` names a throw-away database;
 the test works on two schemas of its own and drops both.
 
-Run:  TEST_POSTGRES_URL=postgresql+asyncpg://... python -m pytest tests/test_pg_schema_postgres.py -q
+Run:  TEST_POSTGRES_URL=postgresql+asyncpg://... \
+          python -m pytest tests/test_pg_schema_postgres.py -q
 """
 
 from __future__ import annotations
@@ -67,7 +68,9 @@ async def test_adoption_moves_ours_and_leaves_the_foreign_table():
             await c.run_sync(Base.metadata.create_all)
             await c.execute(text("DROP TABLE chat_conversations CASCADE"))
             await c.execute(text(FOREIGN_CHAT_CONVERSATIONS))
-            await c.execute(text("INSERT INTO chat_conversations (id, user_id) VALUES ('c1', 'u1')"))
+            await c.execute(text(
+                "INSERT INTO chat_conversations (id, user_id) VALUES ('c1', 'u1')"
+            ))
             await c.execute(text(
                 "INSERT INTO skill_configs (name, description, content) VALUES ('s1', 'd', 'c')"
             ))
@@ -83,8 +86,10 @@ async def test_adoption_moves_ours_and_leaves_the_foreign_table():
             tables = {(r[0], r[1]) for r in rows}
             assert (dst, "skill_configs") in tables and (src, "skill_configs") not in tables
             assert (src, "chat_conversations") in tables and (dst, "chat_conversations") in tables
-            assert (await c.execute(text(f'SELECT name FROM "{dst}".skill_configs'))).scalar() == "s1"
-            assert (await c.execute(text(f'SELECT user_id FROM "{src}".chat_conversations'))).scalar() == "u1"
+            moved = await c.execute(text(f'SELECT name FROM "{dst}".skill_configs'))
+            assert moved.scalar() == "s1"
+            kept = await c.execute(text(f'SELECT user_id FROM "{src}".chat_conversations'))
+            assert kept.scalar() == "u1"
             cols = {r[0] for r in await c.execute(text(
                 "SELECT column_name FROM information_schema.columns "
                 "WHERE table_schema = :s AND table_name = 'chat_conversations'"
