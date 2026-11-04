@@ -285,7 +285,7 @@ EC_FKS = [("chat_files", "chat_files_conversation_id_fkey", "public", "chat_conv
 
 async def test_the_step_creates_the_schema_reads_once_and_moves_ours(caplog):
     conn = FakeConn(CATALOGUE)
-    with caplog.at_level(logging.INFO, logger="agents.db"):
+    with caplog.at_level(logging.INFO, logger="agents.pg_schema"):
         plan = await agents_db._adopt_schema(conn, "pydantic_agent")
     texts = [s for s, _ in conn.statements]
     assert texts[0] == 'CREATE SCHEMA IF NOT EXISTS "pydantic_agent"'
@@ -341,7 +341,7 @@ async def test_a_foreign_twin_is_logged_below_warning(caplog):
            for c in sorted(_model_columns("chat_conversations"))]
     )
     conn = FakeConn(rows)
-    with caplog.at_level(logging.INFO, logger="agents.db"):
+    with caplog.at_level(logging.INFO, logger="agents.pg_schema"):
         plan = await agents_db._adopt_schema(conn, "pydantic_agent")
     assert plan.foreign_twins == [("chat_conversations", "principal")]
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
