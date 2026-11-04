@@ -6,7 +6,7 @@ bindings), as the technical user of the destination:
     cf ssh pydantic-agent -c 'cd /home/vcap/app; unset PYTHONHOME; \\
         export LD_LIBRARY_PATH=/home/vcap/deps/0/lib:/home/vcap/deps/0/python/lib \\
         PYTHONPATH=/home/vcap/deps/0/lib/python3.13/site-packages; \\
-        /home/vcap/deps/0/bin/python3 scripts/probe_ina.py --destination saperp-sia-100'
+        /home/vcap/deps/0/bin/python3 scripts/probe_ina.py --destination <name>'
 
 (the buildpack's profile script does not work in an ssh shell; a version of
 this file that is not in the droplet yet is piped in with ``cf ssh
@@ -41,18 +41,27 @@ with ``ProcessingDirectives.ProcessingStep``) before the read, on one
 ``InstanceId``. On SIA (2026-11-04) the plain run, also with both mandatory
 variables and in either variable form, was refused ("all mandatory
 variables need values"); the batch was answered with the submit's
-``Cube`` alone (``ServerState`` 0, the derived variables filled), no grid.
+``Cube`` alone (``ServerState`` 0, the derived variables filled), no grid;
+``--submit separate --variable-form sap --structure <real name>`` was
+answered with a grid (run 5): the form the app sends since 2.37.1.
+``--group-by DIM`` (repeatable) puts dimensions on Rows, ``--top N`` sets
+the rows asked for, and ``--close`` releases the query instance afterwards
+(firefly's ``Close`` action).
 
-A run answer holds DATA: DIR is a scratch directory in the container
-(``/tmp/...``); copy the files back with ``cf ssh pydantic-agent -c 'cat
+A run answer holds DATA: DIR must lie under the system temp directory
+(``tempfile.gettempdir()``, ``/tmp`` in the container; anything else is
+refused), is created ``0700`` and every file ``0600``; ``--label`` is
+``[A-Za-z0-9_-]``, at most 40 characters. Copy the files back with ``cf ssh pydantic-agent -c 'cat
 /tmp/<dir>/<file>'`` into the local, gitignored ``docs/evidence/`` and
 delete them in the container. A fixture made from a dump is sanitised first
 (session ids, and every data value and member text of a grid, replaced), as
 ``tests/fixtures/ina/describe_sia.json`` is. Example::
 
-    python scripts/probe_ina.py --destination saperp-sia-100 --skip-catalog \\
-        --query 2CCMMPURORDQUERY --dump /tmp/ina --run \\
-        --variable '!CDS_P_P_DISPLAYCURRENCY=EUR' --label run-1
+    python scripts/probe_ina.py --destination <name> --skip-catalog \\
+        --query 2CCMMPURORDQUERY --dump /tmp/ina --run --submit separate \\
+        --variable-form sap --structure ELTUIDSTRCMMPURORDQUERY \\
+        --variable '!CDS_P_P_DISPLAYCURRENCY=EUR' \\
+        --variable '!CDS_P_P_DATEFUNCTION=YEARTODATE' --label run-5
 """
 from __future__ import annotations
 
@@ -60,7 +69,9 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -203,13 +214,42 @@ async def _send(
     return response.status_code, ctype, payload, response.content
 
 
+LABEL = re.compile(r"[A-Za-z0-9_-]{1,40}")
+DUMP_REFUSED = "--dump must name a directory under the system temp directory"
+
+
+def _label(value: str) -> str:
+    """``--label``: it becomes part of a file name."""
+    if not LABEL.fullmatch(value):
+        raise argparse.ArgumentTypeError("--label takes 1 to 40 of A-Z a-z 0-9 _ -")
+    return value
+
+
+def _dump_dir(directory: str) -> Path:
+    """The dump directory, which must lie under the system temp directory:
+    an answer holds a session ticket or data and is never written next to
+    the code or into a synced folder by mistake."""
+    root = Path(tempfile.gettempdir()).resolve()
+    target = Path(directory).resolve()
+    if target == root or root not in target.parents:
+        raise ProbeError(DUMP_REFUSED)
+    return target
+
+
 def _dump(directory: str, name: str, raw: bytes) -> None:
-    """Write ``raw`` as it came to ``directory/name``; print name and size only."""
+    """Write ``raw`` as it came to ``directory/name`` (directory 0700, file
+    0600); print name and size only."""
     if not directory:
         return
-    target = Path(directory)
-    target.mkdir(parents=True, exist_ok=True)
-    (target / name).write_bytes(raw)
+    target = _dump_dir(directory)
+    target.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(target, 0o700)
+    fd = os.open(target / name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        os.write(fd, raw)
+    finally:
+        os.close(fd)
     print(f"DUMP {name} bytes={len(raw)}")
 
 
@@ -240,9 +280,7 @@ def _variable_entry(name: str, value: str, field: str = "") -> dict[str, Any]:
     variable's name), or with ``field`` in the form SAP's describe answer
     states a variable's value (``FieldName`` the key of the variable's
     dimension, ``IsExcluding`` false)."""
-    element: dict[str, Any] = {"Comparison": "=", "Low": value}
-    if field:
-        element["IsExcluding"] = False
+    element: dict[str, Any] = {"Comparison": "=", "Low": value, "IsExcluding": False}
     return {"Name": name, "Values": {"Selection": {"SetOperand": {
         "FieldName": field or name, "Elements": [element]}}}}
 
@@ -261,11 +299,14 @@ def _variable_fields(cube: Any) -> dict[str, str]:
 def _run_request(capabilities: list[str], query: str, measure: str,
                  variables: list[tuple[str, str]], top: int = 1,
                  structure: str = "Measures",
-                 fields: dict[str, str] | None = None) -> dict[str, Any]:
-    """The body ``analytics_request`` builds for one measure, no grouping, no
-    filter, no sort (mirrored from ``agents/ina/protocol.py``)."""
+                 fields: dict[str, str] | None = None,
+                 group_by: list[str] | None = None,
+                 instance: str = "") -> dict[str, Any]:
+    """The body ``analytics_request`` builds for one measure, the dimensions
+    of ``group_by`` on Rows, no filter, no sort (mirrored from
+    ``agents/ina/protocol.py``)."""
     definition: dict[str, Any] = {
-        "Dimensions": [{
+        "Dimensions": [*({"Name": name, "Axis": "Rows"} for name in group_by or []), {
             "Name": structure,
             "Axis": "Columns",
             "Members": [{"Name": measure, "Visibility": "Visible"}],
@@ -282,11 +323,14 @@ def _run_request(capabilities: list[str], query: str, measure: str,
     if variables:
         definition["Variables"] = [_variable_entry(n, v, (fields or {}).get(n, ""))
                                    for n, v in variables]
+    source = {"ObjectName": query, "Type": "Query"}
+    if instance:
+        source["InstanceId"] = instance
     return {
         "ClientInfo": CLIENT_INFO,
         "Analytics": {
             "Capabilities": capabilities,
-            "DataSource": {"ObjectName": query, "Type": "Query"},
+            "DataSource": source,
             "Definition": definition,
             "Language": "EN",
         },
@@ -304,6 +348,13 @@ def _batch_with_submit(body: dict[str, Any], instance: str) -> dict[str, Any]:
     submit = json.loads(json.dumps(read))
     submit["Analytics"]["ProcessingDirectives"] = {"ProcessingStep": "VariableSubmit"}
     return {"Batch": [submit, read]}
+
+
+def _close_request(instance: str) -> dict[str, Any]:
+    """firefly's ``Close`` of a query instance (``InAQMgrShutdownAction``),
+    as ``agents.ina.protocol.close_request`` builds it."""
+    return {"Analytics": {"Actions": [{"Type": "Close", "DataSources": [instance]}]},
+            "Options": ["StatefulServer"]}
 
 
 def _grids(payload: Any) -> list[int]:
@@ -346,6 +397,8 @@ def _top_keys(payload: Any) -> str:
 
 async def run(args: argparse.Namespace, environ: dict[str, str]) -> int:
     try:
+        if args.dump:
+            _dump_dir(args.dump)  # refused before anything is sent
         cfg = read_bindings(environ.get("VCAP_SERVICES", ""))
         describe_bindings(cfg)
         async with httpx.AsyncClient(timeout=args.timeout, trust_env=False) as client:
@@ -411,16 +464,19 @@ async def run(args: argparse.Namespace, environ: dict[str, str]) -> int:
             measure = args.measure or _first_measure(cube)
             if not measure:
                 raise ProbeError("no measure: describe the query or pass --measure")
+            instance = "probe" + os.urandom(8).hex()
             body = _run_request(
                 capabilities, args.query, measure, _parse_variables(args.variable or []),
+                top=args.top,
                 structure=args.structure or "Measures",
                 fields=_variable_fields(cube) if args.variable_form == "sap" else None,
+                group_by=args.group_by or [],
             )
             if args.submit == "batch":
-                body = _batch_with_submit(body, "probe" + os.urandom(8).hex())
+                body = _batch_with_submit(body, instance)
             elif args.submit == "separate":
                 # The submit alone first, on the InstanceId the read then uses.
-                submit, body = _batch_with_submit(body, "probe" + os.urandom(8).hex())["Batch"]
+                submit, body = _batch_with_submit(body, instance)["Batch"]
                 _dump(args.dump, f"{args.label}.submit.request.json",
                       json.dumps(submit, indent=1).encode("utf-8"))
                 status, ctype, payload, raw = await _send(
@@ -441,6 +497,16 @@ async def run(args: argparse.Namespace, environ: dict[str, str]) -> int:
             print(f"{'PASS' if ok else 'FAIL'} run {_name(args.label)}: HTTP {status} {ctype} "
                   f"bytes={len(raw)} keys={_top_keys(payload)} grids={grids} "
                   f"variables={len(args.variable or [])} messages={_messages(payload)}")
+            if args.close and args.submit == "separate":
+                close = _close_request(instance)
+                _dump(args.dump, f"{args.label}.close.request.json",
+                      json.dumps(close, indent=1).encode("utf-8"))
+                status, ctype, payload, raw = await _send(
+                    proxied, "POST", url, headers, close, csrf)
+                _dump(args.dump, f"{args.label}.close.response.json", raw)
+                print(f"{'PASS' if status == 200 else 'FAIL'} close {_name(args.label)}: "
+                      f"HTTP {status} {ctype} bytes={len(raw)} keys={_top_keys(payload)} "
+                      f"messages={_messages(payload)}")
         await proxied.aclose()
         return 0
     except ProbeError as exc:
@@ -499,7 +565,13 @@ def main() -> int:
     parser.add_argument("--measure", default="", help="the measure of the run")
     parser.add_argument("--variable", action="append", metavar="NAME=VALUE",
                         help="a single-value variable of the run (repeatable)")
-    parser.add_argument("--label", default="run", help="file name stem of the run's dump")
+    parser.add_argument("--label", default="run", type=_label,
+                        help="file name stem of the run's dump ([A-Za-z0-9_-], at most 40)")
+    parser.add_argument("--group-by", action="append", metavar="DIMENSION",
+                        help="a dimension of the run on Rows (repeatable)")
+    parser.add_argument("--top", type=int, default=1, help="rows asked for (default 1)")
+    parser.add_argument("--close", action="store_true",
+                        help="with --submit separate: release the query instance afterwards")
     parser.add_argument("--variable-form", choices=("app", "sap"), default="app",
                         help="app: FieldName the variable name (as plan_run sends it); "
                         "sap: the key of the variable's dimension, as the describe states it")

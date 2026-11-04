@@ -94,3 +94,58 @@ def test_a_dump_prints_its_name_and_size_only(tmp_path, capsys):
     assert out == f"DUMP run.response.json bytes={len(raw)}\n" and "4711" not in out
     probe._dump("", "x.json", b"{}")
     assert capsys.readouterr().out == ""
+
+
+def test_the_probes_grouped_run_on_an_instance_is_the_apps_run():
+    """The form run 5 answered (the variables named by their dimension's
+    key, the real structure) plus Rows and an InstanceId: the app's body."""
+    from agents.ina.protocol import read_description
+
+    definition = read_description(sia_cube()).definition
+    values = {"!CDS_P_P_DISPLAYCURRENCY": "EUR", "!CDS_P_P_DATEFUNCTION": "YEARTODATE"}
+    plan = plan_run(definition, measures=["ELTUIDCMP1"], group_by=["2CIMMPURGORG", "2CIPLANT"],
+                    filters=None, top=3, order=None, variables=values)
+    app = analytics_request(CAPABILITIES, data_source("2CCMMPURORDQUERY", "", "probe1"), plan)
+    body = probe._run_request(
+        CAPABILITIES, "2CCMMPURORDQUERY", "ELTUIDCMP1", list(values.items()), top=3,
+        structure="ELTUIDSTRCMMPURORDQUERY", fields=probe._variable_fields(sia_cube()),
+        group_by=["2CIMMPURGORG", "2CIPLANT"], instance="probe1",
+    )
+    assert without_client_info(body) == without_client_info(app)
+
+
+def test_the_probes_close_is_the_apps_close():
+    from agents.ina.protocol import close_request
+
+    assert probe._close_request("probe1") == close_request("probe1")
+
+
+def test_a_dump_outside_the_temp_directory_is_refused(tmp_path, monkeypatch):
+    import pytest
+
+    monkeypatch.setattr(probe.tempfile, "gettempdir", lambda: str(tmp_path / "tmp"))
+    (tmp_path / "tmp").mkdir()
+    for directory in (str(tmp_path / "elsewhere"), str(tmp_path / "tmp"),
+                      str(tmp_path / "tmp" / ".." / "out")):
+        with pytest.raises(probe.ProbeError) as info:
+            probe._dump(directory, "x.json", b"{}")
+        assert str(info.value) == probe.DUMP_REFUSED
+    assert not (tmp_path / "elsewhere").exists() and not (tmp_path / "out").exists()
+
+
+def test_a_dump_is_private_to_its_owner(tmp_path, capsys):
+    target = tmp_path / "dumps"
+    probe._dump(str(target), "run.response.json", b"{}")
+    assert target.stat().st_mode & 0o777 == 0o700
+    assert (target / "run.response.json").stat().st_mode & 0o777 == 0o600
+
+
+def test_a_label_is_a_plain_file_name_stem():
+    import argparse
+
+    import pytest
+
+    assert probe._label("run-6_b") == "run-6_b"
+    for bad in ("", "../x", "a/b", "a.b", "x" * 41, "run 6"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            probe._label(bad)
