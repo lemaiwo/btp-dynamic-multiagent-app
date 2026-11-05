@@ -56,10 +56,13 @@ class Lookup:
 
     ``duplicates`` counts the later rows whose key was already taken, so the
     report can say a table was ambiguous without listing its values.
+    ``truncated`` is set when :data:`MAX_LOOKUP_ROWS` ended the reading while
+    a non-blank row followed, so a run can say a code table was cut.
     """
 
     entries: dict[tuple[str, ...], str]
     duplicates: int
+    truncated: bool = False
 
     def get(self, key: tuple[str, ...]) -> str | None:
         return self.entries.get(key)
@@ -169,7 +172,8 @@ def build_lookup(book: Any, xref: XrefLookup) -> Lookup:
     are cleaned with :func:`values.clean`, as the engine cleans source values.
     A row whose key cells are all blank is skipped; the first row of a key
     wins. Reading ends after :data:`BLANK_ROWS_END` consecutive rows blank in
-    every key and value column, or after :data:`MAX_LOOKUP_ROWS` rows.
+    every key and value column, or after :data:`MAX_LOOKUP_ROWS` rows
+    (``truncated`` when a non-blank row follows the cap).
     """
     ws = find_sheet(book, xref.sheet)
     labels = header(ws, xref.header_row)
@@ -179,10 +183,15 @@ def build_lookup(book: Any, xref: XrefLookup) -> Lookup:
     entries: dict[tuple[str, ...], str] = {}
     duplicates = 0
     blank_run = 0
+    truncated = False
     start = xref.header_row + 1
-    for cells in _rows(ws, start, start + MAX_LOOKUP_ROWS - 1, width):
+    # One row past the cap is read only to tell "cut" from "ended there".
+    for seen, cells in enumerate(_rows(ws, start, start + MAX_LOOKUP_ROWS, width)):
         texts = [clean(cell_text(c)) for c in cells]
         texts += [""] * (width - len(texts))
+        if seen >= MAX_LOOKUP_ROWS:
+            truncated = any(texts[i] for i in [*keys, value])
+            break
         key = tuple(texts[i] for i in keys)
         if not any(key):
             if not texts[value]:
@@ -197,7 +206,7 @@ def build_lookup(book: Any, xref: XrefLookup) -> Lookup:
             duplicates += 1
         else:
             entries[key] = texts[value]
-    return Lookup(entries=entries, duplicates=duplicates)
+    return Lookup(entries=entries, duplicates=duplicates, truncated=truncated)
 
 
 def _signature(xref: XrefLookup) -> tuple[Any, ...]:

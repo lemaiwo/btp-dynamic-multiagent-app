@@ -88,6 +88,8 @@ from agents.oauth2 import refresh_scheduled_tokens  # noqa: E402
 from agents.oauth_routes import router as oauth_router  # noqa: E402
 from agents.odata import audit as odata_audit  # noqa: E402
 from agents.odata.audit import ODATA_AUDIT_RETENTION_DAYS  # noqa: E402
+from agents.reconcile import run as reconcile_run  # noqa: E402
+from agents.reconcile import runs_store as reconcile_runs_store  # noqa: E402
 from agents.registry import registry  # noqa: E402
 from agents.webchat import run as webchat_run  # noqa: E402
 from agents.webchat import store as webchat_store  # noqa: E402
@@ -324,6 +326,8 @@ async def lifespan(app: FastAPI):
         )
         # Web chat turns live in one process: any `running` one is a ghost.
         chat_reset = await webchat_store.reset_running(session)
+        # Reconciliation runs are tasks of one process too (agents/reconcile/run.py).
+        swept_rc = await reconcile_runs_store.sweep_running_at_startup(session)
     if chat_reset:
         logger.info("Reset %d ghost web chat conversation(s) to idle", chat_reset)
     if ide_reset:
@@ -359,6 +363,8 @@ async def lifespan(app: FastAPI):
         logger.info("Marked %d ghost job run(s) as interrupted", swept)
     if swept_wf:
         logger.info("Swept %d stale workflow run(s) at startup", swept_wf)
+    if swept_rc:
+        logger.info("Marked %d reconciliation run(s) as interrupted", swept_rc)
     await seed_from_file_if_empty(SEED_FILE)
     await ensure_ide_seed(IDE_SEED_FILE)
     await registry.reload()
@@ -391,6 +397,7 @@ async def lifespan(app: FastAPI):
     await ide_runner.cancel_all()
     await webchat_run.cancel_all_chat_runs()
     await embedding_run.cancel_all()
+    await reconcile_run.cancel_all()
 
     # An approved trace whose ARC-1 call is in flight runs in its own task,
     # not in a run: let it record its outcome (armed / failed) rather than

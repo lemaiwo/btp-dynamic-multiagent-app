@@ -173,6 +173,24 @@ def test_reading_stops_at_the_row_cap(monkeypatch: pytest.MonkeyPatch) -> None:
     rows = [["k", "v"], *[[f"k{i}", f"v{i}"] for i in range(10)]]
     lookup = _lookup(build_book({"T": rows}), _xref("T", 1, [{"letter": "A"}], {"letter": "B"}))
     assert list(lookup.entries) == [("k0",), ("k1",), ("k2",)]
+    assert lookup.truncated is True
+
+
+def test_a_table_that_ends_at_the_row_cap_is_not_truncated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(xref_reader, "MAX_LOOKUP_ROWS", 3)
+    rows = [["k", "v"], *[[f"k{i}", f"v{i}"] for i in range(3)], [], ["", ""]]
+    lookup = _lookup(build_book({"T": rows}), _xref("T", 1, [{"letter": "A"}], {"letter": "B"}))
+    assert len(lookup.entries) == 3
+    assert lookup.truncated is False
+
+
+def test_a_short_table_is_not_truncated() -> None:
+    rows: list[list[Any]] = [["k", "v"], ["a", "1"]]
+    lookup = _lookup(build_book({"T": rows}), _xref("T", 1, [{"letter": "A"}], {"letter": "B"}))
+    assert lookup.truncated is False
+    assert xref_reader.Lookup(entries={}, duplicates=0).truncated is False
 
 
 def test_max_lookup_rows_default() -> None:

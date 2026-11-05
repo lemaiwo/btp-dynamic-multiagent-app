@@ -66,3 +66,13 @@ def test_a_known_or_absent_pp_mode_says_nothing(caplog):
 
 def test_the_lifespan_runs_the_check():
     assert "warn_on_unknown_pp_mode()" in inspect.getsource(app_module.lifespan)
+
+
+def test_the_lifespan_sweeps_and_cancels_reconciliation_runs():
+    source = inspect.getsource(app_module.lifespan)
+    assert "reconcile_runs_store.sweep_running_at_startup(session)" in source
+    assert "Marked %d reconciliation run(s) as interrupted" in source
+    shutdown = source[source.index("yield"):]
+    assert "await reconcile_run.cancel_all()" in shutdown
+    assert shutdown.index("embedding_run.cancel_all()") < shutdown.index(
+        "reconcile_run.cancel_all()")
