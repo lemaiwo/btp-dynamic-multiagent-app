@@ -574,3 +574,46 @@ def test_end_to_end_with_iter_csv() -> None:
     assert result.invalid_keys == 1
     assert result.missing_in_ecc == [("000000000000000004", 6)]
     assert [(m.column, m.actual) for m in result.mismatches] == [("Unit", "PC")]
+
+
+# --- value_map: a chain of lookups keyed by different source fields ------------
+
+
+def _chain_rule(**over: Any) -> dict[str, Any]:
+    return _vm(lookups=[LOOKUP, {**LOOKUP, "sheet": "Groups", "sources": ["GRPFLD"]}], **over)
+
+
+def test_value_map_chain_uses_each_lookups_own_source_field() -> None:
+    lookups = {("Col", 0): Lookup({("A",): "BY_FIRST"}), ("Col", 1): Lookup({("G",): "BY_SECOND"})}
+    assert _matched(_chain_rule(), "BY_FIRST", {"MTART": "A", "GRPFLD": "G"}, lookups=lookups)
+    assert _matched(_chain_rule(), "BY_SECOND", {"MTART": "Z", "GRPFLD": "G"}, lookups=lookups)
+    # the first source blank: the second lookup still runs on its own field
+    assert _matched(_chain_rule(), "BY_SECOND", {"MTART": "", "GRPFLD": "G"}, lookups=lookups)
+    result, _ = _one(_chain_rule(), "X", {"MTART": "Z", "GRPFLD": "Q"}, lookups=lookups)
+    m = result.mismatches[0]
+    assert (m.reason, m.source) == ("no_xref_entry", "Z | Q")
+
+
+def test_value_map_chain_all_sources_blank_expects_blank() -> None:
+    lookups = {("Col", 0): Lookup({("A",): "BY_FIRST"}), ("Col", 1): Lookup({("G",): "BY_SECOND"})}
+    assert _matched(_chain_rule(), "", {"MTART": " ", "GRPFLD": ""}, lookups=lookups)
+
+
+def test_value_map_chain_exact_pass_over_all_lookups_before_alpha() -> None:
+    lookups = {("Col", 0): Lookup({("10",): "ALPHA_FIRST"}), ("Col", 1): Lookup({("G",): "EXACT"})}
+    rule = _chain_rule(alpha=True)
+    assert _matched(rule, "EXACT", {"MTART": "0010", "GRPFLD": "G"}, lookups=lookups)
+    assert _matched(rule, "ALPHA_FIRST", {"MTART": "0010", "GRPFLD": "Q"}, lookups=lookups)
+
+
+def test_value_map_chain_on_miss_source_keeps_the_rules_own_sources() -> None:
+    lookups = {("Col", 0): Lookup({("A",): "BY_FIRST"}), ("Col", 1): Lookup({("G",): "BY_SECOND"})}
+    rule = _chain_rule(on_miss="source")
+    assert _matched(rule, "Z", {"MTART": "Z", "GRPFLD": "Q"}, lookups=lookups)
+    assert _matched(rule, "", {"MTART": "", "GRPFLD": "Q"}, lookups=lookups)
+
+
+def test_needed_fields_include_a_lookups_own_source_fields() -> None:
+    comparer = Comparer(_spec({"Col": _chain_rule()}),
+                        {("Col", 0): Lookup({}), ("Col", 1): Lookup({})})
+    assert comparer.needed_fields() == ["OBJNR", "GRPFLD", "MTART"]

@@ -210,8 +210,13 @@ def build_lookup(book: Any, xref: XrefLookup) -> Lookup:
 
 
 def _signature(xref: XrefLookup) -> tuple[Any, ...]:
-    """What makes two lookups the same table (``XrefLookup`` holds a list: not hashable)."""
-    return (xref.sheet, xref.header_row, tuple(xref.keys), xref.value)
+    """What makes two lookups the same table (``XrefLookup`` holds lists: not hashable).
+
+    A lookup's own ``sources`` override is part of it: the entries do not depend
+    on it, but a table is shared only between lookups the spec wrote alike.
+    """
+    return (xref.sheet, xref.header_row, tuple(xref.keys), xref.value,
+            tuple(xref.sources or ()))
 
 
 def build_lookups(data: bytes, spec: ReconcileSpec) -> dict[tuple[str, int], Lookup]:

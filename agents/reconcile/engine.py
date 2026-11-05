@@ -450,27 +450,38 @@ class Comparer:
         second pass compare both sides without leading zeros (a source NUMC
         ``0001`` finds ``1`` in a cell Excel stored as a number, and the other
         way round); without it ``0010`` and ``10`` stay different codes.
+
+        Each lookup is keyed by its own source fields (``XrefLookup.sources``,
+        else the rule's), so a chain can switch fields between lookups; a
+        lookup whose fields are all blank is skipped, and the expected value is
+        blank only when every field the rule reads is blank. ``on_miss
+        "source"`` takes the RULE's own fields, never an override's.
         """
-        parts = tuple(clean(ecc_row.get(name)) for name in rule.sources)
-        source = " | ".join(parts)
-        if not any(parts):
-            return _Expected("", source)
         count = len(rule.lookups)
+        keyed = [rule.sources_of(index) for index in range(count)]
+        names = list(dict.fromkeys([*rule.sources, *(n for f in keyed for n in f)]))
+        read = {name: clean(ecc_row.get(name)) for name in names}
+        source = " | ".join(read[name] for name in names)
+        if not any(read.values()):
+            return _Expected("", source)
+        keys = [tuple(read[name] for name in fields) for fields in keyed]
         for index in range(count):
-            hit = self._lookups[(column, index)].get(parts)
-            if hit is not None:
-                return _Expected(hit, source)
-        if rule.alpha:
-            stripped = tuple(alpha(p) for p in parts)
-            for index in range(count):
-                hit = self._alpha_lookup(column, index).get(stripped)
+            if any(keys[index]):
+                hit = self._lookups[(column, index)].get(keys[index])
                 if hit is not None:
                     return _Expected(hit, source)
+        if rule.alpha:
+            for index in range(count):
+                if any(keys[index]):
+                    stripped = tuple(alpha(p) for p in keys[index])
+                    hit = self._alpha_lookup(column, index).get(stripped)
+                    if hit is not None:
+                        return _Expected(hit, source)
         if rule.on_miss == "default":
             return _Expected(rule.default or "", source)
         if rule.on_miss == "source":
-            # several sources: the first non-blank one (all blank returned above)
-            return _Expected(next(p for p in parts if p), source)
+            # several sources: the first non-blank one of the rule's own fields
+            return _Expected(next((read[n] for n in rule.sources if read[n]), ""), source)
         return _Expected("", source, NO_XREF_ENTRY)
 
     def _alpha_lookup(self, column: str, index: int) -> dict[tuple[str, ...], str]:

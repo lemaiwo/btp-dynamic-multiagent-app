@@ -86,12 +86,23 @@ class ColumnRef(_Strict):
 
 
 class XrefLookup(_Strict):
-    """A code table in the mapping workbook: source value(s) in ``keys``, target in ``value``."""
+    """A code table in the mapping workbook: source value(s) in ``keys``, target in ``value``.
+
+    ``sources`` overrides the rule's source fields for this lookup only, so a
+    fallback chain can switch fields ("table 1 by field A, else table 2 by
+    field B"); ``None`` (the default) uses the rule's ``sources``.
+    """
 
     sheet: str = Field(min_length=1, max_length=31)  # Excel's sheet-name limit
     header_row: int = Field(ge=1, le=1000)
     keys: list[ColumnRef] = Field(min_length=1, max_length=4)
     value: ColumnRef
+    sources: list[str] | None = Field(default=None, min_length=1, max_length=4)
+
+    @field_validator("sources")
+    @classmethod
+    def _sources(cls, value: list[str] | None) -> list[str] | None:
+        return None if value is None else [_ident_required(item) for item in value]
 
 
 class Value(_Strict):
@@ -179,10 +190,15 @@ class ValueMapRule(_Rule):
     def _consistent(self) -> ValueMapRule:
         if self.on_miss == "default" and self.default is None:
             raise ValueError("on_miss 'default' needs a default")
-        for lookup in self.lookups:
-            if len(lookup.keys) != len(self.sources):
+        for index, lookup in enumerate(self.lookups):
+            if len(lookup.keys) != len(self.sources_of(index)):
                 raise ValueError("every lookup needs one key column per source field")
         return self
+
+    def sources_of(self, index: int) -> list[str]:
+        """The source fields lookup ``index`` is keyed by: its own, else the rule's."""
+        own = self.lookups[index].sources
+        return self.sources if own is None else own
 
 
 class ExpressionRule(_Rule):
@@ -256,6 +272,8 @@ class ReconcileSpec(_Strict):
                 fields.add(rule.source)
             elif isinstance(rule, ValueMapRule):
                 fields.update(rule.sources)
+                for lookup in rule.lookups:
+                    fields.update(lookup.sources or ())
             elif isinstance(rule, ExpressionRule):
                 for case in rule.cases:
                     fields.update(cond.field for cond in case.when)

@@ -613,3 +613,36 @@ def test_the_registry_preview_uses_the_summary():
                              content={"rows": [{"row": 1, "values": ["SECRETCELL"]}]})
     preview = registry._short_tool_output(result)
     assert preview == "read_mapping: 1 rows"
+
+
+async def test_status_of_a_finished_run_lists_columns_by_mismatches(world):
+    counts = {"rows_total": 5, "mismatches": 4,
+              "col.Few.checked": 5, "col.Few.matched": 4, "col.Few.mismatched": 1,
+              "col.Few.not_checked": 0, "col.Few.kind.direct": 1,
+              "col.Many.checked": 5, "col.Many.matched": 2, "col.Many.mismatched": 3,
+              "col.Many.not_checked": 0, "col.Many.kind.value_map": 1,
+              "col.Open.checked": 0, "col.Open.matched": 0, "col.Open.mismatched": 0,
+              "col.Open.not_checked": 5, "col.Open.kind.unresolved": 1}
+    async with SessionLocal() as s:
+        rid = await runs_store.create_run(
+            s, conversation_id=world.cid, principal=ALICE, message_id=world.mid,
+            table_name="ZTAB", wave="W1", spec_file_id=None, rows_total=5)
+        assert await runs_store.finish_run(s, rid, status="done", counts=counts)
+    status = await call(world.ts, "reconciliation_status")
+    assert status["counts"] == {"rows_total": 5, "mismatches": 4}
+    assert [c["column"] for c in status["columns"]] == ["Many", "Few", "Open"]
+    assert status["columns"][0] == {"column": "Many", "kind": "value_map", "checked": 5,
+                                    "matched": 2, "mismatched": 3, "not_checked": 0}
+
+
+async def test_status_of_a_failed_run_has_no_column_list(world):
+    async with SessionLocal() as s:
+        rid = await runs_store.create_run(
+            s, conversation_id=world.cid, principal=ALICE, message_id=world.mid,
+            table_name="ZTAB", wave="W1", spec_file_id=None, rows_total=5)
+        assert await runs_store.finish_run(
+            s, rid, status="failed", error_code="arc1_timeout",
+            counts={"rows_total": 5, "col.A.checked": 1, "col.A.kind.direct": 1})
+    status = await call(world.ts, "reconciliation_status")
+    assert status["counts"] == {"rows_total": 5}
+    assert "columns" not in status

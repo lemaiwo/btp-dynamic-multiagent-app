@@ -569,3 +569,42 @@ async def test_batch_size_and_cap_are_checked():
             await start(cid, mid, StubServer(), batch_size=bad)
     with pytest.raises(ValueError):
         await start(cid, mid, StubServer(), mismatch_cap=0)
+
+
+# --- per-column counters --------------------------------------------------------
+
+
+def test_column_counters_are_flattened_plain_counters_and_read_back():
+    from agents.reconcile.engine import ColumnStats
+
+    stats = {"A.b": ColumnStats(kind="direct", checked=5, matched=3, mismatched=2),
+             "Free": ColumnStats(kind="unresolved", not_checked=5)}
+    flat = run.column_counts(stats)
+    assert flat["col.A.b.checked"] == 5 and flat["col.A.b.mismatched"] == 2
+    assert flat["col.Free.not_checked"] == 5
+    assert flat["col.A.b.kind.direct"] == 1
+    assert all(type(v) is int for v in flat.values())
+    runs_store._counters(flat)  # runs_store's validator accepts them
+    totals, columns = run.split_counts({"rows_total": 5, **flat, "col.x": 1,
+                                                  "col.Bad.checked": "3"})
+    assert totals == {"rows_total": 5}
+    assert columns == [
+        {"column": "A.b", "kind": "direct", "checked": 5, "matched": 3, "mismatched": 2,
+         "not_checked": 0},
+        {"column": "Free", "kind": "unresolved", "checked": 0, "matched": 0, "mismatched": 0,
+         "not_checked": 5},
+    ]
+
+
+async def test_a_finished_run_stores_per_column_counters():
+    cid, mid = await conversation()
+    server = StubServer()
+    answer = await start(cid, mid, server)
+    await wait(cid)
+    counts = json.loads((await row_of(answer["run_id"])).counts_json)
+    sp = spec()
+    for column in sp.columns:
+        for metric in ("checked", "matched", "mismatched", "not_checked"):
+            assert isinstance(counts[f"col.{column}.{metric}"], int)
+    per_column = sum(counts[f"col.{c}.mismatched"] for c in sp.columns)
+    assert per_column == counts["mismatches"]

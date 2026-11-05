@@ -281,3 +281,15 @@ def test_hint_names_are_cut_and_lose_control_characters() -> None:
     text = xref_reader._hint_name("a\x00b\nc" + "d" * 200)
     assert "\x00" not in text and "\n" not in text
     assert len(text) <= xref_reader.MAX_HINT_NAME
+
+
+def test_build_lookups_builds_each_lookup_of_a_source_chain_from_its_own_table() -> None:
+    groups = {**_GROUPS, "sources": ["GRP"]}
+    spec = _spec({"KIND": {"kind": "value_map", "sources": ["KIND"], "lookups": [_CODES, groups]},
+                  "GROUP": {"kind": "value_map", "sources": ["GRP"], "lookups": [_GROUPS]}})
+    lookups = build_lookups(xref_book(), spec)
+    assert lookups[("KIND", 0)].get(("X1",)) == "B"
+    assert lookups[("KIND", 1)].get(("OLD2",)) == "NEW2"
+    # an override is part of what makes a table "the same": not shared with GROUP
+    assert lookups[("KIND", 1)] is not lookups[("GROUP", 0)]
+    assert lookups[("KIND", 1)].entries == lookups[("GROUP", 0)].entries

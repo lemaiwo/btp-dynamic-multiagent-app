@@ -431,3 +431,35 @@ def test_pad_key() -> None:
 
 def test_same_trailing_newline_not_trimmed() -> None:
     assert values.same("012\n", "12\n", trim=False, alpha=True) is False
+
+
+# --- per-lookup sources (a fallback chain across source fields) ----------------
+
+
+def _chain(second: dict[str, Any]) -> dict[str, Any]:
+    return {"kind": "value_map", "sources": ["AFIELD"], "lookups": [_lookup(), second]}
+
+
+def test_a_lookup_may_name_its_own_source_fields() -> None:
+    rule = _chain(_lookup(sheet="Groups", sources=["bfield"]))
+    spec = ReconcileSpec.model_validate(_spec(columns={"C": rule}))
+    mapped = spec.columns["C"]
+    assert mapped.lookups[0].sources is None
+    assert mapped.lookups[1].sources == ["BFIELD"]
+    assert mapped.sources_of(0) == ["AFIELD"] and mapped.sources_of(1) == ["BFIELD"]
+    assert spec.ecc_fields() == ["OBJNR", "AFIELD", "BFIELD"]
+
+
+def test_a_lookup_override_needs_one_key_column_per_own_source_field() -> None:
+    rule = _chain(_lookup(sources=["B1", "B2"]))
+    with pytest.raises(ValidationError) as exc:
+        ReconcileSpec.model_validate(_spec(columns={"C": rule}))
+    assert "every lookup needs one key column per source field" in str(exc.value)
+    two = _chain(_lookup(keys=[{"letter": "A"}, {"letter": "B"}], sources=["B1", "B2"]))
+    assert ReconcileSpec.model_validate(_spec(columns={"C": two}))
+
+
+@pytest.mark.parametrize("bad", [[], ["not ok"], ["A", "B", "C", "D", "E"]])
+def test_a_lookup_override_is_checked_like_the_rule_sources(bad: list[str]) -> None:
+    with pytest.raises(ValidationError):
+        ReconcileSpec.model_validate(_spec(columns={"C": _chain(_lookup(sources=bad))}))

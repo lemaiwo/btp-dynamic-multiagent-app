@@ -154,7 +154,12 @@ def reconcile_toolset(
 
 def _status_of(row: dict[str, Any], files: list[dict[str, Any]], live: dict[str, int] | None,
                ) -> dict[str, Any]:
-    """The status answer of one run row: counters, the report link, the error code."""
+    """The status answer of one run row: counters, the report link, the error code.
+
+    The per-column counters are taken out of ``counts`` and answered as
+    ``columns`` for a done run only: a failed run's partial numbers per column
+    would read as a verdict.
+    """
     status = row["status"]
     out: dict[str, Any] = {
         "run_id": row["run_id"], "status": status, "table": row["table"], "wave": row["wave"],
@@ -164,8 +169,11 @@ def _status_of(row: dict[str, Any], files: list[dict[str, Any]], live: dict[str,
         if live is not None:
             out["rows_done"] = max(out["rows_done"] or 0, live.get("rows_done", 0))
         return out
-    if row["counts"]:
-        out["counts"] = row["counts"]
+    totals, columns = reconcile_run.split_counts(row["counts"] or {})
+    if totals:
+        out["counts"] = totals
+    if status == "done" and columns:
+        out["columns"] = columns
     report = next((f for f in files if f["id"] == row["report_file_id"]), None)
     if report is not None:
         out["report"] = {"file_id": report["id"], "name": report["name"],
@@ -369,7 +377,9 @@ def _register(toolset: ReconcileToolset, context: ReconcileContext) -> None:
         Without `run_id`: the newest run. Answers `{run_id, status (running,
         done, failed, interrupted), table, wave, rows_done, rows_total}` plus,
         once it ended, `counts` (rows compared, mismatches, missing in the
-        source, ...), `report: {file_id, name, download_url}` (the Excel
+        source, ...), for a done run `columns: [{column, kind, checked,
+        matched, mismatched, not_checked}]` (most mismatches first), `report:
+        {file_id, name, download_url}` (the Excel
         report) and, for failed or interrupted, `error: {code, message}`: tell
         the user what it means; start again only when they ask.
         """
