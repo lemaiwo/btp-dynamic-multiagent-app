@@ -11,6 +11,7 @@ Run:  .venv/bin/python -m pytest tests/test_reconcile_runs_store.py -q
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from datetime import datetime, timedelta, timezone
@@ -94,6 +95,72 @@ async def test_create_run_starts_running_with_its_facts():
     assert got.error_code is None and got.finished_at is None
 
 
+async def test_create_run_refuses_a_second_live_run_of_the_conversation():
+    cid = await conversation()
+    first = await new_run(cid)
+    assert await new_run(cid) is None
+    async with SessionLocal() as s:
+        await runs_store.finish_run(s, first, status="done", counts={})
+    assert await new_run(cid) is not None
+
+
+async def test_create_run_after_a_stale_run_interrupts_it_and_starts():
+    cid = await conversation()
+    stale = await new_run(cid)
+    await age(stale, runs_store.STALE_SECONDS + 5)
+    fresh = await new_run(cid)
+    assert fresh is not None and fresh != stale
+    assert (await row(stale)).status == "interrupted"
+
+
+async def test_create_run_for_a_conversation_that_is_gone_inserts_nothing():
+    assert await new_run("no-such-conversation") is None
+    async with SessionLocal() as s:
+        assert (await s.execute(select(ReconcileRun))).scalars().all() == []
+
+
+async def test_two_concurrent_create_runs_make_exactly_one_row():
+    cid = await conversation()
+    ids = await asyncio.gather(new_run(cid), new_run(cid))
+    assert sorted(i is None for i in ids) == [False, True]
+    async with SessionLocal() as s:
+        rows = (await s.execute(
+            select(ReconcileRun).where(ReconcileRun.conversation_id == cid)
+        )).scalars().all()
+    assert len(rows) == 1 and rows[0].status == "running"
+
+
+async def test_heartbeat_refuses_a_negative_count():
+    cid = await conversation()
+    run_id = await new_run(cid)
+    async with SessionLocal() as s:
+        with pytest.raises(ValueError):
+            await runs_store.heartbeat(s, run_id, -1)
+
+
+async def test_an_interrupted_row_takes_no_heartbeat_and_no_finish():
+    cid = await conversation()
+    run_id = await new_run(cid)
+    async with SessionLocal() as s:
+        assert await runs_store.sweep_running_at_startup(s) == 1
+        assert await runs_store.heartbeat(s, run_id, 30) is False
+        assert await runs_store.finish_run(
+            s, run_id, status="done", counts={"matched": 40}, report_file_id="f") is False
+    got = await row(run_id)
+    assert (got.status, got.error_code, got.rows_done) == ("interrupted", "interrupted", 0)
+    assert got.counts_json is None and got.report_file_id is None
+
+
+@pytest.mark.parametrize("status", ["failed", "interrupted"])
+async def test_a_failed_or_interrupted_outcome_needs_its_error_code(status):
+    cid = await conversation()
+    run_id = await new_run(cid)
+    async with SessionLocal() as s:
+        with pytest.raises(ValueError):
+            await runs_store.finish_run(s, run_id, status=status, counts={})
+    assert (await row(run_id)).status == "running"
+
+
 async def test_heartbeat_moves_a_running_row_and_stops_once_the_conversation_is_gone():
     cid = await conversation()
     run_id = await new_run(cid)
@@ -173,6 +240,8 @@ async def test_active_run_ignores_a_finished_row():
 async def test_latest_run_is_the_newest_of_the_owner_and_never_another_principals():
     cid = await conversation()
     first = await new_run(cid, wave="W1")
+    async with SessionLocal() as s:
+        await runs_store.finish_run(s, first, status="done", counts={})
     second = await new_run(cid, wave="W2")
     async with SessionLocal() as s:
         latest = await runs_store.latest_run(s, cid, ALICE)
@@ -198,12 +267,12 @@ async def test_latest_run_names_a_stale_running_row_interrupted():
 
 
 async def test_sweep_running_at_startup_interrupts_every_running_row():
-    cid = await conversation()
-    a = await new_run(cid)
-    b = await new_run(cid)
-    done = await new_run(cid)
+    done = await new_run(await conversation())
     async with SessionLocal() as s:
         await runs_store.finish_run(s, done, status="done", counts={"matched": 1})
+    a = await new_run(await conversation())
+    b = await new_run(await conversation())
+    async with SessionLocal() as s:
         assert await runs_store.sweep_running_at_startup(s) == 2
     for run_id in (a, b):
         got = await row(run_id)

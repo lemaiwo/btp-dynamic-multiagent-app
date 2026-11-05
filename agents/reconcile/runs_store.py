@@ -8,6 +8,12 @@ after a restart, still finds how it ended. Why each rule:
   once: ``finish_run``, the stale check and the startup sweep all write
   ``WHERE status = 'running'``, so a late failure never overwrites a ``done``
   and two instances never both finish a run. No ``RETURNING`` (SAP HANA).
+* **One live run per conversation.** :func:`create_run` decides under a
+  lock: the conversation row ``FOR UPDATE`` on Postgres and SAP HANA, the
+  write lock up front on SQLite (``begin_exclusive_write``), then "is a run
+  of it ``running``?" and the INSERT in that one transaction. No unique or
+  partial index can say "one ``running`` row" on HANA, and a plain
+  check-then-insert lets two instances (or two tool calls) both start.
 * **Heartbeat.** The task stamps ``updated_at`` with its progress; a
   ``running`` row older than :data:`STALE_SECONDS` belongs to a process that
   is gone (another instance crashed) and is read as ``interrupted`` and
@@ -32,7 +38,7 @@ from typing import Any
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from agents.db import ReconcileRun
+from agents.db import ChatConversation, ReconcileRun, begin_exclusive_write
 from agents.ide.models import iso_utc
 
 # A running row whose heartbeat is older than this is a run nobody drives.
@@ -87,7 +93,25 @@ async def create_run(
     db: AsyncSession, *, conversation_id: str, principal: str, message_id: str | None,
     table_name: str, wave: str, spec_file_id: str | None, rows_total: int,
 ) -> str:
-    """Insert a ``running`` row; its id."""
+    """Insert a ``running`` row and return its id, or ``None`` when nothing
+    was inserted: the conversation already has a live run, or it is gone.
+
+    A running row without a recent heartbeat is interrupted first, so a run
+    a dead process left behind does not block the conversation for good.
+    """
+    await _interrupt_stale(db, conversation_id)
+    await begin_exclusive_write(db)
+    owner = (await db.execute(
+        select(ChatConversation.id).where(ChatConversation.id == conversation_id)
+        .with_for_update()
+    )).scalar_one_or_none()
+    busy = owner is not None and (await db.execute(
+        select(ReconcileRun.id).where(ReconcileRun.conversation_id == conversation_id,
+                                      ReconcileRun.status == RUNNING).limit(1)
+    )).scalar_one_or_none() is not None
+    if owner is None or busy:
+        await db.rollback()
+        return None
     now = _now()
     row = ReconcileRun(
         conversation_id=conversation_id, principal=principal, message_id=message_id,
@@ -103,6 +127,8 @@ async def create_run(
 async def heartbeat(db: AsyncSession, run_id: str, rows_done: int) -> bool:
     """Stamp progress on a running row; ``False`` when the row is gone or no
     longer running (the task should stop)."""
+    if isinstance(rows_done, bool) or not isinstance(rows_done, int) or rows_done < 0:
+        raise ValueError("rows_done: not a count")
     result = await db.execute(
         update(ReconcileRun)
         .where(ReconcileRun.id == run_id, ReconcileRun.status == RUNNING)
@@ -117,9 +143,13 @@ async def finish_run(
     db: AsyncSession, run_id: str, *, status: str, counts: dict[str, int],
     report_file_id: str | None = None, error_code: str | None = None,
 ) -> bool:
-    """``running`` -> ``status``; whether this call moved the row."""
+    """``running`` -> ``status``; whether this call moved the row. An outcome
+    other than ``done`` needs its ``error_code``: a failed row without one
+    could not tell the user what to do."""
     if status not in OUTCOMES:
         raise ValueError("status: not an outcome")
+    if status != "done" and error_code is None:
+        raise ValueError("error_code: required unless the status is done")
     if error_code is not None and (not error_code or len(error_code) > MAX_ERROR_CODE):
         raise ValueError("error_code: not a code")
     counts_json = _counters(counts)
@@ -168,7 +198,10 @@ async def latest_run(
     db: AsyncSession, conversation_id: str, principal: str, run_id: str | None = None,
 ) -> dict[str, Any] | None:
     """The caller's run ``run_id`` of the conversation, or its newest one;
-    ``None`` for another principal's run as for no run at all."""
+    ``None`` for another principal's run as for no run at all.
+
+    Not a pure read: it first marks the conversation's stale running rows
+    ``interrupted`` (and commits), as :func:`active_run` does."""
     await _interrupt_stale(db, conversation_id)
     stmt = select(ReconcileRun).where(
         ReconcileRun.conversation_id == conversation_id,
@@ -186,8 +219,14 @@ async def latest_run(
 
 async def sweep_running_at_startup(db: AsyncSession) -> int:
     """Startup only: a process that has just started drives no run, so every
-    ``running`` row becomes ``interrupted``; the number swept. Assumes ONE
-    app instance, like the other startup sweeps (``store.reset_running``)."""
+    ``running`` row becomes ``interrupted``; the number swept.
+
+    Assumes ONE app instance, like the other startup sweeps
+    (``store.reset_running``): it interrupts every running row, also one a
+    live sibling instance drives (during a rolling restart); that run's next
+    :func:`heartbeat` answers ``False`` and it stops. Not limited to stale
+    rows on purpose: a run of the previous process may have stamped its
+    heartbeat seconds before the restart and is still gone."""
     result = await db.execute(
         update(ReconcileRun)
         .where(ReconcileRun.status == RUNNING)
