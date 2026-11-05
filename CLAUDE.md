@@ -1964,9 +1964,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   text; a 401 is retried once after the destination is invalidated; the body
   of an error status is never read; a 2xx body over 8 MB is `too_large`; a
   destination that is OnPremise or not `https` is `destination_error` before
-  anything is sent; httpx's request line (it carries the CQL) is kept out of the log by
-  the same contextvar filter `agents/bitbucket_tools.py` uses. Denied in ABAP
-  Assistant sessions (not in `READONLY_POLICY`). Unit-tested only
+  anything is sent; httpx's request line (it carries the CQL) is kept out of
+  the log by the same contextvar filter `agents/bitbucket_tools.py` uses.
+  Denied in ABAP Assistant sessions (not in `READONLY_POLICY`). Unit-tested
+  only
   (`tests/test_confluence_tools.py`, `tests/test_confluence_registration.py`);
   first landscape test planned on b-fdn-dev with the `JIRA` destination
 - `agents/confluence_text.py` — storage-format XHTML to plain text, standard
