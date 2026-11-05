@@ -47,12 +47,18 @@ stateful SAP session (``agents/ina/client.py`` sends them):
 3. :func:`close_request`, which releases the instance (SIA answered
    "Query ... has been closed").
 
+A ``Sort`` (recorded 2026-11-05): SIA applied a measure sort in SAP's own
+client's form, without a ``Dimension`` (with the measure structure as
+``Dimension``, the 2.37.1 form, it was ignored), and a dimension sort by
+``MemberKey`` (:func:`_sort_entry`); each was seen alone, a list of several
+is sent in the order given, as that client sends it. The submit carries the
+sort too.
+
 Not seen on SIA: a read of several measures (the column order would be
 inferred, so :func:`check_caps` refuses more than one measure per run until a
-probe verifies it), a ``Filter`` or a ``Sort`` (no recorded request held
-one; the submit carries them too), and variables of type interval or
-multiple (their reading is inferred). The requests are those the probe
-sent; this module's own sequence has not run against the system yet.
+probe verifies it), a ``Filter`` (no recorded request held one; the submit
+carries it too), and variables of type interval or multiple (their reading
+is inferred).
 """
 
 from __future__ import annotations
@@ -331,6 +337,24 @@ def key_of(dimension: InaDimension) -> str:
     return dimension.key_field or f"{dimension.name}.KEY"
 
 
+def _sort_entry(name: str, direction: str, *, measure: bool) -> dict[str, str]:
+    """One entry of a run's ``Sort``, in the form SIA applied (recorded
+    2026-11-05 with ``scripts/probe_ina.py``: rows in descending value order,
+    and in descending key order): a measure as SAP's own InA client writes
+    it (SAPUI5 ``sap/sac/df/firefly/ff4400.olap.providers.js``,
+    ``QInASort.exportMeasureSorting``: ``SortType`` ``Measure``,
+    ``MeasureName``, ``Direction``) and with NO ``Dimension``: a measure sort
+    has none of its own, and with the measure structure named there (what
+    2.37.1 sent) SIA ignored the sort and answered in key order. A row
+    dimension is sorted by its key (``SortType`` ``MemberKey``, its name as
+    ``Dimension``). ``direction`` is ``asc`` or ``desc`` (checked by the
+    caller)."""
+    wire = "Desc" if direction == "desc" else "Asc"
+    if measure:
+        return {"SortType": "Measure", "MeasureName": name, "Direction": wire}
+    return {"Dimension": name, "SortType": "MemberKey", "Direction": wire}
+
+
 def plan_run(
     definition: InaDefinition,
     *,
@@ -393,18 +417,7 @@ def plan_run(
         if by in ordered:
             raise _refuse(f"{where}.by", "repeats an earlier entry")
         ordered.add(by)
-        wire_direction = "Desc" if direction == "desc" else "Asc"
-        if by in chosen_measures:
-            sort.append(
-                {
-                    "Dimension": structure,
-                    "SortType": "Measure",
-                    "MeasureName": by,
-                    "Direction": wire_direction,
-                }
-            )
-        else:
-            sort.append({"Dimension": by, "SortType": "MemberKey", "Direction": wire_direction})
+        sort.append(_sort_entry(by, direction, measure=by in chosen_measures))
 
     known_variables = {v.name: v for v in definition.variables}
     for name in variables:

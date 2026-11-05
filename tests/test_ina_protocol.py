@@ -695,12 +695,52 @@ def test_a_submit_answer_without_dimensions_names_no_text(cube):
     assert text_attributes(cube, SIA_ROWS) == {}
 
 
-def test_a_sort_on_a_measure_names_the_real_structure():
-    plan = sia_plan(group_by=["2CIMMPURGORG"],
+COSTCENTER = "2CCMMPURORDSPND-COSTCENTER"
+
+
+def sort_of(plan: RunPlan) -> list[dict[str, Any]]:
+    return analytics_request(["C"], data_source("Q", ""), plan)["Analytics"]["Definition"][
+        "Sort"]
+
+
+def test_a_sort_on_a_measure_names_the_measure_and_no_dimension():
+    """firefly's form (``QInASort.exportMeasureSorting``: ``SortType``,
+    ``Direction``, ``MeasureName``; a measure sort has no dimension of its
+    own), which SIA applied on 2026-11-05: the rows came back in descending
+    value order. With the measure structure as ``Dimension`` (what 2.37.1
+    sent) SIA ignored the sort and answered in key order."""
+    plan = sia_plan(group_by=[COSTCENTER], top=5,
                     order=[{"by": "ELTUIDCMP1", "direction": "desc"}])
-    assert analytics_request(["C"], data_source("Q", ""), plan)["Analytics"]["Definition"][
-        "Sort"] == [{"Dimension": "ELTUIDSTRCMMPURORDQUERY", "SortType": "Measure",
-                     "MeasureName": "ELTUIDCMP1", "Direction": "Desc"}]
+    assert sort_of(plan) == [
+        {"SortType": "Measure", "MeasureName": "ELTUIDCMP1", "Direction": "Desc"}]
+
+
+def test_a_sort_on_a_dimension_is_by_its_member_key():
+    """The form SIA applied on 2026-11-05 (rows in descending key order)."""
+    plan = sia_plan(group_by=[COSTCENTER], top=5,
+                    order=[{"by": COSTCENTER, "direction": "desc"}])
+    assert sort_of(plan) == [{"Dimension": COSTCENTER, "SortType": "MemberKey",
+                              "Direction": "Desc"}]
+
+
+def test_a_sort_keeps_the_order_given_and_defaults_to_ascending():
+    plan = sia_plan(group_by=[COSTCENTER],
+                    order=[{"by": COSTCENTER}, {"by": "ELTUIDCMP1", "direction": "asc"}])
+    assert sort_of(plan) == [
+        {"Dimension": COSTCENTER, "SortType": "MemberKey", "Direction": "Asc"},
+        {"SortType": "Measure", "MeasureName": "ELTUIDCMP1", "Direction": "Asc"},
+    ]
+
+
+def test_the_submit_carries_the_sort_of_the_read():
+    plan = sia_plan(group_by=[COSTCENTER], order=[{"by": "ELTUIDCMP1", "direction": "desc"}])
+    submit = variable_submit_request(["C"], data_source("Q", ""), plan)
+    assert submit["Analytics"]["Definition"]["Sort"] == sort_of(plan)
+
+
+def test_a_run_without_order_sends_no_sort():
+    definition = analytics_request(["C"], data_source("Q", ""), sia_plan(group_by=[COSTCENTER]))
+    assert "Sort" not in definition["Analytics"]["Definition"]
 
 
 def test_an_older_description_falls_back_to_measures_and_the_variable_name():
