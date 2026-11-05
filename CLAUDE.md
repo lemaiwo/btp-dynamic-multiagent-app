@@ -1268,18 +1268,25 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   each variable's dimension key), the three requests of a run on one
   `InstanceId` (VariableSubmit, read, Close) as the probe sent them, and the
   grid shape SAP answered them with; the run sequence and the grid reader of
-  the app are built on those recorded answers. **Not seen on the system**:
-  the app's own client end to end (only the probe's sequence ran there; the
-  cookie merge, the 403 redo, the Close and the texts taken from the submit
-  answer are unit-tested only), `filters` and `order` (no recorded request
-  held a `Filter` or a `Sort`; the submit carries them too), a read of
-  several measures (their column order would be inferred, so a run takes
-  ONE measure until a probe verifies it), variables of type interval or
-  multiple ("inferred, not seen": every recorded variable was a single
+  the app are built on those recorded answers. **Seen on the system since**:
+  the app's own client end to end (2.37.1: grouped reads, one of them
+  filtered to one member), and, recorded with `scripts/probe_ina.py --order`
+  on 2026-11-05, **`order` verified**: a measure sort in SAP's own client's
+  form, without `Dimension`, came back in descending value order with the
+  full `TupleCountTotal` (2.37.1 named the measure structure as `Dimension`
+  and the system ignored the sort: a "top n by value" came back in key
+  order, silently; fixed in 2.37.2), and a dimension sort by `MemberKey` in
+  descending key order; each alone (a list of several is sent in the order
+  given, not seen); and a dimension's "not assigned" member (key `""`, key
+  `ValuesException` 1), which 2.37.1 refused with the whole run and 2.37.2
+  returns as a row with a null key (`grid.py`). **Not seen on the system**:
+  a 403 redo (unit-tested only), filter operators other than one value, a
+  read of several measures (their column order would be inferred, so a run
+  takes ONE measure until a probe verifies it), variables of type interval
+  or multiple ("inferred, not seen": every recorded variable was a single
   value), a query without variables (no submit, so the read asks for keys
-  only), a value SAP marks (refused, not read as null). The first data read
-  by the app, one filtered and one ordered read among it, is pending on a
-  landscape. **A version before 2.37.1 refuses a definition that holds
+  only), a cell SAP marks or sends as no number and a key mark other than 1
+  (refused, never read as null). **A version before 2.37.1 refuses a definition that holds
   `measure_structure` or `key_field`** (`extra="forbid"`): after a rollback,
   or in a database of an older version (`scripts/copy_registry_config.py`),
   such a row reads back as not described until Describe runs there again,
@@ -1373,8 +1380,11 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     `Columns` (`measure_structure`, `Measures` for a row described before
     2.37.1); a `Selection` of `And` over member filters `=`, `<>`, `>=`,
     `<=`, `between`, `in` on the dimension's key (`key_of`: the same
-    attribute the read lists as the key), `Sort`,
-    `Variables` (each value named by its dimension's key, `key_field` of the
+    attribute the read lists as the key), `Sort` (`_sort_entry`: a measure
+    as `{SortType: Measure, MeasureName, Direction}` with NO `Dimension`, a
+    row dimension as `{Dimension, SortType: MemberKey, Direction}`, in the
+    order given; the forms the system applied, 2026-11-05), `Variables`
+    (each value named by its dimension's key, `key_field` of the
     variable, `IsExcluding: false`), `ResultFormat: Version2`, `RowTo` =
     `top + 1`, no `MaxResultRecords`, `Options: ["StatefulServer"]`),
     `variable_submit_request` (the read in the plain form the system accepted
@@ -1414,7 +1424,7 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     member index is the measure's place in the request); `Cells.Values` /
     `Cells.Units` row-major, `CellArraySizes` `[rows, columns]`; a wrapped
     list is read only with `Encoding` `None`. Answers `{columns, rows,
-    units, row_count, truncated}` (a `<dim>.text` column when a text that
+    units, row_count, truncated, not_assigned?}` (a `<dim>.text` column when a text that
     differs from the key came back, a `<measure>.unit` column when the unit
     differs per row). **Fail-closed**, `sap_error` with one fixed text
     (`UNREADABLE`) for a form it does not know, checked on everything SAP
@@ -1427,7 +1437,15 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     text cell) is `sap_error` with a text of its own (`VALUE_REFUSED`, ending
     "tell the user instead of retrying"), never read as null, and only in a
     row that is returned (the `top + 1`-th row is checked for its form
-    alone; a marked member's key and text are not read). More than `top + 1`
+    alone; a marked member's key and text are not read). **One exception**,
+    the only mark seen on the system (2026-11-05, `run_sia_ordered.json`,
+    `run_sia_not_assigned.json`): a member key marked `NO_VALUE` (1, SAP's
+    own client's `ValueException.NULL_VALUE`) is the dimension's "not
+    assigned" member, key `""`, its cell a plain number: the row is returned
+    with key and text null, and `not_assigned` (only when there is one)
+    counts such rows per dimension; every other key mark and every cell mark
+    (none seen, all `Exceptions` 0) is still refused (`key_exception`,
+    `cell_exception`). More than `top + 1`
     rows or more than 5,000 returned cells is `result_too_large`, never cut.
     Every refusal logs ONE WARNING `ina: grid refused: <reason> (count=n)`,
     a key of the closed list `REFUSAL_REASONS` and a count made by the
@@ -1444,7 +1462,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     filters=None, top=100, order=None, variables=None)` (`measures` a list of
     exactly one, as its description says; arguments checked by
     `plan_run` before a client or resolver is built; `truncated` adds the
-    hint to narrow the filters or raise `top`). A name the entry does not
+    hint to narrow the filters or raise `top`, `not_assigned` the hint
+    `NOT_ASSIGNED_HINT` (report the null key as not assigned, never leave it
+    out), joined by `; ` when both). A name the entry does not
     hold, or holds disabled, is `query_unknown` without the name sent; a
     query no admin has described is the tool-level code `not_described`
     (`NOT_DESCRIBED`, outside `ERROR_CODES`, hint "ask an admin to describe
@@ -1520,14 +1540,18 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `test_ina_sessions.py`, `test_ina_tools.py`, `test_ina_registration.py`,
   `test_ina_db.py`, `test_ina_admin.py`, `test_ina_admin_describe.py`,
   `test_ina_bundles.py`, `test_probe_ina.py` (the probe's read, submit,
-  Close and text reading held to `protocol.py`); the SAP double and grid
+  Close, text reading and `--order` held to `protocol.py`); the SAP double and grid
   builder are `tests/ina_helpers.py`; fixtures in `tests/fixtures/ina/`,
-  synthetic with placeholder names except the four recorded ones,
+  synthetic with placeholder names except the six recorded ones,
   sanitised: `describe_sia.json` (a describe, session ids replaced),
   `submit_sia.json` (a VariableSubmit answer cut to each dimension's name,
   type, key and text attribute), `run_sia_grid.json` (a grid of two row
-  dimensions, every key, text, amount and count replaced) and
-  `run_sia_variables_missing.json` (the refusal of a read without a submit)
+  dimensions, every key, text, amount and count replaced),
+  `run_sia_ordered.json` (top 5 cost centres by value, descending, the "not
+  assigned" member first) and `run_sia_not_assigned.json` (a grouping of
+  one member plus the "not assigned" one), both with synthetic keys and
+  amounts, and `run_sia_variables_missing.json` (the refusal of a read
+  without a submit)
 - `agents/data_catalog/` — the **data catalogue graph** (design addendum j, part 1):
   one graph of every data source attached to at least one enabled agent, built once
   and scoped at query time, so an agent finds the right source without a prompt that
@@ -3245,7 +3269,16 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   and multiple variables. A query described before needs one Describe again so
   its measure structure and its variables' dimension keys are stored; a version
   before 2.37.1 refuses a definition that holds them (`extra="forbid"`: a row
-  reads back as not described there, an HTTP bundle import fails as a whole)
+  reads back as not described there, an HTTP bundle import fails as a whole);
+  2.37.2 is the fix of the first data reads by the app on the system: a measure
+  `order` goes out in the form the system applies (no `Dimension`; 2.37.1's
+  form was ignored, so a "top n by value" came back in key order without a
+  word), verified together with a dimension order (`scripts/probe_ina.py
+  --order`, three recorded reads), and a dimension's "not assigned" member
+  (key `ValuesException` 1) is a row with a null key, counted in
+  `not_assigned`, instead of refusing the whole run as `sap_error`; every
+  other mark is still refused. No new resource, environment variable, table,
+  column or HANA generation
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets
