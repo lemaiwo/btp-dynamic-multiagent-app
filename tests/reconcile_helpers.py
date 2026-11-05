@@ -68,3 +68,44 @@ def mapping_book(extra: list[list[Any]] | None = None) -> bytes:
         "Fields": mapping_rows(extra),
         "Codes": [["Source value", "Target value"], ["01", "A"]],
     })
+
+
+# Cross-reference sheets: four layouts a hand-kept code-table workbook mixes.
+# ``Codes`` holds a duplicate key (first wins), a blank-key row and a padded
+# cell; ``Groups`` puts two tables side by side under duplicate labels.
+XREF_SHEETS: dict[str, list[list[Any]]] = {
+    "Codes": [
+        ["Note", "Source value", "Target value"],
+        [None, "01", "A"],
+        [None, " X1 ", " B "],
+        [None, None, "orphan"],
+        [None, "01", "Z"],
+        [None, 7, "C"],
+    ],
+    "Groups": [
+        ["Group tables"],
+        [],
+        ["Hierarchy", "Group", None, "Group", "Group"],
+        ["H1", "G1", None, "OLD1", "NEW1"],
+        ["H2", "G2", None, "OLD2", "NEW2"],
+        [None, None, None, "OLD3", "NEW3"],
+    ],
+    "Units": [
+        ["Units of measure"],
+        ["Id", "Source unit", "Text", None, None, "Target unit"],
+        [1, "ST", "piece", None, None, "PC"],
+        [2, "KG", "kilogram", None, None, "KGM"],
+    ],
+    "Multi": [
+        ["Kind", "Code", "Target"],
+        ["K1", "01", "T1"],
+        ["K2", "01", "T2"],
+        ["K1", "02", "T3"],
+    ],
+}
+
+
+def xref_book(extra: dict[str, list[list[Any]]] | None = None) -> bytes:
+    """The synthetic cross-reference workbook (:data:`XREF_SHEETS`), plus ``extra`` sheets."""
+    return build_book({**{k: [list(r) for r in v] for k, v in XREF_SHEETS.items()},
+                       **(extra or {})})
