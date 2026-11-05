@@ -12,7 +12,9 @@ Covered: what each tool answers and what it leaves out; a name the entry does
 not hold, a query without a description and every argument the client
 refuses are answered before anything is sent, without the name the model
 sent; the client's answer is passed through, a truncated one with its hint,
-one over the result cap refused; failures are ``{"error": {...}}``, never an
+an ordered one in SAP's order (the sort in the form SIA applied, recorded
+2026-11-05), a "not assigned" row as a null key with its hint, one over the
+result cap refused; failures are ``{"error": {...}}``, never an
 exception; and the fixed-form activity lines.
 
 Run:  python -m pytest tests/test_ina_tools.py
@@ -53,6 +55,7 @@ from agents.ina import tools as ina_tools  # noqa: E402
 from agents.ina.protocol import read_description  # noqa: E402
 from agents.ina.tools import (  # noqa: E402
     MAX_RESULT_CHARS,
+    NOT_ASSIGNED_HINT,
     TRUNCATED_HINT,
     NoUsableQueryError,
     activity_summary,
@@ -327,6 +330,79 @@ async def test_run_query_with_variables_end_to_end_on_the_answers_sia_gave():
         {"Name": "2CI_SUPPLIER_CDS.KEY", "Obtainability": "Always"},
         {"Name": "2CI_SUPPLIER_CDS.LONG_TEXT", "Obtainability": "Always"},
     ]
+
+
+SIA_VALUES = {"!CDS_P_P_DISPLAYCURRENCY": "EUR", "!CDS_P_P_DATEFUNCTION": "YEARTODATE"}
+COSTCENTER = "2CCMMPURORDSPND-COSTCENTER"
+PRODUCTTYPE = "2CCMMPURORDSPND-PRODUCTTYPE"
+
+
+def sia_world(answer: str) -> World:
+    described = read_description(fixture("describe_sia.json")["Cube"]).definition
+    w = world(row(definition=described.model_dump(mode="json")))
+    w.sap.submit_answers = [fixture("submit_sia.json")]
+    w.sap.answers = [fixture(answer)]
+    return w
+
+
+async def test_run_query_ordered_by_the_measure_on_the_answer_sia_gave():
+    """Top 5 cost centres by value (recorded 2026-11-05, sanitised): the
+    sort goes out in the form SIA applied, in the submit and the read, and
+    the rows come back in SAP's order, truncated, the cost centre without a
+    value as a row with a null key."""
+    w = sia_world("run_sia_ordered.json")
+    answer = await w.tool("run_query")(
+        SALES, ["ELTUIDCMP1"], [COSTCENTER], top=5,
+        order=[{"by": "ELTUIDCMP1", "direction": "desc"}], variables=dict(SIA_VALUES))
+    assert answer == {
+        "columns": [COSTCENTER, "ELTUIDCMP1"],
+        "rows": [[None, 9100.5], ["0000000111", 8200.25], ["0000000222", 7300.0],
+                 ["0000000333", 6400.75], ["0000000444", 5500.0]],
+        "units": {"ELTUIDCMP1": "EUR"},
+        "row_count": 5,
+        "truncated": True,
+        "not_assigned": {COSTCENTER: 1},
+        "hint": f"{TRUNCATED_HINT}; {NOT_ASSIGNED_HINT}",
+    }
+    sort = [{"SortType": "Measure", "MeasureName": "ELTUIDCMP1", "Direction": "Desc"}]
+    assert w.sap.read_body()["Analytics"]["Definition"]["Sort"] == sort
+    assert json.loads(w.sap.submits[0].content)["Analytics"]["Definition"]["Sort"] == sort
+    assert w.sap.kinds == ["GET", "submit", "read", "close"]
+
+
+async def test_run_query_answers_the_not_assigned_member_as_a_null_key():
+    """The pilot's read that 2.37.1 refused whole (product type, recorded
+    2026-11-05): SAP's no-value member is a row with a null key, counted in
+    ``not_assigned``, with a hint to report it as such."""
+    w = sia_world("run_sia_not_assigned.json")
+    answer = await w.tool("run_query")(
+        SALES, ["ELTUIDCMP1"], [PRODUCTTYPE], top=20, variables=dict(SIA_VALUES))
+    assert answer == {
+        "columns": [PRODUCTTYPE, "ELTUIDCMP1"],
+        "rows": [["PT1", 1250.75], [None, 3400.5]],
+        "units": {"ELTUIDCMP1": "EUR"},
+        "row_count": 2,
+        "truncated": False,
+        "not_assigned": {PRODUCTTYPE: 1},
+        "hint": NOT_ASSIGNED_HINT,
+    }
+    assert NOT_ASSIGNED_HINT == (
+        "a null key is SAP's 'not assigned' member of that dimension; its number is real: "
+        "report it as not assigned, never leave it out")
+    assert activity_summary("run_query", answer) == "run_query: 2 rows"
+
+
+def test_the_tool_description_says_how_order_and_a_null_key_read():
+    description = " ".join(world().toolset.tools["run_query"].function.__doc__.split())
+    # A mixed list was never recorded: sent in that order, not "applied".
+    assert "sent to SAP in that order" in description
+    assert "applied by SAP" not in description
+    # Seen on the system with one row dimension and once with two, where SAP
+    # sorted the whole result, not within the first dimension's groups.
+    assert ("a measure sorts all rows by its value, across the groups of every "
+            "group_by dimension") in description
+    assert "not_assigned" in description and "null key" in description
+    assert 'a filter on the value "" (the not assigned member) is unverified' in description
 
 
 async def test_the_defaults_of_the_optional_arguments():

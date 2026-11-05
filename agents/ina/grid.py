@@ -43,12 +43,18 @@ A value SAP marks (a key's ``ValuesException`` or a cell's ``Exceptions``
 other than 0) or sends as no number (a null or a text cell) is refused as
 well, never read as null (a missing number would read as data), with a text
 of its own (:data:`VALUE_REFUSED`: the model tells the user instead of
-retrying). Values are checked only in the rows that are returned: the extra
-row only says "there is more". Only the requested key, text, value and unit
-leave, the texts cleaned and cut; every other attribute, label, formatted
-value and the data source are dropped. Never cut either: more rows than
-``top + 1`` or more cells than :data:`MAX_CELLS` in what would be returned
-is ``result_too_large``.
+retrying). The one exception is the mark SIA was seen to send (2026-11-05,
+``run_sia_ordered.json``, ``run_sia_not_assigned.json``): a member key marked
+:data:`NO_VALUE` (1, SAP's own client reads it as ``NULL_VALUE``) is the
+dimension's "not assigned" member, key ``""``, whose cell is a plain number;
+its row is returned with the key (and text) null and counted per dimension
+in ``not_assigned``, its key and text never read. Every other key mark, and
+every cell mark (none was seen), is refused. Values are checked only in the
+rows that are returned: the extra row only says "there is more". Only the
+requested key, text, value and unit leave, the texts cleaned and cut; every
+other attribute, label, formatted value and the data source are dropped.
+Never cut either: more rows than ``top + 1`` or more cells than
+:data:`MAX_CELLS` in what would be returned is ``result_too_large``.
 
 Every refusal logs ONE WARNING, ``ina: grid refused: <reason> (count=n)``:
 a key of the closed list :data:`REFUSAL_REASONS` and a count made here
@@ -110,6 +116,12 @@ VALUE_REASONS: tuple[str, ...] = ("cell_exception", "cell_null", "cell_text", "k
 # More than may be returned (result_too_large):
 SIZE_REASONS: tuple[str, ...] = ("too_many_rows", "too_many_cells")
 REFUSAL_REASONS: tuple[str, ...] = FORM_REASONS + VALUE_REASONS + SIZE_REASONS
+
+# The one key mark seen on SIA (2026-11-05): ``ValuesException`` 1 on a
+# dimension's "not assigned" member (key ""), which SAP's own client maps to
+# ``ValueException.NULL_VALUE`` (SAPUI5 ``sap/sac/df/firefly/ff4310.olap.impl.js``,
+# ``QInAConverter.setupValueException``: 0 normal, 1 null value, 7 error, ...).
+NO_VALUE = 1
 
 VALUE_REFUSED = (
     "SAP marked a value of the rows asked for as an error or sent no number for it, "
@@ -225,12 +237,13 @@ def _member_types(dimension: dict[str, Any], members: int) -> None:
 
 def _member_table(
     dimension: dict[str, Any], key_name: str, text_name: str | None, cap: int
-) -> tuple[list[str], list[str] | None, list[bool]]:
-    """``(keys, texts, marked)`` of a row dimension's members. ``texts`` is
-    None when no text was asked for or SAP sent none; ``marked`` says which
-    members SAP flagged in the key's ``ValuesException``. A marked member is
-    never read (its key and text may be anything; ``""`` stands in): the
-    caller refuses a returned row that points at one."""
+) -> tuple[list[str | None], list[str | None] | None, list[int]]:
+    """``(keys, texts, marks)`` of a row dimension's members. ``texts`` is
+    None when no text was asked for or SAP sent none; ``marks`` is each
+    member's mark in the key's ``ValuesException`` (0 none). A marked member
+    is never read (its key and text may be anything; None stands in): the
+    caller returns a row that points at a :data:`NO_VALUE` member with a null
+    key and refuses one that points at any other mark."""
     attributes = dimension.get("Attributes")
     if not isinstance(attributes, list):
         raise _refused("attributes", 0)
@@ -247,19 +260,19 @@ def _member_table(
     if not isinstance(raw_keys, list) or len(raw_keys) > cap:
         raise _refused("members", _length(raw_keys))
     exceptions = _values(key.get("ValuesException"), len(raw_keys), "key_exception_list")
-    marked = [flag != 0 for flag in _whole_numbers(exceptions, "key_exception_list")]
-    wrong = sum(1 for k, m in zip(raw_keys, marked) if not m and not isinstance(k, str))
+    marks = _whole_numbers(exceptions, "key_exception_list")
+    wrong = sum(1 for k, m in zip(raw_keys, marks) if not m and not isinstance(k, str))
     if wrong:
         raise _refused("key_form", wrong)
     _member_types(dimension, len(raw_keys))
-    keys = ["" if m else _key(k, _KEY_CHARS) for k, m in zip(raw_keys, marked)]
+    keys = [None if m else _key(k, _KEY_CHARS) for k, m in zip(raw_keys, marks)]
     if text_name is None or text_name not in by_name:
-        return keys, None, marked
+        return keys, None, marks
     raw_texts = _values(by_name[text_name].get("Values"), len(raw_keys), "text_form")
-    wrong = sum(1 for t, m in zip(raw_texts, marked) if not m and not isinstance(t, str))
+    wrong = sum(1 for t, m in zip(raw_texts, marks) if not m and not isinstance(t, str))
     if wrong:
         raise _refused("text_form", wrong)
-    return keys, ["" if m else _label(t, _TEXT_CHARS) for t, m in zip(raw_texts, marked)], marked
+    return keys, [None if m else _label(t, _TEXT_CHARS) for t, m in zip(raw_texts, marks)], marks
 
 
 def _measure_order(columns: dict[str, Any], plan: RunPlan) -> list[str]:
@@ -301,7 +314,10 @@ def read_grid(payload: object, plan: RunPlan) -> dict[str, Any]:
     followed by ``<name>.unit`` when its unit is not the same in every
     returned row; otherwise the unit is in ``units``). At most ``top`` rows
     are returned; ``truncated`` is true when SAP says more exist
-    (``TupleCountTotal``, or the extra row the request asks for).
+    (``TupleCountTotal``, or the extra row the request asks for). A row of a
+    dimension's "not assigned" member (:data:`NO_VALUE`) has a null key and
+    text; ``not_assigned`` (only when there is one) counts such rows per
+    dimension.
     """
     grids = payload.get("Grids") if isinstance(payload, dict) else None
     if not isinstance(grids, list) or len(grids) != 1:
@@ -323,18 +339,23 @@ def read_grid(payload: object, plan: RunPlan) -> dict[str, Any]:
     tuples = rows_axis.get("Tuples")
     if not isinstance(tuples, list) or len(tuples) != len(plan.group_by):
         raise _refused("row_tuples", _length(tuples))
-    # The member keys (and texts) of each requested dimension, row by row,
-    # and how many members a returned row points at that SAP marked.
-    keys_by_row: dict[str, list[str]] = {}
-    texts_by_row: dict[str, list[str] | None] = {}
+    # The member keys (and texts) of each requested dimension, row by row;
+    # how many members a returned row points at that SAP marked with a mark
+    # other than NO_VALUE, and per dimension the returned rows of its "not
+    # assigned" member.
+    keys_by_row: dict[str, list[str | None]] = {}
+    texts_by_row: dict[str, list[str | None] | None] = {}
     marked_members = 0
+    not_assigned: dict[str, int] = {}
     for dimension, entry in zip(rows_axis["Dimensions"], tuples):
         name = dimension["Name"]
-        keys, texts, marked = _member_table(
+        keys, texts, marks = _member_table(
             dimensions[name], plan.keys[name], plan.texts.get(name), plan.top + 1
         )
         indexes = _indexes(_object(entry).get("MemberIndexes"), count, len(keys))
-        marked_members += len({i for i in indexes[:shown] if marked[i]})
+        marked_members += len({i for i in indexes[:shown] if marks[i] not in (0, NO_VALUE)})
+        if without := sum(1 for i in indexes[:shown] if marks[i] == NO_VALUE):
+            not_assigned[name] = without
         keys_by_row[name] = [keys[i] for i in indexes]
         texts_by_row[name] = None if texts is None else [texts[i] for i in indexes]
 
@@ -408,13 +429,16 @@ def read_grid(payload: object, plan: RunPlan) -> dict[str, Any]:
             if measure in mixed:
                 out.append(unit)
         rows.append(out)
-    return {
+    result: dict[str, Any] = {
         "columns": _columns(plan, set(text_rows), mixed),
         "rows": rows,
         "units": unit_of,
         "row_count": len(rows),
         "truncated": total > plan.top,
     }
+    if not_assigned:
+        result["not_assigned"] = not_assigned
+    return result
 
 
 def _columns(plan: RunPlan, with_text: set[str], mixed: set[str]) -> list[str]:
@@ -433,6 +457,7 @@ def _columns(plan: RunPlan, with_text: set[str], mixed: set[str]) -> list[str]:
 __all__ = [
     "FORM_REASONS",
     "MAX_CELLS",
+    "NO_VALUE",
     "REFUSAL_REASONS",
     "SIZE_REASONS",
     "VALUE_REASONS",

@@ -50,6 +50,20 @@ answered with a grid (run 5); with Rows the read needed each row's key and
 text as ``Attributes`` and the totals hidden (runs 6 to 8): the sequence the
 app sends since 2.37.1 (``agents/ina/client.py``).
 
+``--order NAME=asc|desc`` (repeatable; added 2026-11-05) sorts the run by
+the measure or a ``--group-by`` dimension with the ``Sort`` ``plan_run``
+builds (in the submit and the read), and the read then prints one ``ORDER``
+line: whether the measure's values came back in descending or ascending
+order over all rows (``value_order``), the rows and ``TupleCount`` /
+``TupleCountTotal``, never a value.
+``--sort-form`` tries other readings of a measure sort (``structure``: the
+measure structure as its ``Dimension``, 2.37.1's form; ``rows``: the first
+row dimension). On SIA (2026-11-05) the default form, a measure without
+``Dimension`` as SAP's own client writes it, gave the rows in descending
+value order with the full ``TupleCountTotal``, and a ``MemberKey`` sort of
+the dimension descending key order; with two ``--group-by`` dimensions the
+measure sort ordered the whole result, across the first one's groups.
+
 A run answer holds DATA: DIR must lie under the system temp directory
 (``tempfile.gettempdir()``, ``/tmp`` in the container; anything else is
 refused), is created ``0700`` and every file ``0600``; ``--label`` is
@@ -316,6 +330,33 @@ def _row(name: str, texts: dict[str, str] | None, submit: bool) -> dict[str, Any
     return entry
 
 
+SORT_FORMS = ("measure", "structure", "rows")
+
+
+def _sort(order: list[tuple[str, str]], measure: str, structure: str,
+          group_by: list[str], form: str = "measure") -> list[dict[str, Any]]:
+    """The ``Sort`` of a run as ``plan_run`` builds it: the measure as
+    firefly's ``QInASort.exportMeasureSorting`` writes it (``SortType``
+    ``Measure``, ``MeasureName``, ``Direction``, no ``Dimension``), any other
+    name as a row dimension by its key (``SortType`` ``MemberKey`` with its
+    ``Dimension``). ``form`` tries the other readings of a measure sort:
+    ``structure`` names the measure structure as its ``Dimension`` (what the
+    app sent up to 2.37.1), ``rows`` the first row dimension."""
+    out: list[dict[str, Any]] = []
+    for name, direction in order:
+        wire = "Desc" if direction == "desc" else "Asc"
+        if name != measure:
+            out.append({"Dimension": name, "SortType": "MemberKey", "Direction": wire})
+            continue
+        entry: dict[str, Any] = {"SortType": "Measure", "MeasureName": name, "Direction": wire}
+        if form == "structure":
+            entry["Dimension"] = structure
+        elif form == "rows" and group_by:
+            entry["Dimension"] = group_by[0]
+        out.append(entry)
+    return out
+
+
 def _run_request(capabilities: list[str], query: str, measure: str,
                  variables: list[tuple[str, str]], top: int = 1,
                  structure: str = "Measures",
@@ -323,10 +364,13 @@ def _run_request(capabilities: list[str], query: str, measure: str,
                  group_by: list[str] | None = None,
                  instance: str = "",
                  texts: dict[str, str] | None = None,
-                 submit: bool = False) -> dict[str, Any]:
+                 submit: bool = False,
+                 order: list[tuple[str, str]] | None = None,
+                 sort_form: str = "measure") -> dict[str, Any]:
     """The read ``analytics_request`` builds for one measure, the dimensions
-    of ``group_by`` on Rows, no filter, no sort -- or with ``submit`` the
-    ``variable_submit_request`` (mirrored from ``agents/ina/protocol.py``)."""
+    of ``group_by`` on Rows, no filter, the ``Sort`` of ``order`` -- or with
+    ``submit`` the ``variable_submit_request`` (mirrored from
+    ``agents/ina/protocol.py``)."""
     feature: dict[str, Any] = {
         "ResultFormat": "Version2",
         "ResultEncoding": "None",
@@ -344,6 +388,8 @@ def _run_request(capabilities: list[str], query: str, measure: str,
         }],
         "ResultSetFeatureRequest": feature,
     }
+    if order:
+        definition["Sort"] = _sort(order, measure, structure, group_by or [], sort_form)
     if variables:
         definition["Variables"] = [_variable_entry(n, v, (fields or {}).get(n, ""))
                                    for n, v in variables]
@@ -406,6 +452,46 @@ def _grids(payload: Any) -> list[int]:
         grids = answer.get("Grids") if isinstance(answer, dict) else None
         out.append(len(grids) if isinstance(grids, list) else 0)
     return out
+
+
+def _parse_order(values: list[str]) -> list[tuple[str, str]]:
+    """``--order NAME=asc|desc`` (repeatable), in the order given."""
+    out: list[tuple[str, str]] = []
+    for item in values:
+        name, sep, direction = item.partition("=")
+        if not sep or not name or direction not in ("asc", "desc"):
+            raise ProbeError("--order takes NAME=asc or NAME=desc")
+        out.append((name, direction))
+    return out
+
+
+def _seen_order(payload: Any) -> str:
+    """How the measure's values (the first column of the read's grid) are
+    ordered over all rows (``desc``, ``asc``, ``unordered``, ``-`` without
+    numbers) and the row counts of its Rows axis -- never a value. Under a
+    dimension sort ``unordered`` is expected: it judges values, not keys."""
+    grids = payload.get("Grids") if isinstance(payload, dict) else None
+    grid = grids[0] if isinstance(grids, list) and grids and isinstance(grids[0], dict) else {}
+    cells = grid.get("Cells") if isinstance(grid.get("Cells"), dict) else {}
+    raw = cells.get("Values")
+    values = raw.get("Values") if isinstance(raw, dict) else raw
+    sizes = grid.get("CellArraySizes")
+    width = sizes[1] if isinstance(sizes, list) and len(sizes) == 2 \
+        and isinstance(sizes[1], int) and sizes[1] > 0 else 1
+    column = [v for v in (values if isinstance(values, list) else [])[::width]
+              if isinstance(v, (int, float)) and not isinstance(v, bool)]
+    if len(column) < 2:
+        verdict = "-"
+    elif all(a >= b for a, b in zip(column, column[1:])):
+        verdict = "desc"
+    elif all(a <= b for a, b in zip(column, column[1:])):
+        verdict = "asc"
+    else:
+        verdict = "unordered"
+    rows = next((a for a in grid.get("Axes") or [] if isinstance(a, dict)
+                 and a.get("Type") == "Rows"), {})
+    return (f"value_order={verdict} rows={len(column)} tuple_count={_name(rows.get('TupleCount'))} "
+            f"tuple_count_total={_name(rows.get('TupleCountTotal'))}")
 
 
 def _parse_variables(values: list[str]) -> list[tuple[str, str]]:
@@ -512,6 +598,8 @@ async def run(args: argparse.Namespace, environ: dict[str, str]) -> int:
                 "fields": _variable_fields(cube) if args.variable_form == "sap" else None,
                 "group_by": group_by,
                 "instance": instance,
+                "order": _parse_order(args.order or []),
+                "sort_form": args.sort_form,
             }
             variables = _parse_variables(args.variable or [])
             body = _run_request(capabilities, args.query, measure, variables, **request)
@@ -544,6 +632,8 @@ async def run(args: argparse.Namespace, environ: dict[str, str]) -> int:
             print(f"{'PASS' if ok else 'FAIL'} run {_name(args.label)}: HTTP {status} {ctype} "
                   f"bytes={len(raw)} keys={_top_keys(payload)} grids={grids} "
                   f"variables={len(args.variable or [])} messages={_messages(payload)}")
+            if args.order:
+                print(f"ORDER {_name(args.label)}: {_seen_order(payload)}")
             if args.close:
                 close = _close_request(instance)
                 _dump(args.dump, f"{args.label}.close.request.json",
@@ -628,6 +718,13 @@ def main() -> int:
     parser.add_argument("--structure", default="",
                         help="name of the measure structure on Columns (default Measures, "
                         "as analytics_request sends it)")
+    parser.add_argument("--order", action="append", metavar="NAME=asc|desc",
+                        help="sort the run by the measure or a --group-by dimension "
+                        "(repeatable); the read prints how its rows came back ordered")
+    parser.add_argument("--sort-form", choices=SORT_FORMS, default="measure",
+                        help="measure: a measure sort as plan_run sends it (no Dimension); "
+                        "structure: with the measure structure as Dimension; rows: with "
+                        "the first --group-by dimension as Dimension")
     args = parser.parse_args()
     return asyncio.run(run(args, dict(os.environ)))
 

@@ -282,12 +282,9 @@ async def test_run_sends_the_analytics_request_exactly():
                     }
                 },
                 "Sort": [
-                    {
-                        "Dimension": "Measures",
-                        "SortType": "Measure",
-                        "MeasureName": "0AMOUNT",
-                        "Direction": "Desc",
-                    },
+                    # A measure sort names no dimension (firefly's form, which
+                    # SIA applied on 2026-11-05).
+                    {"SortType": "Measure", "MeasureName": "0AMOUNT", "Direction": "Desc"},
                     {"Dimension": "0CALMONTH", "SortType": "MemberKey", "Direction": "Asc"},
                 ],
                 "Variables": [

@@ -15,7 +15,11 @@ every form the reader does not know (a total member, a key that is no string
 or carries an exception, axes or tuples that do not match the request, sizes
 that do not add up, a cell without a plain value) is ``sap_error``, never a
 guess and never null; the caps are ``result_too_large``, never a cut list;
-and no error text holds a value of the answer.
+and no error text holds a value of the answer. ``run_sia_ordered.json`` (top
+5 cost centres by value, recorded 2026-11-05) and
+``run_sia_not_assigned.json`` (the pilot's product type read) hold SAP's
+"not assigned" member, key ``ValuesException`` 1: read as a row with a
+null key and counted in ``not_assigned``; any other key mark is refused.
 
 Run:  python -m pytest tests/test_ina_grid.py
 """
@@ -311,7 +315,8 @@ MANGLES: dict[str, Callable[[dict], None]] = {
     "a size that does not match": _set(_mi(rows_axis, 1), "Size", 3),
     "no key attribute": lambda g: SUPPLIER(g)["Attributes"].pop(0),
     "a key that is no string": lambda g: KEY(g)["Values"].__setitem__(0, 101),
-    "a key with an exception": lambda g: KEY(g)["ValuesException"].__setitem__(0, 1),
+    # 7 is firefly's ERROR; only 1 (no value) was seen on SIA and is read.
+    "a key with an exception": lambda g: KEY(g)["ValuesException"].__setitem__(0, 7),
     "a key without its exceptions": _del(KEY, "ValuesException"),
     "fewer key exceptions than keys": lambda g: KEY(g)["ValuesException"].pop(),
     "a text that is no string": lambda g: TEXT(g)["Values"].__setitem__(0, 5),
@@ -464,7 +469,7 @@ EXTRA = 3  # run_sia_grid.json: RowTo 4 = top 3 + 1; row 4 is not returned
          "cell_exception", 2),
         (lambda g: VALUES(g)["Values"].__setitem__(slice(0, 2), [None, None]), "cell_null", 2),
         (lambda g: VALUES(g)["Values"].__setitem__(1, "n/a"), "cell_text", 1),
-        (lambda g: KEY(g)["ValuesException"].__setitem__(slice(1, 3), [1, 2]),
+        (lambda g: KEY(g)["ValuesException"].__setitem__(slice(1, 3), [7, 2]),
          "key_exception", 2),
     ],
     ids=["cell exceptions", "null cells", "text cell", "key exceptions"],
@@ -570,3 +575,142 @@ def test_the_cell_cap_counts_what_is_returned_not_the_extra_row():
                    [{"Value": i} for i in range(len(rows) * 5)])
     out = read_grid(payload, few_plan(5, top=top))
     assert out["row_count"] == top and out["truncated"] is True
+
+
+# -- the order and SAP's "not assigned" member (recorded 2026-11-05) -----------
+
+COSTCENTER = "2CCMMPURORDSPND-COSTCENTER"
+PRODUCTTYPE = "2CCMMPURORDSPND-PRODUCTTYPE"
+
+
+def one_dimension_plan(dimension: str, top: int, order: list[dict] | None = None) -> RunPlan:
+    described = read_description(fixture("describe_sia.json")["Cube"]).definition
+    return plan_run(described, measures=["ELTUIDCMP1"], group_by=[dimension], filters=None,
+                    top=top, order=order, variables=dict(SIA_VALUES))
+
+
+def no_value_key(payload: dict[str, Any]) -> dict[str, Any]:
+    return rows_axis(payload)["Dimensions"][0]["Attributes"][0]
+
+
+def test_the_ordered_answer_keeps_saps_order_and_says_truncated(caplog):
+    """Top 5 cost centres by value, descending (recorded order-1): SAP sent
+    top + 1 rows in value order and a ``TupleCountTotal`` above top (40 in
+    the fixture, synthetic), so five rows
+    come back, in that order, and ``truncated`` is true. The first is the
+    cost centre SAP marks as having no value."""
+    plan = one_dimension_plan(COSTCENTER, 5, [{"by": "ELTUIDCMP1", "direction": "desc"}])
+    with caplog.at_level("INFO", logger="agents.ina.grid"):
+        out = read_grid(fixture("run_sia_ordered.json"), plan)
+    assert out == {
+        "columns": [COSTCENTER, "ELTUIDCMP1"],
+        "rows": [[None, 9100.5], ["0000000111", 8200.25], ["0000000222", 7300.0],
+                 ["0000000333", 6400.75], ["0000000444", 5500.0]],
+        "units": {"ELTUIDCMP1": "EUR"},
+        "row_count": 5,
+        "truncated": True,
+        "not_assigned": {COSTCENTER: 1},
+    }
+    assert not [r for r in caplog.records if r.name == "agents.ina.grid"]
+
+
+def test_the_not_assigned_member_is_a_row_with_a_null_key(caplog):
+    """The pilot's read (product type, top 20, recorded ptype-1) that 2.37.1
+    refused whole: one member and SAP's no-value member (key ``""``, key
+    ``ValuesException`` 1, firefly's ``NULL_VALUE``) whose cell is a plain
+    number. The row is returned with the key null and counted."""
+    with caplog.at_level("INFO", logger="agents.ina.grid"):
+        out = read_grid(fixture("run_sia_not_assigned.json"), one_dimension_plan(PRODUCTTYPE, 20))
+    assert out == {
+        "columns": [PRODUCTTYPE, "ELTUIDCMP1"],
+        "rows": [["PT1", 1250.75], [None, 3400.5]],
+        "units": {"ELTUIDCMP1": "EUR"},
+        "row_count": 2,
+        "truncated": False,
+        "not_assigned": {PRODUCTTYPE: 1},
+    }
+    assert not [r for r in caplog.records if r.name == "agents.ina.grid"]
+
+
+@pytest.mark.parametrize("code", [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, -1])
+def test_a_key_mark_that_was_not_seen_is_still_refused(code, caplog):
+    payload = fixture("run_sia_not_assigned.json")
+    no_value_key(payload)["ValuesException"][1] = code
+    with caplog.at_level("INFO", logger="agents.ina.grid"):
+        error = refused(payload, one_dimension_plan(PRODUCTTYPE, 20))
+    assert (error.code, error.message) == ("sap_error", ina_grid.VALUE_REFUSED)
+    assert logged_refusal(caplog) == ("key_exception", 1)
+
+
+def test_a_no_value_mark_beside_one_not_seen_is_refused():
+    """Only the mark that was seen is read: one other mark refuses the run."""
+    payload = fixture("run_sia_ordered.json")
+    no_value_key(payload)["ValuesException"][2] = 7
+    plan = one_dimension_plan(COSTCENTER, 5, [{"by": "ELTUIDCMP1", "direction": "desc"}])
+    assert refused(payload, plan).message == ina_grid.VALUE_REFUSED
+
+
+@pytest.mark.parametrize("key", [None, 5, {"x": 1}, "secret", "#"])
+def test_the_key_and_text_of_a_not_assigned_member_are_never_read(key):
+    """Whatever SAP puts in the member's key or text, the row shows null."""
+    payload = fixture("run_sia_not_assigned.json")
+    no_value_key(payload)["Values"][1] = key
+    dimension = rows_axis(payload)["Dimensions"][0]
+    dimension["Attributes"].append({
+        "Name": f"{PRODUCTTYPE}.LONG_TEXT", "Values": ["Product", key]})
+    plan = replace(one_dimension_plan(PRODUCTTYPE, 20),
+                   texts={PRODUCTTYPE: f"{PRODUCTTYPE}.LONG_TEXT"})
+    out = read_grid(payload, plan)
+    assert out["columns"] == [PRODUCTTYPE, f"{PRODUCTTYPE}.text", "ELTUIDCMP1"]
+    assert out["rows"] == [["PT1", "Product", 1250.75], [None, None, 3400.5]]
+    assert out["not_assigned"] == {PRODUCTTYPE: 1}
+
+
+def test_a_not_assigned_member_in_the_row_that_is_not_returned_is_not_counted():
+    payload = fixture("run_sia_ordered.json")
+    key = no_value_key(payload)
+    key["ValuesException"] = [0, 0, 0, 0, 0, 1]
+    key["Values"] = ["0000000999", *key["Values"][1:5], ""]
+    plan = one_dimension_plan(COSTCENTER, 5)
+    out = read_grid(payload, plan)
+    assert out["row_count"] == 5 and "not_assigned" not in out
+    assert None not in [row[0] for row in out["rows"]]
+
+
+def test_an_answer_without_a_not_assigned_member_has_no_such_key():
+    assert "not_assigned" not in read_grid(fixture("run_sia_grid.json"), sia_plan())
+
+
+def test_a_no_value_mark_on_a_cell_is_still_refused(caplog):
+    """No cell mark was seen on SIA (every ``Exceptions`` was 0): a cell
+    marked 1 is refused as before, not read as null."""
+    payload = fixture("run_sia_not_assigned.json")
+    cells(payload)["Exceptions"]["Values"] = [1, 0]
+    with caplog.at_level("INFO", logger="agents.ina.grid"):
+        error = refused(payload, one_dimension_plan(PRODUCTTYPE, 20))
+    assert error.message == ina_grid.VALUE_REFUSED
+    assert logged_refusal(caplog) == ("cell_exception", 1)
+
+
+def test_a_real_empty_key_is_a_key_not_the_not_assigned_member():
+    """Only the mark says "not assigned": a member whose key is ``""`` with
+    mark 0 keeps its key and is not counted."""
+    payload = fixture("run_sia_not_assigned.json")
+    no_value_key(payload)["ValuesException"] = [0, 0]
+    out = read_grid(payload, one_dimension_plan(PRODUCTTYPE, 20))
+    assert out["rows"] == [["PT1", 1250.75], ["", 3400.5]]
+    assert "not_assigned" not in out
+
+
+@pytest.mark.parametrize("mark", [True, 1.0, "1"], ids=["true", "one point zero", "text"])
+def test_a_mark_that_only_looks_like_one_is_refused(mark, caplog):
+    """``True == 1`` and ``1.0 == 1`` in Python: a mark must be the whole
+    number 1 to be read as "not assigned". Anything else is a form this
+    reader does not know (``key_exception_list``, the fixed UNREADABLE
+    text), never a null key."""
+    payload = fixture("run_sia_not_assigned.json")
+    no_value_key(payload)["ValuesException"][1] = mark
+    with caplog.at_level("INFO", logger="agents.ina.grid"):
+        error = refused(payload, one_dimension_plan(PRODUCTTYPE, 20))
+    assert (error.code, error.message) == ("sap_error", protocol.UNREADABLE)
+    assert logged_refusal(caplog) == ("key_exception_list", 1)

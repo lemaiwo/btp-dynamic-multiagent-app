@@ -186,3 +186,71 @@ def test_a_label_is_a_plain_file_name_stem():
     for bad in ("", "../x", "a/b", "a.b", "x" * 41, "run 6"):
         with pytest.raises(argparse.ArgumentTypeError):
             probe._label(bad)
+
+
+COSTCENTER = "2CCMMPURORDSPND-COSTCENTER"
+ORDERS = [
+    [("ELTUIDCMP1", "desc")],
+    [(COSTCENTER, "desc")],
+    [(COSTCENTER, "asc"), ("ELTUIDCMP1", "desc")],
+]
+
+
+def ordered(order: list[tuple[str, str]], *, submit: bool) -> tuple[dict, dict]:
+    """The probe's and the app's request of one ordered run (2026-11-05: top
+    5 cost centres of the SIA query), the read or the submit."""
+    from agents.ina.protocol import read_description, variable_submit_request
+
+    plan = plan_run(read_description(sia_cube()).definition, measures=["ELTUIDCMP1"],
+                    group_by=[COSTCENTER], filters=None, top=5,
+                    order=[{"by": n, "direction": d} for n, d in order], variables=VALUES)
+    build = variable_submit_request if submit else analytics_request
+    app = build(CAPABILITIES, data_source("2CCMMPURORDQUERY", "", "probe1"), plan)
+    body = probe._run_request(
+        CAPABILITIES, "2CCMMPURORDQUERY", "ELTUIDCMP1", list(VALUES.items()), top=5,
+        structure="ELTUIDSTRCMMPURORDQUERY", fields=probe._variable_fields(sia_cube()),
+        group_by=[COSTCENTER], instance="probe1", submit=submit, order=order,
+    )
+    return body, app
+
+
+def test_the_probes_order_is_the_apps_sort():
+    """``--order`` sends the ``Sort`` ``plan_run`` builds (a measure without
+    ``Dimension``, a dimension by its key), in the read and in the submit."""
+    for order in ORDERS:
+        for submit in (False, True):
+            body, app = ordered(order, submit=submit)
+            assert without_client_info(body) == without_client_info(app), (order, submit)
+
+
+def test_the_other_sort_forms_name_a_dimension_for_the_measure():
+    """The readings the probe tried besides the app's: the measure structure
+    as ``Dimension`` (2.37.1's form, ignored by SIA) and the row dimension."""
+    order = [("M", "desc")]
+    assert probe._sort(order, "M", "S", ["D"], "structure") == [
+        {"SortType": "Measure", "MeasureName": "M", "Direction": "Desc", "Dimension": "S"}]
+    assert probe._sort(order, "M", "S", ["D"], "rows") == [
+        {"SortType": "Measure", "MeasureName": "M", "Direction": "Desc", "Dimension": "D"}]
+
+
+def test_an_order_is_name_equals_asc_or_desc():
+    import pytest
+
+    assert probe._parse_order(["M=desc", "D=asc"]) == [("M", "desc"), ("D", "asc")]
+    for bad in ("M", "=desc", "M=down", "M=DESC"):
+        with pytest.raises(probe.ProbeError):
+            probe._parse_order([bad])
+
+
+def test_the_order_line_says_how_the_rows_came_back_never_a_value():
+    payload = {"Grids": [{
+        "Axes": [{"Type": "Rows", "TupleCount": 3, "TupleCountTotal": 40}],
+        "CellArraySizes": [3, 1],
+        "Cells": {"Values": {"Encoding": "None", "Size": 3, "Values": [9471.5, 812.25, 3.75]}},
+    }]}
+    line = probe._seen_order(payload)
+    assert line == "value_order=desc rows=3 tuple_count=3 tuple_count_total=40"
+    assert "9471" not in line
+    payload["Grids"][0]["Cells"]["Values"]["Values"] = [3.75, 9471.5, 812.25]
+    assert probe._seen_order(payload).startswith("value_order=unordered ")
+    assert probe._seen_order({}) == "value_order=- rows=0 tuple_count= tuple_count_total="
