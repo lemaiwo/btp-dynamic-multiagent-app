@@ -61,7 +61,8 @@ measure structure as its ``Dimension``, 2.37.1's form; ``rows``: the first
 row dimension). On SIA (2026-11-05) the default form, a measure without
 ``Dimension`` as SAP's own client writes it, gave the rows in descending
 value order with the full ``TupleCountTotal``, and a ``MemberKey`` sort of
-the dimension descending key order.
+the dimension descending key order; with two ``--group-by`` dimensions the
+measure sort ordered the whole result, across the first one's groups.
 
 A run answer holds DATA: DIR must lie under the system temp directory
 (``tempfile.gettempdir()``, ``/tmp`` in the container; anything else is

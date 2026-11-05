@@ -1276,12 +1276,18 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   full `TupleCountTotal` (2.37.1 named the measure structure as `Dimension`
   and the system ignored the sort: a "top n by value" came back in key
   order, silently; fixed in 2.37.2), and a dimension sort by `MemberKey` in
-  descending key order; each alone (a list of several is sent in the order
-  given, not seen); and a dimension's "not assigned" member (key `""`, key
-  `ValuesException` 1), which 2.37.1 refused with the whole run and 2.37.2
-  returns as a row with a null key (`grid.py`). **Not seen on the system**:
-  a 403 redo (unit-tested only), filter operators other than one value, a
-  read of several measures (their column order would be inferred, so a run
+  descending key order; order verified with one row dimension; with several,
+  SAP sorts globally (seen once: grouped by quarter and cost centre, the rows
+  came back by value across the quarters, not within them; no
+  `PreserveGrouping` is sent); each sort kind alone (a list of several is
+  sent in the order given, not seen); and a dimension's "not assigned"
+  member (key `""`, key `ValuesException` 1), which 2.37.1 refused with the
+  whole run and 2.37.2 returns as a row with a null key (`grid.py`); the
+  reading of mark 1 is firefly's `NULL_VALUE`, seen on two dimensions only
+  (cost centre, product type). **Not seen on the system**: a 403 redo
+  (unit-tested only), filter operators other than one value, a filter on the
+  not-assigned member (value `""`; the tool description says it is
+  unverified), a read of several measures (their column order would be inferred, so a run
   takes ONE measure until a probe verifies it), variables of type interval
   or multiple ("inferred, not seen": every recorded variable was a single
   value), a query without variables (no submit, so the read asks for keys
@@ -1439,8 +1445,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     row that is returned (the `top + 1`-th row is checked for its form
     alone; a marked member's key and text are not read). **One exception**,
     the only mark seen on the system (2026-11-05, `run_sia_ordered.json`,
-    `run_sia_not_assigned.json`): a member key marked `NO_VALUE` (1, SAP's
-    own client's `ValueException.NULL_VALUE`) is the dimension's "not
+    `run_sia_not_assigned.json`, on two dimensions only: cost centre and
+    product type): a member key marked `NO_VALUE` (the whole number 1, read
+    as firefly's `ValueException.NULL_VALUE`; `True`, `1.0` or `"1"` is a
+    form refusal, `key_exception_list`) is the dimension's "not
     assigned" member, key `""`, its cell a plain number: the row is returned
     with key and text null, and `not_assigned` (only when there is one)
     counts such rows per dimension; every other key mark and every cell mark
@@ -3273,8 +3281,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   2.37.2 is the fix of the first data reads by the app on the system: a measure
   `order` goes out in the form the system applies (no `Dimension`; 2.37.1's
   form was ignored, so a "top n by value" came back in key order without a
-  word), verified together with a dimension order (`scripts/probe_ina.py
-  --order`, three recorded reads), and a dimension's "not assigned" member
+  word), verified together with a dimension order and, once, a measure order
+  over two row dimensions, which SAP sorted globally (`scripts/probe_ina.py
+  --order`, four recorded reads), and a dimension's "not assigned" member
   (key `ValuesException` 1) is a row with a null key, counted in
   `not_assigned`, instead of refusing the whole run as `sap_error`; every
   other mark is still refused. No new resource, environment variable, table,
