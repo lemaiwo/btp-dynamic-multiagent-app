@@ -5,7 +5,7 @@ catalogue lines), ``describe_query`` (the stored description, never read
 from SAP here) and ``run_query`` (one ``Analytics`` read through the real
 client, ``agents/ina/client.py``). The toolset runs on the real
 ``destination_http_client``; only the destination service and SAP behind it
-are doubles (``tests/test_ina_client.py``'s ``Sap`` over
+are doubles (``tests/ina_helpers.py``'s ``Sap`` over
 ``httpx.MockTransport``).
 
 Covered: what each tool answers and what it leaves out; a name the entry does
@@ -50,6 +50,7 @@ for _v in (
     os.environ.pop(_v, None)
 
 from agents.ina import tools as ina_tools  # noqa: E402
+from agents.ina.protocol import read_description  # noqa: E402
 from agents.ina.tools import (  # noqa: E402
     MAX_RESULT_CHARS,
     TRUNCATED_HINT,
@@ -58,8 +59,7 @@ from agents.ina.tools import (  # noqa: E402
     attached_queries,
     ina_toolset,
 )
-from tests.odata_helpers import FakeResolver  # noqa: E402
-from tests.test_ina_client import (  # noqa: E402
+from tests.ina_helpers import (  # noqa: E402
     DESTINATION,
     QUERY,
     RUN,
@@ -70,6 +70,7 @@ from tests.test_ina_client import (  # noqa: E402
     grid,
     signed_in,
 )
+from tests.odata_helpers import FakeResolver  # noqa: E402
 
 TOOLS = {"list_queries", "describe_query", "run_query"}
 SALES = "sales-by-month"
@@ -271,22 +272,61 @@ async def test_run_query_passes_the_clients_answer_through():
     w = world()
     answer = await w.tool("run_query")(SALES, **RUN)
     assert answer == {
-        "columns": ["0CALMONTH", "0CALMONTH.text", "0AMOUNT", "0QUANTITY"],
+        "columns": ["0CALMONTH", "0CALMONTH.text", "0AMOUNT"],
         "rows": [
-            ["202601", "01.2026", 1200.5, 10],
-            ["202602", "02.2026", 980.0, 8],
-            ["202603", "03.2026", 1430.25, 12],
+            ["202601", "01.2026", 1200.5],
+            ["202602", "02.2026", 980.0],
+            ["202603", "03.2026", 1430.25],
         ],
-        "units": {"0AMOUNT": "EUR", "0QUANTITY": "PC"},
+        "units": {"0AMOUNT": "EUR"},
         "row_count": 3,
         "truncated": False,
     }
-    # The stored description is the client's: one GetServerInfo, one run,
-    # no Describe; through the query's own destination.
-    assert [r.method for r in w.sap.requests] == ["GET", "POST"]
-    assert "Analytics" in w.sap.body() and "Metadata" not in w.sap.body()
-    assert w.sap.body()["Analytics"]["DataSource"]["ObjectName"] == QUERY
+    # The stored description is the client's: one GetServerInfo, one run
+    # (VariableSubmit, read, Close), no Describe; through the query's own
+    # destination.
+    assert w.sap.kinds == ["GET", "submit", "read", "close"]
+    assert w.sap.read_body()["Analytics"]["DataSource"]["ObjectName"] == QUERY
     assert w.resolved == [DESTINATION]
+
+
+async def test_run_query_with_variables_end_to_end_on_the_answers_sia_gave():
+    """SIA's describe, VariableSubmit and grid answers (recorded 2026-11-04,
+    sanitised): the values go in the submit, named by their dimension's key;
+    the read asks for the texts the submit answer named; the rows come back
+    with their texts, the instance is closed."""
+    described = read_description(fixture("describe_sia.json")["Cube"]).definition
+    w = world(row(definition=described.model_dump(mode="json")))
+    w.sap.submit_answers = [fixture("submit_sia.json")]
+    w.sap.answers = [fixture("run_sia_grid.json")]
+    values = {"!CDS_P_P_DISPLAYCURRENCY": "EUR", "!CDS_P_P_DATEFUNCTION": "YEARTODATE"}
+    answer = await w.tool("run_query")(
+        SALES, ["ELTUIDCMP1"], ["2CIMMPURGORG", "2CI_SUPPLIER_CDS"], top=3, variables=values
+    )
+    assert answer == {
+        "columns": ["2CIMMPURGORG", "2CIMMPURGORG.text", "2CI_SUPPLIER_CDS",
+                    "2CI_SUPPLIER_CDS.text", "ELTUIDCMP1"],
+        "rows": [
+            ["P100", "Purchasing organisation 100", "0000000101", "Supplier A", 125.5],
+            ["P100", "Purchasing organisation 100", "0000000102", "Supplier B", 2400.0],
+            ["P100", "Purchasing organisation 100", "0000000103", "Supplier C", 310.25],
+        ],
+        "units": {"ELTUIDCMP1": "EUR"},
+        "row_count": 3,
+        "truncated": True,
+        "hint": TRUNCATED_HINT,
+    }
+    assert w.sap.kinds == ["GET", "submit", "read", "close"]
+    submit = json.loads(w.sap.submits[0].content)["Analytics"]
+    read = w.sap.read_body()["Analytics"]
+    assert [v["Values"]["Selection"]["SetOperand"]["FieldName"]
+            for v in submit["Definition"]["Variables"]] == [
+        "2CH0Y9FATWMXU07PABNUMVE2HHX.KEY", "2CCGCALDFVH.KEY"]
+    assert submit["DataSource"]["InstanceId"] == read["DataSource"]["InstanceId"]
+    assert read["Definition"]["Dimensions"][1]["Attributes"] == [
+        {"Name": "2CI_SUPPLIER_CDS.KEY", "Obtainability": "Always"},
+        {"Name": "2CI_SUPPLIER_CDS.LONG_TEXT", "Obtainability": "Always"},
+    ]
 
 
 async def test_the_defaults_of_the_optional_arguments():
@@ -294,9 +334,11 @@ async def test_the_defaults_of_the_optional_arguments():
                   .model_dump(mode="json")))
     answer = await w.tool("run_query")(SALES, ["0AMOUNT"], ["0CALMONTH"])
     assert answer["row_count"] == 3
-    request = w.sap.body()["Analytics"]["Definition"]
+    request = w.sap.read_body()["Analytics"]["Definition"]
     assert "Filter" not in request and "Sort" not in request and "Variables" not in request
-    assert request["ResultSetFeatureRequest"]["MaxResultRecords"] == 101  # top 100 + 1
+    rows = request["ResultSetFeatureRequest"]["SubSetDescription"]["RowTo"]
+    assert rows == 101  # top 100 + 1
+    assert w.sap.kinds == ["GET", "read", "close"]  # no variables: no VariableSubmit
 
 
 async def test_a_truncated_answer_says_so_with_a_hint():
@@ -314,7 +356,8 @@ async def test_a_truncated_answer_says_so_with_a_hint():
     "patch, where",
     [
         ({"measures": [PROBE]}, "measures[0]"),
-        ({"measures": ["0AMOUNT", PROBE]}, "measures[1]"),
+        # Two measures are refused as such (one per run), never naming one.
+        ({"measures": ["0AMOUNT", PROBE]}, "measures"),
         ({"group_by": [PROBE]}, "group_by[0]"),
         ({"filters": [{"dimension": PROBE, "operator": "=", "value": "x"}]},
          "filters[0].dimension"),
@@ -332,6 +375,29 @@ async def test_an_unknown_name_is_refused_before_anything_is_sent(patch, where):
     # Refused on the stored description alone: no destination resolved, no
     # client built, nothing sent.
     assert w.sap.requests == [] and w.resolved == [] and w.toolset.http_clients == []
+
+
+async def test_two_measures_are_refused_before_anything_is_sent():
+    """One measure per run until the column order of several is verified on
+    SAP (every recorded grid held one); the model is told to run once per
+    measure."""
+    w = world()
+    answer = await w.tool("run_query")(SALES, **{**RUN, "measures": ["0AMOUNT", "0QUANTITY"]})
+    assert error_of(answer) == {
+        "code": "invalid_filter",
+        "message": "measures: one measure per run until the column order is verified",
+        "hint": "run the query once per measure",
+    }
+    assert w.sap.requests == [] and w.resolved == [] and w.toolset.http_clients == []
+    # One measure runs.
+    assert RUN["measures"] == ["0AMOUNT"]
+    assert (await w.tool("run_query")(SALES, **RUN))["row_count"] == 3
+
+
+def test_the_tool_description_says_one_measure_per_run():
+    description = world().toolset.tools["run_query"].function.__doc__
+    assert "measures: exactly one measure name" in description
+    assert "once per measure" in description
 
 
 async def test_a_missing_mandatory_variable_is_refused_before_anything_is_sent():
@@ -359,14 +425,12 @@ async def test_a_refusal_of_sap_is_an_error_object_not_an_exception():
 async def test_an_answer_over_the_result_cap_is_refused_not_cut():
     keys = [[f"{i:06d}"] for i in range(1500)]
     cells = [{"Value": 123456789.123, "Unit": "EUR"} for _ in keys]
-    w = world(row(definition=definition().model_copy(update={"variables": []})
-                  .model_dump(mode="json")))
-    big = grid(["ZREGION"], keys, ["0AMOUNT"], cells)
-    for tuple_ in big["Grids"][0]["Axes"][0]["Tuples"]:
-        key = tuple_["Members"][0]["Name"]
-        tuple_["Members"][0]["Text"] = f"Region {key} " + "x" * 40
-    w.sap.answers = [big]
-    answer = await w.tool("run_query")(SALES, ["0AMOUNT"], ["ZREGION"], top=2000)
+    w = world()
+    # The submit answer (submit_ok.json) names ZREGION's text attribute.
+    w.sap.answers = [grid(["ZREGION"], keys, ["0AMOUNT"], cells,
+                          texts=[[f"Region {k[0]} " + "x" * 40] for k in keys])]
+    answer = await w.tool("run_query")(SALES, ["0AMOUNT"], ["ZREGION"], top=2000,
+                                       variables={"0P_CALYEAR": "2026"})
     error = error_of(answer)
     assert error["code"] == "result_too_large"
     assert str(MAX_RESULT_CHARS) in error["message"]
@@ -386,7 +450,7 @@ async def test_one_session_per_identity_serves_every_run_of_the_toolset():
     w = world()
     await w.tool("run_query")(SALES, **RUN)
     await w.tool("run_query")(SALES, **RUN)
-    assert [r.method for r in w.sap.requests] == ["GET", "POST", "POST"]
+    assert w.sap.kinds == ["GET", *["submit", "read", "close"] * 2]
     assert w.resolved == [DESTINATION]  # one client per query, built once
 
 

@@ -1,36 +1,131 @@
 {
-  "Grids": [
+ "Grids": [
+  {
+   "Axes": [
     {
-      "Axes": [
+     "Name": "ROWS",
+     "Type": "Rows",
+     "Dimensions": [
+      {
+       "Name": "0CALMONTH",
+       "DimensionType": 3,
+       "Attributes": [
         {
-          "Name": "Rows",
-          "Type": 1,
-          "Dimensions": [{"Name": "0CALMONTH"}],
-          "Tuples": [
-            {"Members": [{"Name": "202601", "Text": "01.2026"}]},
-            {"Members": [{"Name": "202602", "Text": "02.2026"}]},
-            {"Members": [{"Name": "202603", "Text": "03.2026"}]}
-          ]
+         "Name": "0CALMONTH.KEY",
+         "Description": "Internal Key",
+         "IsKey": true,
+         "PresentationType": "Key",
+         "Obtainability": "Always",
+         "ValueType": "String",
+         "Values": [
+          "202601",
+          "202602",
+          "202603"
+         ],
+         "ValuesException": [
+          0,
+          0,
+          0
+         ]
         },
         {
-          "Name": "Columns",
-          "Type": 2,
-          "Dimensions": [{"Name": "Measures"}],
-          "Tuples": [
-            {"Members": [{"Name": "0AMOUNT", "Text": "Net amount"}]},
-            {"Members": [{"Name": "0QUANTITY", "Text": "Quantity"}]}
-          ]
+         "Name": "0CALMONTH.LONG_TEXT",
+         "Description": "Long Text",
+         "IsKey": false,
+         "PresentationType": "LongText",
+         "Obtainability": "Always",
+         "ValueType": "String",
+         "Values": [
+          "01.2026",
+          "02.2026",
+          "03.2026"
+         ]
         }
-      ],
-      "Cells": [
-        {"Value": 1200.5, "Unit": "EUR"},
-        {"Value": 10, "Unit": "PC"},
-        {"Value": 980.0, "Unit": "EUR"},
-        {"Value": 8, "Unit": "PC"},
-        {"Value": 1430.25, "Unit": "EUR"},
-        {"Value": 12, "Unit": "PC"}
-      ]
+       ],
+       "MemberTypes": {
+        "Encoding": "None",
+        "Size": 3,
+        "Values": [
+         0,
+         0,
+         0
+        ]
+       }
+      }
+     ],
+     "TupleCount": 3,
+     "TupleCountTotal": 3,
+     "Tuples": [
+      {
+       "MemberIndexes": {
+        "Encoding": "None",
+        "Size": 3,
+        "Values": [
+         0,
+         1,
+         2
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "Name": "COLUMNS",
+     "Type": "Columns",
+     "Dimensions": [
+      {
+       "Name": "Measures",
+       "DimensionType": 2,
+       "Attributes": [],
+       "MemberTypes": {
+        "Encoding": "None",
+        "Size": 1,
+        "Values": [
+         0
+        ]
+       }
+      }
+     ],
+     "TupleCount": 1,
+     "TupleCountTotal": 1,
+     "Tuples": [
+      {
+       "MemberIndexes": {
+        "Encoding": "None",
+        "Size": 1,
+        "Values": [
+         0
+        ]
+       }
+      }
+     ]
     }
-  ],
-  "Messages": []
+   ],
+   "Cells": {
+    "Values": {
+     "Encoding": "None",
+     "Size": 3,
+     "Values": [
+      1200.5,
+      980.0,
+      1430.25
+     ]
+    },
+    "Units": {
+     "Encoding": "None",
+     "Size": 3,
+     "Values": [
+      "EUR",
+      "EUR",
+      "EUR"
+     ]
+    }
+   },
+   "CellArraySizes": [
+    3,
+    1
+   ]
+  }
+ ],
+ "Messages": []
 }

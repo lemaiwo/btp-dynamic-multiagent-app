@@ -101,12 +101,21 @@ class InaVariable(_Model):
     label: Label = ""
     mandatory: StrictBool = False
     type: Literal["single", "interval", "multiple"] = "single"
+    # The key of the dimension the variable's values belong to
+    # (``<DimensionReference.Name>.KEY``): SIA takes a value only named so.
+    # None on a row described before 2.37.1, which then sends the
+    # variable's own name.
+    key_field: InaName | None = None
 
 
 class InaDefinition(_Model):
     """What ``Describe`` read from SAP. Names are compared exactly: InA names
     are case sensitive, and the three lists are separate in a request."""
 
+    # The real name of the measure structure (SIA's is generated,
+    # ``ELTUID...``); None on a row described before 2.37.1, which then sends
+    # ``Measures``.
+    measure_structure: InaName | None = None
     dimensions: list[InaDimension] = Field(default_factory=list, max_length=MAX_DIMENSIONS)
     measures: list[InaMeasure] = Field(default_factory=list, max_length=MAX_MEASURES)
     variables: list[InaVariable] = Field(default_factory=list, max_length=MAX_VARIABLES)

@@ -25,7 +25,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import httpx
 import pytest
@@ -33,7 +33,6 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from agents.auth import current_jwt, current_principal  # noqa: E402
 from agents.destination import DestinationError  # noqa: E402
 from agents.destination_auth import destination_http_client  # noqa: E402
 from agents.ina import client as ina_client  # noqa: E402
@@ -47,15 +46,30 @@ from agents.ina.client import (  # noqa: E402
     InaSessionStore,
 )
 from agents.ina.errors import ERROR_CODES, InaError  # noqa: E402
-from agents.ina.models import InaDefinition, validate_ina_query  # noqa: E402
+from agents.ina.models import validate_ina_query  # noqa: E402
+from tests.ina_helpers import (  # noqa: E402, F401
+    ALICE,
+    BOB,
+    CLOSED,
+    DESTINATION,
+    FIXTURES,
+    INFO_PATH,
+    INSTANCE,
+    QUERY,
+    RESPONSE_PATH,
+    RUN,
+    SIA_URL,
+    Sap,
+    definition,
+    fixture,
+    grid,
+    kind_of,
+    make,
+    refused,
+    signed_in,
+)
 from tests.odata_helpers import FakeConnectivity, FakeResolver, OnPremiseResolver  # noqa: E402
 
-FIXTURES = ROOT / "tests" / "fixtures" / "ina"
-DESTINATION = "SIA_INA"
-QUERY = "ZQ_SALES_01"
-SIA_URL = "https://sia.example.test:44300"
-INFO_PATH = "/sap/bw/ina/GetServerInfo"
-RESPONSE_PATH = "/sap/bw/ina/GetResponse"
 CAPABILITIES = [
     "AggregationNOPNULL",
     "ClientCapabilities",
@@ -63,180 +77,12 @@ CAPABILITIES = [
     "SupportsComplexFilters",
     "Variables",
 ]
-ALICE = "alice@example.com"
-BOB = "bob@example.com"
 
 
-def fixture(name: str) -> Any:
-    return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
-
-
-def definition() -> InaDefinition:
-    """The definition ``describe`` reads from ``describe_ok.json``."""
-    return InaDefinition.model_validate(
-        {
-            "dimensions": [
-                {"name": "0CALMONTH", "label": "Calendar Year/Month", "key_field": "0CALMONTH.KEY"},
-                {"name": "ZREGION", "label": "Sales region", "key_field": "ZREGION.KEY"},
-            ],
-            "measures": [
-                {"name": "0AMOUNT", "label": "Net amount", "unit": "EUR"},
-                {"name": "0QUANTITY", "label": "Quantity", "unit": "PC"},
-            ],
-            "variables": [
-                {
-                    "name": "0P_CALYEAR",
-                    "label": "Calendar year",
-                    "mandatory": True,
-                    "type": "single",
-                },
-                {"name": "ZV_REGION", "label": "Regions", "mandatory": False, "type": "multiple"},
-                {
-                    "name": "ZV_PERIOD",
-                    "label": "Period range",
-                    "mandatory": False,
-                    "type": "interval",
-                },
-            ],
-        }
-    )
-
-
-def grid(
-    dimensions: list[str],
-    rows: list[list[str]],
-    measures: list[str],
-    cells: list[dict[str, Any]],
-) -> dict[str, Any]:
-    """A result grid in the shape of ``run_ok.json``."""
-    return {
-        "Grids": [
-            {
-                "Axes": [
-                    {
-                        "Name": "Rows",
-                        "Type": 1,
-                        "Dimensions": [{"Name": d} for d in dimensions],
-                        "Tuples": [{"Members": [{"Name": key} for key in row]} for row in rows],
-                    },
-                    {
-                        "Name": "Columns",
-                        "Type": 2,
-                        "Dimensions": [{"Name": "Measures"}],
-                        "Tuples": [{"Members": [{"Name": m}]} for m in measures],
-                    },
-                ],
-                "Cells": cells,
-            }
-        ],
-        "Messages": [],
-    }
-
-
-class Sap:
-    """SAP behind the destination: ``GetServerInfo`` hands out a new CSRF
-    token and session cookie per call; ``GetResponse`` answers from a queue
-    (a dict is a 200 JSON answer, an ``httpx.Response`` is sent as it is, a
-    callable gets the request)."""
-
-    def __init__(self) -> None:
-        self.requests: list[httpx.Request] = []
-        self.server_info: Any = fixture("server_info.json")
-        self.info_answer: Callable[[httpx.Request], httpx.Response] | None = None
-        self.answers: list[Any] = []
-        self.fetches = 0
-
-    @property
-    def posts(self) -> list[httpx.Request]:
-        return [r for r in self.requests if r.method == "POST"]
-
-    @property
-    def gets(self) -> list[httpx.Request]:
-        return [r for r in self.requests if r.method == "GET"]
-
-    def body(self, index: int = -1) -> Any:
-        return json.loads(self.posts[index].content)
-
-    def handler(self, request: httpx.Request) -> httpx.Response:
-        self.requests.append(request)
-        if request.method == "GET" and request.url.path == INFO_PATH:
-            if self.info_answer is not None:
-                return self.info_answer(request)
-            self.fetches += 1
-            return httpx.Response(
-                200,
-                json=self.server_info,
-                headers=[
-                    ("x-csrf-token", f"csrf-{self.fetches}"),
-                    ("set-cookie", f"SAP_SESSIONID_XYZ_100=sess-{self.fetches}; path=/; HttpOnly"),
-                ],
-            )
-        if request.method == "POST" and request.url.path == RESPONSE_PATH:
-            answer = self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
-            if callable(answer):
-                return answer(request)
-            if isinstance(answer, httpx.Response):
-                return answer
-            return httpx.Response(200, json=answer)
-        return httpx.Response(404)
-
-
-def make(
-    sap: Sap,
-    *,
-    user_context: bool = False,
-    destination: str = DESTINATION,
-    resolver: Any = None,
-    store: InaSessionStore | None = None,
-    known: InaDefinition | None = None,
-    package: str = "",
-) -> InaClient:
-    resolver = resolver or FakeResolver(url=SIA_URL, name=destination)
-    http = destination_http_client(
-        resolver,
-        user_context=user_context,
-        server_key="builtin:ina",
-        expected_hosts=(),
-        connectivity=None,
-        transport=httpx.MockTransport(sap.handler),
-    )
-    return InaClient(
-        http,
-        store if store is not None else InaSessionStore(),
-        destination=destination,
-        user_context=user_context,
-        query=QUERY,
-        package=package,
-        definition=known,
-    )
-
-
-class signed_in:
-    """A bound user, as the request middleware leaves it."""
-
-    def __init__(self, principal: str) -> None:
-        self.principal = principal
-
-    def __enter__(self) -> None:
-        self._jwt = current_jwt.set(f"jwt-of-{self.principal}")
-        self._principal = current_principal.set(self.principal)
-
-    def __exit__(self, *exc: Any) -> None:
-        current_jwt.reset(self._jwt)
-        current_principal.reset(self._principal)
-
-
-RUN = {
-    "measures": ["0AMOUNT", "0QUANTITY"],
-    "group_by": ["0CALMONTH"],
-    "variables": {"0P_CALYEAR": "2026"},
-}
-
-
-async def refused(coro: Any) -> InaError:
-    with pytest.raises(InaError) as info:
-        await coro
-    return info.value
+HIDE_TOTALS = [
+    {"Result": "Members", "Visibility": "Visible"},
+    {"Result": "Total", "Visibility": "Hidden"},
+]
 
 
 # ----------------------------------------------------------------- the error list
@@ -355,15 +201,34 @@ async def test_run_sends_the_analytics_request_exactly():
         order=[{"by": "0AMOUNT", "direction": "desc"}, {"by": "0CALMONTH"}],
         variables={"0P_CALYEAR": "2026", "ZV_REGION": ["NORTH"], "ZV_PERIOD": ["01", "06"]},
     )
-    assert sap.body() == {
+    body = sap.read_body()
+    assert INSTANCE.fullmatch(body["Analytics"]["DataSource"].pop("InstanceId"))
+    assert body == {
         "ClientInfo": ina_client.CLIENT_INFO,
         "Analytics": {
             "Capabilities": CAPABILITIES,
             "DataSource": {"ObjectName": QUERY, "PackageName": "ZPKG", "Type": "Query"},
             "Definition": {
                 "Dimensions": [
-                    {"Name": "0CALMONTH", "Axis": "Rows"},
-                    {"Name": "ZREGION", "Axis": "Rows"},
+                    {
+                        "Name": "0CALMONTH",
+                        "Axis": "Rows",
+                        # The text attribute the submit answer named (submit_ok.json).
+                        "Attributes": [
+                            {"Name": "0CALMONTH.KEY", "Obtainability": "Always"},
+                            {"Name": "0CALMONTH.LONG_TEXT", "Obtainability": "Always"},
+                        ],
+                        "ResultStructure": HIDE_TOTALS,
+                    },
+                    {
+                        "Name": "ZREGION",
+                        "Axis": "Rows",
+                        "Attributes": [
+                            {"Name": "ZREGION.KEY", "Obtainability": "Always"},
+                            {"Name": "ZREGION.LONG_TEXT", "Obtainability": "Always"},
+                        ],
+                        "ResultStructure": HIDE_TOTALS,
+                    },
                     {
                         "Name": "Measures",
                         "Axis": "Columns",
@@ -432,7 +297,11 @@ async def test_run_sends_the_analytics_request_exactly():
                             "Selection": {
                                 "SetOperand": {
                                     "FieldName": "0P_CALYEAR",
-                                    "Elements": [{"Comparison": "=", "Low": "2026"}],
+                                    "Elements": [{
+                                        "Comparison": "=",
+                                        "Low": "2026",
+                                        "IsExcluding": False,
+                                    }],
                                 }
                             }
                         },
@@ -443,7 +312,11 @@ async def test_run_sends_the_analytics_request_exactly():
                             "Selection": {
                                 "SetOperand": {
                                     "FieldName": "ZV_REGION",
-                                    "Elements": [{"Comparison": "=", "Low": "NORTH"}],
+                                    "Elements": [{
+                                        "Comparison": "=",
+                                        "Low": "NORTH",
+                                        "IsExcluding": False,
+                                    }],
                                 }
                             }
                         },
@@ -455,7 +328,12 @@ async def test_run_sends_the_analytics_request_exactly():
                                 "SetOperand": {
                                     "FieldName": "ZV_PERIOD",
                                     "Elements": [
-                                        {"Comparison": "BETWEEN", "Low": "01", "High": "06"}
+                                        {
+                                            "Comparison": "BETWEEN",
+                                            "Low": "01",
+                                            "High": "06",
+                                            "IsExcluding": False,
+                                        }
                                     ],
                                 }
                             }
@@ -465,8 +343,8 @@ async def test_run_sends_the_analytics_request_exactly():
                 "ResultSetFeatureRequest": {
                     "ResultFormat": "Version2",
                     "ResultEncoding": "None",
-                    # One row more than top: it tells "there is more" from "that is all".
-                    "MaxResultRecords": 51,
+                    # One row more than top: it tells "there is more" from "that is
+                    # all"; no MaxResultRecords (with it SIA added total rows).
                     "SubSetDescription": {
                         "RowFrom": 0,
                         "RowTo": 51,
@@ -486,10 +364,13 @@ async def test_run_without_filters_order_or_variables_sends_none_of_them():
     sap = Sap()
     sap.answers = [fixture("run_ok.json")]
     known = definition().model_copy(update={"variables": []})
-    await make(sap, known=known).run(measures=["0AMOUNT", "0QUANTITY"], group_by=["0CALMONTH"])
-    request = sap.body()["Analytics"]["Definition"]
+    await make(sap, known=known).run(measures=["0AMOUNT"], group_by=["0CALMONTH"])
+    request = sap.read_body()["Analytics"]["Definition"]
     assert "Filter" not in request and "Sort" not in request and "Variables" not in request
-    assert request["ResultSetFeatureRequest"]["MaxResultRecords"] == 101
+    assert "MaxResultRecords" not in request["ResultSetFeatureRequest"]
+    assert request["ResultSetFeatureRequest"]["SubSetDescription"]["RowTo"] == 101
+    # No variables, no VariableSubmit: the read and the Close.
+    assert sap.kinds == ["GET", "read", "close"]
 
 
 async def test_run_reads_rows_and_units_from_the_grid():
@@ -497,13 +378,13 @@ async def test_run_reads_rows_and_units_from_the_grid():
     sap.answers = [fixture("run_ok.json")]
     out = await make(sap, known=definition()).run(**RUN)
     assert out == {
-        "columns": ["0CALMONTH", "0CALMONTH.text", "0AMOUNT", "0QUANTITY"],
+        "columns": ["0CALMONTH", "0CALMONTH.text", "0AMOUNT"],
         "rows": [
-            ["202601", "01.2026", 1200.5, 10],
-            ["202602", "02.2026", 980.0, 8],
-            ["202603", "03.2026", 1430.25, 12],
+            ["202601", "01.2026", 1200.5],
+            ["202602", "02.2026", 980.0],
+            ["202603", "03.2026", 1430.25],
         ],
-        "units": {"0AMOUNT": "EUR", "0QUANTITY": "PC"},
+        "units": {"0AMOUNT": "EUR"},
         "row_count": 3,
         "truncated": False,
     }
@@ -514,7 +395,7 @@ async def test_run_without_a_definition_describes_first():
     sap.answers = [fixture("describe_ok.json"), fixture("run_ok.json")]
     out = await make(sap).run(**RUN)
     assert out["row_count"] == 3
-    assert "Metadata" in sap.body(0) and "Analytics" in sap.body(1)
+    assert sap.kinds == ["GET", "describe", "submit", "read", "close"]
 
 
 # ----------------------------------------------- refused before anything is sent

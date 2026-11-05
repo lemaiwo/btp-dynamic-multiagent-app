@@ -17,10 +17,21 @@ The protocol (design addendum (k), part 2 point 2, and what SIA parsed for
   the CSRF token and the session cookie with it, and refuses a POST without
   them (403).
 * ``POST /sap/bw/ina/GetResponse`` with the token and the cookies: a
-  ``Metadata`` request for :meth:`InaClient.describe` and an ``Analytics``
-  request for :meth:`InaClient.run`. Both carry ``Options:
-  ["StatefulServer"]``: the InA state lives in the SAP session the cookie
-  names.
+  ``Metadata`` request for :meth:`InaClient.describe`, and for
+  :meth:`InaClient.run` three ``Analytics`` requests on one query instance
+  (``DataSource.InstanceId``, ``ina`` and 16 random hex digits per run), as
+  SIA answered them on 2026-11-04 when ``scripts/probe_ina.py`` sent them
+  (this client's own sequence has not run there yet): a VariableSubmit when
+  the run has variables (SIA takes values only so), the read, and a Close
+  that releases the instance. All carry ``Options: ["StatefulServer"]``: the InA state
+  lives in the SAP session the cookie names. The cookies an answer sets join
+  the session for the next request of the run and for later calls; the read
+  asks for the text attribute of each row dimension the submit answer named
+  (``protocol.text_attributes``). The Close is best effort: sent also after
+  a failed submit or read, never the run's failure, logged by exception
+  class only, and not sent once the run's deadline is spent or while the
+  caller is being cancelled (the instance then lives until ICF ends the SAP
+  session).
 
 Whose session it is. The token and the cookies ARE a SAP session of the
 identity the destination signed in as, so they live in the
@@ -30,9 +41,11 @@ only to the request that carries the same token), never in the shared HTTP
 client, whose cookie jar stores nothing (``NoCookieJar``). The capability
 list is stored next to the session it came with. ``GetServerInfo`` is sent
 once per (destination, user) and session lifetime; a 403 on a POST drops the
-session, fetches a new one and sends the request once more -- an InA request
-only reads, so a repeat changes nothing -- and a second 403 is
-``csrf_failed`` (or ``forbidden`` when SAP did not say ``Required``).
+session, fetches a new one and sends the request once more -- for a run the
+whole sequence from the submit on, since the instance lived in the refused
+session; an InA request only reads, so a repeat changes nothing -- and a
+second 403 is ``csrf_failed`` (or ``forbidden`` when SAP did not say
+``Required``).
 
 What reaches the caller. Every failure is an :class:`InaError` with a code
 of the closed list in ``errors.py`` and a fixed text; SAP's own words pass
@@ -42,7 +55,9 @@ default-deny). No body, header, URL, token, cookie or exception text leaves
 this module, and a log line names the step and the class or the status only.
 
 The caps and every argument check (``protocol.plan_run``) refuse before
-anything is sent; a missing mandatory variable is ``variable_required``.
+anything is sent; a missing mandatory variable is ``variable_required``. One
+deadline (:data:`CALL_DEADLINE_SECONDS`) covers each describe and the whole
+sequence of a run, Close included.
 
 Reads only. Nothing here changes data in SAP, and no call is recorded in the
 OData write audit. Never imports ``agents.db``.
@@ -55,10 +70,11 @@ import hashlib
 import json
 import logging
 import re
+import secrets
 from collections import OrderedDict
-from collections.abc import Callable
-from dataclasses import dataclass
-from typing import Any
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, replace
+from typing import Any, TypeVar
 
 import httpx
 from pydantic import ValidationError
@@ -97,9 +113,11 @@ from .protocol import (
     TELL_THE_USER,
     UNREADABLE,
     InaDescription,
+    RunPlan,
     analytics_capabilities,
     analytics_request,
     check_caps,
+    close_request,
     data_source,
     describe_request,
     fits_name,
@@ -108,9 +126,12 @@ from .protocol import (
     read_grid,
     sap_message_error,
     shown_name,
+    text_attributes,
+    variable_submit_request,
 )
 
 logger = logging.getLogger(__name__)
+_T = TypeVar("_T")
 
 # What one answer may weigh before it is parsed: the body is read as a stream
 # and refused beyond this.
@@ -118,6 +139,9 @@ MAX_RESPONSE_BYTES = 8_000_000
 # A total deadline per request, on top of the HTTP client's per-operation
 # timeout: a body that trickles in would otherwise hold the call for good.
 CALL_DEADLINE_SECONDS = 120.0
+# The most a Close may take of what is left of a run's deadline.
+CLOSE_DEADLINE_SECONDS = 10.0
+INSTANCE_PREFIX = "ina"
 INFO_PATH = "/sap/bw/ina/GetServerInfo"
 RESPONSE_PATH = "/sap/bw/ina/GetResponse"
 
@@ -222,6 +246,29 @@ class _Answer:
 
 def _csrf_required(headers: httpx.Headers) -> bool:
     return headers.get("x-csrf-token", "").strip().lower() == "required"
+
+
+@dataclass(repr=False)
+class _Instance:
+    """A run's query instance in the SAP session, and the session (a copy,
+    with the cookies of the run's answers) a request that may have opened it
+    went out with: the one its Close goes to. None while nothing was sent,
+    and after a 403, which leaves nothing to close."""
+
+    name: str
+    session: CsrfSession | None = None
+
+    def __repr__(self) -> str:
+        return f"_Instance(name={self.name!r})"
+
+
+class _Stale(Exception):
+    """A 403 at a step of a run's first attempt: ``session`` is dropped and
+    the whole sequence runs once more."""
+
+    def __init__(self, session: CsrfSession) -> None:
+        super().__init__("stale InA session")
+        self.session = session
 
 
 class InaClient:
@@ -491,33 +538,12 @@ class InaClient:
         content = json.dumps(body, allow_nan=False).encode("utf-8")
         return await self._exchange("POST", RESPONSE_PATH, headers, content)
 
-    async def _post(self, build: Callable[[list[str]], dict[str, Any]]) -> dict[str, Any]:
-        """One ``GetResponse``, with the caller's session: the answer's JSON
-        object, or the refusal it carries."""
-        key = self._session_key()
+    @staticmethod
+    async def _guarded(work: Awaitable[_T]) -> _T:
+        """``work``, with the destination's and the store's refusals as an
+        ``InaError``."""
         try:
-            session, capabilities = await self._acquire(key)
-            answer = await self._send(session, build(capabilities))
-            if answer.status == 403:
-                # Stale token or session: drop exactly the one that was sent,
-                # fetch again and repeat once. A read changes nothing.
-                self._sessions.drop(key, session)
-                session, capabilities = await self._acquire(key)
-                answer = await self._send(session, build(capabilities))
-                if answer.status == 403 and _csrf_required(answer.headers):
-                    raise InaError(
-                        "csrf_failed",
-                        "SAP refused the CSRF token twice",
-                        hint=TELL_THE_USER,
-                        status=403,
-                    )
-            if answer.status >= 300:
-                raise self._refusal(answer)
-            payload = self._decode(answer)
-            if answer.cookies:
-                # Only after a positive verdict: what a sign-in page sets is
-                # never sent with a later request.
-                self._sessions.update(key, session, {**session.cookies, **answer.cookies})
+            return await work
         except DestinationUserRequired:
             raise _no_user() from None
         except InaError:
@@ -528,10 +554,54 @@ class InaClient:
             raise InaError(
                 "destination_error", "the SAP session of this query could not be used"
             ) from None
+
+    def _accept(self, key: Any, session: CsrfSession, answer: _Answer) -> dict[str, Any]:
+        """The JSON object of an answer, or the refusal it is or carries.
+
+        The cookies it sets join the session: in the store, and in
+        ``session``, the copy the run's next request is sent with. Only after
+        a positive verdict (below 300, JSON): what a sign-in page sets is
+        never sent with a later request.
+        """
+        if answer.status >= 300:
+            raise self._refusal(answer)
+        payload = self._decode(answer)
+        if answer.cookies:
+            cookies = {**session.cookies, **answer.cookies}
+            self._sessions.update(key, session, cookies)
+            session.cookies = cookies
         error = sap_message_error(payload)
         if error is not None:
             raise error
         return payload
+
+    def _second_403(self, answer: _Answer) -> InaError:
+        if _csrf_required(answer.headers):
+            return InaError(
+                "csrf_failed", "SAP refused the CSRF token twice", hint=TELL_THE_USER, status=403
+            )
+        return self._refusal(answer)
+
+    async def _post(self, build: Callable[[list[str]], dict[str, Any]]) -> dict[str, Any]:
+        """One ``GetResponse``, with the caller's session: the answer's JSON
+        object, or the refusal it carries."""
+        key = self._session_key()
+        return await self._guarded(self._post_once(key, build))
+
+    async def _post_once(
+        self, key: Any, build: Callable[[list[str]], dict[str, Any]]
+    ) -> dict[str, Any]:
+        session, capabilities = await self._acquire(key)
+        answer = await self._send(session, build(capabilities))
+        if answer.status == 403:
+            # Stale token or session: drop exactly the one that was sent,
+            # fetch again and repeat once. A read changes nothing.
+            self._sessions.drop(key, session)
+            session, capabilities = await self._acquire(key)
+            answer = await self._send(session, build(capabilities))
+            if answer.status == 403:
+                raise self._second_403(answer)
+        return self._accept(key, session, answer)
 
     def _data_source(self) -> dict[str, str]:
         return data_source(self._query, self._package)
@@ -580,11 +650,100 @@ class InaClient:
             order=order,
             variables=variables,
         )
-        source = self._data_source()
-        payload = await self._post(
-            lambda capabilities: analytics_request(capabilities, source, plan)
-        )
+        key = self._session_key()
+        instance = _Instance(INSTANCE_PREFIX + secrets.token_hex(8))
+        ends_at = asyncio.get_running_loop().time() + CALL_DEADLINE_SECONDS
+        deadline = asyncio.timeout_at(ends_at)
+        try:
+            try:
+                async with deadline:
+                    payload, plan = await self._guarded(self._sequence(key, plan, instance))
+            except TimeoutError:
+                logger.warning(
+                    "ina: a run did not finish in time (deadline %s)",
+                    "expired" if deadline.expired() else "not expired",
+                )
+                raise _timed_out() from None
+        finally:
+            await self._close(instance, ends_at)
         return read_grid(payload, plan)
+
+    async def _sequence(
+        self, key: Any, plan: RunPlan, instance: _Instance
+    ) -> tuple[dict[str, Any], RunPlan]:
+        """The submit (when the run has variables) and the read, on one
+        instance in one session: the read's answer and the plan it was sent
+        with. A 403 at either step drops the session that was sent and runs
+        the whole sequence once more, in a new session: the instance lived in
+        the refused one."""
+        try:
+            return await self._attempt(key, plan, instance, repeat=False)
+        except _Stale as stale:
+            self._sessions.drop(key, stale.session)
+            return await self._attempt(key, plan, instance, repeat=True)
+
+    async def _attempt(
+        self, key: Any, plan: RunPlan, instance: _Instance, *, repeat: bool
+    ) -> tuple[dict[str, Any], RunPlan]:
+        session, capabilities = await self._acquire(key)
+        source = data_source(self._query, self._package, instance.name)
+        if plan.variables:
+            submitted = await self._step(
+                key, session, instance, variable_submit_request(capabilities, source, plan), repeat
+            )
+            # The read asks for the text attributes the submit answer names.
+            plan = replace(plan, texts=text_attributes(submitted.get("Cube"), plan.group_by))
+        payload = await self._step(
+            key, session, instance, analytics_request(capabilities, source, plan), repeat
+        )
+        return payload, plan
+
+    async def _step(
+        self,
+        key: Any,
+        session: CsrfSession,
+        instance: _Instance,
+        body: dict[str, Any],
+        repeat: bool,
+    ) -> dict[str, Any]:
+        # Set before sending: a request that left may have opened the instance.
+        instance.session = session
+        answer = await self._send(session, body)
+        if answer.status == 403:
+            instance.session = None
+            if repeat:
+                raise self._second_403(answer)
+            raise _Stale(session)
+        return self._accept(key, session, answer)
+
+    async def _close(self, instance: _Instance, ends_at: float) -> None:
+        """Release the run's query instance, best effort: never raised, a
+        failure logged by exception class (and HTTP status) only. Not sent
+        while the caller is being cancelled or once the run's deadline is
+        spent; otherwise within what is left of it."""
+        session = instance.session
+        task = asyncio.current_task()
+        if session is None or (task is not None and task.cancelling()):
+            return
+        left = ends_at - asyncio.get_running_loop().time()
+        if left <= 0:
+            logger.warning("ina: the query instance was not closed (no time left)")
+            return
+        try:
+            async with asyncio.timeout(min(left, CLOSE_DEADLINE_SECONDS)):
+                answer = await self._send(session, close_request(instance.name))
+            if answer.status >= 300:
+                raise self._refusal(answer)
+            error = sap_message_error(self._decode(answer))
+            if error is not None:
+                raise error
+        except Exception as exc:  # noqa: BLE001 - a Close never fails the run
+            status = getattr(exc, "status", None)
+            logger.warning(
+                "ina: the query instance was not closed (%s%s)",
+                type(exc).__name__,
+                f", HTTP {status}" if isinstance(status, int) else "",
+            )
 
 
 def _timed_out() -> InaError:
@@ -607,6 +766,7 @@ def _no_user() -> InaError:
 __all__ = [
     "CALL_DEADLINE_SECONDS",
     "CLIENT_INFO",
+    "CLOSE_DEADLINE_SECONDS",
     "DEFAULT_TOP",
     "DESCRIBE_EXPAND",
     "FILTER_OPERATORS",

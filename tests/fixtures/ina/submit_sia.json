@@ -1,0 +1,197 @@
+{
+ "Cube": {
+  "Name": "2CCMMPURORDSPND",
+  "Dimensions": [
+   {
+    "Name": "2CHZY5N72NNDJ2R09JG98XXDF7M",
+    "DimensionType": 7,
+    "KeyAttribute": "2CHZY5N72NNDJ2R09JG98XXDF7M.KEY"
+   },
+   {
+    "Name": "2CH0Y9FATWMXU07PABNUMVE2HHX",
+    "DimensionType": 4,
+    "KeyAttribute": "2CH0Y9FATWMXU07PABNUMVE2HHX.KEY",
+    "TextAttribute": "2CH0Y9FATWMXU07PABNUMVE2HHX.MEDIUM_TEXT"
+   },
+   {
+    "Name": "2CQVA05CB3RQ8IWG16R9ADB9KSB",
+    "DimensionType": 7,
+    "KeyAttribute": "2CQVA05CB3RQ8IWG16R9ADB9KSB.KEY"
+   },
+   {
+    "Name": "ELTUIDSTRCMMPURORDQUERY",
+    "DimensionType": 2,
+    "KeyAttribute": "ELTUIDSTRCMMPURORDQUERY.KEY"
+   },
+   {
+    "Name": "2CCMMPURORDSPND-WBSELEMENT",
+    "DimensionType": 3,
+    "KeyAttribute": "2CCMMPURORDSPND-WBSELEMENT.KEY"
+   },
+   {
+    "Name": "2CCMMPURORDSPND-YEARQUARTER",
+    "DimensionType": 3,
+    "KeyAttribute": "2CCMMPURORDSPND-YEARQUARTER.KEY"
+   },
+   {
+    "Name": "2CGIDM6LH966QQ7P9SWDU97VN5Q",
+    "DimensionType": 3,
+    "KeyAttribute": "2CGIDM6LH966QQ7P9SWDU97VN5Q.KEY"
+   },
+   {
+    "Name": "2CGTFFBTM6NPYFVPCZAKK48TQMW",
+    "DimensionType": 3,
+    "KeyAttribute": "2CGTFFBTM6NPYFVPCZAKK48TQMW.KEY"
+   },
+   {
+    "Name": "2CCMMPURORDSPND-PRODUCTTYPE",
+    "DimensionType": 3,
+    "KeyAttribute": "2CCMMPURORDSPND-PRODUCTTYPE.KEY"
+   },
+   {
+    "Name": "2CHY5M70U37SV83XURU3JL3PICS",
+    "DimensionType": 3,
+    "KeyAttribute": "2CHY5M70U37SV83XURU3JL3PICS.KEY"
+   },
+   {
+    "Name": "2CCMMPURORDSPND-COSTCENTER",
+    "DimensionType": 3,
+    "KeyAttribute": "2CCMMPURORDSPND-COSTCENTER.KEY"
+   },
+   {
+    "Name": "2CI9P3D40QX9MR7YT9SD9ALVV3K",
+    "DimensionType": 3,
+    "KeyAttribute": "2CI9P3D40QX9MR7YT9SD9ALVV3K.KEY"
+   },
+   {
+    "Name": "2CIFICOUNTRY",
+    "DimensionType": 3,
+    "KeyAttribute": "2CIFICOUNTRY.KEY",
+    "TextAttribute": "2CIFICOUNTRY.LONG_TEXT"
+   },
+   {
+    "Name": "2CIMATERIAL",
+    "DimensionType": 3,
+    "KeyAttribute": "2CIMATERIAL.KEY",
+    "TextAttribute": "2CIMATERIAL.LONG_TEXT"
+   },
+   {
+    "Name": "2CIMATGROUP",
+    "DimensionType": 3,
+    "KeyAttribute": "2CIMATGROUP.KEY",
+    "TextAttribute": "2CIMATGROUP.MEDIUM_TEXT"
+   },
+   {
+    "Name": "2CCMMPURORDSPND-COMPANYCODE",
+    "DimensionType": 3,
+    "KeyAttribute": "2CCMMPURORDSPND-COMPANYCODE.KEY"
+   },
+   {
+    "Name": "2CIMMPURCHGROUP",
+    "DimensionType": 3,
+    "KeyAttribute": "2CIMMPURCHGROUP.KEY",
+    "TextAttribute": "2CIMMPURCHGROUP.LONG_TEXT"
+   },
+   {
+    "Name": "2CCMMPURORDSPND-PURGCATNAME",
+    "DimensionType": 3,
+    "KeyAttribute": "2CCMMPURORDSPND-PURGCATNAME.KEY"
+   },
+   {
+    "Name": "2CIMMPURGDOCSTA",
+    "DimensionType": 3,
+    "KeyAttribute": "2CIMMPURGDOCSTA.KEY",
+    "TextAttribute": "2CIMMPURGDOCSTA.LONG_TEXT"
+   },
+   {
+    "Name": "2CIMMPURGORG",
+    "DimensionType": 3,
+    "KeyAttribute": "2CIMMPURGORG.KEY",
+    "TextAttribute": "2CIMMPURGORG.LONG_TEXT"
+   },
+   {
+    "Name": "2CIPLANT",
+    "DimensionType": 3,
+    "KeyAttribute": "2CIPLANT.KEY",
+    "TextAttribute": "2CIPLANT.LONG_TEXT"
+   },
+   {
+    "Name": "2CIUSU6TX647EBYVDN00SSTQB22",
+    "DimensionType": 3,
+    "KeyAttribute": "2CIUSU6TX647EBYVDN00SSTQB22.KEY"
+   },
+   {
+    "Name": "2CIWC2AWRN0TP4N4RGABETWBNNF",
+    "DimensionType": 3,
+    "KeyAttribute": "2CIWC2AWRN0TP4N4RGABETWBNNF.KEY"
+   },
+   {
+    "Name": "2CI_SUPPLIER_CDS",
+    "DimensionType": 3,
+    "KeyAttribute": "2CI_SUPPLIER_CDS.KEY",
+    "TextAttribute": "2CI_SUPPLIER_CDS.LONG_TEXT"
+   },
+   {
+    "Name": "2CK4YFDXKIGC0ZI9NKTP9OISMYB",
+    "DimensionType": 7,
+    "KeyAttribute": "2CK4YFDXKIGC0ZI9NKTP9OISMYB.KEY"
+   },
+   {
+    "Name": "2CK7SUH2UP4PONH5XH87YCZ93BI",
+    "DimensionType": 3,
+    "KeyAttribute": "2CK7SUH2UP4PONH5XH87YCZ93BI.KEY"
+   },
+   {
+    "Name": "2CKDZ7I5S9XCRCN355YOBDHUHOI",
+    "DimensionType": 3,
+    "KeyAttribute": "2CKDZ7I5S9XCRCN355YOBDHUHOI.KEY"
+   },
+   {
+    "Name": "2CMBRFZSZE7EY82KT6NK0AJYP2J",
+    "DimensionType": 3,
+    "KeyAttribute": "2CMBRFZSZE7EY82KT6NK0AJYP2J.KEY"
+   },
+   {
+    "Name": "2CCMMPURORDSPND-PURGCATUUID",
+    "DimensionType": 3,
+    "KeyAttribute": "2CCMMPURORDSPND-PURGCATUUID.KEY"
+   },
+   {
+    "Name": "2CRQNEI1ZK3DYN6MAYSP9RQJIK1",
+    "DimensionType": 3,
+    "KeyAttribute": "2CRQNEI1ZK3DYN6MAYSP9RQJIK1.KEY"
+   },
+   {
+    "Name": "2CSAXN20C7YI56A85L2U7K5Q82M",
+    "DimensionType": 3,
+    "KeyAttribute": "2CSAXN20C7YI56A85L2U7K5Q82M.KEY"
+   },
+   {
+    "Name": "2CT30808YZRNBPU8IMGP3TQ4OKQ",
+    "DimensionType": 4,
+    "KeyAttribute": "2CT30808YZRNBPU8IMGP3TQ4OKQ.KEY",
+    "TextAttribute": "2CT30808YZRNBPU8IMGP3TQ4OKQ.SHORT_TEXT"
+   },
+   {
+    "Name": "2CTJT8ROP1LDEMNDH5SEAHX71LW",
+    "DimensionType": 3,
+    "KeyAttribute": "2CTJT8ROP1LDEMNDH5SEAHX71LW.KEY"
+   },
+   {
+    "Name": "1TEXT",
+    "DimensionType": 3,
+    "KeyAttribute": "1TEXT.KEY"
+   },
+   {
+    "Name": "2CCGCALDFVH",
+    "DimensionType": 3,
+    "KeyAttribute": "2CCGCALDFVH.KEY",
+    "TextAttribute": "2CCGCALDFVH.LONG_TEXT"
+   }
+  ],
+  "ServerState": {
+   "State": 0
+  }
+ },
+ "Messages": []
+}

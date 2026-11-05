@@ -1258,14 +1258,32 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   registers each query (`ina_queries`, page "Analytical queries"); identity is
   per query (`destination` + `user_context`), never per agent; the agent's
   entry only names queries (`agents/db.py`). The tools are denied in ABAP
-  Assistant sessions (not in `READONLY_POLICY`). **Unit-tested only, on
-  synthetic fixtures**: the describe envelope is the one SIA accepted in the
-  2.34.0 probe (`scripts/probe_ina.py`), but the Analytics request and the
-  result grid are a best reading of the design and of a reference
-  implementation, NOT of a recorded SIA exchange (no SIA query was named for
-  this release), so the data read is unverified; the first landscape check is
-  a Describe of a dummy name, which proves transport, CSRF and the message
-  envelope by answering `query_unknown`
+  Assistant sessions (not in `READONLY_POLICY`). **Recorded against a real
+  system** (S/4HANA 2022, SAP_BW 757, an SAP CDS query through an OnPremise
+  destination as a technical user, 2026-11-04, `scripts/probe_ina.py
+  --dump`; the raw dumps stay local and gitignored, the fixtures are
+  sanitised: structure and SAP's metadata names kept, every member key,
+  text, amount, count and session id replaced): **verified** are Describe
+  (the `InputType` mandatory marker, the generated measure-structure name,
+  each variable's dimension key), the three requests of a run on one
+  `InstanceId` (VariableSubmit, read, Close) as the probe sent them, and the
+  grid shape SAP answered them with; the run sequence and the grid reader of
+  the app are built on those recorded answers. **Not seen on the system**:
+  the app's own client end to end (only the probe's sequence ran there; the
+  cookie merge, the 403 redo, the Close and the texts taken from the submit
+  answer are unit-tested only), `filters` and `order` (no recorded request
+  held a `Filter` or a `Sort`; the submit carries them too), a read of
+  several measures (their column order would be inferred, so a run takes
+  ONE measure until a probe verifies it), variables of type interval or
+  multiple ("inferred, not seen": every recorded variable was a single
+  value), a query without variables (no submit, so the read asks for keys
+  only), a value SAP marks (refused, not read as null). The first data read
+  by the app, one filtered and one ordered read among it, is pending on a
+  landscape. **A version before 2.37.1 refuses a definition that holds
+  `measure_structure` or `key_field`** (`extra="forbid"`): after a rollback,
+  or in a database of an older version (`scripts/copy_registry_config.py`),
+  such a row reads back as not described until Describe runs there again,
+  and an HTTP bundle import of it into an older version fails as a whole
   - `models.py` — the save-time gate, never imports `agents.db`:
     `validate_ina_query(data)` returns the model (`InaQueryPayload`,
     `extra="forbid"`, strict strings and booleans; `definition` and
@@ -1275,9 +1293,12 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     `QUERY_NAME_RE` (`^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$`), `title` ≤ 120 and
     `purpose` ≤ 200 required, `destination` the OData gate's
     `DESTINATION_NAME_RE`, `query` (the InA object name) ≤ 128; the
-    definition holds dimensions `{name, label, key_field?}` and measures
+    definition holds `measure_structure?` (the measure structure's name, a
+    generated one on the recorded system; absent on a row described before
+    2.37.1), dimensions `{name, label, key_field?}` and measures
     `{name, label, unit?}` (≤ 100 each), variables `{name, label, mandatory,
-    type: single|interval|multiple}` (≤ 50), names distinct per list
+    type: single|interval|multiple, key_field?}` (≤ 50; `key_field` the key of
+    the dimension the values belong to), names distinct per list
     (case-sensitive), member names, labels and units one line without control
     OR format characters (`one_line_strict`, i.e. `one_line_text(...,
     refuse_format=True)`: a bidi override in a name is refused).
@@ -1289,7 +1310,7 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     group_by, filters, top, order, variables)`; `build_ina_http_client` (the
     one builder of the tools and the admin calls:
     `destination_http_client(..., connectivity=...)` with a `NoCookieJar`, so
-    OnPremise destinations through the Cloud Connector work, SIA is one);
+    OnPremise destinations through the Cloud Connector work);
     `InaSessionStore` (a `CsrfSessionStore` keyed like OData's, per
     destination and signed-in user and token digest, that also keeps the
     Analytics capabilities). `GET /sap/bw/ina/GetServerInfo` with
@@ -1298,14 +1319,41 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     drop, refetch and resend after a 403; `csrf_failed` when SAP says
     `Required` again; cookies taken only from a 2xx JSON answer); the
     resolved destination must be the registration's (name and
-    `user_context`). Streamed up to `MAX_RESPONSE_BYTES` (8 MB), no redirect,
-    a total deadline of `CALL_DEADLINE_SECONDS` (120, `asyncio.timeout` with
-    `expired()`), a 407 body never read. **Caps** (refused before anything is
-    sent, never cut): 20 dimensions, 20 measures, 30 filters, `top` ≤ 2,000
-    (default 100), 10 order terms, 50 `in` values, 255 characters per value;
-    5,000 cells counted on what is returned. `MaxResultRecords` is `top + 1`:
-    the extra row means `truncated: true` and is not returned; more than
-    `top + 1` rows is `result_too_large`. Every failure is an `InaError` from
+    `user_context`). **A run is three requests on one query instance**
+    (`DataSource.InstanceId` = `ina` + `secrets.token_hex(8)`, new per run)
+    in one stateful session: a VariableSubmit when the run has variables
+    (the system has no `DirectVariableTransfer`: values in the read alone are
+    refused with "the query can only run once all mandatory variables have
+    values"), the read, then a Close. The cookies an answer sets join the
+    session for the run's next request and later calls; the read asks for
+    the text attribute of each row dimension the submit answer's `Cube`
+    names (`TextAttribute`, taken only when it passes `fits_name`, starts
+    with `<dim>.` and is not the key; the describe answer names it for few
+    dimensions). Every answer goes through `sap_message_error`. A 403 at the
+    submit or the read drops that session and runs the whole sequence once
+    more in a new one; a second 403 is `csrf_failed` / `forbidden` and
+    nothing is closed. The Close is best effort (`_close`): also after a
+    refused submit or read, never raised, a failure logged by exception class
+    (and HTTP status) only, within what is left of the deadline and at most
+    `CLOSE_DEADLINE_SECONDS` (10), not sent while the caller is cancelled:
+    a run cancelled mid-sequence (the admin Test route's 25 s budget, a
+    stopped chat turn) raises `CancelledError` and leaves its query instance
+    open in the SAP session until ICF ends that session
+    (`tests/test_ina_run.py`).
+    Streamed up to `MAX_RESPONSE_BYTES` (8 MB) per answer, no redirect, one
+    deadline of `CALL_DEADLINE_SECONDS` (120, `asyncio.timeout` with
+    `expired()`) for a describe and for a run's whole sequence, a 407 body
+    never read. **Caps** (refused before anything is sent, never cut): 20
+    dimensions, ONE measure per run (`check_caps`, also before an
+    undescribed query is read: `invalid_filter` "measures: one measure per
+    run until the column order is verified", hint "run the query once per
+    measure"; every recorded grid held one measure and nothing in the answer
+    names the measure of a column, so a wrong order would be wrong numbers
+    under the right names; `MAX_MEASURES` 20 stays behind it), 30 filters,
+    `top` ≤ 2,000 (default 100), 10 order terms, 50 `in` values, 255
+    characters per value; 5,000 cells counted on what is returned. `RowTo` is `top + 1`: the extra row is not
+    returned; `truncated` is `TupleCountTotal > top`; more than `top + 1`
+    rows is `result_too_large`. Every failure is an `InaError` from
     the closed `ERROR_CODES` of `errors.py` (`destination_error`,
     `proxy_refused`, `user_token_required`, `unauthorized`, `forbidden`,
     `csrf_failed`, `query_unknown`, `variable_required`, `invalid_filter`,
@@ -1317,26 +1365,74 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     warning messages are dropped. No user JWT with `user_context` is
     `user_token_required` before anything is resolved
   - `protocol.py` — the wire format as pure functions: `describe_request`,
-    `analytics_request` (dimensions on `Rows`, the `Measures` structure on
-    `Columns`, a `Selection` of `And` over member filters `=`, `<>`, `>=`,
-    `<=`, `between`, `in` on the dimension's `key_field`, `Sort`,
-    `Variables`, `ResultFormat: Version2`, `Options: ["StatefulServer"]`),
-    `plan_run` / `check_caps` (every argument rule; an unknown measure or
+    `analytics_request` (the read: each `Rows` dimension lists `Attributes`
+    `[{Name: <key attribute>, Obtainability: Always}]` plus its text
+    attribute when known (without them the system sent no member keys) and
+    `ResultStructure` Members visible / Total hidden (without it subtotal and
+    total rows came); the measure structure by its described name on
+    `Columns` (`measure_structure`, `Measures` for a row described before
+    2.37.1); a `Selection` of `And` over member filters `=`, `<>`, `>=`,
+    `<=`, `between`, `in` on the dimension's key (`key_of`: the same
+    attribute the read lists as the key), `Sort`,
+    `Variables` (each value named by its dimension's key, `key_field` of the
+    variable, `IsExcluding: false`), `ResultFormat: Version2`, `RowTo` =
+    `top + 1`, no `MaxResultRecords`, `Options: ["StatefulServer"]`),
+    `variable_submit_request` (the read in the plain form the system accepted
+    as a submit: rows without attributes, `MaxResultRecords` `top + 1`, plus
+    `ProcessingDirectives: {ProcessingStep: VariableSubmit}`),
+    `close_request` (`Actions: [{Type: Close, DataSources: [<instance>]}]`),
+    `data_source(query, package, instance_id)`, `text_attributes(cube,
+    group_by)`, `key_of(dimension)` (`key_field` else `<dim>.KEY`; the one
+    key rule of a filter and of `RunPlan.keys`) and
+    `RunPlan.texts`, `plan_run` / `check_caps` (every argument rule; an unknown measure or
     dimension is `invalid_filter` `<field>[i]: not a measure|dimension of
     this query`, the name sent never echoed; a mandatory variable left out is
     `variable_required`), `read_description` (labels cut to 120, units to
     32, a name the gate would refuse or a repeat skipped and counted, more
-    than 100/100/50 sets `truncated`) and `read_grid` (`{columns, rows, units,
-    row_count, truncated}`; a `<dim>.text` column when SAP sent a text other
-    than the key, a `<measure>.unit` column when the unit differs per row).
-    **The real SIA grid shape is UNVERIFIED**: `read_grid` reads
-    `Grids[0].Axes[].Tuples[].Members[]` and `Cells[]` of `{Value, Unit}`;
-    a reference implementation reads a columnar Version2 grid
-    (`Cells.Values.Values`, `MemberIndexes`) instead. A shape the reader does
-    not know is `sap_error` ("a form this client does not read"), and a cell
-    without a `Value` key is never read as null: it fails closed, never
-    leaks. Record one describe and one run on SIA (`scripts/probe_ina.py`)
-    before a pilot and adapt `read_grid` / `read_description` then
+    than 100/100/50 sets `truncated`; **a variable is mandatory** when
+    `Mandatory` (boolean, `1`, `"X"`) or `InputType` (`Mandatory`,
+    `MandatoryNotInitial`; the recorded system's spelling, `Mandatory` is
+    absent there) says
+    so, optional only when every marker it carries was read and says
+    optional; no marker, or an `InputType` of another value or type, is
+    mandatory with one WARNING naming the variable's position, never its
+    name: read as optional, the Test sent a run the system refused; the
+    selection type comes from `SelectionType`, else
+    `FilterCapability.ComparisonGroup` (`Interval` / `Range`: interval) and
+    `MultipleValues` (exactly `true`: multiple), never from `VariableType`
+    (`DimensionMemberVariable` / `SimpleTypeVariable` there); the interval
+    and multiple readings are inferred, not seen). Wire format reference:
+    SAP's own InA client in SAPUI5 (`sap/sac/df/firefly`), read, not vendored
+  - `grid.py` — `read_grid(payload, plan)` (re-exported by `protocol.py`)
+    and `MAX_CELLS`: the recorded `Version2` columnar grid
+    (`run_sia_grid.json`): one `Rows` and one `Columns` axis (`Type`), each
+    with `Dimensions`, `TupleCount`, `TupleCountTotal` and `Tuples` (one per
+    dimension, `MemberIndexes.Values` one index per tuple into that
+    dimension's member table); a row dimension's member table is its
+    `Attributes` (the key with `ValuesException`, the text) and
+    `MemberTypes`; the measure structure carries no attributes (a column's
+    member index is the measure's place in the request); `Cells.Values` /
+    `Cells.Units` row-major, `CellArraySizes` `[rows, columns]`; a wrapped
+    list is read only with `Encoding` `None`. Answers `{columns, rows,
+    units, row_count, truncated}` (a `<dim>.text` column when a text that
+    differs from the key came back, a `<measure>.unit` column when the unit
+    differs per row). **Fail-closed**, `sap_error` with one fixed text
+    (`UNREADABLE`) for a form it does not know, checked on everything SAP
+    sent, the extra row included: axes, dimensions or tuples that do not
+    match the request, a member index out of range, a key that is no string,
+    a member of type 1 (a total) or any other type, a structure with
+    attributes, sizes that do not add up, a cell that is neither a finite
+    number, null nor text. A value SAP marks or sends as no number (a key's
+    `ValuesException` or a cell's `Exceptions` other than 0, a null or a
+    text cell) is `sap_error` with a text of its own (`VALUE_REFUSED`, ending
+    "tell the user instead of retrying"), never read as null, and only in a
+    row that is returned (the `top + 1`-th row is checked for its form
+    alone; a marked member's key and text are not read). More than `top + 1`
+    rows or more than 5,000 returned cells is `result_too_large`, never cut.
+    Every refusal logs ONE WARNING `ina: grid refused: <reason> (count=n)`,
+    a key of the closed list `REFUSAL_REASONS` and a count made by the
+    reader, never a value. Only the requested key, text, value and unit
+    leave
   - `tools.py` — `ina_toolset(...)` (the factory of `agents/builtins.py`,
     `queries=` the snapshot of registered queries the registry loaded;
     `attached_queries` is the one selection; no usable query is
@@ -1345,7 +1441,8 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     ones in entry order; no destination, InA name or member),
     `describe_query(query)` (from the stored description only, never SAP;
     `key_field` left out) and `run_query(query, measures, group_by,
-    filters=None, top=100, order=None, variables=None)` (arguments checked by
+    filters=None, top=100, order=None, variables=None)` (`measures` a list of
+    exactly one, as its description says; arguments checked by
     `plan_run` before a client or resolver is built; `truncated` adds the
     hint to narrow the filters or raise `top`). A name the entry does not
     hold, or holds disabled, is `query_unknown` without the name sent; a
@@ -1418,11 +1515,19 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     `GET /admin/api/credential-health` lists a `builtin:ina` entry once per
     query it names (`query`, `query_enabled`, `destination`, `user_context`,
     `state`; `missing` for a name nobody registered).
-  Tests: `tests/test_ina_models.py`, `test_ina_client.py`,
-  `test_ina_protocol.py`, `test_ina_sessions.py`, `test_ina_tools.py`,
-  `test_ina_registration.py`, `test_ina_db.py`, `test_ina_admin.py`,
-  `test_ina_bundles.py` (fixtures in `tests/fixtures/ina/`, synthetic, placeholder
-  names). Never run against a real SIA query
+  Tests: `tests/test_ina_models.py`, `test_ina_client.py`, `test_ina_run.py`
+  (the three-request sequence), `test_ina_grid.py`, `test_ina_protocol.py`,
+  `test_ina_sessions.py`, `test_ina_tools.py`, `test_ina_registration.py`,
+  `test_ina_db.py`, `test_ina_admin.py`, `test_ina_admin_describe.py`,
+  `test_ina_bundles.py`, `test_probe_ina.py` (the probe's read, submit,
+  Close and text reading held to `protocol.py`); the SAP double and grid
+  builder are `tests/ina_helpers.py`; fixtures in `tests/fixtures/ina/`,
+  synthetic with placeholder names except the four recorded ones,
+  sanitised: `describe_sia.json` (a describe, session ids replaced),
+  `submit_sia.json` (a VariableSubmit answer cut to each dimension's name,
+  type, key and text attribute), `run_sia_grid.json` (a grid of two row
+  dimensions, every key, text, amount and count replaced) and
+  `run_sia_variables_missing.json` (the refusal of a read without a submit)
 - `agents/data_catalog/` — the **data catalogue graph** (design addendum j, part 1):
   one graph of every data source attached to at least one enabled agent, built once
   and scoped at query time, so an agent finds the right source without a prompt that
@@ -3122,7 +3227,25 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   table, column or HANA generation. A landscape that sets `PG_SCHEMA` and still has
   this app's tables in `public` needs `PG_SCHEMA_ADOPT: true` (or `false`) in its
   `.mtaext` before deploying 2.37.0, and `true` removed again (or set `false`) in
-  the deploy after the one that moved the tables
+  the deploy after the one that moved the tables; 2.37.1 is the fix of the first
+  real InA exchange (2026-11-04): `read_description` reads the system's
+  mandatory marker (`InputType`) and selection type, so the admin Test of a query
+  with a mandatory variable answers 422 `variable_required` before anything is
+  sent instead of SAP's refusal (an already described query needs one Describe
+  again to store the flags); `scripts/probe_ina.py` records the raw exchange
+  (`--dump`, `--run`, `--variable`); no new resource, environment variable, table,
+  column or HANA generation. The same release builds the run sequence and the
+  grid reader on the recorded answers: a run is the VariableSubmit, the read
+  (each row dimension asks for its key and text and hides its totals) and a
+  Close on one query instance, and the grid is read in the recorded `Version2`
+  columnar form (`agents/ina/grid.py`, fail-closed); the first data read by the
+  app itself is pending on the landscape. Not seen on the system: the app's own
+  client end to end (only the probe's sequence ran there), `filters` and
+  `order`, several measures (refused for now: one measure per run), interval
+  and multiple variables. A query described before needs one Describe again so
+  its measure structure and its variables' dimension keys are stored; a version
+  before 2.37.1 refuses a definition that holds them (`extra="forbid"`: a row
+  reads back as not described there, an HTTP bundle import fails as a whole)
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets

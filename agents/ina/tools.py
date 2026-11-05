@@ -391,7 +391,7 @@ def ina_toolset(
         order: list[dict[str, Any]] | None = None,
         variables: dict[str, Any] | None = None,
     ) -> dict:
-        """Read an analytical query: the measures, grouped by the dimensions.
+        """Read an analytical query: one measure, grouped by the dimensions.
 
         Answers {columns, rows, units, row_count, truncated}. The numbers are
         SAP's: report them as they are and never estimate a missing one.
@@ -400,7 +400,10 @@ def ina_toolset(
 
         Args:
             query: A query name from list_queries.
-            measures: 1 to 20 measure names from describe_query.
+            measures: exactly one measure name from describe_query, as a
+                list of one: one measure per run until the column order of
+                several is verified; run the query once per measure to read
+                more.
             group_by: 0 to 20 dimension names from describe_query; empty
                 gives one total row.
             filters: Up to 30 filters, each {"dimension": <name>, "operator":

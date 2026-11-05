@@ -9,46 +9,81 @@ these build and hands them what SAP answered:
   ``GetResponse`` bodies (design addendum (k), part 2 point 2);
 * :func:`analytics_capabilities` reads the ``Analytics`` capability names of
   a ``GetServerInfo`` answer, :func:`read_description` a query's dimensions,
-  measures and variables, :func:`read_grid` the rows of a result, and
-  :func:`sap_message_error` the refusal an answer's ``Messages`` carry.
+  measures and variables, :func:`text_attributes` the text attribute of each
+  row dimension a VariableSubmit answer names, :func:`read_grid`
+  (``grid.py``) the rows of a result, and :func:`sap_message_error` the
+  refusal an answer's ``Messages`` carry.
 
 What leaves is default-deny. Of a grid only the requested dimensions (key,
 and text when SAP sent one) and measures (value, and unit) come back, text
-cleaned of control, format and separator characters and cut; a column of
-anything else is dropped, and a grid of a form this module does not know is
-refused (``sap_error``), not guessed at. A filter or variable value is a
-string or a number and only ever becomes a JSON string of the body. Of SAP's
-own words only the text of an error message passes, cleaned, URL- and
-credential-masked (``agents.errors.mask_text``) and cut at 500 characters.
-Every refusal is an ``InaError`` that names the argument and the rule, never
-a value the caller sent.
+cleaned of control, format and separator characters and cut, and a grid of a
+form the reader does not know is refused (``sap_error``), not guessed at. A
+filter or variable value is a string or a number and only ever becomes a
+JSON string of the body. Of SAP's own words only the text of an error
+message passes, cleaned, URL- and credential-masked
+(``agents.errors.mask_text``) and cut at 500 characters. Every refusal is an
+``InaError`` that names the argument and the rule, never a value the caller
+sent.
 
-Not verified against a landscape (the fixtures in ``tests/fixtures/ina/``
-are synthetic): the measure structure's name, the sort, variable and
-comparison forms of the request, and the shape of the result grid. Each is
-built or read in one place here for the first run on SIA to correct.
+Verified against SIA (S/4HANA 2022, SAP_BW 757), recorded 2026-11-04:
+the describe (``tests/fixtures/ina/describe_sia.json``: the ``Cube`` with its
+``Dimensions``, the measure structure ``DimensionType`` 2 under a generated
+name, its members keyed ``<structure>.KEY``; the ``Variables``, which say
+"mandatory" as ``InputType`` and name the dimension their values belong to)
+and a run, which is three requests on one ``DataSource.InstanceId`` in one
+stateful SAP session (``agents/ina/client.py`` sends them):
+
+1. :func:`variable_submit_request`, only when the run has variables: SIA has
+   no ``DirectVariableTransfer``, so values in the read alone are not taken
+   ("the query can only run once all mandatory variables have values",
+   ``run_sia_variables_missing.json``). Each value is named by the key of
+   the variable's dimension. Its answer's ``Cube`` names the text attribute
+   of a dimension (``submit_sia.json``), which the describe answer does not.
+2. :func:`analytics_request`, the read: each row dimension lists its key
+   and text attribute (without them SIA sent no member keys) and hides its
+   totals (without that SIA sent subtotal and total rows); ``RowTo`` is
+   ``top + 1`` and cuts the rows, no ``MaxResultRecords``, as in the reads
+   SIA answered so (``run_sia_grid.json``).
+3. :func:`close_request`, which releases the instance (SIA answered
+   "Query ... has been closed").
+
+Not seen on SIA: a read of several measures (the column order would be
+inferred, so :func:`check_caps` refuses more than one measure per run until a
+probe verifies it), a ``Filter`` or a ``Sort`` (no recorded request held
+one; the submit carries them too), and variables of type interval or
+multiple (their reading is inferred). The requests are those the probe
+sent; this module's own sequence has not run against the system yet.
 """
 
 from __future__ import annotations
 
+import logging
 import re
-import unicodedata
 from dataclasses import dataclass, field
 from typing import Any
-
-from pydantic import TypeAdapter, ValidationError
 
 from agents.errors import mask_text
 from agents.odata.common import plain_float
 
+# The description reader lives in its own module; its names are re-exported.
+from .description import (
+    _MAX_SCANNED,
+    MEASURES_DIMENSION,
+    UNREADABLE,
+    InaDescription,
+    _label,
+    fits_name,
+    read_description,
+    shown_name,
+)
 from .errors import InaError
-from .models import MAX_DIMENSIONS as MAX_DESCRIBED_DIMENSIONS
-from .models import MAX_MEASURES as MAX_DESCRIBED_MEASURES
-from .models import MAX_VARIABLES as MAX_DESCRIBED_VARIABLES
-from .models import InaDefinition, InaDimension, InaMeasure, InaName, InaVariable
 
-# The caps of one run (design addendum (k), part 2 point 2).
-MAX_CELLS = 5000
+# The grid reader holds the cap of an answer's cells; both names are kept here.
+from .grid import MAX_CELLS, read_grid
+from .models import InaDefinition, InaDimension
+
+# The caps of one run (design addendum (k), part 2 point 2; MAX_CELLS is the
+# grid reader's).
 MAX_DIMENSIONS = 20
 MAX_MEASURES = 20
 MAX_FILTERS = 30
@@ -60,18 +95,8 @@ MAX_VALUE_CHARS = 255
 FILTER_OPERATORS = ("=", "<>", ">=", "<=", "between", "in")
 
 MAX_MESSAGE_CHARS = 500
-# How many entries of a description are looked at; the definition keeps at
-# most the gate's 100 / 100 / 50 of them.
-_MAX_SCANNED = 2000
 _MAX_CAPABILITIES = 1000
 _MAX_MESSAGES = 50
-# What a grid may hold before it is parsed at all: `top + 1` rows of every
-# measure a run may name.
-_MAX_RAW_CELLS = (MAX_TOP + 1) * MAX_MEASURES
-
-# The structure of the measures (key figures) on the Columns axis.
-MEASURES_DIMENSION = "Measures"
-_MEASURE_STRUCTURE_TYPE = 2
 
 CLIENT_INFO = {"Version": "1.0", "Identifier": "btp-dynamic-multiagent", "Component": "builtin-ina"}
 DESCRIBE_EXPAND = [
@@ -83,6 +108,12 @@ DESCRIBE_EXPAND = [
     "DynamicFilter",
 ]
 _OPTIONS = ["StatefulServer"]
+# A row dimension of a read lists its members and hides its totals (SAP's
+# `DefaultResultStructure`): a total row would read as one more member.
+HIDE_TOTALS = (
+    {"Result": "Members", "Visibility": "Visible"},
+    {"Result": "Total", "Visibility": "Hidden"},
+)
 
 # The tool's operator and the InA comparison it is sent as; `in` is one
 # element per value.
@@ -100,50 +131,10 @@ _UNKNOWN_QUERY = re.compile(
     r"|existiert nicht|not found)\.?$",
     re.IGNORECASE,
 )
-# Control, format, surrogate, private-use and line/paragraph separators.
-_DROPPED = frozenset({"Cc", "Cf", "Cs", "Co", "Zl", "Zp"})
+logger = logging.getLogger(__name__)
 
-_NAME = TypeAdapter(InaName)
-
-UNREADABLE = "the answer of SAP has a form this client does not read"
 TELL_THE_USER = "tell the user instead of retrying"
 
-
-# -- text ------------------------------------------------------------------
-
-
-def _label(value: object, limit: int) -> str:
-    """One line of text: dropped characters become spaces, runs of white
-    space one space, cut at ``limit``."""
-    if not isinstance(value, str):
-        return ""
-    cleaned = "".join(
-        " " if unicodedata.category(ch) in _DROPPED else ch for ch in value[: limit * 4]
-    )
-    return " ".join(cleaned.split())[:limit]
-
-
-def _key(value: str, limit: int) -> str:
-    """A member key as SAP sent it, without the dropped characters. Not
-    otherwise changed: the model filters by it again."""
-    return "".join(ch for ch in value[: limit * 4] if unicodedata.category(ch) not in _DROPPED)[
-        :limit
-    ]
-
-
-def shown_name(value: object) -> str:
-    """A name SAP sent that the gate refused, as it may be listed."""
-    text = _label(value, 64)
-    return text or "<unnamed>"
-
-
-def fits_name(value: object) -> bool:
-    """Whether ``value`` passes the gate's name rule (``models.InaName``)."""
-    try:
-        _NAME.validate_python(value)
-    except ValidationError:
-        return False
-    return True
 
 
 def _message_text(value: object) -> str:
@@ -205,139 +196,6 @@ def analytics_capabilities(payload: object) -> list[str] | None:
     return None
 
 
-# -- the description -------------------------------------------------------
-
-
-@dataclass
-class InaDescription:
-    """What ``describe`` read: a definition the save-time gate takes, the
-    names it had to leave out (cleaned and cut) and whether a list was
-    longer than the gate allows."""
-
-    definition: InaDefinition
-    skipped: list[str] = field(default_factory=list)
-    truncated: bool = False
-
-
-def _variable_type(raw: dict[str, Any]) -> str:
-    kind = raw.get("SelectionType") or raw.get("VariableType")
-    low = kind.lower() if isinstance(kind, str) else ""
-    if "interval" in low:
-        return "interval"
-    if "multi" in low:
-        return "multiple"
-    return "single"
-
-
-def _is_mandatory(value: object) -> bool:
-    """InA says "mandatory" as a JSON boolean, ``1`` or ABAP's ``"X"``;
-    anything else (``"false"``, ``2``, ``None``) is optional."""
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, int):
-        return value == 1
-    return isinstance(value, str) and value.strip().lower() in ("x", "true")
-
-
-def _is_measure_structure(raw: dict[str, Any]) -> bool:
-    kind = raw.get("DimensionType")
-    return (
-        (isinstance(kind, int) and not isinstance(kind, bool) and kind == _MEASURE_STRUCTURE_TYPE)
-        or raw.get("Name") == MEASURES_DIMENSION
-    ) and isinstance(raw.get("Members"), list)
-
-
-def read_description(cube: object) -> InaDescription:
-    """SAP's description of a query (the ``Cube`` of a metadata answer) as
-    an ``InaDefinition``.
-
-    Never refuses the whole description for one odd entry: labels are cut
-    to 120 characters and units to 32 with dropped characters removed; an
-    entry whose name does not pass the gate's rule, or repeats an earlier
-    name, is left out and listed in ``skipped``; beyond 100 dimensions, 100
-    measures or 50 variables ``truncated`` is set. A description without a
-    measure structure is refused (``sap_error``): it is not one this reader
-    knows, and a query read as "no measures" could never be run.
-    """
-    if not isinstance(cube, dict) or not isinstance(cube.get("Dimensions"), list):
-        raise InaError("sap_error", UNREADABLE)
-    out = InaDescription(definition=InaDefinition())
-    dimensions: list[InaDimension] = []
-    measures: list[InaMeasure] = []
-    variables: list[InaVariable] = []
-
-    def keep(kind: type, bucket: list, limit: int, name: object, **values: Any) -> None:
-        if not fits_name(name) or any(entry.name == name for entry in bucket):
-            out.skipped.append(shown_name(name))
-            return
-        if len(bucket) >= limit:
-            out.truncated = True
-            return
-        bucket.append(kind(name=name, **values))
-
-    structures = 0
-    for raw in cube["Dimensions"][:_MAX_SCANNED]:
-        if not isinstance(raw, dict):
-            continue
-        if _is_measure_structure(raw):
-            structures += 1
-            structure = raw.get("Name") if isinstance(raw.get("Name"), str) else ""
-            for member in raw["Members"][:_MAX_SCANNED]:
-                if not isinstance(member, dict):
-                    continue
-                name = member.get(f"{structure}.KEY", member.get("Name"))
-                label = next(
-                    (
-                        member[k]
-                        for k in (
-                            f"{structure}.LONG_TEXT",
-                            f"{structure}.MEDIUM_TEXT",
-                            f"{structure}.SHORT_TEXT",
-                            "Description",
-                            "Text",
-                        )
-                        if isinstance(member.get(k), str)
-                    ),
-                    "",
-                )
-                unit = _label(member.get("Unit") or member.get("Currency"), 32) or None
-                keep(
-                    InaMeasure,
-                    measures,
-                    MAX_DESCRIBED_MEASURES,
-                    name,
-                    label=_label(label, 120),
-                    unit=unit,
-                )
-            continue
-        key_field = raw.get("KeyAttribute")
-        keep(
-            InaDimension,
-            dimensions,
-            MAX_DESCRIBED_DIMENSIONS,
-            raw.get("Name"),
-            label=_label(raw.get("Description"), 120),
-            key_field=key_field if fits_name(key_field) else None,
-        )
-    if not structures:
-        raise InaError("sap_error", UNREADABLE)
-    raw_variables = cube.get("Variables")
-    for raw in raw_variables[:_MAX_SCANNED] if isinstance(raw_variables, list) else []:
-        if not isinstance(raw, dict):
-            continue
-        keep(
-            InaVariable,
-            variables,
-            MAX_DESCRIBED_VARIABLES,
-            raw.get("Name"),
-            label=_label(raw.get("Description") or raw.get("Text"), 120),
-            mandatory=_is_mandatory(raw.get("Mandatory")),
-            type=_variable_type(raw),
-        )
-    out.definition = InaDefinition(dimensions=dimensions, measures=measures, variables=variables)
-    return out
-
-
 # -- a run -----------------------------------------------------------------
 
 
@@ -352,6 +210,14 @@ class RunPlan:
     sort: list[dict[str, Any]]
     variables: list[dict[str, Any]]
     top: int
+    # The measure structure the measures are members of, on Columns.
+    structure: str = MEASURES_DIMENSION
+    # The key attribute of each row dimension: the described key field, else
+    # `<dimension>.KEY` (SIA's `KeyAttribute`).
+    keys: dict[str, str] = field(default_factory=dict)
+    # The text attribute of a row dimension, when the VariableSubmit answer
+    # named one (`text_attributes`); set by the client before the read.
+    texts: dict[str, str] = field(default_factory=dict)
 
 
 def _refuse(field_name: str, rule: str, code: str = "invalid_filter") -> InaError:
@@ -385,7 +251,9 @@ def _wire_value(value: object, where: str) -> str:
 def check_caps(
     *, measures: Any, group_by: Any, filters: Any, top: Any, order: Any, variables: Any
 ) -> None:
-    """The checks of a run that need no description: types and caps."""
+    """The checks of a run that need no description: types and caps, one
+    measure per run among them (so the client refuses two before it reads an
+    undescribed query)."""
     for value, where, cap, kind, minimum in (
         (measures, "measures", MAX_MEASURES, "measure", 1),
         (group_by, "group_by", MAX_DIMENSIONS, "dimension", 0),
@@ -396,6 +264,16 @@ def check_caps(
             raise _refuse(where, f"at most {cap} {kind}s", "result_too_large")
         if len(value) < minimum:
             raise _refuse(where, f"at least {minimum} {kind}")
+    if len(measures) > 1:
+        # Every grid SIA answered held one measure. With several, nothing in
+        # the answer names the measure of a column (the structure comes back
+        # without attributes), so a wrong reading of the order would be wrong
+        # numbers under the right names: refused until a probe verifies it.
+        raise InaError(
+            "invalid_filter",
+            "measures: one measure per run until the column order is verified",
+            hint="run the query once per measure",
+        )
     if isinstance(top, bool) or not isinstance(top, int) or top < 1:
         raise _refuse("top", f"a whole number from 1 to {MAX_TOP}")
     if top > MAX_TOP:
@@ -442,8 +320,15 @@ def _elements(operator: str, value: object, where: str) -> list[dict[str, str]]:
     return [{"Comparison": _COMPARISON[operator], "Low": _wire_value(value, where)}]
 
 
-def _selection(field_name: str, elements: list[dict[str, str]]) -> dict[str, Any]:
+def _selection(field_name: str, elements: list[dict[str, Any]]) -> dict[str, Any]:
     return {"SetOperand": {"FieldName": field_name, "Elements": elements}}
+
+
+def key_of(dimension: InaDimension) -> str:
+    """The key attribute of a dimension, the one name a filter and the read
+    use: the described key field, else ``<dimension>.KEY`` (the system's
+    ``KeyAttribute`` for each of its dimensions)."""
+    return dimension.key_field or f"{dimension.name}.KEY"
 
 
 def plan_run(
@@ -473,6 +358,7 @@ def plan_run(
     filters, order, variables = filters or [], order or [], variables or {}
     dimensions = {d.name: d for d in definition.dimensions}
     known_measures = {m.name: m for m in definition.measures}
+    structure = definition.measure_structure or MEASURES_DIMENSION
     chosen_measures = _names(measures, "measures", known_measures, "measure")
     chosen_dimensions = _names(group_by, "group_by", dimensions, "dimension")
 
@@ -486,10 +372,9 @@ def plan_run(
             raise _refuse(f"{where}.dimension", "not a dimension of this query")
         if operator not in FILTER_OPERATORS:
             raise _refuse(f"{where}.operator", f"one of {', '.join(FILTER_OPERATORS)}")
-        target = dimensions[name]
         selections.append(
             _selection(
-                target.key_field or target.name,
+                key_of(dimensions[name]),
                 _elements(operator, entry["value"], f"{where}.value"),
             )
         )
@@ -512,7 +397,7 @@ def plan_run(
         if by in chosen_measures:
             sort.append(
                 {
-                    "Dimension": MEASURES_DIMENSION,
+                    "Dimension": structure,
                     "SortType": "Measure",
                     "MeasureName": by,
                     "Direction": wire_direction,
@@ -550,8 +435,16 @@ def plan_run(
             if not isinstance(value, list):
                 raise _refuse(where, f"a list of 1 to {MAX_IN_VALUES} values")
             elements = _elements("in", value, where)
+        # SIA's form (recorded run 5): the value named by its dimension's
+        # key, each element marked inclusive.
+        inclusive: list[dict[str, Any]] = [{**e, "IsExcluding": False} for e in elements]
         wire_variables.append(
-            {"Name": variable.name, "Values": {"Selection": _selection(variable.name, elements)}}
+            {
+                "Name": variable.name,
+                "Values": {
+                    "Selection": _selection(variable.key_field or variable.name, inclusive)
+                },
+            }
         )
     return RunPlan(
         measures=chosen_measures,
@@ -560,18 +453,23 @@ def plan_run(
         sort=sort,
         variables=wire_variables,
         top=top,
+        structure=structure,
+        keys={name: key_of(dimensions[name]) for name in chosen_dimensions},
     )
 
 
 # -- the requests -----------------------------------------------------------
 
 
-def data_source(query: str, package: str) -> dict[str, str]:
+def data_source(query: str, package: str, instance_id: str = "") -> dict[str, str]:
     """``DataSource`` of a request; ``PackageName`` is left out when blank,
-    as in the request SIA accepted."""
+    as in the request SIA accepted. ``InstanceId`` names the query instance
+    a run's VariableSubmit, read and Close share in the SAP session."""
     source = {"ObjectName": query, "Type": "Query"}
     if package:
         source["PackageName"] = package
+    if instance_id:
+        source["InstanceId"] = instance_id
     return source
 
 
@@ -590,33 +488,52 @@ def describe_request(capabilities: list[str], source: dict[str, str]) -> dict[st
     }
 
 
-def analytics_request(
-    capabilities: list[str], source: dict[str, str], plan: RunPlan
+def _row(plan: RunPlan, name: str, *, submit: bool) -> dict[str, Any]:
+    """A row dimension of a request. The read lists the key attribute and
+    the text attribute (when known) -- without them SIA sent no member keys
+    at all (run 6) -- and hides the totals; the submit keeps the plain form
+    SIA accepted (runs 5 to 8)."""
+    entry: dict[str, Any] = {"Name": name, "Axis": "Rows"}
+    if not submit:
+        attributes = [plan.keys.get(name) or f"{name}.KEY"]
+        if plan.texts.get(name):
+            attributes.append(plan.texts[name])
+        entry["Attributes"] = [{"Name": a, "Obtainability": "Always"} for a in attributes]
+        entry["ResultStructure"] = [dict(r) for r in HIDE_TOTALS]
+    return entry
+
+
+def _run_body(
+    capabilities: list[str], source: dict[str, str], plan: RunPlan, *, submit: bool
 ) -> dict[str, Any]:
-    """The ``GetResponse`` body of a run."""
+    feature: dict[str, Any] = {
+        "ResultFormat": "Version2",
+        "ResultEncoding": "None",
+        # One row more than top: the extra row is how "there is more" is told
+        # from "that is all"; it is never returned. `RowTo` alone cuts the
+        # rows (run 7), and `TupleCountTotal` says how many exist.
+        "SubSetDescription": {
+            "RowFrom": 0,
+            "RowTo": plan.top + 1,
+            "ColumnFrom": 0,
+            "ColumnTo": -1,
+        },
+        "UseDefaultAttributeKey": False,
+    }
+    if submit:
+        # As SIA accepted it as a submit (runs 5 to 8); the reads that came
+        # back without totals (runs 7, 8) left it out.
+        feature["MaxResultRecords"] = plan.top + 1
     definition: dict[str, Any] = {
         "Dimensions": [
-            *({"Name": name, "Axis": "Rows"} for name in plan.group_by),
+            *(_row(plan, name, submit=submit) for name in plan.group_by),
             {
-                "Name": MEASURES_DIMENSION,
+                "Name": plan.structure,
                 "Axis": "Columns",
                 "Members": [{"Name": m, "Visibility": "Visible"} for m in plan.measures],
             },
         ],
-        "ResultSetFeatureRequest": {
-            "ResultFormat": "Version2",
-            "ResultEncoding": "None",
-            # One row more than top: the extra row is how "there is more" is
-            # told from "that is all"; it is never returned.
-            "MaxResultRecords": plan.top + 1,
-            "SubSetDescription": {
-                "RowFrom": 0,
-                "RowTo": plan.top + 1,
-                "ColumnFrom": 0,
-                "ColumnTo": -1,
-            },
-            "UseDefaultAttributeKey": False,
-        },
+        "ResultSetFeatureRequest": feature,
     }
     if plan.selections:
         definition["Filter"] = {
@@ -626,215 +543,76 @@ def analytics_request(
         definition["Sort"] = plan.sort
     if plan.variables:
         definition["Variables"] = plan.variables
-    return {
-        "ClientInfo": CLIENT_INFO,
-        "Analytics": {
-            "Capabilities": capabilities,
-            "DataSource": source,
-            "Definition": definition,
-            "Language": "EN",
-        },
-        "Options": list(_OPTIONS),
+    analytics: dict[str, Any] = {
+        "Capabilities": capabilities,
+        "DataSource": source,
+        "Definition": definition,
+        "Language": "EN",
     }
+    if submit:
+        analytics["ProcessingDirectives"] = {"ProcessingStep": "VariableSubmit"}
+    return {"ClientInfo": CLIENT_INFO, "Analytics": analytics, "Options": list(_OPTIONS)}
 
 
-# -- the grid ---------------------------------------------------------------
+def analytics_request(
+    capabilities: list[str], source: dict[str, str], plan: RunPlan
+) -> dict[str, Any]:
+    """The ``GetResponse`` body of a run's read, in the form SIA answered
+    with keys and texts (run 8): each row dimension lists its key and text
+    attribute (``plan.keys``, ``plan.texts``) and hides its totals, and
+    ``RowTo`` is ``top + 1``."""
+    return _run_body(capabilities, source, plan, submit=False)
 
 
-def _cells_value(value: object) -> Any:
-    """A cell's value as the model gets it, or raise when it is no value."""
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        raise InaError("sap_error", UNREADABLE)
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        if value != value or value in (float("inf"), float("-inf")):
-            raise InaError("sap_error", UNREADABLE)
-        return value
-    if isinstance(value, str):
-        return _key(value, MAX_VALUE_CHARS)
-    raise InaError("sap_error", UNREADABLE)
+def variable_submit_request(
+    capabilities: list[str], source: dict[str, str], plan: RunPlan
+) -> dict[str, Any]:
+    """The VariableSubmit SIA needs before a read with variables, sent as a
+    request of its own on the read's ``InstanceId`` (SIA has no
+    ``DirectVariableTransfer``: values in the read alone are not taken; a
+    ``Batch`` of the two was answered with the submit's ``Cube`` alone).
+    The body is the read of the form SIA accepted as a submit in runs 5 to 8
+    (row dimensions without attributes, ``MaxResultRecords``) with
+    ``ProcessingDirectives.ProcessingStep``. SAP's own InA client does the
+    same (SAPUI5 ``sap/sac/df/firefly``, ``ff4400.olap.providers.js``,
+    ``InAQMgrVarAction`` / ``ProcessingStep.VARIABLE_SUBMIT``)."""
+    return _run_body(capabilities, source, plan, submit=True)
 
 
-def _axis(axes: list[Any], name: str, kind: int) -> dict[str, Any] | None:
-    found = [
-        a for a in axes if isinstance(a, dict) and (a.get("Name") == name or a.get("Type") == kind)
-    ]
-    if len(found) > 1:
-        raise InaError("sap_error", UNREADABLE)
-    return found[0] if found else None
-
-
-def _axis_dimensions(axis: dict[str, Any]) -> list[str]:
-    raw = axis.get("Dimensions")
-    if not isinstance(raw, list):
-        raise InaError("sap_error", UNREADABLE)
-    names = [d.get("Name") if isinstance(d, dict) else None for d in raw]
-    if not all(isinstance(n, str) for n in names):
-        raise InaError("sap_error", UNREADABLE)
-    return names  # type: ignore[return-value]
-
-
-def _tuples(axis: dict[str, Any], width: int) -> list[list[tuple[str, str]]]:
-    """``(key, text)`` per member of every tuple of ``axis``."""
-    raw = axis.get("Tuples")
-    if not isinstance(raw, list) or len(raw) > MAX_CELLS:
-        raise InaError("sap_error", UNREADABLE)
-    out: list[list[tuple[str, str]]] = []
-    for entry in raw:
-        members = entry.get("Members") if isinstance(entry, dict) else None
-        if not isinstance(members, list) or len(members) != width:
-            raise InaError("sap_error", UNREADABLE)
-        row: list[tuple[str, str]] = []
-        for member in members:
-            key = member.get("Name") if isinstance(member, dict) else None
-            if not isinstance(key, str):
-                raise InaError("sap_error", UNREADABLE)
-            row.append((_key(key, 128), _label(member.get("Text"), 120)))
-        out.append(row)
+def text_attributes(cube: object, group_by: list[str]) -> dict[str, str]:
+    """The text attribute of each of ``group_by`` that a VariableSubmit
+    answer's ``Cube`` names (``Dimensions[].TextAttribute``; the describe
+    answer names it for few dimensions). Taken only when it passes the
+    gate's name rule, belongs to the dimension (``<dimension>.``) and is not
+    its key; anything else asks for the key alone."""
+    dimensions = cube.get("Dimensions") if isinstance(cube, dict) else None
+    if not isinstance(dimensions, list):
+        return {}
+    wanted = set(group_by)
+    out: dict[str, str] = {}
+    for raw in dimensions[:_MAX_SCANNED]:
+        name = raw.get("Name") if isinstance(raw, dict) else None
+        if not isinstance(name, str) or name not in wanted or name in out:
+            continue
+        text = raw.get("TextAttribute")
+        if (
+            fits_name(text)
+            and text.startswith(f"{name}.")
+            and text != raw.get("KeyAttribute", f"{name}.KEY")
+            and text != f"{name}.KEY"
+        ):
+            out[name] = text
     return out
 
 
-def read_grid(payload: object, plan: RunPlan) -> dict[str, Any]:
-    """The rows of ``Grids[0]`` for the dimensions and measures of ``plan``.
-
-    ``columns`` are the requested dimensions (each followed by
-    ``<name>.text`` when SAP sent a text that differs from the key) and
-    measures (each followed by ``<name>.unit`` when its unit is not the same
-    in every row; otherwise the unit is in ``units``). Columns of anything
-    that was not asked for are dropped. The request asks for ``top + 1``
-    rows: when that extra row came, ``top`` rows are returned and
-    ``truncated`` is true. More than :data:`MAX_CELLS` cells in what would
-    be returned, or more than ``top + 1`` rows, is refused, never cut.
-    """
-    grids = payload.get("Grids") if isinstance(payload, dict) else None
-    if not isinstance(grids, list) or not grids or not isinstance(grids[0], dict):
-        raise InaError("sap_error", UNREADABLE)
-    grid = grids[0]
-    axes, cells = grid.get("Axes"), grid.get("Cells")
-    if not isinstance(axes, list) or not isinstance(cells, list):
-        raise InaError("sap_error", UNREADABLE)
-    # A bound on the work before anything is parsed; the cap is applied to
-    # what would be returned, below.
-    if len(cells) > _MAX_RAW_CELLS:
-        raise _too_many_cells()
-    columns_axis = _axis(axes, "Columns", 2)
-    rows_axis = _axis(axes, "Rows", 1)
-    if columns_axis is None or _axis_dimensions(columns_axis) != [MEASURES_DIMENSION]:
-        raise InaError("sap_error", UNREADABLE)
-    column_measures = [t[0][0] for t in _tuples(columns_axis, 1)]
-    if rows_axis is None:
-        if plan.group_by:
-            raise InaError("sap_error", UNREADABLE)
-        row_dimensions: list[str] = []
-        row_tuples: list[list[tuple[str, str]]] = [[]] if cells else []
-    else:
-        row_dimensions = _axis_dimensions(rows_axis)
-        if sorted(row_dimensions) != sorted(plan.group_by):
-            raise InaError("sap_error", UNREADABLE)
-        row_tuples = _tuples(rows_axis, len(row_dimensions))
-    if not row_tuples and not cells:
-        return {
-            "columns": _columns(plan, set(), set()),
-            "rows": [],
-            "units": {},
-            "row_count": 0,
-            "truncated": False,
-        }
-    width = len(column_measures)
-    if len(row_tuples) * width != len(cells):
-        raise InaError("sap_error", UNREADABLE)
-    if len(row_tuples) > plan.top + 1:
-        raise InaError(
-            "result_too_large",
-            "SAP answered with more rows than were asked for",
-            hint="filter, or group by fewer dimensions",
-        )
-    truncated = len(row_tuples) > plan.top
-    row_tuples = row_tuples[: plan.top]
-    if len(row_tuples) * len(plan.measures) > MAX_CELLS:
-        raise _too_many_cells()
-    position = {}
-    for index, name in enumerate(column_measures):
-        if name in plan.measures:
-            if name in position:
-                raise InaError("sap_error", UNREADABLE)
-            position[name] = index
-    if set(position) != set(plan.measures):
-        raise InaError("sap_error", UNREADABLE)
-    dimension_at = {name: row_dimensions.index(name) for name in plan.group_by}
-
-    values: list[dict[str, tuple[Any, str | None]]] = []
-    for row_index in range(len(row_tuples)):
-        row: dict[str, tuple[Any, str | None]] = {}
-        for name, column in position.items():
-            cell = cells[row_index * width + column]
-            # Only a `Value` that is there and null is null; a cell without
-            # one is not a cell this reader knows.
-            if not isinstance(cell, dict) or "Value" not in cell:
-                raise InaError("sap_error", UNREADABLE)
-            unit = cell.get("Unit") if isinstance(cell.get("Unit"), str) else cell.get("Currency")
-            row[name] = (_cells_value(cell.get("Value")), _label(unit, 32) or None)
-        values.append(row)
-
-    # A text column only where SAP sent a text that says more than the key.
-    with_text = {
-        name
-        for name in plan.group_by
-        if any(text and text != key for key, text in (t[dimension_at[name]] for t in row_tuples))
-    }
-    units: dict[str, str] = {}
-    mixed: set[str] = set()
-    for name in plan.measures:
-        seen = {row[name][1] for row in values}
-        if len(seen) > 1:
-            mixed.add(name)
-        elif seen and (only := next(iter(seen))) is not None:
-            units[name] = only
-    rows: list[list[Any]] = []
-    for members, row in zip(row_tuples, values):
-        line: list[Any] = []
-        for name in plan.group_by:
-            key, text = members[dimension_at[name]]
-            line.append(key)
-            if name in with_text:
-                line.append(text or None)
-        for name in plan.measures:
-            value, unit = row[name]
-            line.append(value)
-            if name in mixed:
-                line.append(unit)
-        rows.append(line)
+def close_request(instance_id: str) -> dict[str, Any]:
+    """Release a run's query instance in the SAP session, as firefly's
+    ``InAQMgrShutdownAction`` does (``Actions: [{Type: Close, DataSources:
+    [<InstanceId>]}]``): the session outlives the run, the instance need not."""
     return {
-        "columns": _columns(plan, with_text, mixed),
-        "rows": rows,
-        "units": units,
-        "row_count": len(rows),
-        "truncated": truncated,
+        "Analytics": {"Actions": [{"Type": "Close", "DataSources": [instance_id]}]},
+        "Options": list(_OPTIONS),
     }
-
-
-def _too_many_cells() -> InaError:
-    return InaError(
-        "result_too_large",
-        f"the answer has more than {MAX_CELLS} cells",
-        hint="group by fewer dimensions, ask for fewer measures, filter, or lower top",
-    )
-
-
-def _columns(plan: RunPlan, with_text: set[str], mixed: set[str]) -> list[str]:
-    columns: list[str] = []
-    for name in plan.group_by:
-        columns.append(name)
-        if name in with_text:
-            columns.append(f"{name}.text")
-    for name in plan.measures:
-        columns.append(name)
-        if name in mixed:
-            columns.append(f"{name}.unit")
-    return columns
 
 
 __all__ = [
@@ -842,6 +620,7 @@ __all__ = [
     "DEFAULT_TOP",
     "DESCRIBE_EXPAND",
     "FILTER_OPERATORS",
+    "HIDE_TOTALS",
     "MAX_CELLS",
     "MAX_DIMENSIONS",
     "MAX_FILTERS",
@@ -857,6 +636,8 @@ __all__ = [
     "analytics_capabilities",
     "analytics_request",
     "check_caps",
+    "key_of",
+    "close_request",
     "data_source",
     "describe_request",
     "fits_name",
@@ -865,4 +646,6 @@ __all__ = [
     "read_grid",
     "sap_message_error",
     "shown_name",
+    "text_attributes",
+    "variable_submit_request",
 ]

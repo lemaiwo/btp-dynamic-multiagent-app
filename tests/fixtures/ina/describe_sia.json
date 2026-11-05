@@ -1,0 +1,1681 @@
+{
+ "Cube": {
+  "MetadataType": "DesignTime",
+  "CreatedOn": "20260828",
+  "CreatedBy": "SAP",
+  "LastDataUpdate": "20261104",
+  "BaseDataSource": {
+   "ObjectName": "2CCMMPURORDSPND",
+   "Type": "VirtualProvider",
+   "NameExternal": "C_PurchaseOrderSpend"
+  },
+  "DocumentsInfo": {
+   "SupportsDocuments": "None",
+   "IsBasedOnCDSView": false,
+   "DocumentsServicePath": "",
+   "DefaultDocumentsDirectory": "",
+   "ActiveDocumentsDirectory": "",
+   "DocumentsDirectories": []
+  },
+  "ExtendedSortTypes": [
+   "MemberKey",
+   "MemberText",
+   "Filter",
+   "Hierarchy",
+   "Measure",
+   "Custom"
+  ],
+  "Sort": [],
+  "ExceptionAggregations": {
+   "DimensionSets": [
+    {
+     "Name": "4 ",
+     "Dimensions": [
+      "2CIFICOUNTRY",
+      "2CIPLANT",
+      "2CI_SUPPLIER_CDS",
+      "2CIMATERIAL",
+      "2CIMATGROUP",
+      "2CIMMPURCHGROUP",
+      "2CIMMPURGORG",
+      "2CCMMPURORDSPND-COMPANYCODE",
+      "2CCMMPURORDSPND-COSTCENTER",
+      "2CCMMPURORDSPND-PRODUCTTYPE",
+      "2CCMMPURORDSPND-PURGCATNAME",
+      "2CCMMPURORDSPND-PURGCATUUID",
+      "2CCMMPURORDSPND-WBSELEMENT",
+      "2CCMMPURORDSPND-YEARQUARTER",
+      "2CGIDM6LH966QQ7P9SWDU97VN5Q",
+      "2CGTFFBTM6NPYFVPCZAKK48TQMW",
+      "2CH0Y9FATWMXU07PABNUMVE2HHX",
+      "2CHY5M70U37SV83XURU3JL3PICS",
+      "2CHZY5N72NNDJ2R09JG98XXDF7M",
+      "2CI9P3D40QX9MR7YT9SD9ALVV3K",
+      "2CIMMPURGDOCSTA",
+      "2CIUSU6TX647EBYVDN00SSTQB22",
+      "2CIWC2AWRN0TP4N4RGABETWBNNF",
+      "2CK4YFDXKIGC0ZI9NKTP9OISMYB",
+      "2CK7SUH2UP4PONH5XH87YCZ93BI",
+      "2CKDZ7I5S9XCRCN355YOBDHUHOI",
+      "2CMBRFZSZE7EY82KT6NK0AJYP2J",
+      "2CQVA05CB3RQ8IWG16R9ADB9KSB",
+      "2CRQNEI1ZK3DYN6MAYSP9RQJIK1",
+      "2CSAXN20C7YI56A85L2U7K5Q82M",
+      "2CT30808YZRNBPU8IMGP3TQ4OKQ",
+      "2CTJT8ROP1LDEMNDH5SEAHX71LW"
+     ]
+    },
+    {
+     "Name": "5 ",
+     "Dimensions": [
+      "2CIFICOUNTRY",
+      "2CIPLANT",
+      "2CI_SUPPLIER_CDS",
+      "2CIMATERIAL",
+      "2CIMATGROUP",
+      "2CIMMPURCHGROUP",
+      "2CIMMPURGORG",
+      "2CCMMPURORDSPND-COMPANYCODE",
+      "2CCMMPURORDSPND-COSTCENTER",
+      "2CCMMPURORDSPND-PRODUCTTYPE",
+      "2CCMMPURORDSPND-PURGCATNAME",
+      "2CCMMPURORDSPND-PURGCATUUID",
+      "2CCMMPURORDSPND-WBSELEMENT",
+      "2CCMMPURORDSPND-YEARQUARTER",
+      "2CGIDM6LH966QQ7P9SWDU97VN5Q",
+      "2CGTFFBTM6NPYFVPCZAKK48TQMW",
+      "2CH0Y9FATWMXU07PABNUMVE2HHX",
+      "2CHY5M70U37SV83XURU3JL3PICS",
+      "2CHZY5N72NNDJ2R09JG98XXDF7M",
+      "2CI9P3D40QX9MR7YT9SD9ALVV3K",
+      "2CIMMPURGDOCSTA",
+      "2CIUSU6TX647EBYVDN00SSTQB22",
+      "2CIWC2AWRN0TP4N4RGABETWBNNF",
+      "2CK4YFDXKIGC0ZI9NKTP9OISMYB",
+      "2CK7SUH2UP4PONH5XH87YCZ93BI",
+      "2CKDZ7I5S9XCRCN355YOBDHUHOI",
+      "2CMBRFZSZE7EY82KT6NK0AJYP2J",
+      "2CQVA05CB3RQ8IWG16R9ADB9KSB",
+      "2CRQNEI1ZK3DYN6MAYSP9RQJIK1",
+      "2CSAXN20C7YI56A85L2U7K5Q82M",
+      "2CT30808YZRNBPU8IMGP3TQ4OKQ",
+      "2CTJT8ROP1LDEMNDH5SEAHX71LW"
+     ]
+    }
+   ],
+   "AggregationGroups": [
+    {
+     "Name": "4 ",
+     "SupportedDimensions": "4 ",
+     "MaxNumberOfDimensions": 5,
+     "AggregationMap": [
+      {
+       "MembersCode": 4,
+       "AggregationTypes": [
+        "AVERAGE",
+        "AVERAGENULLZERO",
+        "COUNT",
+        "COUNTNULLZERO",
+        "MAX",
+        "MIN",
+        "NOPNULLZERO",
+        "NOPNULL",
+        "STANDARD_DEVIATION",
+        "SUM",
+        "VARIANCE"
+       ]
+      }
+     ]
+    },
+    {
+     "Name": "5 ",
+     "SupportedDimensions": "5 ",
+     "MaxNumberOfDimensions": 1,
+     "AggregationMap": [
+      {
+       "MembersCode": 4,
+       "AggregationTypes": [
+        "FIRST",
+        "LAST"
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  "DataSource": {
+   "ObjectName": "2CCMMPURORDQUERY",
+   "Type": "Query",
+   "Description": "Analyse des dépenses",
+   "NameExternal": "C_PurchaseOrderSpendQuery",
+   "InstanceId": "INSTANCEPLACEHOLDER",
+   "DataArea": "DEFAULT"
+  },
+  "DueDate": "20261104",
+  "Dimensions": [
+   {
+    "Name": "2CHZY5N72NNDJ2R09JG98XXDF7M",
+    "ID": 3624,
+    "Description": "Date de la commande",
+    "DimensionType": 7,
+    "KeyAttributes": [
+     "2CHZY5N72NNDJ2R09JG98XXDF7M.KEY"
+    ],
+    "DataType": "DATS",
+    "AxisDefault": "Filter",
+    "AxisConstraints": [
+     "Filter"
+    ],
+    "DefaultResultSetAttributes": [],
+    "SupportsCummulative": true,
+    "AttributeHierarchy": {
+     "AttributeNames": [
+      "2CHZY5N72NNDJ2R09JG98XXDF7M.$$HierarchyField$$.KEY",
+      "2CHZY5N72NNDJ2R09JG98XXDF7M.ID",
+      "2CHZY5N72NNDJ2R09JG98XXDF7M.KEY",
+      "2CHZY5N72NNDJ2R09JG98XXDF7M.DISPLAY_KEY"
+     ],
+     "DefaultKeyAttribute": "2CHZY5N72NNDJ2R09JG98XXDF7M.KEY",
+     "DefaultDisplayKeyAttribute": "2CHZY5N72NNDJ2R09JG98XXDF7M.DISPLAY_KEY",
+     "Name": "2CHZY5N72NNDJ2R09JG98XXDF7M",
+     "Description": "Date de la commande",
+     "HierarchyKeyAttribute": "2CHZY5N72NNDJ2R09JG98XXDF7M.$$HierarchyField$$.KEY",
+     "HierarchyNavigationAttribute": "2CHZY5N72NNDJ2R09JG98XXDF7M.$$HierarchyField$$.KEY",
+     "HierarchyDisplayKeyAttribute": "2CHZY5N72NNDJ2R09JG98XXDF7M.DISPLAY_KEY",
+     "DefaultResultSetAttributes": [
+      ""
+     ],
+     "Children": []
+    },
+    "DefaultResultSetAttributeNodes": [
+     "2CHZY5N72NNDJ2R09JG98XXDF7M"
+    ],
+    "HierarchyActiveDefault": "false",
+    "KeyAttribute": "2CHZY5N72NNDJ2R09JG98XXDF7M.KEY",
+    "SelectorReadMode": "MasterAndSpace",
+    "DefaultSelectorReadMode": "MasterAndSpace",
+    "SupportedSelectorReadModes": [
+     "MasterAndSpace"
+    ],
+    "ResultSetReadMode": "BookedAndSpaceAndState",
+    "DefaultResultSetReadMode": "BookedAndSpaceAndState",
+    "SupportedResultSetReadModes": [
+     "MasterAndSpace",
+     "BookedAndSpaceAndState"
+    ],
+    "VariableReadMode": "Undefined",
+    "DefaultVariableReadMode": "Undefined",
+    "SupportedVariableReadModes": [
+     "MasterAndSpace",
+     "Undefined"
+    ],
+    "HierarchiesPossible": true,
+    "NumberOfHierarchies": 1,
+    "Attributes": [
+     {
+      "Name": "2CHZY5N72NNDJ2R09JG98XXDF7M.$$HierarchyField$$.KEY",
+      "IsKey": true,
+      "Length": 0,
+      "Decimals": 0,
+      "InitialValue": "",
+      "SortOrder": 0,
+      "PresentationType": "Key",
+      "Description": "",
+      "IsFilterable": true,
+      "FilterCapability": {
+       "ComparisonGroup": "SingleValue"
+      },
+      "DataType": "String"
+     },
+     {
+      "Name": "2CHZY5N72NNDJ2R09JG98XXDF7M.ID",
+      "IsKey": true,
+      "Length": 0,
+      "Decimals": 0,
+      "InitialValue": "",
+      "SortOrder": 0,
+      "PresentationType": "Text",
+      "Description": "",
+      "IsFilterable": false,
+      "DataType": "String"
+     },
+     {
+      "Name": "2CHZY5N72NNDJ2R09JG98XXDF7M.KEY",
+      "IsKey": true,
+      "Length": 0,
+      "FixedLength": 8,
+      "Decimals": 0,
+      "InitialValue": "",
+      "SortOrder": 0,
+      "PresentationType": "Key",
+      "Description": "",
+      "IsFilterable": true,
+      "FilterCapability": {
+       "ComparisonGroup": "Range"
+      },
+      "DataType": "Date"
+     },
+     {
+      "Name": "2CHZY5N72NNDJ2R09JG98XXDF7M.DISPLAY_KEY",
+      "IsKey": true,
+      "Length": 0,
+      "Decimals": 0,
+      "InitialValue": "",
+      "SortOrder": 0,
+      "PresentationType": "DisplayKey",
+      "Description": "",
+      "IsFilterable": true,
+      "FilterCapability": {
+       "ComparisonGroup": "Range"
+      },
+      "DataType": "String"
+     }
+    ],
+    "DefaultResultStructure": {
+     "ResultAlignment": "",
+     "ResultStructure": [
+      {
+       "Result": "Total",
+       "Visibility": "Visible"
+      },
+      {
+       "Result": "Members",
+       "Visibility": "Visible"
+      }
+     ]
+    },
+    "MultipleValues": true,
+    "NameExternal": "P_EndDate",
+    "Length": 10,
+    "Hierarchies": [],
+    "LevelHierarchies": []
+   },
+   {
+    "Name": "2CH0Y9FATWMXU07PABNUMVE2HHX",
+    "ID": 3622,
+    "Description": "Devise d'affichage",
+    "DimensionType": 4,
+    "KeyAttributes": [
+     "2CH0Y9FATWMXU07PABNUMVE2HHX.KEY"
+    ],
+    "DataType": "CUKY",
+    "AxisDefault": "Filter",
+    "AxisConstraints": [
+     "Filter"
+    ],
+    "DefaultResultSetAttributes": [],
+    "HasCheckTable": true,
+    "SupportsCummulative": true,
+    "AttributeHierarchy": {
+     "AttributeNames": [
+      "2CH0Y9FATWMXU07PABNUMVE2HHX.SHORT_TEXT",
+      "2CH0Y9FATWMXU07PABNUMVE2HHX.MEDIUM_TEXT",
+      "2CH0Y9FATWMXU07PABNUMVE2HHX.KEY",
+      "2CH0Y9FATWMXU07PABNUMVE2HHX.DISPLAY_KEY",
+      "2CH0Y9FATWMXU07PABNUMVE2HHX.QUERY_TEXT"
+     ],
+     "DefaultKeyAttribute": "2CH0Y9FATWMXU07PABNUMVE2HHX.KEY",
+     "DefaultTextAttribute": "2CH0Y9FATWMXU07PABNUMVE2HHX.MEDIUM_TEXT",
+     "DefaultDisplayKeyAttribute": "2CH0Y9FATWMXU07PABNUMVE2HHX.DISPLAY_KEY",
+     "DefaultResultTextAttribute": "2CH0Y9FATWMXU07PABNUMVE2HHX.MEDIUM_TEXT",
+     "Name": "2CH0Y9FATWMXU07PABNUMVE2HHX",
+     "Description": "Devise d'affichage",
+     "DefaultResultSetAttributes": [
+      "2CH0Y9FATWMXU07PABNUMVE2HHX.MEDIUM_TEXT"
+     ],
+     "Children": []
+    },
+    "DefaultResultSetAttributeNodes": [
+     "2CH0Y9FATWMXU07PABNUMVE2HHX"
+    ],
+    "HierarchyActiveDefault": "false",
+    "TextAttribute": "2CH0Y9FATWMXU07PABNUMVE2HHX.MEDIUM_TEXT",
+    "KeyAttribute": "2CH0Y9FATWMXU07PABNUMVE2HHX.KEY",
+    "SelectorReadMode": "MasterAndSpace",
+    "DefaultSelectorReadMode": "MasterAndSpace",
+    "SupportedSelectorReadModes": [
+     "MasterAndSpace"
+    ],
+    "ResultSetReadMode": "BookedAndSpaceAndState",
+    "DefaultResultSetReadMode": "BookedAndSpaceAndState",
+    "SupportedResultSetReadModes": [
+     "MasterAndSpace",
+     "BookedAndSpaceAndState"
+    ],
+    "VariableReadMode": "MasterAndSpace",
+    "DefaultVariableReadMode": "MasterAndSpace",
+    "SupportedVariableReadModes": [
+     "MasterAndSpace"
+    ],
+    "Attributes": [
+     {
+      "Name": "2CH0Y9FATWMXU07PABNUMVE2HHX.SHORT_TEXT",
+      "Length": 20,
+      "Decimals": 0,
+      "InitialValue": "",
+      "SortOrder": 0,
+      "PresentationType": "ShortText",
+      "Description": "",
+      "IsFilterable": true,
+      "FilterCapability": {
+       "ComparisonGroup": "Range"
+      },
+      "DataType": "String"
+     },
+     {
+      "Name": "2CH0Y9FATWMXU07PABNUMVE2HHX.MEDIUM_TEXT",
+      "Length": 40,
+      "Decimals": 0,
+      "InitialValue": "",
+      "SortOrder": 0,
+      "PresentationType": "MediumText",
+      "Description": "",
+      "IsFilterable": true,
+      "FilterCapability": {
+       "ComparisonGroup": "Range"
+      },
+      "DataType": "String"
+     },
+     {
+      "Name": "2CH0Y9FATWMXU07PABNUMVE2HHX.KEY",
+      "IsKey": true,
+      "Length": 40,
+      "FixedLength": 5,
+      "Decimals": 0,
+      "InitialValue": "",
+      "SortOrder": 0,
+      "PresentationType": "Key",
+      "Description": "",
+      "IsFilterable": true,
+      "FilterCapability": {
+       "ComparisonGroup": "Range"
+      },
+      "DataType": "String"
+     },
+     {
+      "Name": "2CH0Y9FATWMXU07PABNUMVE2HHX.DISPLAY_KEY",
+      "IsKey": true,
+      "Length": 0,
+      "Decimals": 0,
+      "InitialValue": "",
+      "SortOrder": 0,
+      "PresentationType": "DisplayKey",
+      "Description": "",
+      "IsFilterable": true,
+      "FilterCapability": {
+       "ComparisonGroup": "Range"
+      },
+      "DataType": "String"
+     },
+     {
+      "Name": "2CH0Y9FATWMXU07PABNUMVE2HHX.QUERY_TEXT",
+      "Length": 0,
+      "Decimals": 0,
+      "InitialValue": "",
+      "SortOrder": 0,
+      "PresentationType": "QueryText",
+      "Description": "",
+      "IsFilterable": true,
+      "FilterCapability": {
+       "ComparisonGroup": "Range"
+      },
+      "DataType": "String"
+     }
+    ],
+    "DefaultResultStructure": {
+     "ResultAlignment": "",
+     "ResultStructure": [
+      {
+       "Result": "Total",
+       "Visibility": "Visible"
+      },
+      {
+       "Result": "Members",
+       "Visibility": "Visible"
+      }
+     ]
+    },
+    "MultipleValues": true,
+    "NameExternal": "P_DisplayCurrency",
+    "Length": 5,
+    "Hierarchies": [],
+    "LevelHierarchies": []
+   },
+   {
+    "Name": "2CQVA05CB3RQ8IWG16R9ADB9KSB",
+    "ID": 3635,
+    "Description": "Date de la commande",
+    "DimensionType": 7,
+    "KeyAttributes": [
+     "2CQVA05CB3RQ8IWG16R9ADB9KSB.KEY"
+    ],
+    "DataType": "DATS",
+    "AxisDefault": "Filter",
+    "AxisConstraints": [
+     "Filter"
+    ],
+    "DefaultResultSetAttributes": [],
+    "SupportsCummulative": true,
+    "AttributeHierarchy": {
+     "AttributeNames": [
+      "2CQVA05CB3RQ8IWG16R9ADB9KSB.$$HierarchyField$$.KEY",
+      "2CQVA05CB3RQ8IWG16R9ADB9KSB.ID",
+      "2CQVA05CB3RQ8IWG16R9ADB9KSB.KEY",
+      "2CQVA05CB3RQ8IWG16R9ADB9KSB.DISPLAY_KEY"
+     ],
+     "DefaultKeyAttribute": "2CQVA05CB3RQ8IWG16R9ADB9KSB.KEY",
+     "DefaultDisplayKeyAttribute": "2CQVA05CB3RQ8IWG16R9ADB9KSB.DISPLAY_KEY",
+     "Name": "2CQVA05CB3RQ8IWG16R9ADB9KSB",
+     "Description": "Date de la commande",
+     "HierarchyKeyAttribute": "2CQVA05CB3RQ8IWG16R9ADB9KSB.$$HierarchyField$$.KEY",
+     "HierarchyNavigationAttribute": "2CQVA05CB3RQ8IWG16R9ADB9KSB.$$HierarchyField$$.KEY",
+     "HierarchyDisplayKeyAttribute": "2CQVA05CB3RQ8IWG16R9ADB9KSB.DISPLAY_KEY",
+     "DefaultResultSetAttributes": [
+      ""
+     ],
+     "Children": []
+    },
+    "DefaultResultSetAttributeNodes": [
+     "2CQVA05CB3RQ8IWG16R9ADB9KSB"
+    ],
+    "HierarchyActiveDefault": "false",
+    "KeyAttribute": "2CQVA05CB3RQ8IWG16R9ADB9KSB.KEY",
+    "SelectorReadMode": "MasterAndSpace",
+    "DefaultSelectorReadMode": "MasterAndSpace",
+    "SupportedSelectorReadModes": [
+     "MasterAndSpace"
+    ],
+    "ResultSetReadMode": "BookedAndSpaceAndState",
+    "DefaultResultSetReadMode": "BookedAndSpaceAndState",
+    "SupportedResultSetReadModes": [
+     "MasterAndSpace",
+     "BookedAndSpaceAndState"
+    ],
+    "VariableReadMode": "Undefined",
+    "DefaultVariableReadMode": "Undefined",
+    "SupportedVariableReadModes": [
+     "MasterAndSpace",
+     "Undefined"
+    ],
+    "HierarchiesPossible": true,
+    "NumberOfHierarchies": 1,
+    "Attributes": [
+     {
+      "Name": "2CQVA05CB3RQ8IWG16R9ADB9KSB.$$HierarchyField$$.KEY",
+      "IsKey": true,
+      "Length": 0,
+      "Decimals": 0,
+      "InitialValue": "",
+      "SortOrder": 0,
+      "PresentationType": "Key",
+      "Description": "",
+      "IsFilterable": true,
+      "FilterCapability": {
+       "ComparisonGroup": "SingleValue"
+      },
+      "DataType": "String"
+     },
+     {
+      "Name": "2CQVA05CB3RQ8IWG16R9ADB9KSB.ID",
+      "IsKey": true,
+      "Length": 0,
+      "Decimals": 0,
+      "InitialValue": "",
+      "SortOrder": 0,
+      "PresentationType": "Text",
+      "Description": "",
+      "IsFilterable": false,
+      "DataType": "String"
+     },
+     {
+      "Name": "2CQVA05CB3RQ8IWG16R9ADB9KSB.KEY",
+      "IsKey": true,
+      "Length": 0,
+      "FixedLength": 8,
+      "Decimals": 0,
+      "InitialValue": "",
+      "SortOrder": 0,
+      "PresentationType": "Key",
+      "Description": "",
+      "IsFilterable": true,
+      "FilterCapability": {
+       "ComparisonGroup": "Range"
+      },
+      "DataType": "Date"
+     },
+     {
+      "Name": "2CQVA05CB3RQ8IWG16R9ADB9KSB.DISPLAY_KEY",
+      "IsKey": true,
+      "Length": 0,
+      "Decimals": 0,
+      "InitialValue": "",
+      "SortOrder": 0,
+      "PresentationType": "DisplayKey",
+      "Description": "",
+      "IsFilterable": true,
+      "FilterCapability": {
+       "ComparisonGroup": "Range"
+      },
+      "DataType": "String"
+     }
+    ],
+    "DefaultResultStructure": {
+     "ResultAlignment": "",
+     "ResultStructure": [
+      {
+       "Result": "Total",
+       "Visibility": "Visible"
+      },
+      {
+       "Result": "Members",
+       "Visibility": "Visible"
+      }
+     ]
+    },
+    "MultipleValues": true,
+    "NameExternal": "P_StartDate",
+    "Length": 10,
+    "Hierarchies": [],
+    "LevelHierarchies": []
+   },
+   {
+    "Name": "ELTUIDSTRCMMPURORDQUERY",
+    "ID": 2000000908,
+    "Description": "Ratios",
+    "DimensionType": 2,
+    "AxisDefault": "Columns",
+    "AxisConstraints": [
+     "Rows",
+     "Columns",
+     "Free"
+    ],
+    "DefaultResultSetAttributes": [],
+    "AttributeHierarchy": {
+     "AttributeNames": [
+      "ELTUIDSTRCMMPURORDQUERY.KEY",
+      "ELTUIDSTRCMMPURORDQUERY.DISPLAY_KEY",
+      "ELTUIDSTRCMMPURORDQUERY.ID",
+      "ELTUIDSTRCMMPURORDQUERY.TEXT"
+     ],
+     "DefaultKeyAttribute": "ELTUIDSTRCMMPURORDQUERY.KEY",
+     "DefaultDisplayKeyAttribute": "ELTUIDSTRCMMPURORDQUERY.DISPLAY_KEY",
+     "Name": "ELTUIDSTRCMMPURORDQUERY",
+     "Description": "Ratios",
+     "DefaultResultSetAttributes": [
+      "ELTUIDSTRCMMPURORDQUERY.LONG_TEXT"
+     ],
+     "Children": []
+    },
+    "DefaultResultSetAttributeNodes": [
+     "ELTUIDSTRCMMPURORDQUERY"
+    ],
+    "HierarchyActiveDefault": "false",
+    "KeyAttribute": "ELTUIDSTRCMMPURORDQUERY.KEY",
+    "SelectorReadMode": "None",
+    "DefaultSelectorReadMode": "None",
+    "ResultSetReadMode": "None",
+    "DefaultResultSetReadMode": "None",
+    "Attributes": [
+     {
+      "Name": "ELTUIDSTRCMMPURORDQUERY.KEY",
+      "IsKey": true,
+      "Length": 0,
+      "Decimals": 0,
+      "InitialValue": "",
+      "SortOrder": 0,
+      "PresentationType": "Key",
+      "Description": "",
+      "IsFilterable": true,
+      "FilterCapability": {
+       "ComparisonGroup": "SingleValue"
+      },
+      "DataType": "String"
+     },
+     {
+      "Name": "ELTUIDSTRCMMPURORDQUERY.DISPLAY_KEY",
+      "Length": 0,
+      "Decimals": 0,
+      "InitialValue": "",
+      "SortOrder": 0,
+      "PresentationType": "DisplayKey",
+      "Description": "",
+      "IsFilterable": false,
+      "DataType": "String"
+     },
+     {
+      "Name": "ELTUIDSTRCMMPURORDQUERY.ID",
+      "Length": 0,
+      "Decimals": 0,
+      "InitialValue": "",
+      "SortOrder": 0,
+      "PresentationType": "Key",
+      "Description": "",
+      "IsFilterable": false,
+      "DataType": "String"
+     },
+     {
+      "Name": "ELTUIDSTRCMMPURORDQUERY.TEXT",
+      "Length": 0,
+      "Decimals": 0,
+      "InitialValue": "",
+      "SortOrder": 0,
+      "PresentationType": "Text",
+      "Description": "",
+      "IsFilterable": false,
+      "DataType": "String"
+     }
+    ],
+    "DefaultResultStructure": {
+     "ResultAlignment": "",
+     "ResultStructure": [
+      {
+       "Result": "Members",
+       "Visibility": "Visible"
+      }
+     ]
+    },
+    "MultipleValues": true,
+    "NameExternal": "",
+    "Length": 0,
+    "Members": [
+     {
+      "ELTUIDSTRCMMPURORDQUERY.KEY": "ELTUIDCMP1",
+      "ELTUIDSTRCMMPURORDQUERY.ID": 1,
+      "ELTUIDSTRCMMPURORDQUERY.DISPLAY_KEY": "PurOrdNetAmountInDisplayCrcy",
+      "ELTUIDSTRCMMPURORDQUERY.LONG_TEXT": "Mnt net cde achat",
+      "IsSelectionCandidate": true,
+      "DefaultSelectedDimensions": [
+       "1TEXT",
+       "2CCGCALDFVH"
+      ],
+      "ResultCalculation": "00",
+      "SingleValueCalculation": "",
+      "Digits": 21,
+      "FractDigits": 5,
+      "Visibility": "Visible",
+      "Quickinfo": "Montant net de la commande d'achat"
+     }
+    ],
+    "Hierarchies": [],
+    "LevelHierarchies": []
+   },
+   {
+    "Name": "2CCMMPURORDSPND-WBSELEMENT",
+    "ID": 3618,
+    "Description": "Elément d'OTP",
+    "DimensionType": 0,
+    "AxisDefault": "Free",
+    "DefaultResultSetAttributes": [],
+    "KeyAttribute": "2CCMMPURORDSPND-WBSELEMENT.KEY",
+    "Attributes": [],
+    "DefaultResultStructure": {
+     "ResultAlignment": "",
+     "ResultStructure": [
+      {
+       "Result": "Members",
+       "Visibility": "Visible"
+      }
+     ]
+    },
+    "NameExternal": "WBSElement",
+    "Length": 0,
+    "Hierarchies": [],
+    "LevelHierarchies": []
+   },
+   {
+    "Name": "2CCMMPURORDSPND-YEARQUARTER",
+    "ID": 3619,
+    "Description": "Trimestre de l'année",
+    "DimensionType": 0,
+    "AxisDefault": "Free",
+    "DefaultResultSetAttributes": [],
+    "KeyAttribute": "2CCMMPURORDSPND-YEARQUARTER.KEY",
+    "Attributes": [],
+    "DefaultResultStructure": {
+     "ResultAlignment": "",
+     "ResultStructure": [
+      {
+       "Result": "Members",
+       "Visibility": "Visible"
+      }
+     ]
+    },
+    "NameExternal": "YearQuarter",
+    "Length": 0,
+    "Hierarchies": [],
+    "LevelHierarchies": []
+   },
+   {
+    "Name": "2CGIDM6LH966QQ7P9SWDU97VN5Q",
+    "ID": 3620,
+    "Description": "Nº imputation",
+    "DimensionType": 0,
+    "AxisDefault": "Free",
+    "DefaultResultSetAttributes": [],
+    "KeyAttribute": "2CGIDM6LH966QQ7P9SWDU97VN5Q.KEY",
+    "Attributes": [],
+    "DefaultResultStructure": {
+     "ResultAlignment": "",
+     "ResultStructure": [
+      {
+       "Result": "Members",
+       "Visibility": "Visible"
+      }
+     ]
+    },
+    "NameExternal": "AccountAssignmentNumber",
+    "Length": 0,
+    "Hierarchies": [],
+    "LevelHierarchies": []
+   },
+   {
+    "Name": "2CGTFFBTM6NPYFVPCZAKK48TQMW",
+    "ID": 3621,
+    "Description": "Prest. services",
+    "DimensionType": 0,
+    "AxisDefault": "Free",
+    "DefaultResultSetAttributes": [],
+    "KeyAttribute": "2CGTFFBTM6NPYFVPCZAKK48TQMW.KEY",
+    "Attributes": [],
+    "DefaultResultStructure": {
+     "ResultAlignment": "",
+     "ResultStructure": [
+      {
+       "Result": "Members",
+       "Visibility": "Visible"
+      }
+     ]
+    },
+    "NameExternal": "ServicePerformer",
+    "Length": 0,
+    "Hierarchies": [],
+    "LevelHierarchies": []
+   },
+   {
+    "Name": "2CCMMPURORDSPND-PRODUCTTYPE",
+    "ID": 3615,
+    "Description": "Type de produit",
+    "DimensionType": 0,
+    "AxisDefault": "Free",
+    "DefaultResultSetAttributes": [],
+    "KeyAttribute": "2CCMMPURORDSPND-PRODUCTTYPE.KEY",
+    "Attributes": [],
+    "DefaultResultStructure": {
+     "ResultAlignment": "",
+     "ResultStructure": [
+      {
+       "Result": "Members",
+       "Visibility": "Visible"
+      }
+     ]
+    },
+    "NameExternal": "ProductType",
+    "Length": 0,
+    "Hierarchies": [],
+    "LevelHierarchies": []
+   },
+   {
+    "Name": "2CHY5M70U37SV83XURU3JL3PICS",
+    "ID": 3623,
+    "Description": "Semaine calendaire",
+    "DimensionType": 0,
+    "AxisDefault": "Free",
+    "DefaultResultSetAttributes": [],
+    "KeyAttribute": "2CHY5M70U37SV83XURU3JL3PICS.KEY",
+    "Attributes": [],
+    "DefaultResultStructure": {
+     "ResultAlignment": "",
+     "ResultStructure": [
+      {
+       "Result": "Members",
+       "Visibility": "Visible"
+      }
+     ]
+    },
+    "NameExternal": "CalendarWeek",
+    "Length": 0,
+    "Hierarchies": [],
+    "LevelHierarchies": []
+   },
+   {
+    "Name": "2CCMMPURORDSPND-COSTCENTER",
+    "ID": 3614,
+    "Description": "Centre de coûts",
+    "DimensionType": 0,
+    "AxisDefault": "Free",
+    "DefaultResultSetAttributes": [],
+    "KeyAttribute": "2CCMMPURORDSPND-COSTCENTER.KEY",
+    "Attributes": [],
+    "DefaultResultStructure": {
+     "ResultAlignment": "",
+     "ResultStructure": [
+      {
+       "Result": "Members",
+       "Visibility": "Visible"
+      }
+     ]
+    },
+    "NameExternal": "CostCenter",
+    "Length": 0,
+    "Hierarchies": [],
+    "LevelHierarchies": []
+   },
+   {
+    "Name": "2CI9P3D40QX9MR7YT9SD9ALVV3K",
+    "ID": 3625,
+    "Description": "Grpe types produits",
+    "DimensionType": 0,
+    "AxisDefault": "Free",
+    "DefaultResultSetAttributes": [],
+    "KeyAttribute": "2CI9P3D40QX9MR7YT9SD9ALVV3K.KEY",
+    "Attributes": [],
+    "DefaultResultStructure": {
+     "ResultAlignment": "",
+     "ResultStructure": [
+      {
+       "Result": "Members",
+       "Visibility": "Visible"
+      }
+     ]
+    },
+    "NameExternal": "ProductTypeCode",
+    "Length": 0,
+    "Hierarchies": [],
+    "LevelHierarchies": []
+   },
+   {
+    "Name": "2CIFICOUNTRY",
+    "ID": 766,
+    "Description": "Pays/Région frnssr",
+    "DimensionType": 0,
+    "AxisDefault": "Free",
+    "DefaultResultSetAttributes": [],
+    "KeyAttribute": "2CIFICOUNTRY.KEY",
+    "Attributes": [],
+    "DefaultResultStructure": {
+     "ResultAlignment": "",
+     "ResultStructure": [
+      {
+       "Result": "Members",
+       "Visibility": "Visible"
+      }
+     ]
+    },
+    "NameExternal": "SupplierCountry",
+    "Length": 0,
+    "Hierarchies": [],
+    "LevelHierarchies": []
+   },
+   {
+    "Name": "2CIMATERIAL",
+    "ID": 1407,
+    "Description": "Article",
+    "DimensionType": 0,
+    "AxisDefault": "Free",
+    "DefaultResultSetAttributes": [],
+    "KeyAttribute": "2CIMATERIAL.KEY",
+    "Attributes": [],
+    "DefaultResultStructure": {
+     "ResultAlignment": "",
+     "ResultStructure": [
+      {
+       "Result": "Members",
+       "Visibility": "Visible"
+      }
+     ]
+    },
+    "NameExternal": "Material",
+    "Length": 0,
+    "Hierarchies": [],
+    "LevelHierarchies": []
+   },
+   {
+    "Name": "2CIMATGROUP",
+    "ID": 1445,
+    "Description": "Groupe d'articles",
+    "DimensionType": 0,
+    "AxisDefault": "Free",
+    "DefaultResultSetAttributes": [],
+    "KeyAttribute": "2CIMATGROUP.KEY",
+    "Attributes": [],
+    "DefaultResultStructure": {
+     "ResultAlignment": "",
+     "ResultStructure": [
+      {
+       "Result": "Members",
+       "Visibility": "Visible"
+      }
+     ]
+    },
+    "NameExternal": "MaterialGroup",
+    "Length": 0,
+    "Hierarchies": [],
+    "LevelHierarchies": []
+   },
+   {
+    "Name": "2CCMMPURORDSPND-COMPANYCODE",
+    "ID": 3613,
+    "Description": "Société",
+    "DimensionType": 0,
+    "AxisDefault": "Free",
+    "DefaultResultSetAttributes": [],
+    "KeyAttribute": "2CCMMPURORDSPND-COMPANYCODE.KEY",
+    "Attributes": [],
+    "DefaultResultStructure": {
+     "ResultAlignment": "",
+     "ResultStructure": [
+      {
+       "Result": "Members",
+       "Visibility": "Visible"
+      }
+     ]
+    },
+    "NameExternal": "CompanyCode",
+    "Length": 0,
+    "Hierarchies": [],
+    "LevelHierarchies": []
+   },
+   {
+    "Name": "2CIMMPURCHGROUP",
+    "ID": 2855,
+    "Description": "Groupe d'acheteurs",
+    "DimensionType": 0,
+    "AxisDefault": "Free",
+    "DefaultResultSetAttributes": [],
+    "KeyAttribute": "2CIMMPURCHGROUP.KEY",
+    "Attributes": [],
+    "DefaultResultStructure": {
+     "ResultAlignment": "",
+     "ResultStructure": [
+      {
+       "Result": "Members",
+       "Visibility": "Visible"
+      }
+     ]
+    },
+    "NameExternal": "PurchasingGroup",
+    "Length": 0,
+    "Hierarchies": [],
+    "LevelHierarchies": []
+   },
+   {
+    "Name": "2CCMMPURORDSPND-PURGCATNAME",
+    "ID": 3616,
+    "Description": "Nom catégorie achats",
+    "DimensionType": 0,
+    "AxisDefault": "Free",
+    "DefaultResultSetAttributes": [],
+    "KeyAttribute": "2CCMMPURORDSPND-PURGCATNAME.KEY",
+    "Attributes": [],
+    "DefaultResultStructure": {
+     "ResultAlignment": "",
+     "ResultStructure": [
+      {
+       "Result": "Members",
+       "Visibility": "Visible"
+      }
+     ]
+    },
+    "NameExternal": "PurgCatName",
+    "Length": 0,
+    "Hierarchies": [],
+    "LevelHierarchies": []
+   },
+   {
+    "Name": "2CIMMPURGDOCSTA",
+    "ID": 3626,
+    "Description": "Statut",
+    "DimensionType": 0,
+    "AxisDefault": "Free",
+    "DefaultResultSetAttributes": [],
+    "KeyAttribute": "2CIMMPURGDOCSTA.KEY",
+    "Attributes": [],
+    "DefaultResultStructure": {
+     "ResultAlignment": "",
+     "ResultStructure": [
+      {
+       "Result": "Members",
+       "Visibility": "Visible"
+      }
+     ]
+    },
+    "NameExternal": "PurchasingDocumentStatus",
+    "Length": 0,
+    "Hierarchies": [],
+    "LevelHierarchies": []
+   },
+   {
+    "Name": "2CIMMPURGORG",
+    "ID": 2883,
+    "Description": "Organisation achats",
+    "DimensionType": 0,
+    "AxisDefault": "Free",
+    "DefaultResultSetAttributes": [],
+    "KeyAttribute": "2CIMMPURGORG.KEY",
+    "Attributes": [],
+    "DefaultResultStructure": {
+     "ResultAlignment": "",
+     "ResultStructure": [
+      {
+       "Result": "Members",
+       "Visibility": "Visible"
+      }
+     ]
+    },
+    "NameExternal": "PurchasingOrganization",
+    "Length": 0,
+    "Hierarchies": [],
+    "LevelHierarchies": []
+   },
+   {
+    "Name": "2CIPLANT",
+    "ID": 775,
+    "Description": "Division",
+    "DimensionType": 0,
+    "AxisDefault": "Free",
+    "DefaultResultSetAttributes": [],
+    "KeyAttribute": "2CIPLANT.KEY",
+    "Attributes": [],
+    "DefaultResultStructure": {
+     "ResultAlignment": "",
+     "ResultStructure": [
+      {
+       "Result": "Members",
+       "Visibility": "Visible"
+      }
+     ]
+    },
+    "NameExternal": "Plant",
+    "Length": 0,
+    "Hierarchies": [],
+    "LevelHierarchies": []
+   },
+   {
+    "Name": "2CIUSU6TX647EBYVDN00SSTQB22",
+    "ID": 3627,
+    "Description": "Nom élément d'OTP",
+    "DimensionType": 0,
+    "AxisDefault": "Free",
+    "DefaultResultSetAttributes": [],
+    "KeyAttribute": "2CIUSU6TX647EBYVDN00SSTQB22.KEY",
+    "Attributes": [],
+    "DefaultResultStructure": {
+     "ResultAlignment": "",
+     "ResultStructure": [
+      {
+       "Result": "Members",
+       "Visibility": "Visible"
+      }
+     ]
+    },
+    "NameExternal": "WBSDescription",
+    "Length": 0,
+    "Hierarchies": [],
+    "LevelHierarchies": []
+   },
+   {
+    "Name": "2CIWC2AWRN0TP4N4RGABETWBNNF",
+    "ID": 3628,
+    "Description": "Catégorie d'achats",
+    "DimensionType": 0,
+    "AxisDefault": "Free",
+    "DefaultResultSetAttributes": [],
+    "KeyAttribute": "2CIWC2AWRN0TP4N4RGABETWBNNF.KEY",
+    "Attributes": [],
+    "DefaultResultStructure": {
+     "ResultAlignment": "",
+     "ResultStructure": [
+      {
+       "Result": "Members",
+       "Visibility": "Visible"
+      }
+     ]
+    },
+    "NameExternal": "PurchasingCategory",
+    "Length": 0,
+    "Hierarchies": [],
+    "LevelHierarchies": []
+   },
+   {
+    "Name": "2CI_SUPPLIER_CDS",
+    "ID": 1368,
+    "Description": "Fournisseur",
+    "DimensionType": 0,
+    "AxisDefault": "Free",
+    "DefaultResultSetAttributes": [],
+    "KeyAttribute": "2CI_SUPPLIER_CDS.KEY",
+    "Attributes": [],
+    "DefaultResultStructure": {
+     "ResultAlignment": "",
+     "ResultStructure": [
+      {
+       "Result": "Members",
+       "Visibility": "Visible"
+      }
+     ]
+    },
+    "NameExternal": "Supplier",
+    "Length": 0,
+    "Hierarchies": [],
+    "LevelHierarchies": []
+   },
+   {
+    "Name": "2CK4YFDXKIGC0ZI9NKTP9OISMYB",
+    "ID": 3630,
+    "Description": "Date de la commande",
+    "DimensionType": 0,
+    "AxisDefault": "Free",
+    "DefaultResultSetAttributes": [],
+    "KeyAttribute": "2CK4YFDXKIGC0ZI9NKTP9OISMYB.KEY",
+    "Attributes": [],
+    "DefaultResultStructure": {
+     "ResultAlignment": "",
+     "ResultStructure": [
+      {
+       "Result": "Members",
+       "Visibility": "Visible"
+      }
+     ]
+    },
+    "NameExternal": "PurchaseOrderDate",
+    "Length": 0,
+    "Hierarchies": [],
+    "LevelHierarchies": []
+   },
+   {
+    "Name": "2CK7SUH2UP4PONH5XH87YCZ93BI",
+    "ID": 3631,
+    "Description": "Année civile",
+    "DimensionType": 0,
+    "AxisDefault": "Free",
+    "DefaultResultSetAttributes": [],
+    "KeyAttribute": "2CK7SUH2UP4PONH5XH87YCZ93BI.KEY",
+    "Attributes": [],
+    "DefaultResultStructure": {
+     "ResultAlignment": "",
+     "ResultStructure": [
+      {
+       "Result": "Members",
+       "Visibility": "Visible"
+      }
+     ]
+    },
+    "NameExternal": "CalendarYear",
+    "Length": 0,
+    "Hierarchies": [],
+    "LevelHierarchies": []
+   },
+   {
+    "Name": "2CKDZ7I5S9XCRCN355YOBDHUHOI",
+    "ID": 3632,
+    "Description": "Mois calendrier",
+    "DimensionType": 0,
+    "AxisDefault": "Free",
+    "DefaultResultSetAttributes": [],
+    "KeyAttribute": "2CKDZ7I5S9XCRCN355YOBDHUHOI.KEY",
+    "Attributes": [],
+    "DefaultResultStructure": {
+     "ResultAlignment": "",
+     "ResultStructure": [
+      {
+       "Result": "Members",
+       "Visibility": "Visible"
+      }
+     ]
+    },
+    "NameExternal": "CalendarMonth",
+    "Length": 0,
+    "Hierarchies": [],
+    "LevelHierarchies": []
+   },
+   {
+    "Name": "2CMBRFZSZE7EY82KT6NK0AJYP2J",
+    "ID": 3634,
+    "Description": "Poste cde achat",
+    "DimensionType": 0,
+    "AxisDefault": "Free",
+    "DefaultResultSetAttributes": [],
+    "KeyAttribute": "2CMBRFZSZE7EY82KT6NK0AJYP2J.KEY",
+    "Attributes": [],
+    "DefaultResultStructure": {
+     "ResultAlignment": "",
+     "ResultStructure": [
+      {
+       "Result": "Members",
+       "Visibility": "Visible"
+      }
+     ]
+    },
+    "NameExternal": "PurchaseOrderItem",
+    "Length": 0,
+    "Hierarchies": [],
+    "LevelHierarchies": []
+   },
+   {
+    "Name": "2CCMMPURORDSPND-PURGCATUUID",
+    "ID": 3617,
+    "Description": "UUID catég. d'achats",
+    "DimensionType": 0,
+    "AxisDefault": "Free",
+    "DefaultResultSetAttributes": [],
+    "KeyAttribute": "2CCMMPURORDSPND-PURGCATUUID.KEY",
+    "Attributes": [],
+    "DefaultResultStructure": {
+     "ResultAlignment": "",
+     "ResultStructure": [
+      {
+       "Result": "Members",
+       "Visibility": "Visible"
+      }
+     ]
+    },
+    "NameExternal": "PurgCatUUID",
+    "Length": 0,
+    "Hierarchies": [],
+    "LevelHierarchies": []
+   },
+   {
+    "Name": "2CRQNEI1ZK3DYN6MAYSP9RQJIK1",
+    "ID": 3636,
+    "Description": "Trimestre civil",
+    "DimensionType": 0,
+    "AxisDefault": "Free",
+    "DefaultResultSetAttributes": [],
+    "KeyAttribute": "2CRQNEI1ZK3DYN6MAYSP9RQJIK1.KEY",
+    "Attributes": [],
+    "DefaultResultStructure": {
+     "ResultAlignment": "",
+     "ResultStructure": [
+      {
+       "Result": "Members",
+       "Visibility": "Visible"
+      }
+     ]
+    },
+    "NameExternal": "CalendarQuarter",
+    "Length": 0,
+    "Hierarchies": [],
+    "LevelHierarchies": []
+   },
+   {
+    "Name": "2CSAXN20C7YI56A85L2U7K5Q82M",
+    "ID": 3638,
+    "Description": "Élément d'OTP",
+    "DimensionType": 0,
+    "AxisDefault": "Free",
+    "DefaultResultSetAttributes": [],
+    "KeyAttribute": "2CSAXN20C7YI56A85L2U7K5Q82M.KEY",
+    "Attributes": [],
+    "DefaultResultStructure": {
+     "ResultAlignment": "",
+     "ResultStructure": [
+      {
+       "Result": "Members",
+       "Visibility": "Visible"
+      }
+     ]
+    },
+    "NameExternal": "WBSElementInternalID",
+    "Length": 0,
+    "Hierarchies": [],
+    "LevelHierarchies": []
+   },
+   {
+    "Name": "2CT30808YZRNBPU8IMGP3TQ4OKQ",
+    "ID": 3639,
+    "Description": "Devise d'affichage",
+    "DimensionType": 0,
+    "AxisDefault": "Free",
+    "DefaultResultSetAttributes": [],
+    "KeyAttribute": "2CT30808YZRNBPU8IMGP3TQ4OKQ.KEY",
+    "Attributes": [],
+    "DefaultResultStructure": {
+     "ResultAlignment": "",
+     "ResultStructure": [
+      {
+       "Result": "Members",
+       "Visibility": "Visible"
+      }
+     ]
+    },
+    "NameExternal": "DisplayCurrency",
+    "Length": 0,
+    "Hierarchies": [],
+    "LevelHierarchies": []
+   },
+   {
+    "Name": "2CTJT8ROP1LDEMNDH5SEAHX71LW",
+    "ID": 3640,
+    "Description": "Commande achat",
+    "DimensionType": 0,
+    "AxisDefault": "Free",
+    "DefaultResultSetAttributes": [],
+    "KeyAttribute": "2CTJT8ROP1LDEMNDH5SEAHX71LW.KEY",
+    "Attributes": [],
+    "DefaultResultStructure": {
+     "ResultAlignment": "",
+     "ResultStructure": [
+      {
+       "Result": "Members",
+       "Visibility": "Visible"
+      }
+     ]
+    },
+    "NameExternal": "PurchaseOrder",
+    "Length": 0,
+    "Hierarchies": [],
+    "LevelHierarchies": []
+   },
+   {
+    "Name": "1TEXT",
+    "ID": 356,
+    "Description": "",
+    "DimensionType": 0,
+    "AxisDefault": "Repository",
+    "DefaultResultSetAttributes": [],
+    "KeyAttribute": "1TEXT.KEY",
+    "Attributes": [],
+    "DefaultResultStructure": {
+     "ResultAlignment": "",
+     "ResultStructure": [
+      {
+       "Result": "Members",
+       "Visibility": "Visible"
+      }
+     ]
+    },
+    "NameExternal": "",
+    "Length": 0,
+    "Hierarchies": [],
+    "LevelHierarchies": []
+   },
+   {
+    "Name": "2CCGCALDFVH",
+    "ID": 2916,
+    "Description": "",
+    "DimensionType": 0,
+    "AxisDefault": "Repository",
+    "DefaultResultSetAttributes": [],
+    "KeyAttribute": "2CCGCALDFVH.KEY",
+    "Attributes": [],
+    "DefaultResultStructure": {
+     "ResultAlignment": "",
+     "ResultStructure": [
+      {
+       "Result": "Members",
+       "Visibility": "Visible"
+      }
+     ]
+    },
+    "NameExternal": "",
+    "Length": 0,
+    "Hierarchies": [],
+    "LevelHierarchies": []
+   }
+  ],
+  "QueryDataCells": [],
+  "Query": {
+   "Axes": [
+    {
+     "DimensionOrderFixed": false,
+     "Axis": "Rows",
+     "ZeroSuppressionType": 0,
+     "ResultAlignment": "Bottom"
+    },
+    {
+     "DimensionOrderFixed": false,
+     "Axis": "Columns",
+     "ZeroSuppressionType": 0,
+     "ResultAlignment": "Bottom"
+    },
+    {
+     "DimensionOrderFixed": false,
+     "Axis": "Free",
+     "ZeroSuppressionType": 0,
+     "ResultAlignment": "Bottom"
+    }
+   ],
+   "CurrencyTranslationEnabled": "Possible",
+   "ResultStructureFeature": {
+    "Enabled": true,
+    "Reordering": "None",
+    "ResultAlignment": {
+     "ConfigLevel": "Axis",
+     "ResultAlignmentList": [
+      "Top",
+      "Bottom"
+     ]
+    },
+    "ConditionalVisibility": true,
+    "ConditionalTotals": false,
+    "ConditionalTotalsList": []
+   }
+  },
+  "FixedFilter": {},
+  "DynamicFilter": {},
+  "Variables": [
+   {
+    "Name": "!CDS_P_P_DISPLAYCURRENCY",
+    "NameExternal": "P_DisplayCurrency",
+    "Description": "Devise d'affichage",
+    "InputEnabled": true,
+    "Length": 0,
+    "ValueType": "String",
+    "VariableType": "DimensionMemberVariable",
+    "IsInputEnabledAndExit": false,
+    "ScreenOrder": 1,
+    "DependentOfVariable": [],
+    "InputType": "Mandatory",
+    "SupportsValueHelp": true,
+    "MultipleValues": false,
+    "FilterCapability": {
+     "ComparisonGroup": "SingleValue"
+    },
+    "ValueHelpType": "V",
+    "UsedInDynamicFilter": false,
+    "UsedInFixedFilter": true,
+    "Values": {
+     "Selection": {
+      "SetOperand": {
+       "Elements": [
+        {
+         "IsExcluding": false,
+         "Low": "EUR",
+         "LowSupplements": [
+          "EUR",
+          "Euro européen"
+         ]
+        }
+       ],
+       "FieldName": "2CH0Y9FATWMXU07PABNUMVE2HHX.KEY",
+       "SupplementsFieldNames": [
+        "2CH0Y9FATWMXU07PABNUMVE2HHX.DISPLAY_KEY",
+        "2CH0Y9FATWMXU07PABNUMVE2HHX.MEDIUM_TEXT"
+       ]
+      }
+     }
+    },
+    "DimensionReference": {
+     "Name": "2CH0Y9FATWMXU07PABNUMVE2HHX"
+    },
+    "RuntimeReferences": [
+     "2CH0Y9FATWMXU07PABNUMVE2HHX"
+    ]
+   },
+   {
+    "Name": "!CDS_P_P_DATEFUNCTION",
+    "NameExternal": "P_DateFunction",
+    "Description": "Fonction date relative",
+    "InputEnabled": true,
+    "Length": 0,
+    "ValueType": "String",
+    "VariableType": "DimensionMemberVariable",
+    "IsInputEnabledAndExit": false,
+    "ScreenOrder": 2,
+    "DependentOfVariable": [],
+    "InputType": "Mandatory",
+    "SupportsValueHelp": true,
+    "MultipleValues": false,
+    "FilterCapability": {
+     "ComparisonGroup": "SingleValue"
+    },
+    "ValueHelpType": "V",
+    "UsedInDynamicFilter": false,
+    "UsedInFixedFilter": true,
+    "Values": {
+     "Selection": {
+      "SetOperand": {
+       "Elements": [
+        {
+         "IsExcluding": false,
+         "Low": "YEARTODATE",
+         "LowSupplements": [
+          "YEARTODATE",
+          "Année actuelle"
+         ]
+        }
+       ],
+       "FieldName": "2CCGCALDFVH.KEY",
+       "SupplementsFieldNames": [
+        "2CCGCALDFVH.DISPLAY_KEY",
+        "2CCGCALDFVH.LONG_TEXT"
+       ]
+      }
+     }
+    },
+    "DimensionReference": {
+     "Name": "2CCGCALDFVH"
+    },
+    "RuntimeReferences": [
+     "2CCGCALDFVH"
+    ]
+   },
+   {
+    "Name": "!CDS_P_P_STARTDATE",
+    "NameExternal": "",
+    "Description": "Paramètre dérivé P_StartDate",
+    "InputEnabled": false,
+    "Length": 0,
+    "ValueType": "String",
+    "VariableType": "DimensionMemberVariable",
+    "IsInputEnabledAndExit": false,
+    "ScreenOrder": 3,
+    "DependentOfVariable": [],
+    "InputType": "Optional",
+    "SupportsValueHelp": false,
+    "MultipleValues": false,
+    "FilterCapability": {
+     "ComparisonGroup": "SingleValue"
+    },
+    "ValueHelpType": "",
+    "UsedInDynamicFilter": false,
+    "UsedInFixedFilter": true,
+    "DimensionReference": {
+     "Name": "2CQVA05CB3RQ8IWG16R9ADB9KSB"
+    },
+    "RuntimeReferences": [
+     "2CQVA05CB3RQ8IWG16R9ADB9KSB"
+    ]
+   },
+   {
+    "Name": "!CDS_P_P_ENDDATE",
+    "NameExternal": "",
+    "Description": "Paramètre dérivé P_EndDate",
+    "InputEnabled": false,
+    "Length": 0,
+    "ValueType": "String",
+    "VariableType": "DimensionMemberVariable",
+    "IsInputEnabledAndExit": false,
+    "ScreenOrder": 4,
+    "DependentOfVariable": [],
+    "InputType": "Optional",
+    "SupportsValueHelp": false,
+    "MultipleValues": false,
+    "FilterCapability": {
+     "ComparisonGroup": "SingleValue"
+    },
+    "ValueHelpType": "",
+    "UsedInDynamicFilter": false,
+    "UsedInFixedFilter": true,
+    "DimensionReference": {
+     "Name": "2CHZY5N72NNDJ2R09JG98XXDF7M"
+    },
+    "RuntimeReferences": [
+     "2CHZY5N72NNDJ2R09JG98XXDF7M"
+    ]
+   },
+   {
+    "Name": "!CDS_S_SYSTEM_LANGUAGE",
+    "NameExternal": "",
+    "Description": "Zone système SYSTEM_LANGUAGE",
+    "InputEnabled": false,
+    "Length": 0,
+    "ValueType": "String",
+    "VariableType": "SimpleTypeVariable",
+    "IsInputEnabledAndExit": false,
+    "ScreenOrder": 5,
+    "SemanticType": "TextVariable",
+    "DependentOfVariable": [],
+    "InputType": "Optional",
+    "SupportsValueHelp": false,
+    "MultipleValues": false,
+    "FilterCapability": {},
+    "ValueHelpType": "",
+    "UsedInDynamicFilter": false,
+    "UsedInFixedFilter": true,
+    "SimpleStringValues": [
+     "F"
+    ],
+    "DimensionReference": {
+     "Name": "1TEXT"
+    },
+    "RuntimeReferences": [
+     "1TEXT"
+    ]
+   }
+  ],
+  "ServerState": {
+   "State": 1
+  }
+ },
+ "DataAreas": [
+  {
+   "Name": "DEFAULT",
+   "Environment": "",
+   "Model": "",
+   "CellLocking": "",
+   "IsWorkStatusActive": false,
+   "HasChangedData": false,
+   "ChangeCounter": 0
+  }
+ ],
+ "Messages": [],
+ "PerformanceData": {
+  "SessionId": "SESSIONPLACEHOLDER",
+  "StepId": "STEPPLACEHOLDER",
+  "Runtime": 1.666659,
+  "Timestamp": "2026-01-01 00:00:00.000000",
+  "Measurements": [
+   {
+    "Description": "Execution",
+    "Calls": 1,
+    "Time": 0.188175
+   },
+   {
+    "Description": "JSON Parser",
+    "Calls": 1,
+    "Time": 0.000638
+   },
+   {
+    "Description": "Prepare",
+    "Calls": 1,
+    "Time": 1.473599
+   },
+   {
+    "Description": "Usage",
+    "Calls": 1,
+    "Time": 0.004247
+   }
+  ]
+ }
+}

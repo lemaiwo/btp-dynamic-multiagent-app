@@ -47,7 +47,7 @@ from agents.db import (  # noqa: E402
     list_ina_queries,
 )
 from agents.odata import admin_routes as odata_routes  # noqa: E402
-from tests.test_ina_client import definition  # noqa: E402
+from tests.ina_helpers import definition  # noqa: E402
 
 EXPORT = "/admin/api/export"
 IMPORT = "/admin/api/import"

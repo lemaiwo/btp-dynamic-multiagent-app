@@ -1,0 +1,12 @@
+{
+ "Messages": [
+  {
+   "Type": 2,
+   "MessageClass": "",
+   "Number": 0,
+   "Text": "Query kann nur dann ausgeführt werden, wenn Werte für alle Pflichtvariablen festgelegt wurden",
+   "ExceptionClass": "CX_BICS_VARIABLES_EXIST",
+   "OlapMessageClass": 0
+  }
+ ]
+}
