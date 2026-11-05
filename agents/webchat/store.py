@@ -394,7 +394,24 @@ async def add_generated_file(
     db.add(row)
     await db.commit()
     return {"file_id": row.id, "name": row.name, "media_type": row.media_type,
-            "size": row.size, "download_url": f"/chat/api/files/{row.id}"}
+            "size": row.size, "download_url": file_url(row.id)}
+
+
+def file_url(fid: str) -> str:
+    """Where the chat downloads a file (``GET /chat/api/files/{id}``, owner-checked)."""
+    return f"/chat/api/files/{fid}"
+
+
+async def conversation_files(db: AsyncSession, cid: str, principal: str, *,
+                             kind: str | None = None) -> list[dict[str, Any]]:
+    """The caller's files of one conversation, metadata only (never the bytes),
+    oldest first; ``kind`` narrows to ``upload`` or ``generated``."""
+    stmt = select(*_FILE_META).where(ChatFile.conversation_id == cid,
+                                     ChatFile.principal == principal)
+    if kind is not None:
+        stmt = stmt.where(ChatFile.kind == kind)
+    rows = (await db.execute(stmt.order_by(ChatFile.created_at, ChatFile.id))).all()
+    return [file_out(row) for row in rows]
 
 
 async def history_json(db: AsyncSession, cid: str) -> list[str]:

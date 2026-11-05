@@ -45,6 +45,7 @@ from agents.ina.tools import NoUsableQueryError, attached_queries
 from agents.ina.tools import activity_summary as ina_activity_summary
 from agents.odata import BUILTIN_ODATA_URL
 from agents.odata.tools import NoUsableServiceError, attached_services
+from agents.reconcile.tool_support import activity_summary as reconcile_activity_summary
 from agents.shared import (
     create_mcp_server,
     default_model_name,
@@ -232,6 +233,13 @@ def _short_tool_output(result) -> str:
             return fixed
         # The InA tools return SAP figures and member keys: counts only.
         fixed = ina_activity_summary(
+            getattr(result, "tool_name", None), getattr(result, "content", None)
+        )
+        if fixed is not None:
+            return fixed
+        # The reconcile tools return mapping and code-table cell text: counts,
+        # a status word and codes only.
+        fixed = reconcile_activity_summary(
             getattr(result, "tool_name", None), getattr(result, "content", None)
         )
         if fixed is not None:

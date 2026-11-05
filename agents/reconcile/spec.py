@@ -301,22 +301,33 @@ def _hint_text(text: str) -> str:
     return flat if len(flat) <= _MAX_HINT_PART else flat[: _MAX_HINT_PART - 3] + "..."
 
 
-def validation_hint(exc: ValidationError) -> str:
-    """What is wrong with a spec, by location and message, without any input value.
+def validation_errors(exc: ValidationError, limit: int = _MAX_HINT_ERRORS) -> list[dict[str, str]]:
+    """The first ``limit`` problems of a spec as ``{loc, msg}``, without any input value.
 
-    For a caller that runs ``ReconcileSpec.model_validate`` itself and wants to
-    tell the model what to fix. ``str(exc)`` is no good for that: it prints every
-    offending input, and a spec holds values from the customer's files.
+    ``str(exc)`` and ``exc.errors()`` carry every offending input, and a spec
+    holds values copied from the customer's files: the message of a type that
+    quotes its input is replaced by a fixed text or the error type.
     """
-    lines: list[str] = []
-    errors = exc.errors(include_url=False, include_context=False)
-    for err in errors[:_MAX_HINT_ERRORS]:
+    items: list[dict[str, str]] = []
+    for err in exc.errors(include_url=False, include_context=False)[:limit]:
         loc = ".".join(str(part) for part in err["loc"]) or "spec"
         msg = _ECHOING_TYPES.get(err["type"], err["msg"])
         value = err.get("input")
         if isinstance(value, str) and value and value in msg:
             msg = err["type"]
-        lines.append(f"{_hint_text(loc)}: {_hint_text(msg)}")
-    if len(errors) > _MAX_HINT_ERRORS:
-        lines.append(f"(and {len(errors) - _MAX_HINT_ERRORS} more)")
+        items.append({"loc": _hint_text(loc), "msg": _hint_text(msg)})
+    return items
+
+
+def validation_hint(exc: ValidationError) -> str:
+    """What is wrong with a spec, by location and message, without any input value.
+
+    For a caller that runs ``ReconcileSpec.model_validate`` itself and wants to
+    tell the model what to fix in one line (:func:`validation_errors` is the
+    same as a list).
+    """
+    lines = [f"{item['loc']}: {item['msg']}" for item in validation_errors(exc)]
+    total = exc.error_count()
+    if total > _MAX_HINT_ERRORS:
+        lines.append(f"(and {total - _MAX_HINT_ERRORS} more)")
     return "; ".join(lines)
