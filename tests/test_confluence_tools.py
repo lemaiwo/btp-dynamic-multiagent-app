@@ -440,6 +440,44 @@ async def test_the_get_page_tool_passes_start_and_answers_a_bad_one_as_a_result(
     assert bad["error"]["code"] == "invalid_start" and "-5" not in json.dumps(bad)
 
 
+@pytest.mark.parametrize("length", [0, MAX_BODY_CHARS, MAX_BODY_CHARS + 1])
+async def test_get_page_parts_at_the_edges_of_the_cap(length):
+    text = ("abcdefghij" * (length // 10 + 1))[:length]
+    server = Server()
+    server.routes["/content/1"] = _page(pid="1", body=f"<p>{text}</p>")
+    client, http, _ = _client(server)
+    async with http:
+        first = await client.get_page("1")
+        assert first["body"] == text[:MAX_BODY_CHARS] and first["body_chars"] == length
+        if length <= MAX_BODY_CHARS:
+            assert first["truncated"] is False and first["next_start"] is None
+            return
+        assert first["truncated"] is True and first["next_start"] == MAX_BODY_CHARS
+        second = await client.get_page("1", start=first["next_start"])
+    assert len(second["body"]) == 1 and second["body"] == text[-1:]
+    assert second["truncated"] is False and second["next_start"] is None
+
+
+async def test_get_page_accepts_the_last_character_as_start():
+    server = Server()
+    client, http, _ = _long_page_client(server)
+    async with http:
+        out = await client.get_page("1", start=len(_LONG) - 1)
+    assert out["body"] == _LONG[-1:] and out["next_start"] is None
+    assert out["truncated"] is False
+
+
+@pytest.mark.parametrize("start", [60_000, 150_000])
+async def test_get_page_with_a_start_outside_the_pin_is_refused_without_its_body(start):
+    server = Server()
+    server.routes["/content/1"] = _page(pid="1", space="HR", body="<p>" + _LONG + "</p>")
+    client, http, _ = _client(server, spaces=["shERPa"])
+    async with http:
+        err = await _refused(client.get_page("1", start=start))
+    assert err.code == "space_not_allowed"
+    assert _LONG[:20] not in err.message and _LONG[:20] not in (err.hint or "")
+
+
 async def test_get_page_over_the_html_cap_is_too_large(monkeypatch):
     monkeypatch.setattr(confluence_text, "MAX_HTML_BYTES", 50)
     server = Server()
