@@ -101,6 +101,8 @@ _MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 _PKG_REL = "http://schemas.openxmlformats.org/package/2006/relationships"
 _DOC_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 _ERROR = object()  # a cell holding an Excel error value
+# The public name of the marker, for readers built on :func:`_plain` elsewhere.
+ERROR_CELL = _ERROR
 # ``date.fromisoformat`` alone also reads a week date (``2026-W01-1``).
 _DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 _YEAR = "{year}"

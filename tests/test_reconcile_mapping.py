@@ -237,6 +237,10 @@ def test_a_missing_column_is_refused_without_its_label() -> None:
     {"columns": []},
     {"columns": [{"letter": "A", "label": "x"}]},
     {"columns": "Target field"},
+    {"filter_value": "x" * 256},
+    {"columns": [{"letter": "A"}] * 201},
+    {"columns": [{"label": "   "}]},
+    {"columns": [{"label": "\n\xa0"}]},
 ])
 def test_bad_arguments_are_refused(over: dict[str, Any]) -> None:
     _refused("invalid_arguments", _read, **over)
@@ -249,3 +253,89 @@ def test_modules_hold_no_customer_layout() -> None:
         source = inspect.getsource(module)
         for word in ("Fields", "Target table", "ZTAB"):
             assert word not in source
+
+
+# --- final review hygiene -------------------------------------------------
+
+class _Book:
+    def __init__(self, names: list[str]) -> None:
+        self.sheetnames = names
+        self.closed = 0
+
+    def __getitem__(self, name: str) -> Any:
+        return name
+
+    def close(self) -> None:
+        self.closed += 1
+
+
+def test_the_sheet_hint_cuts_each_name_and_strips_control_characters() -> None:
+    long_name = "N" * 40
+    err = _refused("sheet_not_found", workbook.sheet, _Book(["Ok\nname\u202e", long_name]), "x")
+    hint = err.hint or ""
+    assert "\n" not in hint and "\u202e" not in hint
+    assert "Okname" in hint
+    assert long_name not in hint and "N" * 30 + "…" in hint
+
+
+def test_xref_reader_reuses_the_shared_hint_name() -> None:
+    from agents.reconcile import xref_reader
+
+    assert xref_reader._hint_name("a\nb") == workbook.hint_name("a\nb") == "ab"
+
+
+def test_error_cells_have_a_public_marker() -> None:
+    from agents import sharepoint_workbook
+
+    assert sharepoint_workbook.ERROR_CELL is sharepoint_workbook._ERROR
+    assert workbook.ERROR_CELL is sharepoint_workbook.ERROR_CELL
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_opened_closes_the_book_on_exit_and_on_an_exception(
+    monkeypatch: pytest.MonkeyPatch, fail: bool
+) -> None:
+    book = _Book(["S"])
+    monkeypatch.setattr(workbook, "check_archive", lambda data: None)
+    monkeypatch.setattr(workbook, "open_workbook", lambda data: book)
+    with pytest.raises(RuntimeError) if fail else _nothing():
+        with opened(b"x"):
+            if fail:
+                raise RuntimeError("boom")
+    assert book.closed == 1
+
+
+class _nothing:
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, *exc: Any) -> bool:
+        return False
+
+
+def test_an_ambiguous_label_in_read_mapping_is_refused() -> None:
+    _refused("column_ambiguous", _read, header_row=4, columns=[ColumnRef(label="Rule type")])
+
+
+def test_a_letter_beyond_the_header_reads_as_a_blank_column() -> None:
+    out = _read(header_row=4, columns=[ColumnRef(label="Target field"), ColumnRef(letter="Z")])
+    assert out["columns"] == ["Target field", ""]
+    assert [r["values"] for r in out["rows"]] == [["OBJNR", ""], ["KIND", ""], ["NOTE", ""]]
+
+
+def test_a_matching_row_blank_in_every_requested_column_is_left_out() -> None:
+    data = mapping_book(extra=[["ZTAB", None, None, None, "Y"]])
+    out = _read(data, columns=[ColumnRef(label="Target field")])
+    assert 11 not in [r["row"] for r in out["rows"]]
+
+
+def test_non_matching_rows_are_scanned_up_to_a_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    extra = [["ZOTHER", f"F{i}"] for i in range(20)] + [["ZTAB", "LATE"]]
+    data = mapping_book(extra=extra)
+    columns = [ColumnRef(label="Target field")]
+    out = _read(data, columns=columns)
+    assert out["truncated"] is False and "LATE" in [r["values"][0] for r in out["rows"]]
+    monkeypatch.setattr(mapping_reader, "MAX_MAPPING_SCAN", 10)
+    out = _read(data, columns=columns)
+    assert out["truncated"] is True
+    assert [r["values"][0] for r in out["rows"]] == ["OBJNR", "KIND", "NOTE"]

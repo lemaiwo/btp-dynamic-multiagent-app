@@ -267,6 +267,17 @@ def test_value_map_alpha_exact_still_wins() -> None:
     assert _matched(_vm(alpha=True), "PLAIN", {"ITEMTYP": "10"}, lookups=lookups)
 
 
+def test_value_map_alpha_collapsed_entries_keep_the_first_workbook_entry() -> None:
+    lookups = {("Col", 0): Lookup({("0010",): "FIRST", ("010",): "SECOND"})}
+    assert _matched(_vm(alpha=True), "FIRST", {"ITEMTYP": "10"}, lookups=lookups)
+
+
+def test_the_lookup_protocol_reads_entries_only() -> None:
+    from agents.reconcile.engine import LookupTable
+
+    assert isinstance(LookupTable.__dict__["entries"], property)
+
+
 def test_value_map_exact_in_later_lookup_beats_alpha_in_earlier() -> None:
     rule = _vm(alpha=True, lookups=[LOOKUP, {**LOOKUP, "sheet": "Groups"}])
     lookups = {("Col", 0): Lookup({("10",): "ALPHA_HIT"}), ("Col", 1): Lookup({("0010",): "EXACT"})}

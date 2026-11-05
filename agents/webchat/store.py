@@ -465,6 +465,26 @@ async def get_file(db: AsyncSession, fid: str, principal: str) -> ChatFile | Non
     return row.scalar_one_or_none()
 
 
+async def get_conversation_file(
+    db: AsyncSession, fid: str, principal: str, *, conversation_id: str,
+    kinds: tuple[str, ...],
+) -> ChatFile | None:
+    """The file with its bytes, only when the caller owns it, it belongs to
+    ``conversation_id`` and its kind is one of ``kinds``.
+
+    Every condition is in the WHERE clause, so the bytes of a file that does
+    not qualify (another conversation's, even the same owner's) are never
+    loaded.
+    """
+    row = await db.execute(
+        select(ChatFile).where(
+            ChatFile.id == fid, ChatFile.principal == principal,
+            ChatFile.conversation_id == conversation_id, ChatFile.kind.in_(kinds),
+        )
+    )
+    return row.scalar_one_or_none()
+
+
 # ---------------------------------------------------------------------------
 # Retention
 # ---------------------------------------------------------------------------

@@ -793,3 +793,35 @@ def test_a_duplicate_row_at_the_extra_row_is_an_ambiguous_key() -> None:
         _run(go())
     assert info.value.code == "ambiguous_key"
     assert server.calls[-1][1]["maxRows"] == 2
+
+
+# --- final review hygiene ----------------------------------------------------
+
+
+def test_target_not_supported_names_only_plain_property_names() -> None:
+    schema = {
+        "type": "object",
+        "properties": {
+            "sql": {"type": "string"},
+            "maxRows": {"type": "integer"},
+            "bad\nname": {"type": "string"},
+            "<b>x</b>": {"type": "string"},
+            "y" * 41: {"type": "string"},
+        },
+        "required": ["sql"],
+    }
+    with pytest.raises(Arc1ReadError) as info:
+        _preflight(StubServer(schema=schema), target="SRC")
+    text = str(info.value)
+    assert info.value.code == "target_not_supported"
+    assert "sql" in text and "maxRows" in text
+    assert "\n" not in text and "<b>" not in text and "y" * 41 not in text
+
+
+def test_keys_equal_but_for_trailing_blanks_send_one_literal_and_get_both() -> None:
+    server = StubServer()
+    answer = _rows(["MATNR", "MATKL"], [["AB", "A"]])
+    out = _read_with(server, answer, ["AB", "AB "])
+    sql = server.calls[0][1]["sql"]
+    assert sql.count("'AB'") == 1 and "'AB '" not in sql
+    assert out["AB"] == out["AB "] == {"MATNR": "AB", "MATKL": "A"}

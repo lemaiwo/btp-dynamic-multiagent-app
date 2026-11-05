@@ -18,7 +18,6 @@ run it in ``asyncio.to_thread``.
 
 from __future__ import annotations
 
-import unicodedata
 from dataclasses import dataclass
 from typing import Any
 
@@ -27,9 +26,13 @@ from openpyxl.utils import get_column_letter
 from agents.reconcile.spec import ReconcileSpec, ValueMapRule, XrefLookup
 from agents.reconcile.values import clean
 from agents.reconcile.workbook import (
+    MAX_HINT_NAME as MAX_HINT_NAME,  # kept importable from here
+)
+from agents.reconcile.workbook import (
     Refused,
     cell_text,
     header,
+    hint_name,
     opened,
     resolve_column,
 )
@@ -47,7 +50,6 @@ MAX_GRID_COLUMNS = 60
 MAX_GRID_CELL_CHARS = 120
 MAX_FIRST_ROW = 1_048_576  # Excel's last row
 MAX_LOOKUP_ROWS = 100_000  # data rows read below a header row
-MAX_HINT_NAME = 40
 
 
 @dataclass(frozen=True)
@@ -68,14 +70,8 @@ class Lookup:
         return self.entries.get(key)
 
 
-def _hint_name(text: str) -> str:
-    """A sheet or column name for a hint: control/format characters gone, cut short.
-
-    The name was typed into the upload (or copied from it by a model), so it
-    may carry a newline or a bidi mark that would reshape the hint.
-    """
-    flat = "".join(ch for ch in text if unicodedata.category(ch)[0] != "C")
-    return flat if len(flat) <= MAX_HINT_NAME else flat[: MAX_HINT_NAME - 1] + "…"
+# One rule for names in hints, shared with the mapping reader's sheet lookup.
+_hint_name = hint_name
 
 
 def _invalid(message: str) -> Refused:
@@ -133,7 +129,8 @@ def read_grid(
     columns ``A`` onward; ``max_rows`` is clamped to :data:`MAX_GRID_ROWS`,
     ``max_columns`` to :data:`MAX_GRID_COLUMNS`, each cell cut at
     :data:`MAX_GRID_CELL_CHARS`. Blank rows are left out (each row carries its
-    number) and trailing blank cells dropped. ``truncated`` says that a
+    number) and trailing blank cells dropped. ``max_rows`` in the answer is
+    the window height actually used (after the clamp). ``truncated`` says that a
     non-blank row follows the window within :data:`BLANK_ROWS_END` rows.
     """
     if not isinstance(sheet, str) or not 1 <= len(sheet) <= 31:
@@ -159,7 +156,7 @@ def read_grid(
                 break
             rows.append({"row": number, "cells": texts})
         title = ws.title
-    return {"sheet": title, "first_row": first,
+    return {"sheet": title, "first_row": first, "max_rows": rows_wanted,
             "columns": [get_column_letter(i) for i in range(1, width + 1)],
             "rows": rows, "truncated": truncated}
 
@@ -212,11 +209,12 @@ def build_lookup(book: Any, xref: XrefLookup) -> Lookup:
 def _signature(xref: XrefLookup) -> tuple[Any, ...]:
     """What makes two lookups the same table (``XrefLookup`` holds lists: not hashable).
 
-    A lookup's own ``sources`` override is part of it: the entries do not depend
-    on it, but a table is shared only between lookups the spec wrote alike.
+    The sheet name is casefolded, as :func:`~agents.reconcile.workbook.sheet`
+    finds it. A lookup's own ``sources`` override is left out: it says which
+    CSV fields feed the lookup, and the entries read from the sheet do not
+    depend on it.
     """
-    return (xref.sheet, xref.header_row, tuple(xref.keys), xref.value,
-            tuple(xref.sources or ()))
+    return (xref.sheet.casefold(), xref.header_row, tuple(xref.keys), xref.value)
 
 
 def build_lookups(data: bytes, spec: ReconcileSpec) -> dict[tuple[str, int], Lookup]:

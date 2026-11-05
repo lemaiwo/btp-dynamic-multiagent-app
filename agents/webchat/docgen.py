@@ -631,6 +631,11 @@ async def _store(ctx: ChatRunContext, name: str, media_type: str,
     return info
 
 
+# The public name of the one way a tool stores a generated file of the answer
+# (counted against MAX_FILES_PER_RUN), for toolsets outside this module.
+store_file = _store
+
+
 def _title(title: Any) -> str | None:
     if not isinstance(title, str):
         return None

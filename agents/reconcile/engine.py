@@ -75,10 +75,14 @@ class LookupTable(Protocol):
     """A code table: cleaned source value(s) → target value (``xref_reader.Lookup``).
 
     ``entries`` (in workbook order) is read only for rules with ``alpha``, to
-    build the leading-zero-free index once per lookup.
+    build the leading-zero-free index once per lookup; keys that collapse to
+    the same zero-free form keep the FIRST workbook entry (as a duplicate key
+    does in the table itself). Read-only: the engine never writes it, so a
+    frozen dataclass field satisfies it.
     """
 
-    entries: Mapping[tuple[str, ...], str]
+    @property
+    def entries(self) -> Mapping[tuple[str, ...], str]: ...
 
     def get(self, key: tuple[str, ...]) -> str | None: ...
 

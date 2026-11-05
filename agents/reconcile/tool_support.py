@@ -23,7 +23,7 @@ import agents.db as agents_db
 from agents.oauth2 import OAuthAuthorizationRequired
 from agents.reconcile import runs_store
 from agents.reconcile.engine import iter_csv
-from agents.reconcile.spec import ReconcileSpec, ValueMapRule, validation_errors
+from agents.reconcile.spec import ReconcileSpec, ValueMapRule, _hint_text, validation_errors
 from agents.reconcile.workbook import Refused
 from agents.webchat import store
 from agents.webchat.docgen import ChatRunContext, current_chat_run
@@ -121,15 +121,17 @@ async def load_file(ctx: ChatRunContext, file_id: Any, want: str,
                 kinds: tuple[str, ...] = ("upload",)) -> bytes:
     """The bytes of a file of THIS conversation and its owner, of the type wanted.
 
-    Owner check by ``store.get_file`` and conversation check here: a file id
-    of another conversation (even the same tester's) is unknown, so a model
+    Owner, conversation and kind are checked in the query
+    (``store.get_conversation_file``): a file id of another conversation (even
+    the same tester's) is unknown and its bytes are never loaded, so a model
     cannot be talked into reading another conversation's files.
     """
     async with agents_db.SessionLocal() as db:
         row = None
         if isinstance(file_id, str) and 0 < len(file_id) <= MAX_ID:
-            row = await store.get_file(db, file_id, ctx.principal)
-        if row is None or row.conversation_id != ctx.conversation_id or row.kind not in kinds:
+            row = await store.get_conversation_file(
+                db, file_id, ctx.principal, conversation_id=ctx.conversation_id, kinds=kinds)
+        if row is None:
             uploads = await store.conversation_files(
                 db, ctx.conversation_id, ctx.principal, kind="upload")
             raise Refusal(error("file_not_found", uploads=[
@@ -192,7 +194,9 @@ async def in_thread(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
 
 
 def lookup_refusal(exc: Refused) -> dict[str, Any]:
-    return error("lookup_failed", reason=exc.code, hint=exc.hint)
+    # The hint names a sheet and a CSV column (already cut): kept to one bounded line.
+    return error("lookup_failed", reason=exc.code,
+                 hint=_hint_text(exc.hint) if exc.hint else None)
 
 
 def spec_file_name(spec: ReconcileSpec) -> str:

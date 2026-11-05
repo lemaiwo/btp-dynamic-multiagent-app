@@ -22,7 +22,7 @@ from typing import Any, Iterator
 from agents.reconcile.spec import ColumnRef
 from agents.sharepoint_views import column_index
 from agents.sharepoint_workbook import (
-    _ERROR,
+    ERROR_CELL,
     Refused,
     _plain,
     _rows,
@@ -31,9 +31,9 @@ from agents.sharepoint_workbook import (
 )
 
 __all__ = [
-    "MAX_CELL_CHARS", "MAX_LABEL_CHARS", "MAX_SCAN_ROWS", "MAX_SHEET_COLUMNS",
-    "MAX_SHEETS_LISTED", "Refused", "cell_text", "find_header_row", "header",
-    "norm_label", "opened", "resolve_column", "sheet",
+    "MAX_CELL_CHARS", "MAX_HINT_NAME", "MAX_LABEL_CHARS", "MAX_SCAN_ROWS",
+    "MAX_SHEET_COLUMNS", "MAX_SHEETS_LISTED", "Refused", "cell_text", "find_header_row",
+    "header", "hint_name", "norm_label", "opened", "resolve_column", "sheet",
 ]
 
 MAX_SCAN_ROWS = 50  # how far down a header row is looked for
@@ -41,6 +41,8 @@ MAX_SHEET_COLUMNS = 200
 MAX_CELL_CHARS = 2000
 MAX_LABEL_CHARS = 200  # ColumnRef.label's own limit
 MAX_SHEETS_LISTED = 100
+MAX_HINT_NAME = 40
+MAX_SHEET_NAME = 31  # Excel's own limit for a sheet name
 
 
 def norm_label(value: Any) -> str:
@@ -59,10 +61,20 @@ def _cut(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+def hint_name(text: str, limit: int = MAX_HINT_NAME) -> str:
+    """A sheet or column name for a hint: control/format characters gone, cut short.
+
+    The name was typed into the upload (or copied from it by a model), so it
+    may carry a newline or a bidi mark that would reshape the hint.
+    """
+    flat = "".join(ch for ch in text if unicodedata.category(ch)[0] != "C")
+    return _cut(flat, limit)
+
+
 def cell_text(cell: Any, limit: int = MAX_CELL_CHARS) -> str:
     """A cell as text of at most ``limit`` characters; ``""`` for empty and error cells."""
     value = _plain(cell)
-    if value is None or value is _ERROR:
+    if value is None or value is ERROR_CELL:
         return ""
     return _cut(value if isinstance(value, str) else str(value), limit)
 
@@ -94,7 +106,9 @@ def sheet(book: Any, name: str) -> Any:
     """The sheet ``name``: exact first, then case-insensitive (Excel's own rule).
 
     The refusal lists the sheet names (at most :data:`MAX_SHEETS_LISTED`) in
-    its hint so the model can correct itself; names are not cell values.
+    its hint so the model can correct itself; names are not cell values, but
+    each passes :func:`hint_name` (cut to Excel's 31 characters) since a
+    crafted file may hold longer names with control characters.
     """
     names = list(book.sheetnames)
     if name in names:
@@ -103,7 +117,7 @@ def sheet(book: Any, name: str) -> Any:
     for candidate in names:
         if candidate.casefold() == wanted:
             return book[candidate]
-    listed = ", ".join(names[:MAX_SHEETS_LISTED])
+    listed = ", ".join(hint_name(str(n), MAX_SHEET_NAME) for n in names[:MAX_SHEETS_LISTED])
     more = len(names) - MAX_SHEETS_LISTED
     if more > 0:
         listed += f" (and {more} more)"

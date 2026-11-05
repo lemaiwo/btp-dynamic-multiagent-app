@@ -30,6 +30,7 @@ from agents.reconcile.workbook import sheet as find_sheet
 from agents.sharepoint_workbook import BLANK_ROWS_END, _rows
 
 MAX_MAPPING_ROWS = 2000
+MAX_MAPPING_SCAN = 50_000  # rows below the header looked at, matching or not
 MAX_HEADER_ROW = 1000  # XrefLookup.header_row's own bound
 
 
@@ -83,9 +84,13 @@ def read_mapping(
     Returns ``{"sheet", "header_row", "columns", "rows", "truncated"}``:
     ``columns`` are the header labels as written (whitespace collapsed),
     each row is ``{"row": <sheet row number>, "values": [...]}`` in the order
-    of ``columns``. Rows whose requested cells are all blank are left out;
-    reading ends after :data:`BLANK_ROWS_END` consecutive blank rows or at
-    :data:`MAX_MAPPING_ROWS` matching rows (``truncated``).
+    of ``columns``. Rows whose requested cells are all blank are left out,
+    even when their filter cell matches (a row with nothing to say is no
+    mapping). A row counts as blank when the cells up to the right-most column
+    read (the filter included) are blank: data further right does not keep
+    reading going. Reading ends after :data:`BLANK_ROWS_END` consecutive blank
+    rows, at :data:`MAX_MAPPING_ROWS` matching rows or at a non-blank row more
+    than :data:`MAX_MAPPING_SCAN` rows below the header (both ``truncated``).
     """
     fcol, refs = _check(sheet, header_row, filter_column, filter_value, columns)
     wanted = None if filter_value is None else norm_label(filter_value)
@@ -110,6 +115,9 @@ def read_mapping(
                     break
                 continue
             blank_run = 0
+            if number - header_row > MAX_MAPPING_SCAN:
+                truncated = True
+                break
             if findex is not None and norm_label(texts[findex]) != wanted:
                 continue
             values = [texts[i] for i in indices]

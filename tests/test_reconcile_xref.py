@@ -81,6 +81,20 @@ def test_read_grid_window_and_truncation() -> None:
     assert [r["row"] for r in grid["rows"]] == [4, 5]
     assert grid["truncated"] is True
     assert grid["columns"] == list("ABCDE")
+    assert grid["max_rows"] == 2
+
+
+def test_read_grid_echoes_the_clamped_max_rows() -> None:
+    grid = read_grid(xref_book(), "Groups", max_rows=10_000)
+    assert grid["max_rows"] == MAX_GRID_ROWS
+
+
+def test_lookups_naming_a_sheet_in_another_case_share_one_table() -> None:
+    spec = _spec({"KIND": {"kind": "value_map", "sources": ["KIND"], "lookups": [_CODES]},
+                  "GROUP": {"kind": "value_map", "sources": ["GRP"],
+                            "lookups": [{**_CODES, "sheet": "CODES"}]}})
+    lookups = build_lookups(xref_book(), spec)
+    assert lookups[("KIND", 0)] is lookups[("GROUP", 0)]
 
 
 def test_read_grid_caps_rows_columns_and_cell_length() -> None:
@@ -290,6 +304,5 @@ def test_build_lookups_builds_each_lookup_of_a_source_chain_from_its_own_table()
     lookups = build_lookups(xref_book(), spec)
     assert lookups[("KIND", 0)].get(("X1",)) == "B"
     assert lookups[("KIND", 1)].get(("OLD2",)) == "NEW2"
-    # an override is part of what makes a table "the same": not shared with GROUP
-    assert lookups[("KIND", 1)] is not lookups[("GROUP", 0)]
-    assert lookups[("KIND", 1)].entries == lookups[("GROUP", 0)].entries
+    # the entries do not depend on the override: the table is read once and shared
+    assert lookups[("KIND", 1)] is lookups[("GROUP", 0)]

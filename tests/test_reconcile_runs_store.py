@@ -294,3 +294,25 @@ async def test_purge_older_than_removes_the_conversations_runs():
         assert await store.purge_older_than(s, 7) == 1
     assert await row(old_run) is None
     assert await row(kept_run) is not None
+
+
+async def test_a_failed_insert_is_rolled_back_before_the_error_leaves():
+    cid = await conversation()
+
+    async with SessionLocal() as s:
+        real_commit = s.commit
+
+        async def broken_commit() -> None:
+            if s.new:  # the INSERT's commit, not the stale sweep's
+                raise RuntimeError("insert refused")
+            await real_commit()
+
+        s.commit = broken_commit  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError):
+            await runs_store.create_run(
+                s, conversation_id=cid, principal=ALICE, message_id=None, table_name="ZTAB",
+                wave="W1", spec_file_id=None, rows_total=1)
+        assert not s.new  # the pending row is gone
+        # and the write lock with it: another session starts the run while
+        # this one is still open
+        assert await asyncio.wait_for(new_run(cid), 10) is not None

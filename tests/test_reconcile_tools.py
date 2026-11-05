@@ -647,3 +647,109 @@ async def test_status_of_a_failed_run_has_no_column_list(world):
     status = await call(world.ts, "reconciliation_status")
     assert status["counts"] == {"rows_total": 5}
     assert "columns" not in status
+
+
+# --- final review hygiene -----------------------------------------------------
+
+
+_FILE_ARGS = [
+    ("read_mapping", "file_id", XLSX),
+    ("read_xref_sheet", "file_id", XLSX),
+    ("save_spec", "csv_file_id", CSV),
+    ("save_spec", "xref_file_id", XLSX),
+    ("start_reconciliation", "spec_file_id", JSON),
+    ("start_reconciliation", "csv_file_id", CSV),
+    ("start_reconciliation", "xref_file_id", XLSX),
+]
+
+
+def _args(world: Any, spec_id: str) -> dict[str, dict[str, Any]]:
+    return {
+        "read_mapping": {"file_id": world.mapping, "sheet": "Fields", "filter_column": None,
+                         "filter_value": None, "columns": [{"letter": "A"}], "header_row": 4},
+        "read_xref_sheet": {"file_id": world.xref},
+        "save_spec": {"spec": spec_dict(), "csv_file_id": world.csv,
+                      "xref_file_id": world.xref},
+        "start_reconciliation": {"spec_file_id": spec_id, "csv_file_id": world.csv,
+                                 "xref_file_id": world.xref},
+    }
+
+
+@pytest.mark.parametrize("tool, arg, media_type", _FILE_ARGS)
+async def test_every_file_argument_refuses_another_conversations_file_unread(
+    world, monkeypatch, tool, arg, media_type
+):
+    spec_id = (await call(world.ts, "save_spec", spec=spec_dict(), csv_file_id=world.csv,
+                          xref_file_id=world.xref))["file_id"]
+    other_cid, _ = await conversation()
+    data = {XLSX: xref_book(), CSV: csv_bytes(), JSON: b"{}"}[media_type]
+    theirs = await upload(other_cid, "theirs", media_type, data)
+    loaded: list[str] = []
+    real = store.get_file
+
+    async def spying(db: Any, fid: str, principal: str) -> Any:
+        loaded.append(fid)
+        return await real(db, fid, principal)
+
+    monkeypatch.setattr(store, "get_file", spying)
+    kwargs = {**_args(world, spec_id)[tool], arg: theirs}
+    err = error_of(await call(world.ts, tool, **kwargs))
+    assert err["code"] == "file_not_found"
+    assert theirs not in loaded  # its bytes were never read
+
+
+async def test_start_refuses_a_spec_saved_in_another_conversation(world):
+    other_cid, other_mid = await conversation()
+    other = chat_context(other_cid, other_mid)
+    other_csv = await upload(other_cid, "ztab.csv", CSV, csv_bytes())
+    other_xref = await upload(other_cid, "codes.xlsx", XLSX, xref_book())
+    with bound(other):
+        spec_id = (await call(world.ts, "save_spec", spec=spec_dict(),
+                              csv_file_id=other_csv, xref_file_id=other_xref))["file_id"]
+    err = error_of(await call(world.ts, "start_reconciliation", spec_file_id=spec_id,
+                              csv_file_id=world.csv, xref_file_id=world.xref))
+    assert err["code"] == "file_not_found"
+
+
+async def _start_raising(world: Any, monkeypatch: Any, exc: BaseException) -> dict[str, Any]:
+    spec_id = (await call(world.ts, "save_spec", spec=spec_dict(), csv_file_id=world.csv,
+                          xref_file_id=world.xref))["file_id"]
+
+    async def failing(**kwargs: Any) -> Any:
+        raise exc
+
+    monkeypatch.setattr(run, "start", failing)
+    return error_of(await call(world.ts, "start_reconciliation", spec_file_id=spec_id,
+                               csv_file_id=world.csv, xref_file_id=world.xref))
+
+
+async def test_sign_in_needed_without_an_oauth_cause_is_answered_not_raised(world, monkeypatch):
+    from agents.reconcile.arc1_reader import Arc1ReadError
+
+    err = await _start_raising(world, monkeypatch, Arc1ReadError("sign_in_needed"))
+    assert err["code"] == "sign_in_needed" and err["message"] == MESSAGES["sign_in_needed"]
+
+
+async def test_an_unknown_reader_code_gets_the_fixed_failed_text(world, monkeypatch):
+    from agents.reconcile.arc1_reader import Arc1ReadError
+    from agents.reconcile.tool_support import FAILED
+
+    err = await _start_raising(world, monkeypatch, Arc1ReadError("brand_new", "server said x"))
+    assert err["code"] == "brand_new" and err["message"] == FAILED
+
+
+def test_a_lookup_refusal_hint_is_one_bounded_line():
+    from agents.reconcile.tool_support import lookup_refusal
+    from agents.reconcile.workbook import Refused
+
+    answer = lookup_refusal(Refused("lookup_empty", "m", "sheet 'a\nb'; " + "c" * 300))
+    hint = answer["error"]["hint"]
+    assert "\n" not in hint and len(hint) <= 160
+
+
+def test_save_spec_names_the_per_answer_file_cap():
+    from agents.webchat import docgen
+
+    ts = toolset()
+    assert f"{docgen.MAX_FILES_PER_RUN} files" in (ts.tools["save_spec"].function.__doc__ or "")
+    assert docgen.store_file is docgen._store

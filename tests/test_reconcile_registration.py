@@ -552,3 +552,36 @@ def test_endpoint_key_folds_scheme_and_host_case_only():
     assert endpoint_key(" https://arc1.example ") == "https://arc1.example/mcp"
     assert endpoint_key("https://arc1.example/Multi/MCP") == "https://arc1.example/Multi/MCP"
     assert endpoint_key("https://arc1.example:8443/mcp") == "https://arc1.example:8443/mcp"
+
+
+# --- bundles and the seed keep the four keys ----------------------------------
+
+
+async def test_export_import_and_seed_keep_the_four_reconcile_keys(client, tmp_path):
+    import json
+
+    from agents.admin import seed_from_file_if_empty
+
+    r = await client.post("/admin/api/agents",
+                          json=_agent("recon-trip", [_reconcile(dict(BLOCK)), _arc1()]))
+    assert r.status_code in (200, 201), r.text
+    stored = await _stored("recon-trip")
+    assert stored[0] == _reconcile(BLOCK)
+
+    exported = await client.get("/admin/api/export")
+    assert exported.status_code == 200, exported.text
+    bundle = exported.json()
+    (agent,) = [a for a in bundle["agents"] if a["name"] == "recon-trip"]
+    (entry,) = [s for s in agent["mcp_servers"] if s["url"] == URL]
+    assert {k: entry["oauth"][k] for k in BLOCK} == BLOCK
+
+    await _wipe()
+    r = await client.post("/admin/api/import", json=bundle)
+    assert r.status_code == 200, r.text
+    assert await _stored("recon-trip") == stored
+
+    await _wipe()
+    seed = tmp_path / "seed.json"
+    seed.write_text(json.dumps({"agents": [agent]}))
+    await seed_from_file_if_empty(seed)
+    assert await _stored("recon-trip") == stored

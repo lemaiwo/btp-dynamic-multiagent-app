@@ -92,9 +92,12 @@ def _as_dict(row: ReconcileRun) -> dict[str, Any]:
 async def create_run(
     db: AsyncSession, *, conversation_id: str, principal: str, message_id: str | None,
     table_name: str, wave: str, spec_file_id: str | None, rows_total: int,
-) -> str:
+) -> str | None:
     """Insert a ``running`` row and return its id, or ``None`` when nothing
     was inserted: the conversation already has a live run, or it is gone.
+
+    A failed INSERT or commit is rolled back before the error leaves, so the
+    write lock taken here is not held until the caller closes its session.
 
     A running row without a recent heartbeat is interrupted first, so a run
     a dead process left behind does not block the conversation for good.
@@ -119,8 +122,12 @@ async def create_run(
         status=RUNNING, rows_total=rows_total, rows_done=0,
         started_at=now, updated_at=now,
     )
-    db.add(row)
-    await db.commit()
+    try:
+        db.add(row)
+        await db.commit()
+    except BaseException:
+        await db.rollback()
+        raise
     return row.id
 
 

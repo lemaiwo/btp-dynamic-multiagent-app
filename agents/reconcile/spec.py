@@ -78,6 +78,15 @@ class ColumnRef(_Strict):
             raise ValueError("a column letter is one to three letters A-Z")
         return upper
 
+    @field_validator("label")
+    @classmethod
+    def _label(cls, value: str | None) -> str | None:
+        # A blank label (after NFKC, which folds a no-break space) is a prefix
+        # of every header label: refuse it rather than match a column by luck.
+        if value is not None and not unicodedata.normalize("NFKC", value).split():
+            raise ValueError("a column label is not blank")
+        return value
+
     @model_validator(mode="after")
     def _exactly_one(self) -> ColumnRef:
         if (self.letter is None) == (self.label is None):

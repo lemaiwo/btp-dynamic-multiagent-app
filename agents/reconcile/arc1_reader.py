@@ -243,6 +243,10 @@ def parse_answer(text: str) -> QueryAnswer:
     )
 
 
+# A schema property name fit to be named in a message: anything else is left out.
+_SHOWN_PROPERTY_RE = re.compile(r"[A-Za-z0-9_.-]{1,40}")
+
+
 def _schema_parts(schema: Any) -> list[dict[str, Any]]:
     """The schema and its ``anyOf``/``allOf``/``oneOf`` branches, one level deep."""
     if not isinstance(schema, dict):
@@ -422,7 +426,8 @@ class Arc1Reader:
                 names += [str(p) for p in props if str(p) not in names]
             req = part.get("required")
             # Top level and allOf branches bind; an anyOf/oneOf branch may not apply.
-            binding = i == 0 or part in (schema.get("allOf") or [])
+            # By identity: an anyOf branch equal to an allOf branch is still optional.
+            binding = i == 0 or any(part is b for b in (schema.get("allOf") or []))
             if binding and isinstance(req, list):
                 required += [str(r) for r in req]
         target_like = sorted(
@@ -432,10 +437,13 @@ class Arc1Reader:
         if self.target:
             if not target_like:
                 # The schema's property names come from the ARC-1 server, not
-                # from customer data, and tell an admin what the tool takes.
+                # from customer data, and tell an admin what the tool takes;
+                # only plain names are repeated (a server is not trusted to
+                # send no markup or line breaks).
+                shown = [n for n in names if _SHOWN_PROPERTY_RE.fullmatch(n)]
                 message = (
-                    _MESSAGES["target_not_supported"] + " It takes: " + ", ".join(names[:20]) + "."
-                    if names
+                    _MESSAGES["target_not_supported"] + " It takes: " + ", ".join(shown[:20]) + "."
+                    if shown
                     else _SCHEMA_UNREADABLE
                 )
                 err = Arc1ReadError("target_not_supported", message)
