@@ -553,3 +553,212 @@ def test_only_sap_query_is_called() -> None:
 
     _run(go())
     assert {name for name, _ in server.calls} == {"SAPQuery"}
+
+
+# --- fix round 1 -------------------------------------------------------------
+
+
+def _read_with(server: StubServer, answer: Any, keys: list[str], **kw: Any) -> Any:
+    async def go() -> Any:
+        async with _reader(server, **kw) as reader:
+            await reader.preflight()
+            server.calls.clear()
+            server.answers.append(answer)
+            return await reader.read(keys)
+
+    return _run(go())
+
+
+def test_read_duplicate_key_rows_are_ambiguous() -> None:
+    answer = _rows(["MATNR", "MATKL"], [["1", "A"], ["1", "B"]])
+    with pytest.raises(Arc1ReadError) as info:
+        _read_with(StubServer(), answer, ["1", "2"])
+    assert info.value.code == "ambiguous_key"
+
+
+def test_read_more_rows_than_keys_fails() -> None:
+    answer = _rows(["MATNR", "MATKL"], [["1", "A"], ["9", "B"]])
+    with pytest.raises(Arc1ReadError) as info:
+        _read_with(StubServer(), answer, ["1"])
+    assert info.value.code == "unexpected_result"
+
+
+def test_read_unrequested_key_fails() -> None:
+    answer = _rows(["MATNR", "MATKL"], [["9", "B"]])
+    with pytest.raises(Arc1ReadError) as info:
+        _read_with(StubServer(), answer, ["1", "2"])
+    assert info.value.code == "unexpected_result"
+
+
+@pytest.mark.parametrize(
+    "envelope",
+    [
+        {"truncated": True},
+        {"hasMore": True},
+        {"total": 5},
+        {"totalRows": 5},
+        {"rowCount": 5},
+    ],
+)
+def test_read_truncation_marker_fails(envelope: dict[str, Any]) -> None:
+    answer = json.dumps({"columns": ["MATNR", "MATKL"], "rows": [["1", "A"]], **envelope})
+    with pytest.raises(Arc1ReadError) as info:
+        _read_with(StubServer(), answer, ["1", "2", "3", "4", "5"])
+    assert info.value.code == "truncated"
+
+
+def test_read_envelope_counts_that_match_are_fine() -> None:
+    answer = json.dumps(
+        {"columns": ["MATNR", "MATKL"], "rows": [["1", "A"]], "rowCount": 1, "truncated": False}
+    )
+    assert _read_with(StubServer(), answer, ["1", "2"]) == {"1": {"MATNR": "1", "MATKL": "A"}}
+
+
+def test_parse_answer_keeps_envelope() -> None:
+    answer = arc1_reader.parse_answer(
+        json.dumps({"columns": ["A"], "rows": [["1"]], "truncated": True, "rowCount": 7})
+    )
+    assert answer.rows == [{"A": "1"}]
+    assert answer.truncated is True
+    assert answer.total == 7
+
+
+def test_read_padded_key_maps_to_requested_key() -> None:
+    answer = _rows(["MATNR", "MATKL"], [["AB   ", "X"]])
+    out = _read_with(StubServer(), answer, ["AB", "CD"])
+    assert out == {"AB": {"MATNR": "AB   ", "MATKL": "X"}}
+
+
+def test_read_requested_key_with_trailing_blank_maps_too() -> None:
+    server = StubServer()
+    answer = _rows(["MATNR", "MATKL"], [["AB", "X"]])
+    out = _read_with(server, answer, ["AB ", "CD"])
+    assert out == {"AB ": {"MATNR": "AB", "MATKL": "X"}}
+
+
+def test_read_refuses_trailing_newline_key() -> None:
+    server = StubServer()
+
+    async def go() -> None:
+        async with _reader(server) as reader:
+            await reader.preflight()
+            server.calls.clear()
+            await reader.read(["AB\n"])
+
+    with pytest.raises(ValueError):
+        _run(go())
+    assert server.calls == []
+    assert arc1_reader.KEY_RE.pattern.endswith(r"\Z")
+
+
+def test_preflight_dd03l_refused_has_own_code() -> None:
+    server = StubServer()
+    server.answers = [_payload(error="POLICY_DENIED", retryable=False, requestId="r-9")]
+    with pytest.raises(Arc1ReadError) as info:
+        _preflight(server)
+    assert info.value.code == "preflight_refused"
+    assert info.value.request_id == "r-9"
+
+
+def test_check_fields_false_skips_dd03l() -> None:
+    server = StubServer()
+
+    async def go() -> dict[str, dict[str, str]]:
+        async with _reader(server, check_fields=False) as reader:
+            await reader.preflight()
+            server.answers.append(_rows(["MATNR", "MATKL"], [["1", "A"]]))
+            return await reader.read(["1"])
+
+    assert _run(go()) == {"1": {"MATNR": "1", "MATKL": "A"}}
+    assert len(server.calls) == 1
+    assert " FROM MARA " in server.calls[0][1]["sql"]
+
+
+def test_preflight_full_dd03l_answer_skips_verdict() -> None:
+    fields = ["MATNR"] + [f"F{i:04d}" for i in range(999)]
+    server = StubServer(dd03l=fields)  # exactly 1000 rows, MATKL not among them
+    _preflight(server)
+
+
+def test_preflight_dd03l_truncation_marker_skips_verdict() -> None:
+    server = StubServer()
+    server.answers = [
+        json.dumps({"columns": ["FIELDNAME"], "rows": [["MATNR"]], "truncated": True})
+    ]
+    _preflight(server)
+
+
+def test_aexit_error_is_mapped_when_nothing_propagates() -> None:
+    server = StubServer()
+
+    async def boom(*exc: Any) -> None:
+        raise ExceptionGroup("tg", [ConnectionError("https://h/?token=secret")])
+
+    async def go() -> None:
+        async with _reader(server) as reader:
+            reader._run.__aexit__ = boom
+
+    with pytest.raises(Arc1ReadError) as info:
+        _run(go())
+    assert info.value.code == "arc1_failed"
+    assert "secret" not in str(info.value)
+
+
+def test_aexit_error_does_not_replace_propagating_error() -> None:
+    server = StubServer()
+
+    async def boom(*exc: Any) -> None:
+        raise ConnectionError("closing")
+
+    async def go() -> None:
+        async with _reader(server) as reader:
+            reader._run.__aexit__ = boom
+            raise KeyError("body")
+
+    with pytest.raises(KeyError):
+        _run(go())
+
+
+def test_target_with_unreadable_schema_says_so() -> None:
+    server = StubServer(tools=[SimpleNamespace(name="SAPQuery", inputSchema=None)])
+    with pytest.raises(Arc1ReadError) as info:
+        _preflight(server, target="SRC")
+    assert info.value.code == "target_not_supported"
+    assert "could not be read" in info.value.message
+    assert "It takes" not in info.value.message
+
+
+def test_target_inside_any_of_is_found() -> None:
+    schema = {
+        "type": "object",
+        "properties": {"sql": {}, "maxRows": {}},
+        "anyOf": [{"properties": {"system": {"type": "string"}}}],
+    }
+    server = StubServer(schema=schema)
+    _preflight(server, target="SRC")
+    assert server.calls[0][1]["system"] == "SRC"
+
+
+def test_target_required_inside_all_of() -> None:
+    schema = {
+        "type": "object",
+        "allOf": [{"properties": {"sql": {}, "target": {}}, "required": ["sql", "target"]}],
+    }
+    server = StubServer(schema=schema)
+    with pytest.raises(Arc1ReadError) as info:
+        _preflight(server)
+    assert info.value.code == "target_required"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        json.dumps({"columns": ["a", "A"], "rows": [["1", "2"]]}),
+        json.dumps([{"a": "1", "A": "2"}]),
+        "No rows found.",
+    ],
+)
+def test_parse_rows_collisions_and_plain_text(text: str) -> None:
+    with pytest.raises(Arc1ReadError) as info:
+        parse_rows(text)
+    assert info.value.code == "unexpected_result"

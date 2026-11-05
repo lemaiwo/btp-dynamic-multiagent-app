@@ -24,8 +24,16 @@ three promises:
 
 ``maxRows`` is always sent: ARC-1 defaults it to 100, so relying on the
 default would silently drop rows from a larger batch. A batch asks for exactly
-as many rows as it has (unique) keys; on a full key a key matches one row at
-most, so ``rows == maxRows`` is a complete answer.
+as many rows as it has (unique) keys. **``key_field`` must be the table's full
+key** (the spec and Task 9 enforce this): then a key matches one row at most,
+``rows == maxRows`` is a complete answer, and a second row for one key is an
+error (``ambiguous_key``) rather than a silent overwrite. A short answer is
+caught where ARC-1 says so: an envelope with ``truncated``/``hasMore`` true or
+a ``total``/``totalRows``/``rowCount`` above the rows returned is ``truncated``.
+
+CHAR keys: ABAP compares CHAR values ignoring trailing blanks, so rows are
+matched to the requested keys after ``rstrip()`` and the result is keyed by
+the key *as the caller passed it*.
 
 Target selection: a single-target ARC-1 has no target argument; a multi-target
 one may. Which property it is is read from the tool's input schema
@@ -39,7 +47,8 @@ import json
 import logging
 import re
 from collections.abc import Awaitable, Callable
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, NoReturn
 
 from pydantic_ai.exceptions import ModelRetry
 
@@ -54,8 +63,8 @@ logger = logging.getLogger(__name__)
 
 QUERY_TOOL = "SAPQuery"
 TARGET_PROPERTIES = ("target", "system", "sapsystem", "targetid")
-KEY_RE = re.compile(r"^[A-Za-z0-9 _\-./']{1,40}$")
-TARGET_RE = re.compile(r"^[A-Za-z0-9_.\-]{0,64}$")
+KEY_RE = re.compile(r"^[A-Za-z0-9 _\-./']{1,40}\Z")
+TARGET_RE = re.compile(r"^[A-Za-z0-9_.\-]{0,64}\Z")
 MAX_ROWS = 10_000  # ARC-1's SAPQuery ceiling for maxRows
 DD03L_MAX_ROWS = 1000
 REFUSED_MARKERS = ("policy", "forbidden", "not_allowed", "blocked")
@@ -71,7 +80,16 @@ _MESSAGES = {
     "target_not_supported": "A target system is configured, but the ARC-1 query tool "
     "takes no target argument.",
     "field_not_in_table": "Some fields the spec reads are not in the source table.",
+    "ambiguous_key": "The source table returned more than one row for a key; "
+    "the key field is not the full key.",
+    "truncated": "ARC-1 returned only part of the rows of a batch.",
+    "preflight_refused": "ARC-1 refused the field check on the data dictionary (DD03L). "
+    "The field check can be turned off for this source.",
 }
+_SCHEMA_UNREADABLE = (
+    "A target system is configured, but the input schema of the ARC-1 query "
+    "tool could not be read."
+)
 
 
 class Arc1ReadError(Exception):
@@ -137,23 +155,57 @@ def _cell(value: object) -> str:
 def _row(obj: object) -> dict[str, str]:
     if not isinstance(obj, dict):
         raise Arc1ReadError("unexpected_result")
-    return {str(k).upper(): _cell(v) for k, v in obj.items()}
+    out = {str(k).upper(): _cell(v) for k, v in obj.items()}
+    if len(out) != len(obj):  # "a" and "A": which one is the field?
+        raise Arc1ReadError("unexpected_result")
+    return out
+
+
+@dataclass(frozen=True)
+class QueryAnswer:
+    """The rows of a ``SAPQuery`` answer plus what its envelope says about them."""
+
+    rows: list[dict[str, str]] = field(default_factory=list)
+    truncated: bool = False
+    total: int | None = None
+
+    @property
+    def short(self) -> bool:
+        """ARC-1 said there are more rows than it returned."""
+        return self.truncated or (self.total is not None and self.total > len(self.rows))
+
+
+def _envelope_total(data: dict[str, Any]) -> int | None:
+    for name in ("total", "totalRows", "rowCount"):
+        value = data.get(name)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
 
 
 def parse_rows(text: str) -> list[dict[str, str]]:
-    """Rows of a ``SAPQuery`` answer as ``{FIELD: str}``; field names upper-cased.
+    """Rows of a ``SAPQuery`` answer as ``{FIELD: str}``; see :func:`parse_answer`."""
+    return parse_answer(text).rows
+
+
+def parse_answer(text: str) -> QueryAnswer:
+    """A ``SAPQuery`` answer as :class:`QueryAnswer`; field names upper-cased.
 
     Accepts ``{"columns": [names], "rows": [[...]]}``, ``{"columns":
     [{"name": ...}], "rows": [{...}]}`` and a bare list of objects. Anything
-    else is ``unexpected_result``: reading a strange answer as "no rows" would
-    report every CSV row as missing in the source.
+    else -- plain text included -- is ``unexpected_result``: reading a strange
+    answer as "no rows" would report every CSV row as missing in the source.
+    Values become ``str``: ``None`` is ``""``, numbers and booleans are
+    ``str(value)`` (``7``, ``1.5``, ``True``); nested values are refused. Field
+    names that collide after upper-casing are refused too. The envelope's
+    ``truncated``/``hasMore`` and ``total``/``totalRows``/``rowCount`` are kept.
     """
     try:
         data = json.loads(text)
     except (TypeError, ValueError, RecursionError):
         raise Arc1ReadError("unexpected_result") from None
     if isinstance(data, list):
-        return [_row(item) for item in data]
+        return QueryAnswer(rows=[_row(item) for item in data])
     if not isinstance(data, dict) or not isinstance(data.get("rows"), list):
         raise Arc1ReadError("unexpected_result")
     names: list[str] = []
@@ -164,6 +216,8 @@ def parse_rows(text: str) -> list[dict[str, str]]:
             names.append(col.upper())
         else:
             raise Arc1ReadError("unexpected_result")
+    if len(set(names)) != len(names):
+        raise Arc1ReadError("unexpected_result")
     out: list[dict[str, str]] = []
     for item in data["rows"]:
         if isinstance(item, list):
@@ -172,7 +226,23 @@ def parse_rows(text: str) -> list[dict[str, str]]:
             out.append({n: _cell(v) for n, v in zip(names, item, strict=True)})
         else:
             out.append(_row(item))
-    return out
+    return QueryAnswer(
+        rows=out,
+        truncated=data.get("truncated") is True or data.get("hasMore") is True,
+        total=_envelope_total(data),
+    )
+
+
+def _schema_parts(schema: Any) -> list[dict[str, Any]]:
+    """The schema and its ``anyOf``/``allOf``/``oneOf`` branches, one level deep."""
+    if not isinstance(schema, dict):
+        return []
+    parts = [schema]
+    for comb in ("anyOf", "allOf", "oneOf"):
+        branches = schema.get(comb)
+        if isinstance(branches, list):
+            parts += [b for b in branches if isinstance(b, dict)]
+    return parts
 
 
 def _tool_attr(tool: Any, *names: str) -> Any:
@@ -231,6 +301,7 @@ class Arc1Reader:
         target: str = "",
         retries: int = 3,
         sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
+        check_fields: bool = True,
     ):
         self.table = _check_ident(table)
         self.key_field = _check_ident(key_field)
@@ -241,6 +312,9 @@ class Arc1Reader:
             raise ValueError("not a target name")
         self.target = target
         self.retries = max(1, int(retries))
+        # Off for an ARC-1 whose policy refuses DD03L while the table itself is
+        # readable; a missing field then shows up as missing values instead.
+        self.check_fields = check_fields
         self._server = server
         self._sleep = sleep
         self._run: Any = None
@@ -259,8 +333,16 @@ class Arc1Reader:
 
     async def __aexit__(self, *exc: Any) -> None:
         run, self._run = self._run, None
-        if run is not None:
+        if run is None:
+            return
+        try:
             await run.__aexit__(*exc)
+        except Exception as close_exc:  # noqa: BLE001 -- mapped or logged below
+            err, _ = _exception_error(close_exc, self.target)
+            self._log(err, close_exc)
+            if exc and exc[0] is not None:
+                return  # never replace the exception already propagating
+            raise err from None
 
     def _log(self, err: Arc1ReadError, exc: BaseException | None = None) -> None:
         # Code, table and exception type only: SQL text, keys and ARC-1
@@ -292,12 +374,29 @@ class Arc1Reader:
         self._target_args = self._resolve_target(
             _tool_attr(tool, "inputSchema", "input_schema") or {}
         )
-        text = await self._query(
-            "SELECT FIELDNAME FROM DD03L "
-            f"WHERE TABNAME = {_literal(self.table)} AND AS4LOCAL = 'A'",
-            DD03L_MAX_ROWS,
-        )
-        present = {row.get("FIELDNAME", "").strip().upper() for row in self._parse(text)}
+        if not self.check_fields:
+            return
+        try:
+            text = await self._query(
+                "SELECT FIELDNAME FROM DD03L "
+                f"WHERE TABNAME = {_literal(self.table)} AND AS4LOCAL = 'A'",
+                DD03L_MAX_ROWS,
+            )
+        except Arc1ReadError as exc:
+            if exc.code != "arc1_refused":
+                raise
+            err = Arc1ReadError("preflight_refused", request_id=exc.request_id)
+            self._log(err)
+            raise err from None
+        answer = self._parse(text)
+        if answer.short or len(answer.rows) >= DD03L_MAX_ROWS:
+            # A cut-off field list would call existing fields missing.
+            logger.warning(
+                "[reconcile] DD03L answer for %s may be incomplete; field check skipped",
+                self.table,
+            )
+            return
+        present = {row.get("FIELDNAME", "").strip().upper() for row in answer.rows}
         missing = [f for f in self.fields if f not in present]
         if missing:
             err = Arc1ReadError("field_not_in_table", fields=missing)
@@ -305,10 +404,17 @@ class Arc1Reader:
             raise err
 
     def _resolve_target(self, schema: Any) -> dict[str, str]:
-        props = schema.get("properties") if isinstance(schema, dict) else None
-        names = [str(p) for p in props] if isinstance(props, dict) else []
-        required = schema.get("required") if isinstance(schema, dict) else None
-        required = [str(r) for r in required] if isinstance(required, list) else []
+        names: list[str] = []
+        required: list[str] = []
+        for i, part in enumerate(_schema_parts(schema)):
+            props = part.get("properties")
+            if isinstance(props, dict):
+                names += [str(p) for p in props if str(p) not in names]
+            req = part.get("required")
+            # Top level and allOf branches bind; an anyOf/oneOf branch may not apply.
+            binding = i == 0 or part in (schema.get("allOf") or [])
+            if binding and isinstance(req, list):
+                required += [str(r) for r in req]
         target_like = sorted(
             (n for n in names if n.lower() in TARGET_PROPERTIES),
             key=lambda n: TARGET_PROPERTIES.index(n.lower()),
@@ -317,11 +423,12 @@ class Arc1Reader:
             if not target_like:
                 # The schema's property names come from the ARC-1 server, not
                 # from customer data, and tell an admin what the tool takes.
-                err = Arc1ReadError(
-                    "target_not_supported",
-                    _MESSAGES["target_not_supported"]
-                    + " It takes: " + ", ".join(names[:20]) + ".",
+                message = (
+                    _MESSAGES["target_not_supported"] + " It takes: " + ", ".join(names[:20]) + "."
+                    if names
+                    else _SCHEMA_UNREADABLE
                 )
+                err = Arc1ReadError("target_not_supported", message)
                 self._log(err)
                 raise err
             return {target_like[0]: self.target}
@@ -331,9 +438,9 @@ class Arc1Reader:
             raise err
         return {}
 
-    def _parse(self, text: str) -> list[dict[str, str]]:
+    def _parse(self, text: str) -> QueryAnswer:
         try:
-            return parse_rows(text)
+            return parse_answer(text)
         except Arc1ReadError as err:
             self._log(err)
             raise
@@ -343,24 +450,51 @@ class Arc1Reader:
 
         The caller sizes the batch (at most :data:`MAX_ROWS` unique keys).
         """
-        unique = list(dict.fromkeys(keys))
-        if not unique:
+        for k in keys:
+            if not isinstance(k, str) or not KEY_RE.fullmatch(k):
+                raise ValueError("a key holds characters a key literal may not")
+        # Requested keys by their trimmed form (ABAP CHAR ignores trailing blanks).
+        wanted: dict[str, list[str]] = {}
+        for k in dict.fromkeys(keys):
+            wanted.setdefault(k.rstrip(), []).append(k)
+        if not wanted:
             return {}
-        if len(unique) > MAX_ROWS:
+        if len(wanted) > MAX_ROWS:
             raise ValueError("a batch holds at most 10000 keys")
-        sql = build_sql(self.table, self.fields, self.key_field, unique)
+        sql = build_sql(
+            self.table, self.fields, self.key_field, [ks[0] for ks in wanted.values()]
+        )
         self._require_run()
         if self._target_args is None:
             await self.preflight()
-        text = await self._query(sql, len(unique))
+        answer = self._parse(await self._query(sql, len(wanted)))
+        if answer.short:
+            self._fail("truncated")
+        if len(answer.rows) > len(wanted):
+            self._fail("ambiguous_key" if self._has_duplicate(answer.rows) else "unexpected_result")
         out: dict[str, dict[str, str]] = {}
-        for row in self._parse(text):
+        seen: set[str] = set()
+        for row in answer.rows:
             if self.key_field not in row:
-                err = Arc1ReadError("unexpected_result")
-                self._log(err)
-                raise err
-            out[row[self.key_field]] = row
+                self._fail("unexpected_result")
+            found = row[self.key_field].rstrip()
+            if found in seen:
+                self._fail("ambiguous_key")
+            if found not in wanted:
+                self._fail("unexpected_result")  # a row we did not ask for
+            seen.add(found)
+            for requested in wanted[found]:
+                out[requested] = row
         return out
+
+    def _has_duplicate(self, rows: list[dict[str, str]]) -> bool:
+        found = [row.get(self.key_field, "").rstrip() for row in rows]
+        return len(set(found)) != len(found)
+
+    def _fail(self, code: str) -> NoReturn:
+        err = Arc1ReadError(code)
+        self._log(err)
+        raise err
 
     async def _query(self, sql: str, max_rows: int) -> str:
         """One ``SAPQuery`` with retries for transient failures only."""
