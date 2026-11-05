@@ -23,11 +23,15 @@ three promises:
   is kept. Logs carry the code and the table, never the SQL text or keys.
 
 ``maxRows`` is always sent: ARC-1 defaults it to 100, so relying on the
-default would silently drop rows from a larger batch. A batch asks for exactly
-as many rows as it has (unique) keys. **``key_field`` must be the table's full
-key** (the spec and Task 9 enforce this): then a key matches one row at most,
-``rows == maxRows`` is a complete answer, and a second row for one key is an
-error (``ambiguous_key``) rather than a silent overwrite. A short answer is
+default would silently drop rows from a larger batch. A batch asks for **one
+row more** than it has (unique) keys (so it holds at most
+:data:`MAX_BATCH_KEYS`). **``key_field`` must be the table's full key** (the
+spec and Task 9 enforce this): then a key matches one row at most, an answer
+of as many rows as keys is provably not cut at ``maxRows``, and a second row
+for one key reaches the reader (``ambiguous_key``) instead of pushing a found
+key out of a full answer. An answer cut below the keys asked for (ARC-1's
+byte limit) cannot be told from keys that are not there; the run reads such
+keys once more on their own before it counts them missing. A short answer is
 caught where ARC-1 says so: an envelope with ``truncated``/``hasMore`` true or
 a ``total``/``totalRows``/``rowCount`` above the rows returned is ``truncated``.
 
@@ -66,6 +70,8 @@ TARGET_PROPERTIES = ("target", "system", "sapsystem", "targetid")
 KEY_RE = re.compile(r"^[A-Za-z0-9 _\-./']{1,40}\Z")
 TARGET_RE = re.compile(r"^[A-Za-z0-9_.\-]{0,64}\Z")
 MAX_ROWS = 10_000  # ARC-1's SAPQuery ceiling for maxRows
+# A batch asks for one row more than it has keys, so it holds at most this many.
+MAX_BATCH_KEYS = MAX_ROWS - 1
 DD03L_MAX_ROWS = 1000
 REFUSED_MARKERS = ("policy", "forbidden", "not_allowed", "blocked")
 BACKOFF_SECONDS = 0.5
@@ -448,7 +454,7 @@ class Arc1Reader:
     async def read(self, keys: list[str]) -> dict[str, dict[str, str]]:
         """``{key: row}`` for the keys found; one ``SAPQuery`` per call.
 
-        The caller sizes the batch (at most :data:`MAX_ROWS` unique keys).
+        The caller sizes the batch (at most :data:`MAX_BATCH_KEYS` unique keys).
         """
         for k in keys:
             if not isinstance(k, str) or not KEY_RE.fullmatch(k):
@@ -459,15 +465,15 @@ class Arc1Reader:
             wanted.setdefault(k.rstrip(), []).append(k)
         if not wanted:
             return {}
-        if len(wanted) > MAX_ROWS:
-            raise ValueError("a batch holds at most 10000 keys")
+        if len(wanted) > MAX_BATCH_KEYS:
+            raise ValueError("a batch holds at most 9999 keys")
         sql = build_sql(
             self.table, self.fields, self.key_field, [ks[0] for ks in wanted.values()]
         )
         self._require_run()
         if self._target_args is None:
             await self.preflight()
-        answer = self._parse(await self._query(sql, len(wanted)))
+        answer = self._parse(await self._query(sql, len(wanted) + 1))
         if answer.short:
             self._fail("truncated")
         if len(answer.rows) > len(wanted):

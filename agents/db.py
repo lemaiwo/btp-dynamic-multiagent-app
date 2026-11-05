@@ -84,7 +84,11 @@ from agents.pg_schema import (  # noqa: F401  (re-exported: they lived here)
     required_columns,
 )
 from agents.reconcile import BUILTIN_RECONCILE_URL
-from agents.reconcile.config import RECONCILE_KEYS  # noqa: F401  (re-export)
+from agents.reconcile.config import (  # noqa: F401  (the two names in capitals re-exported)
+    RECONCILE_KEYS,
+    RECONCILE_SINGLE_ENTRY_MESSAGE,
+    check_reconcile_entries,
+)
 from agents.reconcile.config import validate_reconcile_block as _validate_reconcile_block
 
 # Supported MCP auth modes
@@ -3059,6 +3063,7 @@ def prepare_servers(
     ina_seen = False
     bitbucket_seen = False
     git_seen = False
+    reconcile_seen = False
     for s in mcp_servers:
         url = (s.get("url") or "").strip()
         mode = (s.get("auth_mode") or AUTH_MODE_JWT).strip().lower()
@@ -3119,11 +3124,16 @@ def prepare_servers(
             url = BUILTIN_RECONCILE_URL
             if mode != AUTH_MODE_NONE:
                 raise ValueError(RECONCILE_MODE_MESSAGE)
+            if reconcile_seen:
+                raise ValueError(RECONCILE_SINGLE_ENTRY_MESSAGE)
+            reconcile_seen = True
         oauth = _clean_oauth(s.get("oauth"), mode, prev_oauth_by_url.get(url), url=url)
         entry: dict[str, Any] = {"url": url, "auth_mode": mode}
         if oauth is not None:
             entry["oauth"] = oauth
         normalized.append(entry)
+    # The ARC-1 sibling of a reconcile entry, on the stored (cleaned) list.
+    check_reconcile_entries(normalized)
 
     primary = normalized[0]
     extras = normalized[1:]

@@ -425,9 +425,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   write switches Jira `allow_comment` and the `allow_send` of oauth2 and
   app_only Outlook/Teams/Gmail are stored true only for the JSON boolean
   `true` (`is True`, never `bool()`: the string `"false"` is truthy).
-  `builtin:reconcile` (`agents/reconcile/`, `auth_mode=none`) gets only
-  `server_for`, the lookup of the agent's other MCP servers filled in the same
-  registry pass. `builtin:odata` and `builtin:ina` are the two whose entry
+  `builtin:reconcile` (`agents/reconcile/`, `auth_mode=none`) gets
+  `server_for` (`context["mcp_server_for"]`, the lookup of the agent's other MCP
+  servers filled in the same registry pass) and `agent_name`. `builtin:odata` and `builtin:ina` are the two whose entry
   names no destination (each catalogue service or registered query names its
   own) and the two factories that also receive the snapshot the registry
   loaded (catalogue services, `context["ina_queries"]`); `builtin:odata` is
@@ -1570,8 +1570,11 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   user), and stores an Excel report. Entry config (`config.py`,
   `validate_reconcile_block` shared by the admin gate, `agents.db._clean_builtin_public`
   and the factory; standard library only): `arc1_server` (https URL of the sibling
-  entry, blank = `arc1_not_configured`), `target` (`TARGET_RE`, blank for a
-  single-target ARC-1), `batch_size` (1..10,000, default 200), `mismatch_cap`
+  entry, blank = `arc1_not_configured`; `check_reconcile_entries`, at the gate and
+  in `prepare_servers`: that entry must be in the same agent with `auth_mode`
+  `oauth2` or `jwt`, `ARC1_SIBLING_MESSAGE`, and an agent has at most one
+  reconcile entry, `RECONCILE_SINGLE_ENTRY_MESSAGE`), `target` (`TARGET_RE`, blank for a
+  single-target ARC-1), `batch_size` (1..9,999, default 200), `mismatch_cap`
   (1..200,000, default 50,000); the numbers are strings in the stored block.
   - `spec.py` — `ReconcileSpec` and its rule models (`direct`, `constant`,
     `value_map`, `expression`, `not_needed`, `unresolved`; `KeySpec`,

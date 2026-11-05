@@ -446,9 +446,9 @@ It holds no credential. Keys of the config block (all optional, blank = default)
 
 | Key            | Meaning                                                                                   | Range / default |
 |----------------|-------------------------------------------------------------------------------------------|-----------------|
-| `arc1_server`  | URL of the ARC-1 server entry (an `oauth2` entry) of the **same** agent                    | https URL; blank = the tools answer `arc1_not_configured` |
+| `arc1_server`  | URL of the ARC-1 server entry of the **same** agent; that entry must be `oauth2` or `jwt` (a save is refused otherwise) | https URL; blank = the tools answer `arc1_not_configured` |
 | `target`       | Target system name on a multi-target ARC-1 server; blank for a single-target one           | `[A-Za-z0-9_.-]`, 1 to 64 characters; blank |
-| `batch_size`   | Distinct keys read per `SAPQuery` call                                                    | 1 to 10,000; 200 |
+| `batch_size`   | Distinct keys read per `SAPQuery` call (each call asks for one row more than its keys)    | 1 to 9,999; 200 |
 | `mismatch_cap` | Mismatch rows (and rows missing in the source) listed in the report; counts stay exact     | 1 to 200,000; 50,000 |
 
 The mapping layout (sheet name, header row, column labels) is not code: the
@@ -494,6 +494,8 @@ line) and `Not checked` (columns and why). Text cells are never formulas.
 
 - One table per run and a single-field key. Other source tables a rule needs are not read; the column is listed as not checked.
 - One run per conversation at a time (`already_running`). An app restart or deleting the conversation stops it.
+- An agent has at most one `builtin:reconcile` entry. A registry reload during a run (an agent save, a catalogue edit, a bundle import) is safe: the run keeps the ARC-1 connection of the build it started on until it ends.
+- Keys a batch's answer did not hold are read once more on their own before they count as missing in the source.
 - Upload size: `CHAT_MAX_FILE_BYTES` (default 10 MiB) per file. Mapping workbooks and CSVs of a migration can be larger: raise it for the landscape and size the instance memory to match.
 - Upload text in the prompt: `CHAT_ATTACHMENT_MAX_CHARS` (default 200,000 characters per file, minimum 1,000) cuts the text extracted from an upload. It applies to every chat agent of the landscape; the reconciliation tools read the files themselves and do not need the text in the prompt.
 - Mismatch cap: the report lists at most `mismatch_cap` mismatch rows and as many missing rows; the Summary says how many were dropped.

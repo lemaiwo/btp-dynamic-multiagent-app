@@ -31,7 +31,10 @@ deadline from a ``TimeoutError`` of the callee), failing the run as
 
 **Batches.** CSV rows are taken in order until :attr:`batch_size` distinct
 keys are pending; one ``SAPQuery`` reads them, then every pending row is
-compared. ``rows_done`` counts the data rows dealt with (invalid keys too).
+compared. Keys a batch's answer did not hold are read once more in their
+own query before they count as missing in the source (one retry per batch:
+an answer silently cut by ARC-1's byte limit must not read as "Missing in
+ECC"). ``rows_done`` counts the data rows dealt with (invalid keys too).
 
 **Heartbeat.** After every batch, and from a ticker every
 :data:`HEARTBEAT_SECONDS` while a read waits on ARC-1 or the report is built,
@@ -69,7 +72,7 @@ from sqlalchemy import delete
 import agents.db as agents_db
 from agents.auth import current_principal
 from agents.reconcile import runs_store
-from agents.reconcile.arc1_reader import MAX_ROWS, Arc1Reader, Arc1ReadError
+from agents.reconcile.arc1_reader import MAX_BATCH_KEYS, Arc1Reader, Arc1ReadError
 from agents.reconcile.engine import (
     ColumnStats,
     Comparer,
@@ -175,6 +178,14 @@ def task_of(conversation_id: str) -> asyncio.Task | None:
     return task if task is not None and not task.done() else None
 
 
+def in_flight() -> int:
+    """Runs in flight in this process, starts still in preflight included.
+
+    The registry's drain counts them: a reload must not close the retired
+    build's MCP clients while a run still reads through one of them."""
+    return sum(1 for t in _tasks.values() if not t.done()) + len(_starting)
+
+
 def progress(conversation_id: str) -> dict[str, int] | None:
     """``{rows_done, rows_total}`` of the conversation's run in this process, else ``None``.
 
@@ -223,10 +234,10 @@ async def start(
 
     Raises :class:`RunError`, ``Arc1ReadError`` (the preflight),
     ``xref_reader.Refused`` (a code table) or ``ValueError`` (a ``batch_size``
-    outside 1..10,000, a ``mismatch_cap`` below 1, a bad target name: the
+    outside 1..9,999, a ``mismatch_cap`` below 1, a bad target name: the
     entry's configuration, not the tester's input).
     """
-    _whole(batch_size, "batch_size", 1, MAX_ROWS)
+    _whole(batch_size, "batch_size", 1, MAX_BATCH_KEYS)
     _whole(mismatch_cap, "mismatch_cap", 1)
     if not principal or current_principal.get() != principal:
         raise RunError("not_signed_in")
@@ -425,6 +436,11 @@ async def _drive(job: _Job) -> None:
         async def flush() -> None:
             if pending:
                 found = await _read(reader, list(distinct))
+                # An answer cut below its keys (ARC-1's byte limit) looks like
+                # keys that are not there: read those once more on their own.
+                absent = [k for k in distinct if k not in found]
+                if absent:
+                    found.update(await _read(reader, absent))
                 for key, row_no, row in pending:
                     comparer.compare(key, row_no, row, found.get(key))
                 pending.clear()

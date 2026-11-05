@@ -45,12 +45,12 @@ from agents.ina.tools import NoUsableQueryError, attached_queries
 from agents.ina.tools import activity_summary as ina_activity_summary
 from agents.odata import BUILTIN_ODATA_URL
 from agents.odata.tools import NoUsableServiceError, attached_services
+from agents.reconcile.config import endpoint_key
 from agents.reconcile.tool_support import activity_summary as reconcile_activity_summary
 from agents.shared import (
     create_mcp_server,
     default_model_name,
     get_model,
-    mcp_endpoint_url,
     run_usage_limits,
 )
 from agents.sharepoint_tools import activity_summary as sharepoint_activity_summary
@@ -188,7 +188,7 @@ def _sibling_lookup(by_endpoint: dict[str, Any]) -> Callable[[str], Any | None]:
     """
 
     def server_for(url: str) -> Any | None:
-        return by_endpoint.get(mcp_endpoint_url(str(url or "").strip()))
+        return by_endpoint.get(endpoint_key(url))
 
     return server_for
 
@@ -1091,7 +1091,8 @@ async def build_orchestrator() -> BuildResult:
                 # rule (only SAPQuery, only the SQL it builds), and the
                 # reconcile tools themselves are denied in ABAP Assistant
                 # sessions (not in READONLY_POLICY).
-                by_endpoint[mcp_endpoint_url(str(spec["url"]).strip())] = server
+                # Scheme and host case folded on both sides (`endpoint_key`).
+                by_endpoint[endpoint_key(spec["url"])] = server
                 servers.append(server)
                 closable.append(server)
             except NoUsableQueryError:
@@ -1604,10 +1605,15 @@ class Registry:
         # global rather than per build, so while any job or workflow run is
         # in flight every retired build is kept; the per-build counter
         # covers chat, A2A and peer delegations.
+        # A reconciliation run (and a start still in its preflight) holds
+        # the agent's ARC-1 server of the build it was started on for its
+        # whole life, so it counts like a job run.
         from agents.job_runner import _tasks as in_flight_runs
+        from agents.reconcile import run as reconcile_run
         from agents.workflow_runner import _tasks as in_flight_workflows
 
-        background = len(in_flight_runs) + len(in_flight_workflows)
+        background = (len(in_flight_runs) + len(in_flight_workflows)
+                      + reconcile_run.in_flight())
         still_busy: list[BuildResult] = []
         closed: list[BuildResult] = []
         for build in self._retired:

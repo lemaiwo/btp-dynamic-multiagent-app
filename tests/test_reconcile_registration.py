@@ -124,16 +124,16 @@ def test_config_defaults_and_parsing():
     assert RECONCILE_KEYS == ("arc1_server", "target", "batch_size", "mismatch_cap")
     assert ReconcileConfig.from_oauth(None) == ReconcileConfig(
         "", "", DEFAULT_BATCH_SIZE, DEFAULT_MISMATCH_CAP)
-    assert ReconcileConfig.from_oauth({**BLOCK, "batch_size": "10000",
+    assert ReconcileConfig.from_oauth({**BLOCK, "batch_size": "9999",
                                        "mismatch_cap": "200000", "target": " SRC "}) == (
-        ReconcileConfig(ARC1, "SRC", 10_000, 200_000))
+        ReconcileConfig(ARC1, "SRC", 9_999, 200_000))
     assert ReconcileConfig.from_oauth({"batch_size": " ", "mismatch_cap": ""}) == (
         ReconcileConfig("", "", DEFAULT_BATCH_SIZE, DEFAULT_MISMATCH_CAP))
 
 
 @pytest.mark.parametrize("change, field", [
     ({"batch_size": "0"}, "oauth.batch_size"),
-    ({"batch_size": "10001"}, "oauth.batch_size"),
+    ({"batch_size": "10000"}, "oauth.batch_size"),
     ({"batch_size": "abc"}, "oauth.batch_size"),
     ({"batch_size": "-5"}, "oauth.batch_size"),
     ({"batch_size": "1.5"}, "oauth.batch_size"),
@@ -187,7 +187,7 @@ def test_the_gate_hands_storage_exactly_the_four_keys():
 
 @pytest.mark.parametrize("change, said", [
     ({"batch_size": "0"}, "oauth.batch_size"),
-    ({"batch_size": "10001"}, "oauth.batch_size"),
+    ({"batch_size": "10000"}, "oauth.batch_size"),
     ({"batch_size": "abc"}, "oauth.batch_size"),
     ({"mismatch_cap": "200001"}, "oauth.mismatch_cap"),
     ({"arc1_server": "http://x"}, "oauth.arc1_server"),
@@ -308,7 +308,7 @@ async def test_the_api_stores_the_entry_and_refuses_bad_values_with_422(client):
 
     refused = [
         ({"batch_size": "0"}, "oauth.batch_size"),
-        ({"batch_size": "10001"}, "oauth.batch_size"),
+        ({"batch_size": "10000"}, "oauth.batch_size"),
         ({"batch_size": "abc"}, "oauth.batch_size"),
         ({"mismatch_cap": "200001"}, "oauth.mismatch_cap"),
         ({"arc1_server": "http://x"}, "oauth.arc1_server"),
@@ -381,13 +381,14 @@ async def test_the_factory_resolves_the_very_server_of_its_own_agent(monkeypatch
         # The reconcile entry first: the sibling is built after it.
         "alpha": [_reconcile(dict(BLOCK)), _arc1()],
         "beta": [_arc1(OTHER_ARC1), _reconcile({**BLOCK, "arc1_server": OTHER_ARC1})],
-        "gamma": [_reconcile(dict(BLOCK))],
+        "gamma": [_reconcile({**BLOCK, "arc1_server": ""})],
     }, monkeypatch)
     assert {"alpha", "beta", "gamma"} <= set(build.specialists)
 
     alpha = toolsets["alpha"].reconcile_context
     server = alpha.server_for(f"{ARC1}/")
     assert isinstance(server, PerRunMCPServer)
+    assert alpha.server_for("HTTPS://ARC1.Example/mcp") is server  # host case folded
     assert server is created[("alpha", ARC1)]
     assert alpha.arc1_server() is server
     assert mcp_endpoint_url(ARC1) == mcp_endpoint_url(f"{ARC1}/")
@@ -408,8 +409,146 @@ async def test_the_factory_resolves_the_very_server_of_its_own_agent(monkeypatch
 async def test_a_builtin_url_is_never_a_sibling(monkeypatch):
     monkeypatch.setenv("MCP_URL_ALLOWLIST", "arc1.example")
     _, toolsets, _ = await _build({
-        "delta": [_reconcile(dict(BLOCK)), {"url": "builtin:sapnotes", "auth_mode": "none"}],
+        "delta": [_reconcile({**BLOCK, "arc1_server": ""}),
+                  {"url": "builtin:sapnotes", "auth_mode": "none"}],
     }, monkeypatch)
     ctx = toolsets["delta"].reconcile_context
     assert ctx.server_for("builtin:sapnotes") is None
     assert ctx.server_for(URL) is None
+
+
+# --- A1: a reload keeps a retired build open while a reconciliation runs ---------------
+
+class _Client:
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class _Server:
+    def __init__(self) -> None:
+        self._http_client = _Client()
+
+
+async def test_a_reload_keeps_the_retired_build_open_while_a_run_is_in_flight(monkeypatch):
+    import asyncio
+
+    import agents.registry as registry_module
+    from agents.reconcile import run as reconcile_run
+
+    async def build():
+        return registry_module.BuildResult(
+            orchestrator=object(), specialists={}, mcp_clients=[_Server()], configs=[])
+
+    monkeypatch.setattr(registry_module, "build_orchestrator", build)
+    reg = registry_module.Registry()
+    first = await reg.reload()
+    gate = asyncio.Event()
+    task = asyncio.create_task(gate.wait())
+    monkeypatch.setitem(reconcile_run._tasks, "conv-a1", task)
+    try:
+        await reg.reload()
+        assert not first.mcp_clients[0]._http_client.closed
+        assert reg._retired == [first]
+    finally:
+        gate.set()
+        await task
+    # A finished task no longer counts, even before its entry is removed.
+    await reg.reload()
+    assert first.mcp_clients[0]._http_client.closed
+
+
+# --- A3: the ARC-1 sibling and a single entry -------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _allow_the_test_hosts(monkeypatch):
+    monkeypatch.setenv("MCP_URL_ALLOWLIST", "arc1.example,arc1-other.example")
+
+
+def _agent_payload(servers: list[dict[str, Any]]):
+    from agents.admin import AgentPayload
+
+    return AgentPayload(**_agent("recon-a3", servers))
+
+
+def _agent_refusal(servers: list[dict[str, Any]]) -> str:
+    with pytest.raises(ValidationError) as info:
+        _agent_payload(servers)
+    return " | ".join(e["msg"] for e in info.value.errors())
+
+
+def _sibling(mode: str, url: str = ARC1) -> dict[str, Any]:
+    if mode == "oauth2":
+        return _arc1(url)
+    if mode == "destination":
+        return {"url": url, "auth_mode": mode, "oauth": {"destination": "ARC1_DEST"}}
+    if mode == "app_only":
+        return {"url": url, "auth_mode": mode, "oauth": {
+            "client_id": "cid", "client_secret": SECRET,
+            "token_url": "https://login.example/token"}}
+    return {"url": url, "auth_mode": mode}
+
+
+@pytest.mark.parametrize("mode", ["oauth2", "jwt"])
+def test_an_oauth2_or_jwt_sibling_is_accepted(mode):
+    payload = _agent_payload([_reconcile(dict(BLOCK)), _sibling(mode)])
+    assert len(payload.mcp_servers) == 2
+    # The sibling may be spelled differently (host case, trailing slash, bare host).
+    _agent_payload([_reconcile({**BLOCK, "arc1_server": "https://ARC1.example/mcp/"}),
+                    _sibling(mode)])
+    _agent_payload([_reconcile({**BLOCK, "arc1_server": "https://arc1.example"}),
+                    _sibling(mode)])
+
+
+@pytest.mark.parametrize("mode", ["none", "app_only", "destination"])
+def test_a_sibling_on_another_mode_is_refused(mode):
+    from agents.reconcile.config import ARC1_SIBLING_MESSAGE
+
+    text = _agent_refusal([_reconcile(dict(BLOCK)), _sibling(mode)])
+    assert ARC1_SIBLING_MESSAGE in text and "oauth.arc1_server" in text
+    assert SECRET not in text
+
+
+def test_no_sibling_is_refused_but_a_blank_arc1_server_is_not():
+    from agents.reconcile.config import ARC1_SIBLING_MESSAGE
+
+    assert ARC1_SIBLING_MESSAGE in _agent_refusal(
+        [_reconcile(dict(BLOCK)), _arc1(OTHER_ARC1)])
+    assert ARC1_SIBLING_MESSAGE in _agent_refusal([_reconcile(dict(BLOCK))])
+    _agent_payload([_reconcile({**BLOCK, "arc1_server": ""})])
+
+
+def test_two_reconcile_entries_are_refused_at_the_gate_and_in_storage():
+    from agents.db import prepare_servers
+    from agents.reconcile.config import RECONCILE_SINGLE_ENTRY_MESSAGE
+
+    assert RECONCILE_SINGLE_ENTRY_MESSAGE in _agent_refusal(
+        [_reconcile(dict(BLOCK)), _reconcile(dict(BLOCK)), _arc1()])
+    with pytest.raises(ValueError, match="at most one builtin:reconcile entry"):
+        prepare_servers([_reconcile(dict(BLOCK)),
+                         {**_reconcile(dict(BLOCK)), "url": "BUILTIN:Reconcile/"}, _arc1()],
+                        None)
+
+
+@pytest.mark.parametrize("mode", ["none", "app_only", "destination"])
+def test_storage_refuses_a_sibling_on_another_mode(mode):
+    from agents.db import prepare_servers
+    from agents.reconcile.config import ARC1_SIBLING_MESSAGE
+
+    with pytest.raises(ValueError) as info:
+        prepare_servers([_reconcile(dict(BLOCK)), _sibling(mode)], None)
+    assert str(info.value) == ARC1_SIBLING_MESSAGE
+    with pytest.raises(ValueError, match="oauth.arc1_server"):
+        prepare_servers([_reconcile(dict(BLOCK))], None)
+    prepare_servers([_reconcile(dict(BLOCK)), _sibling("jwt")], None)
+
+
+def test_endpoint_key_folds_scheme_and_host_case_only():
+    from agents.reconcile.config import endpoint_key
+
+    assert endpoint_key("HTTPS://ARC1.Example/mcp/") == "https://arc1.example/mcp"
+    assert endpoint_key(" https://arc1.example ") == "https://arc1.example/mcp"
+    assert endpoint_key("https://arc1.example/Multi/MCP") == "https://arc1.example/Multi/MCP"
+    assert endpoint_key("https://arc1.example:8443/mcp") == "https://arc1.example:8443/mcp"

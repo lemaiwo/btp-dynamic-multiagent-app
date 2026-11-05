@@ -137,7 +137,10 @@ class StubRun:
             raise server.fail_at[n]
         keys = [k.replace("''", "'") for k in _LITERAL.findall(_IN_LIST.search(sql).group(1))]
         fields = sql[len("SELECT "):sql.index(" FROM ")].split(", ")
-        rows = [[server.table[k][f] for f in fields] for k in keys if k in server.table]
+        dropped = server.drop_once & set(keys)
+        server.drop_once -= dropped
+        rows = [[server.table[k][f] for f in fields] for k in keys
+                if k in server.table and k not in dropped]
         return json.dumps({"columns": fields, "rows": rows})
 
 
@@ -154,6 +157,8 @@ class StubServer:
         self.gate: asyncio.Event | None = None
         self.on_batch: Any = None
         self.fail_at: dict[int, BaseException] = {}
+        # Keys left out of the first answer that asks for them (a silently short answer).
+        self.drop_once: set[str] = set()
 
     def check_caller(self) -> None:
         who = current_principal.get()
@@ -261,7 +266,8 @@ async def test_a_run_reads_in_batches_and_stores_its_report():
     assert {k: counts[k] for k in expected} == expected
     assert counts["mismatches"] > 0 and counts["missing_in_ecc"] == 10
 
-    assert [c["maxRows"] for c in server.calls] == [200, 200, 200, 200, 200, 50]
+    # One extra row per read; a batch with keys missing reads them once more.
+    assert [c["maxRows"] for c in server.calls] == [201, 3] * 5 + [51]
     assert server.dd03l_calls == 1  # the preflight of start, not again in the task
     files = await files_of(cid)
     assert len(files) == 1
@@ -272,6 +278,21 @@ async def test_a_run_reads_in_batches_and_stores_its_report():
     assert f.name.startswith("reconcile-ZTAB-W1-") and f.name.endswith(".xlsx")
     assert f.data[:2] == b"PK"
     assert server.closed == server.sessions  # every ARC-1 session it opened is closed
+
+
+async def test_keys_a_short_answer_left_out_are_read_again_before_they_count_missing():
+    cid, mid = await conversation()
+    server = StubServer()
+    server.drop_once = {"0000000001", "0000000250"}
+    answer = await start(cid, mid, server)
+    await wait(cid)
+    got = await row_of(answer["run_id"])
+    assert got.status == "done"
+    counts = json.loads(got.counts_json)
+    assert counts["missing_in_ecc"] == 10  # the two dropped keys were found the second time
+    retries = [c for c in server.calls if c["maxRows"] < 50]
+    assert ("'0000000001'" in retries[0]["sql"] and "'0000000100'" in retries[0]["sql"])
+    assert len(server.calls) == 11  # still one retry per batch at most
 
 
 async def test_the_background_task_keeps_acting_as_the_caller():
@@ -424,7 +445,8 @@ async def test_create_run_answering_none_is_already_running(monkeypatch):
 async def test_sign_in_needed_mid_run_fails_the_row_without_a_report():
     cid, mid = await conversation()
     server = StubServer()
-    server.fail_at = {3: OAuthAuthorizationRequired("https://arc1.example/mcp")}
+    # Calls 1-4 are batches 1-2 and their re-reads of missing keys; 5 is batch 3.
+    server.fail_at = {5: OAuthAuthorizationRequired("https://arc1.example/mcp")}
     answer = await start(cid, mid, server)
     await wait(cid)
     got = await row_of(answer["run_id"])
@@ -542,7 +564,8 @@ async def test_progress_while_running_and_cancel_all_interrupts():
     server.gate = asyncio.Event()
 
     async def second_waits(n: int) -> None:
-        if n == 1:
+        # Calls 1 and 2 are batch 1 and its re-read of missing keys.
+        if n <= 2:
             server.gate.set()
         else:
             server.gate.clear()
@@ -550,7 +573,7 @@ async def test_progress_while_running_and_cancel_all_interrupts():
     server.on_batch = second_waits
     answer = await start(cid, mid, server)
     for _ in range(100):
-        if len(server.calls) >= 2:
+        if len(server.calls) >= 3:
             break
         await asyncio.sleep(0.01)
     assert run.progress(cid) == {"rows_done": 200, "rows_total": ROWS}

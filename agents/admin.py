@@ -153,7 +153,7 @@ from agents.odata import BUILTIN_ODATA_URL
 from agents.odata.models import MAX_DEFINITION_BYTES, SERVICE_NAME_RE
 from agents.outlook_tools import BUILTIN_OUTLOOK_URL
 from agents.reconcile import BUILTIN_RECONCILE_URL
-from agents.reconcile.config import validate_reconcile_block
+from agents.reconcile.config import check_reconcile_entries, validate_reconcile_block
 from agents.registry import registry
 from agents.sapnotedetail_tools import BUILTIN_SAPNOTEDETAIL_URL
 from agents.shared import available_models, default_model_name
@@ -1280,6 +1280,9 @@ class AgentPayload(BaseModel):
             raise ValueError(BITBUCKET_SINGLE_ENTRY_MESSAGE)
         if sum(1 for u in urls if _server_key(u) == BUILTIN_GIT_URL) > 1:
             raise ValueError(GIT_SINGLE_ENTRY_MESSAGE)
+        # One reconcile entry, and its ARC-1 sibling in this very list on a
+        # mode that acts as the tester (storage checks the same).
+        check_reconcile_entries(self.to_servers_list())
         if len(set(urls)) != len(urls):
             raise ValueError("mcp_servers contains duplicate urls")
         return self

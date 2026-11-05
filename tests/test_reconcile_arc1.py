@@ -207,7 +207,9 @@ def test_read_sends_one_query_with_max_rows_and_maps_by_key() -> None:
             {
                 "sql": "SELECT MATNR, MATKL FROM MARA WHERE MATNR IN "
                 "('000000000000000001', '000000000000000002')",
-                "maxRows": 2,
+                # One more than the keys: a full answer (rows == keys) is then
+                # provably not cut at maxRows, and a duplicate shows up.
+                "maxRows": 3,
             },
         )
     ]
@@ -762,3 +764,32 @@ def test_parse_rows_collisions_and_plain_text(text: str) -> None:
     with pytest.raises(Arc1ReadError) as info:
         parse_rows(text)
     assert info.value.code == "unexpected_result"
+
+
+def test_read_refuses_more_keys_than_leave_room_for_the_extra_row() -> None:
+    server = StubServer()
+    keys = [str(i) for i in range(arc1_reader.MAX_BATCH_KEYS + 1)]
+
+    async def go() -> None:
+        async with _reader(server) as reader:
+            await reader.preflight()
+            await reader.read(keys)
+
+    assert arc1_reader.MAX_BATCH_KEYS == arc1_reader.MAX_ROWS - 1 == 9_999
+    with pytest.raises(ValueError):
+        _run(go())
+
+
+def test_a_duplicate_row_at_the_extra_row_is_an_ambiguous_key() -> None:
+    server = StubServer()
+
+    async def go() -> None:
+        async with _reader(server) as reader:
+            await reader.preflight()
+            server.answers.append(_rows(["MATNR", "MATKL"], [["1", "A"], ["1", "B"]]))
+            await reader.read(["1"])
+
+    with pytest.raises(Arc1ReadError) as info:
+        _run(go())
+    assert info.value.code == "ambiguous_key"
+    assert server.calls[-1][1]["maxRows"] == 2
