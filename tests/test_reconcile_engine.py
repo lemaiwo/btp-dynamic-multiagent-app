@@ -231,11 +231,38 @@ def test_value_map_first_lookup_wins() -> None:
     assert _matched(rule, "FIRST", {"MTART": "A"}, lookups=lookups)
 
 
-def test_value_map_lookup_key_is_trimmed_and_alpha_fallback() -> None:
+def test_value_map_lookup_key_is_trimmed() -> None:
     lookups = {("Col", 0): Lookup({("1",): "ONE"})}
     assert _matched(_vm(), "ONE", {"MTART": " 1 "}, lookups=lookups)
-    # SAP NUMC "0001" against a code table cell that Excel stored as the number 1
-    assert _matched(_vm(), "ONE", {"MTART": "0001"}, lookups=lookups)
+
+
+def test_value_map_no_alpha_keeps_leading_zero_codes_distinct() -> None:
+    lookups = {("Col", 0): Lookup({("0010",): "PADDED", ("10",): "PLAIN"})}
+    assert _matched(_vm(), "PADDED", {"MTART": "0010"}, lookups=lookups)
+    assert _matched(_vm(), "PLAIN", {"MTART": "10"}, lookups=lookups)
+    result, _ = _one(_vm(), "PLAIN", {"MTART": "010"}, lookups=lookups)
+    assert result.mismatches[0].reason == "no_xref_entry"
+
+
+def test_value_map_alpha_is_opt_in_and_both_directions() -> None:
+    table = {("Col", 0): Lookup({("1",): "ONE"})}
+    assert not _matched(_vm(), "ONE", {"MTART": "0001"}, lookups=table)
+    # SAP NUMC "0001" against a code-table cell Excel stored as the number 1
+    assert _matched(_vm(alpha=True), "ONE", {"MTART": "0001"}, lookups=table)
+    padded = {("Col", 0): Lookup({("0010",): "TEN"})}
+    assert _matched(_vm(alpha=True), "TEN", {"MTART": "10"}, lookups=padded)
+
+
+def test_value_map_alpha_exact_still_wins() -> None:
+    lookups = {("Col", 0): Lookup({("0010",): "PADDED", ("10",): "PLAIN"})}
+    assert _matched(_vm(alpha=True), "PADDED", {"MTART": "0010"}, lookups=lookups)
+    assert _matched(_vm(alpha=True), "PLAIN", {"MTART": "10"}, lookups=lookups)
+
+
+def test_value_map_exact_in_later_lookup_beats_alpha_in_earlier() -> None:
+    rule = _vm(alpha=True, lookups=[LOOKUP, {**LOOKUP, "sheet": "Groups"}])
+    lookups = {("Col", 0): Lookup({("10",): "ALPHA_HIT"}), ("Col", 1): Lookup({("0010",): "EXACT"})}
+    assert _matched(rule, "EXACT", {"MTART": "0010"}, lookups=lookups)
 
 
 def test_value_map_miss_report() -> None:
@@ -257,6 +284,14 @@ def test_value_map_miss_source() -> None:
     lookups = {("Col", 0): Lookup({("A",): "NEW_A"})}
     rule = _vm(on_miss="source")
     assert _matched(rule, "Z", {"MTART": "Z"}, lookups=lookups)
+
+
+def test_value_map_miss_source_uses_first_non_blank_source() -> None:
+    two = {**LOOKUP, "keys": [{"letter": "A"}, {"letter": "B"}]}
+    rule = _vm(sources=["MTART", "MATKL"], lookups=[two], on_miss="source")
+    lookups = {("Col", 0): Lookup({("A", "G1"): "AG"})}
+    assert _matched(rule, "G2", {"MTART": " ", "MATKL": "G2"}, lookups=lookups)
+    assert _matched(rule, "B", {"MTART": "B", "MATKL": "G2"}, lookups=lookups)
 
 
 def test_value_map_all_sources_blank_expects_blank() -> None:
@@ -351,6 +386,25 @@ def test_expression_value_field() -> None:
     assert (m.kind, m.source, m.expected) == ("expression", "three", "three")
 
 
+def _numc_expr(**over: Any) -> dict[str, Any]:
+    rule = _expr([_case([{"field": "F1", "op": "equals", "values": ["1"]}], {"const": "X"}),
+                  _case([{"field": "F1", "op": "in", "values": ["2", "3"]}], {"const": "Z"})],
+                 {"const": "Y"})
+    rule.update(over)
+    return rule
+
+
+def test_expression_conditions_honour_alpha() -> None:
+    assert _matched(_numc_expr(), "Y", {"F1": "0001"})
+    assert _matched(_numc_expr(alpha=True), "X", {"F1": "0001"})
+    assert _matched(_numc_expr(alpha=True), "Z", {"F1": "003"})
+
+
+def test_expression_conditions_honour_numeric() -> None:
+    assert _matched(_numc_expr(numeric=True), "X", {"F1": "1.00"})
+    assert _matched(_numc_expr(), "Y", {"F1": "1.00"})
+
+
 def test_expression_equals_is_trimmed() -> None:
     rule = _expr([_case([{"field": "F1", "op": "equals", "values": ["A"]}], {"const": "X"})],
                  {"const": "Y"})
@@ -443,10 +497,40 @@ def test_result_takes_malformed_rows() -> None:
     assert comparer.result(malformed_rows=3).malformed_rows == 3
 
 
-def test_csv_column_missing_from_row_counts_as_blank() -> None:
-    comparer = Comparer(_spec({"Col": {"kind": "not_needed"}}), {})
-    comparer.compare("K1", 2, {}, {"OBJNR": "K1"})
-    assert comparer.result().stats["Col"].matched == 1
+@pytest.mark.parametrize("rule", [{"kind": "not_needed"},
+                                  {"kind": "unresolved", "text": "unclear"}])
+def test_csv_column_missing_from_row_is_refused(rule: dict[str, Any]) -> None:
+    comparer = Comparer(_spec({"Col": rule}), {})
+    with pytest.raises(CsvError) as exc:
+        comparer.compare("K1", 2, {"Object": "K1"}, {"OBJNR": "K1"})
+    assert exc.value.code == "column_missing"
+    assert comparer.result().stats["Col"].checked == 0
+
+
+def test_key_of_contract_once_per_row() -> None:
+    """Each call is one data row: calling twice for the same row counts a duplicate."""
+    comparer = Comparer(_spec({"Col": {"kind": "not_needed"}}), {}, mismatch_cap=2)
+    row = {"Object": "1"}
+    comparer.key_of(row, row_no=2)
+    comparer.key_of(row, row_no=2)
+    for row_no in (3, 4, 5):
+        assert comparer.key_of({"Object": "bad'key"}, row_no=row_no) is None
+    result = comparer.result()
+    assert (result.rows_total, result.duplicate_keys, result.invalid_keys) == (5, 1, 3)
+    assert result.invalid_key_rows == [3, 4]  # capped like the other lists
+
+
+def test_iter_csv_not_utf8_late_in_file() -> None:
+    body = b"".join(b"%d,ok\n" % n for n in range(5000))
+    header, rows = iter_csv(b"Object,Text\n" + body + b"9,caf\xe9\n")
+    assert header == ["Object", "Text"]
+    with pytest.raises(CsvError) as exc:
+        list(rows)
+    assert exc.value.code == "not_utf8"
+
+
+def test_normalise_key_full_match_only() -> None:
+    assert normalise_key("AB\nCD", KEY) is None
 
 
 def test_missing_columns() -> None:

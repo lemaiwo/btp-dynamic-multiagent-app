@@ -15,6 +15,9 @@ mismatches and of keys missing in the source stop at ``mismatch_cap`` and count
 what they dropped, so a CSV that is wrong in every cell cannot exhaust the
 instance. The only per-row state is the set of keys seen (for duplicates).
 
+Keys are compared case-sensitively, as SAP stores them: a lower-case CSV key
+for an upper-case source key is reported as missing in the source.
+
 Error texts are fixed (:class:`CsvError` carries a ``code``): a CSV holds
 customer data, and an exception that quoted a cell would carry it into logs.
 """
@@ -42,7 +45,8 @@ from agents.reconcile.spec import (
 )
 from agents.reconcile.values import alpha, clean, pad_key, same
 
-KEY_RE = re.compile(r"^[A-Za-z0-9 _\-./]+$")  # also what may be pasted into an ABAP SQL literal
+# Used with fullmatch; also what may be pasted into an ABAP SQL literal.
+KEY_RE = re.compile(r"[A-Za-z0-9 _\-./]+")
 
 CSV_ERRORS = {
     "not_utf8": "The CSV file is not UTF-8 text.",
@@ -50,6 +54,7 @@ CSV_ERRORS = {
     "duplicate_header": "The CSV header names a column twice.",
     "too_many_columns": f"The CSV file has more than {MAX_COLUMNS} columns.",
     "malformed_csv": "The CSV file cannot be parsed.",
+    "column_missing": "A column of the spec is not in the CSV header.",
 }
 
 # Mismatch reasons (stable codes; the report and the model show them).
@@ -67,7 +72,13 @@ class CsvError(ValueError):
 
 
 class LookupTable(Protocol):
-    """A code table: cleaned source value(s) → target value (``xref_reader.Lookup``)."""
+    """A code table: cleaned source value(s) → target value (``xref_reader.Lookup``).
+
+    ``entries`` (in workbook order) is read only for rules with ``alpha``, to
+    build the leading-zero-free index once per lookup.
+    """
+
+    entries: Mapping[tuple[str, ...], str]
 
     def get(self, key: tuple[str, ...]) -> str | None: ...
 
@@ -84,6 +95,7 @@ class CsvRows(Iterator[tuple[int, dict[str, str]]]):
     """
 
     def __init__(self, reader: Iterator[list[str]], header: list[str]) -> None:
+        # ``reader`` decodes lazily: a bad byte late in the file surfaces here.
         self._reader = reader
         self._header = header
         self._row_no = 1
@@ -99,6 +111,8 @@ class CsvRows(Iterator[tuple[int, dict[str, str]]]):
                 fields = next(self._reader)
             except csv.Error:
                 raise CsvError("malformed_csv") from None
+            except UnicodeDecodeError:
+                raise CsvError("not_utf8") from None
             self._row_no += 1
             if not fields:
                 continue
@@ -113,17 +127,18 @@ def iter_csv(data: bytes) -> tuple[list[str], CsvRows]:
 
     A byte-order mark is dropped; header names are stripped. The header is
     checked at once (so a caller can refuse the file before starting a run);
-    the rows are parsed while iterated.
+    the rows are decoded and parsed while iterated, so the file is not copied
+    into one large string: a non-UTF-8 byte in the first chunk fails here,
+    one further on fails during iteration, both as ``CsvError("not_utf8")``.
     """
-    try:
-        text = data.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        raise CsvError("not_utf8") from None
-    reader = csv.reader(io.StringIO(text, newline=""))
+    stream = io.TextIOWrapper(io.BytesIO(data), encoding="utf-8-sig", newline="")
+    reader = csv.reader(stream)
     try:
         first = next(reader, None)
     except csv.Error:
         raise CsvError("malformed_csv") from None
+    except UnicodeDecodeError:
+        raise CsvError("not_utf8") from None
     header = [name.strip() for name in first or []]
     if not any(header):
         raise CsvError("no_header")
@@ -142,7 +157,7 @@ def normalise_key(raw: str | None, key: KeySpec) -> str | None:
     refused: it could not exist in the source and must never reach a query.
     """
     text = clean(raw)
-    if not text or not KEY_RE.match(text):
+    if not text or not KEY_RE.fullmatch(text):
         return None
     if key.pad_numeric:
         text = pad_key(text, key.length)
@@ -197,6 +212,7 @@ class EngineResult:
     mismatches_dropped: int
     not_checked: list[NotChecked]
     missing_in_ecc_dropped: int = 0
+    invalid_key_rows: list[int] = field(default_factory=list)  # capped like the other lists
 
     @property
     def mismatch_count(self) -> int:
@@ -224,6 +240,7 @@ class _Counters:
     invalid_keys: int = 0
     duplicate_keys: int = 0
     seen: set[str] = field(default_factory=set)
+    invalid_rows: list[int] = field(default_factory=list)
 
 
 class Comparer:
@@ -255,6 +272,7 @@ class Comparer:
         self._dropped = 0
         self._missing: list[tuple[str, int]] = []
         self._missing_dropped = 0
+        self._alpha_index: dict[tuple[str, int], dict[tuple[str, ...], str]] = {}
         self._not_checked = [
             NotChecked(
                 column=column,
@@ -276,17 +294,23 @@ class Comparer:
         wanted = [self._spec.key.csv_column, *self._spec.columns]
         return [name for name in dict.fromkeys(wanted) if name not in present]
 
-    def key_of(self, csv_row: Mapping[str, str]) -> str | None:
+    def key_of(self, csv_row: Mapping[str, str], row_no: int | None = None) -> str | None:
         """The normalised key of a CSV row; counts the row, invalid and duplicate keys.
 
-        Call it once per data row. A duplicate is still returned (and compared):
-        both rows were migrated, so both are checked.
+        Contract: call it exactly once per data row, because every call counts
+        a row (calling it twice for one row counts a duplicate). A duplicate is
+        still returned (and compared): both rows were migrated, so both are
+        checked. Remembering the keys seen costs memory per distinct key; that
+        is the one per-row state the engine keeps. ``row_no`` of an invalid key
+        is listed in ``invalid_key_rows`` up to the cap.
         """
         counters = self._counters
         counters.rows_total += 1
         key = normalise_key(csv_row.get(self._spec.key.csv_column), self._spec.key)
         if key is None:
             counters.invalid_keys += 1
+            if row_no is not None and len(counters.invalid_rows) < self._cap:
+                counters.invalid_rows.append(row_no)
         elif key in counters.seen:
             counters.duplicate_keys += 1
         else:
@@ -300,7 +324,16 @@ class Comparer:
         csv_row: Mapping[str, str],
         ecc_row: Mapping[str, object] | None,
     ) -> None:
-        """Compare every spec column of one CSV row; ``ecc_row=None`` = not in the source."""
+        """Compare every spec column of one CSV row; ``ecc_row=None`` = not in the source.
+
+        A spec column absent from ``csv_row`` raises ``CsvError("column_missing")``
+        before anything is counted: read as blank it would pass every
+        ``not_needed`` rule and fail every other one. Callers check the header
+        with :meth:`missing_columns` first; this is the guard if they did not.
+        """
+        for column in self._spec.columns:
+            if column not in csv_row:
+                raise CsvError("column_missing")
         if ecc_row is None:
             if len(self._missing) < self._cap:
                 self._missing.append((key, row_no))
@@ -355,6 +388,7 @@ class Comparer:
             mismatches_dropped=self._dropped,
             not_checked=list(self._not_checked),
             missing_in_ecc_dropped=self._missing_dropped,
+            invalid_key_rows=list(counters.invalid_rows),
         )
 
     # --- expected values per rule kind ---
@@ -372,7 +406,7 @@ class Comparer:
             return self._value_map(column, rule, ecc_row)
         if isinstance(rule, ExpressionRule):
             for case in rule.cases:
-                if all(self._holds(c.field, c.op, c.values, ecc_row) for c in case.when):
+                if all(self._holds(rule, c.field, c.op, c.values, ecc_row) for c in case.when):
                     return self._value(case.then, ecc_row)
             return self._value(rule.otherwise, ecc_row)
         return _Expected("", "")  # NotNeededRule: the CSV value must be blank
@@ -384,38 +418,68 @@ class Comparer:
         return _Expected(value.const or "", "")
 
     def _holds(
-        self, name: str, op: str, values: list[str], ecc_row: Mapping[str, object]
+        self,
+        rule: ExpressionRule,
+        name: str,
+        op: str,
+        values: list[str],
+        ecc_row: Mapping[str, object],
     ) -> bool:
-        text = clean(ecc_row.get(name))  # conditions always ignore surrounding blanks
+        """One condition; ``equals``/``in`` honour the rule's ``alpha`` and ``numeric``.
+
+        Conditions always ignore surrounding blanks (a source ``' '`` is blank),
+        whatever ``spec.trim`` says about the output comparison.
+        """
+        text = clean(ecc_row.get(name))
         if op == "blank":
             return not text
         if op == "not_blank":
             return bool(text)
-        return any(text == clean(v) for v in values)  # equals (one value) or in
+        return any(  # equals (one value) or in
+            same(text, v, trim=True, alpha=rule.alpha, numeric=rule.numeric) for v in values
+        )
 
     def _value_map(
         self, column: str, rule: ValueMapRule, ecc_row: Mapping[str, object]
     ) -> _Expected:
         """Translate the source value(s) through the lookups; the first that matches wins.
 
-        Lookup keys are cleaned like the workbook cells (trimmed). When the exact
-        key misses, the ALPHA form is tried too: a source NUMC ``0001`` is ``1`` in
-        a code-table cell Excel stored as a number.
+        Lookup keys are cleaned like the workbook cells (trimmed). An exact pass
+        over all lookups comes first, so an exact hit in a later lookup beats a
+        leading-zero match in an earlier one. Only with ``rule.alpha`` does a
+        second pass compare both sides without leading zeros (a source NUMC
+        ``0001`` finds ``1`` in a cell Excel stored as a number, and the other
+        way round); without it ``0010`` and ``10`` stay different codes.
         """
         parts = tuple(clean(ecc_row.get(name)) for name in rule.sources)
         source = " | ".join(parts)
         if not any(parts):
             return _Expected("", source)
-        alpha_parts = tuple(alpha(p) for p in parts)
-        candidates = [parts] if alpha_parts == parts else [parts, alpha_parts]
-        for index in range(len(rule.lookups)):
-            table = self._lookups[(column, index)]
-            for candidate in candidates:
-                hit = table.get(candidate)
+        count = len(rule.lookups)
+        for index in range(count):
+            hit = self._lookups[(column, index)].get(parts)
+            if hit is not None:
+                return _Expected(hit, source)
+        if rule.alpha:
+            stripped = tuple(alpha(p) for p in parts)
+            for index in range(count):
+                hit = self._alpha_lookup(column, index).get(stripped)
                 if hit is not None:
                     return _Expected(hit, source)
         if rule.on_miss == "default":
             return _Expected(rule.default or "", source)
         if rule.on_miss == "source":
-            return _Expected(parts[0], source)
+            # several sources: the first non-blank one (all blank returned above)
+            return _Expected(next(p for p in parts if p), source)
         return _Expected("", source, NO_XREF_ENTRY)
+
+    def _alpha_lookup(self, column: str, index: int) -> dict[tuple[str, ...], str]:
+        """The lookup keyed without leading zeros, built once; the first entry wins."""
+        slot = (column, index)
+        table = self._alpha_index.get(slot)
+        if table is None:
+            table = {}
+            for key, value in self._lookups[slot].entries.items():
+                table.setdefault(tuple(alpha(p) for p in key), value)
+            self._alpha_index[slot] = table
+        return table
