@@ -53,8 +53,9 @@ app sends since 2.37.1 (``agents/ina/client.py``).
 ``--order NAME=asc|desc`` (repeatable; added 2026-11-05) sorts the run by
 the measure or a ``--group-by`` dimension with the ``Sort`` ``plan_run``
 builds (in the submit and the read), and the read then prints one ``ORDER``
-line: whether the first column came back in descending or ascending order,
-the rows and ``TupleCount`` / ``TupleCountTotal``, never a value.
+line: whether the measure's values came back in descending or ascending
+order over all rows (``value_order``), the rows and ``TupleCount`` /
+``TupleCountTotal``, never a value.
 ``--sort-form`` tries other readings of a measure sort (``structure``: the
 measure structure as its ``Dimension``, 2.37.1's form; ``rows``: the first
 row dimension). On SIA (2026-11-05) the default form, a measure without
@@ -464,9 +465,10 @@ def _parse_order(values: list[str]) -> list[tuple[str, str]]:
 
 
 def _seen_order(payload: Any) -> str:
-    """How the first column of the read's grid is ordered (``desc``,
-    ``asc``, ``unordered``, ``-`` without numbers) and the row counts of its
-    Rows axis -- never a value."""
+    """How the measure's values (the first column of the read's grid) are
+    ordered over all rows (``desc``, ``asc``, ``unordered``, ``-`` without
+    numbers) and the row counts of its Rows axis -- never a value. Under a
+    dimension sort ``unordered`` is expected: it judges values, not keys."""
     grids = payload.get("Grids") if isinstance(payload, dict) else None
     grid = grids[0] if isinstance(grids, list) and grids and isinstance(grids[0], dict) else {}
     cells = grid.get("Cells") if isinstance(grid.get("Cells"), dict) else {}
@@ -487,7 +489,7 @@ def _seen_order(payload: Any) -> str:
         verdict = "unordered"
     rows = next((a for a in grid.get("Axes") or [] if isinstance(a, dict)
                  and a.get("Type") == "Rows"), {})
-    return (f"order={verdict} rows={len(column)} tuple_count={_name(rows.get('TupleCount'))} "
+    return (f"value_order={verdict} rows={len(column)} tuple_count={_name(rows.get('TupleCount'))} "
             f"tuple_count_total={_name(rows.get('TupleCountTotal'))}")
 
 

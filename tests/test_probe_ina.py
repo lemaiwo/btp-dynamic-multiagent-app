@@ -244,13 +244,13 @@ def test_an_order_is_name_equals_asc_or_desc():
 
 def test_the_order_line_says_how_the_rows_came_back_never_a_value():
     payload = {"Grids": [{
-        "Axes": [{"Type": "Rows", "TupleCount": 3, "TupleCountTotal": 352}],
+        "Axes": [{"Type": "Rows", "TupleCount": 3, "TupleCountTotal": 40}],
         "CellArraySizes": [3, 1],
         "Cells": {"Values": {"Encoding": "None", "Size": 3, "Values": [9471.5, 812.25, 3.75]}},
     }]}
     line = probe._seen_order(payload)
-    assert line == "order=desc rows=3 tuple_count=3 tuple_count_total=352"
+    assert line == "value_order=desc rows=3 tuple_count=3 tuple_count_total=40"
     assert "9471" not in line
     payload["Grids"][0]["Cells"]["Values"]["Values"] = [3.75, 9471.5, 812.25]
-    assert probe._seen_order(payload).startswith("order=unordered ")
-    assert probe._seen_order({}) == "order=- rows=0 tuple_count= tuple_count_total="
+    assert probe._seen_order(payload).startswith("value_order=unordered ")
+    assert probe._seen_order({}) == "value_order=- rows=0 tuple_count= tuple_count_total="
