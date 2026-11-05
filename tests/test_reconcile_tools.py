@@ -372,6 +372,7 @@ async def test_save_spec_stores_the_spec_and_answers_what_it_holds(world):
     [lookup] = answer["lookups"]
     assert lookup["sheet"] == "Codes" and lookup["header_row"] == 1
     assert lookup["entries"] >= 1 and isinstance(lookup["duplicates"], int)
+    assert lookup["truncated"] is False
     async with SessionLocal() as s:
         row = await store.get_file(s, answer["file_id"], ALICE)
     assert (row.kind, row.media_type, row.conversation_id, row.message_id) == (

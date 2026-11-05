@@ -128,6 +128,14 @@ def test_normalise_key_pads_digits() -> None:
     assert normalise_key(" 12345 ", KEY) == "000000000000012345"
 
 
+def test_normalise_key_strips_extra_leading_zeros_before_padding() -> None:
+    # A key written with more leading zeros than the field holds is still that key.
+    assert normalise_key("0" * 25 + "12345", KEY) == "000000000000012345"
+    assert normalise_key("0" * 30, KEY) == "000000000000000000"
+    # Not all digits: unchanged, so too long stays invalid.
+    assert normalise_key("0" * 18 + "A", KEY) is None
+
+
 def test_normalise_key_no_padding_when_off() -> None:
     key = KeySpec(csv_column="Object", ecc_field="OBJNR", length=18, pad_numeric=False)
     assert normalise_key("12345", key) == "12345"
@@ -158,9 +166,9 @@ def test_key_of_counts_invalid_and_duplicate_keys() -> None:
 
 
 def test_direct_match_and_mismatch() -> None:
-    rule = {"kind": "direct", "source": "MATNR"}
-    assert _matched(rule, "M1", {"MATNR": "M1"})
-    result, _ = _one(rule, "M2", {"MATNR": "M1"})
+    rule = {"kind": "direct", "source": "ITEMNO"}
+    assert _matched(rule, "M1", {"ITEMNO": "M1"})
+    result, _ = _one(rule, "M2", {"ITEMNO": "M1"})
     assert result.mismatches == [
         Mismatch(key="K1", column="Col", kind="direct", source="M1", expected="M1",
                  actual="M2", reason="value_differs")
@@ -168,9 +176,9 @@ def test_direct_match_and_mismatch() -> None:
 
 
 def test_direct_alpha() -> None:
-    rule = {"kind": "direct", "source": "MATNR", "alpha": True}
-    assert _matched(rule, "123", {"MATNR": "000123"})
-    assert not _matched({"kind": "direct", "source": "MATNR"}, "123", {"MATNR": "000123"})
+    rule = {"kind": "direct", "source": "ITEMNO", "alpha": True}
+    assert _matched(rule, "123", {"ITEMNO": "000123"})
+    assert not _matched({"kind": "direct", "source": "ITEMNO"}, "123", {"ITEMNO": "000123"})
 
 
 def test_direct_numeric() -> None:
@@ -184,11 +192,11 @@ def test_direct_non_string_ecc_value() -> None:
 
 
 def test_blank_equals_single_space_with_trim() -> None:
-    rule = {"kind": "direct", "source": "MATNR"}
-    assert _matched(rule, "", {"MATNR": " "})
-    assert _matched(rule, " ", {"MATNR": ""})
-    assert _matched(rule, " ", {"MATNR": None})
-    assert not _matched(rule, "", {"MATNR": " "}, trim=False)
+    rule = {"kind": "direct", "source": "ITEMNO"}
+    assert _matched(rule, "", {"ITEMNO": " "})
+    assert _matched(rule, " ", {"ITEMNO": ""})
+    assert _matched(rule, " ", {"ITEMNO": None})
+    assert not _matched(rule, "", {"ITEMNO": " "}, trim=False)
 
 
 # --- constant ------------------------------------------------------------------
@@ -206,15 +214,15 @@ def test_constant() -> None:
 
 
 def _vm(**over: Any) -> dict[str, Any]:
-    rule: dict[str, Any] = {"kind": "value_map", "sources": ["MTART"], "lookups": [LOOKUP]}
+    rule: dict[str, Any] = {"kind": "value_map", "sources": ["ITEMTYP"], "lookups": [LOOKUP]}
     rule.update(over)
     return rule
 
 
 def test_value_map_hit_in_first_lookup() -> None:
     lookups = {("Col", 0): Lookup({("A",): "NEW_A"})}
-    assert _matched(_vm(), "NEW_A", {"MTART": "A"}, lookups=lookups)
-    result, _ = _one(_vm(), "OTHER", {"MTART": "A"}, lookups=lookups)
+    assert _matched(_vm(), "NEW_A", {"ITEMTYP": "A"}, lookups=lookups)
+    result, _ = _one(_vm(), "OTHER", {"ITEMTYP": "A"}, lookups=lookups)
     m = result.mismatches[0]
     assert (m.expected, m.actual, m.reason, m.source) == ("NEW_A", "OTHER", "value_differs", "A")
 
@@ -222,52 +230,52 @@ def test_value_map_hit_in_first_lookup() -> None:
 def test_value_map_fallback_to_second_lookup() -> None:
     rule = _vm(lookups=[LOOKUP, {**LOOKUP, "sheet": "Groups"}])
     lookups = {("Col", 0): Lookup({("X",): "NX"}), ("Col", 1): Lookup({("A",): "NEW_A"})}
-    assert _matched(rule, "NEW_A", {"MTART": "A"}, lookups=lookups)
+    assert _matched(rule, "NEW_A", {"ITEMTYP": "A"}, lookups=lookups)
 
 
 def test_value_map_first_lookup_wins() -> None:
     rule = _vm(lookups=[LOOKUP, {**LOOKUP, "sheet": "Groups"}])
     lookups = {("Col", 0): Lookup({("A",): "FIRST"}), ("Col", 1): Lookup({("A",): "SECOND"})}
-    assert _matched(rule, "FIRST", {"MTART": "A"}, lookups=lookups)
+    assert _matched(rule, "FIRST", {"ITEMTYP": "A"}, lookups=lookups)
 
 
 def test_value_map_lookup_key_is_trimmed() -> None:
     lookups = {("Col", 0): Lookup({("1",): "ONE"})}
-    assert _matched(_vm(), "ONE", {"MTART": " 1 "}, lookups=lookups)
+    assert _matched(_vm(), "ONE", {"ITEMTYP": " 1 "}, lookups=lookups)
 
 
 def test_value_map_no_alpha_keeps_leading_zero_codes_distinct() -> None:
     lookups = {("Col", 0): Lookup({("0010",): "PADDED", ("10",): "PLAIN"})}
-    assert _matched(_vm(), "PADDED", {"MTART": "0010"}, lookups=lookups)
-    assert _matched(_vm(), "PLAIN", {"MTART": "10"}, lookups=lookups)
-    result, _ = _one(_vm(), "PLAIN", {"MTART": "010"}, lookups=lookups)
+    assert _matched(_vm(), "PADDED", {"ITEMTYP": "0010"}, lookups=lookups)
+    assert _matched(_vm(), "PLAIN", {"ITEMTYP": "10"}, lookups=lookups)
+    result, _ = _one(_vm(), "PLAIN", {"ITEMTYP": "010"}, lookups=lookups)
     assert result.mismatches[0].reason == "no_xref_entry"
 
 
 def test_value_map_alpha_is_opt_in_and_both_directions() -> None:
     table = {("Col", 0): Lookup({("1",): "ONE"})}
-    assert not _matched(_vm(), "ONE", {"MTART": "0001"}, lookups=table)
+    assert not _matched(_vm(), "ONE", {"ITEMTYP": "0001"}, lookups=table)
     # SAP NUMC "0001" against a code-table cell Excel stored as the number 1
-    assert _matched(_vm(alpha=True), "ONE", {"MTART": "0001"}, lookups=table)
+    assert _matched(_vm(alpha=True), "ONE", {"ITEMTYP": "0001"}, lookups=table)
     padded = {("Col", 0): Lookup({("0010",): "TEN"})}
-    assert _matched(_vm(alpha=True), "TEN", {"MTART": "10"}, lookups=padded)
+    assert _matched(_vm(alpha=True), "TEN", {"ITEMTYP": "10"}, lookups=padded)
 
 
 def test_value_map_alpha_exact_still_wins() -> None:
     lookups = {("Col", 0): Lookup({("0010",): "PADDED", ("10",): "PLAIN"})}
-    assert _matched(_vm(alpha=True), "PADDED", {"MTART": "0010"}, lookups=lookups)
-    assert _matched(_vm(alpha=True), "PLAIN", {"MTART": "10"}, lookups=lookups)
+    assert _matched(_vm(alpha=True), "PADDED", {"ITEMTYP": "0010"}, lookups=lookups)
+    assert _matched(_vm(alpha=True), "PLAIN", {"ITEMTYP": "10"}, lookups=lookups)
 
 
 def test_value_map_exact_in_later_lookup_beats_alpha_in_earlier() -> None:
     rule = _vm(alpha=True, lookups=[LOOKUP, {**LOOKUP, "sheet": "Groups"}])
     lookups = {("Col", 0): Lookup({("10",): "ALPHA_HIT"}), ("Col", 1): Lookup({("0010",): "EXACT"})}
-    assert _matched(rule, "EXACT", {"MTART": "0010"}, lookups=lookups)
+    assert _matched(rule, "EXACT", {"ITEMTYP": "0010"}, lookups=lookups)
 
 
 def test_value_map_miss_report() -> None:
     lookups = {("Col", 0): Lookup({("A",): "NEW_A"})}
-    result, _ = _one(_vm(), "ANY", {"MTART": "Z"}, lookups=lookups)
+    result, _ = _one(_vm(), "ANY", {"ITEMTYP": "Z"}, lookups=lookups)
     assert result.stats["Col"].mismatched == 1
     m = result.mismatches[0]
     assert (m.reason, m.expected, m.source) == ("no_xref_entry", "", "Z")
@@ -276,38 +284,38 @@ def test_value_map_miss_report() -> None:
 def test_value_map_miss_default() -> None:
     lookups = {("Col", 0): Lookup({("A",): "NEW_A"})}
     rule = _vm(on_miss="default", default="DEF")
-    assert _matched(rule, "DEF", {"MTART": "Z"}, lookups=lookups)
-    assert not _matched(rule, "Z", {"MTART": "Z"}, lookups=lookups)
+    assert _matched(rule, "DEF", {"ITEMTYP": "Z"}, lookups=lookups)
+    assert not _matched(rule, "Z", {"ITEMTYP": "Z"}, lookups=lookups)
 
 
 def test_value_map_miss_source() -> None:
     lookups = {("Col", 0): Lookup({("A",): "NEW_A"})}
     rule = _vm(on_miss="source")
-    assert _matched(rule, "Z", {"MTART": "Z"}, lookups=lookups)
+    assert _matched(rule, "Z", {"ITEMTYP": "Z"}, lookups=lookups)
 
 
 def test_value_map_miss_source_uses_first_non_blank_source() -> None:
     two = {**LOOKUP, "keys": [{"letter": "A"}, {"letter": "B"}]}
-    rule = _vm(sources=["MTART", "MATKL"], lookups=[two], on_miss="source")
+    rule = _vm(sources=["ITEMTYP", "ITEMGRP"], lookups=[two], on_miss="source")
     lookups = {("Col", 0): Lookup({("A", "G1"): "AG"})}
-    assert _matched(rule, "G2", {"MTART": " ", "MATKL": "G2"}, lookups=lookups)
-    assert _matched(rule, "B", {"MTART": "B", "MATKL": "G2"}, lookups=lookups)
+    assert _matched(rule, "G2", {"ITEMTYP": " ", "ITEMGRP": "G2"}, lookups=lookups)
+    assert _matched(rule, "B", {"ITEMTYP": "B", "ITEMGRP": "G2"}, lookups=lookups)
 
 
 def test_value_map_all_sources_blank_expects_blank() -> None:
     lookups = {("Col", 0): Lookup({("A",): "NEW_A"})}
-    assert _matched(_vm(), "", {"MTART": " "}, lookups=lookups)
-    result, _ = _one(_vm(), "X", {"MTART": ""}, lookups=lookups)
+    assert _matched(_vm(), "", {"ITEMTYP": " "}, lookups=lookups)
+    result, _ = _one(_vm(), "X", {"ITEMTYP": ""}, lookups=lookups)
     assert result.mismatches[0].reason == "value_differs"
     assert result.mismatches[0].expected == ""
 
 
 def test_value_map_two_sources() -> None:
     two = {**LOOKUP, "keys": [{"letter": "A"}, {"letter": "B"}]}
-    rule = _vm(sources=["MTART", "MATKL"], lookups=[two])
+    rule = _vm(sources=["ITEMTYP", "ITEMGRP"], lookups=[two])
     lookups = {("Col", 0): Lookup({("A", "G1"): "AG"})}
-    assert _matched(rule, "AG", {"MTART": "A", "MATKL": "G1"}, lookups=lookups)
-    result, _ = _one(rule, "AG", {"MTART": "A", "MATKL": "G2"}, lookups=lookups)
+    assert _matched(rule, "AG", {"ITEMTYP": "A", "ITEMGRP": "G1"}, lookups=lookups)
+    result, _ = _one(rule, "AG", {"ITEMTYP": "A", "ITEMGRP": "G2"}, lookups=lookups)
     assert result.mismatches[0].source == "A | G2"
 
 
@@ -456,8 +464,8 @@ def test_missing_in_ecc() -> None:
 
 
 def test_duplicate_csv_keys_both_compared() -> None:
-    comparer = Comparer(_spec({"Col": {"kind": "direct", "source": "MATNR"}}), {})
-    ecc = {"OBJNR": "000000000000000001", "MATNR": "M"}
+    comparer = Comparer(_spec({"Col": {"kind": "direct", "source": "ITEMNO"}}), {})
+    ecc = {"OBJNR": "000000000000000001", "ITEMNO": "M"}
     for row_no, value in ((2, "M"), (3, "N")):
         row = {"Object": "1", "Col": value}
         key = comparer.key_of(row)
@@ -541,7 +549,7 @@ def test_missing_columns() -> None:
 
 def test_needed_fields_equals_spec() -> None:
     spec = _spec({
-        "A": {"kind": "direct", "source": "MATNR"},
+        "A": {"kind": "direct", "source": "ITEMNO"},
         "B": _vm(),
         "C": _expr([_case([{"field": "F1", "op": "blank"}], {"field": "F2"})], {"const": "x"}),
     })
@@ -550,18 +558,18 @@ def test_needed_fields_equals_spec() -> None:
 
 
 def test_stats_kind_per_column() -> None:
-    spec = _spec({"A": {"kind": "direct", "source": "MATNR"}, "B": {"kind": "not_needed"}})
+    spec = _spec({"A": {"kind": "direct", "source": "ITEMNO"}, "B": {"kind": "not_needed"}})
     stats = Comparer(spec, {}).result().stats
     assert {c: s.kind for c, s in stats.items()} == {"A": "direct", "B": "not_needed"}
 
 
 def test_end_to_end_with_iter_csv() -> None:
-    spec = _spec({"Material": {"kind": "direct", "source": "MATNR"},
+    spec = _spec({"Item": {"kind": "direct", "source": "ITEMNO"},
                   "Unit": {"kind": "constant", "value": "EA"}})
-    data = b"Object,Material,Unit\n1,M1,EA\n2,M2,PC\n,M3,EA\n3,M3\n4,M4,EA\n"
+    data = b"Object,Item,Unit\n1,M1,EA\n2,M2,PC\n,M3,EA\n3,M3\n4,M4,EA\n"
     ecc = {
-        "000000000000000001": {"OBJNR": "000000000000000001", "MATNR": "M1"},
-        "000000000000000002": {"OBJNR": "000000000000000002", "MATNR": "M2"},
+        "000000000000000001": {"OBJNR": "000000000000000001", "ITEMNO": "M1"},
+        "000000000000000002": {"OBJNR": "000000000000000002", "ITEMNO": "M2"},
     }
     comparer = Comparer(spec, {})
     _, rows = iter_csv(data)
@@ -585,35 +593,35 @@ def _chain_rule(**over: Any) -> dict[str, Any]:
 
 def test_value_map_chain_uses_each_lookups_own_source_field() -> None:
     lookups = {("Col", 0): Lookup({("A",): "BY_FIRST"}), ("Col", 1): Lookup({("G",): "BY_SECOND"})}
-    assert _matched(_chain_rule(), "BY_FIRST", {"MTART": "A", "GRPFLD": "G"}, lookups=lookups)
-    assert _matched(_chain_rule(), "BY_SECOND", {"MTART": "Z", "GRPFLD": "G"}, lookups=lookups)
+    assert _matched(_chain_rule(), "BY_FIRST", {"ITEMTYP": "A", "GRPFLD": "G"}, lookups=lookups)
+    assert _matched(_chain_rule(), "BY_SECOND", {"ITEMTYP": "Z", "GRPFLD": "G"}, lookups=lookups)
     # the first source blank: the second lookup still runs on its own field
-    assert _matched(_chain_rule(), "BY_SECOND", {"MTART": "", "GRPFLD": "G"}, lookups=lookups)
-    result, _ = _one(_chain_rule(), "X", {"MTART": "Z", "GRPFLD": "Q"}, lookups=lookups)
+    assert _matched(_chain_rule(), "BY_SECOND", {"ITEMTYP": "", "GRPFLD": "G"}, lookups=lookups)
+    result, _ = _one(_chain_rule(), "X", {"ITEMTYP": "Z", "GRPFLD": "Q"}, lookups=lookups)
     m = result.mismatches[0]
     assert (m.reason, m.source) == ("no_xref_entry", "Z | Q")
 
 
 def test_value_map_chain_all_sources_blank_expects_blank() -> None:
     lookups = {("Col", 0): Lookup({("A",): "BY_FIRST"}), ("Col", 1): Lookup({("G",): "BY_SECOND"})}
-    assert _matched(_chain_rule(), "", {"MTART": " ", "GRPFLD": ""}, lookups=lookups)
+    assert _matched(_chain_rule(), "", {"ITEMTYP": " ", "GRPFLD": ""}, lookups=lookups)
 
 
 def test_value_map_chain_exact_pass_over_all_lookups_before_alpha() -> None:
     lookups = {("Col", 0): Lookup({("10",): "ALPHA_FIRST"}), ("Col", 1): Lookup({("G",): "EXACT"})}
     rule = _chain_rule(alpha=True)
-    assert _matched(rule, "EXACT", {"MTART": "0010", "GRPFLD": "G"}, lookups=lookups)
-    assert _matched(rule, "ALPHA_FIRST", {"MTART": "0010", "GRPFLD": "Q"}, lookups=lookups)
+    assert _matched(rule, "EXACT", {"ITEMTYP": "0010", "GRPFLD": "G"}, lookups=lookups)
+    assert _matched(rule, "ALPHA_FIRST", {"ITEMTYP": "0010", "GRPFLD": "Q"}, lookups=lookups)
 
 
 def test_value_map_chain_on_miss_source_keeps_the_rules_own_sources() -> None:
     lookups = {("Col", 0): Lookup({("A",): "BY_FIRST"}), ("Col", 1): Lookup({("G",): "BY_SECOND"})}
     rule = _chain_rule(on_miss="source")
-    assert _matched(rule, "Z", {"MTART": "Z", "GRPFLD": "Q"}, lookups=lookups)
-    assert _matched(rule, "", {"MTART": "", "GRPFLD": "Q"}, lookups=lookups)
+    assert _matched(rule, "Z", {"ITEMTYP": "Z", "GRPFLD": "Q"}, lookups=lookups)
+    assert _matched(rule, "", {"ITEMTYP": "", "GRPFLD": "Q"}, lookups=lookups)
 
 
 def test_needed_fields_include_a_lookups_own_source_fields() -> None:
     comparer = Comparer(_spec({"Col": _chain_rule()}),
                         {("Col", 0): Lookup({}), ("Col", 1): Lookup({})})
-    assert comparer.needed_fields() == ["OBJNR", "GRPFLD", "MTART"]
+    assert comparer.needed_fields() == ["OBJNR", "GRPFLD", "ITEMTYP"]

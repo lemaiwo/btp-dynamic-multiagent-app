@@ -21,20 +21,18 @@ per-user auth; there is no technical-user fallback. :func:`start` refuses a
 report file and the ARC-1 calls name the same person.
 
 **Two ARC-1 sessions.** The preflight opens its own reader in the tool call
-and closes it there; the task opens one reader for the whole run (MCP's
-session is entered and left in the task that owns it: anyio cancel scopes do
-not cross tasks) with ``check_fields=False`` (the fields were checked). The
-reader retries a transient failure itself; each batch read is bounded by
-:data:`READ_TIMEOUT_SECONDS` (``asyncio.timeout``; ``expired()`` tells our
-deadline from a ``TimeoutError`` of the callee), failing the run as
+and closes it there; the task holds one for the whole run
+(``batches.ReopeningReader``, ``check_fields=False``: the fields were
+checked), reopened once when the session breaks at the transport. Each batch
+read is bounded by :data:`READ_TIMEOUT_SECONDS` (``asyncio.timeout``;
+``expired()`` tells our deadline from the callee's ``TimeoutError``):
 ``arc1_timeout``.
 
-**Batches.** CSV rows are taken in order until :attr:`batch_size` distinct
-keys are pending; one ``SAPQuery`` reads them, then every pending row is
-compared. Keys a batch's answer did not hold are read once more in their
-own query before they count as missing in the source (one retry per batch:
-an answer silently cut by ARC-1's byte limit must not read as "Missing in
-ECC"). ``rows_done`` counts the data rows dealt with (invalid keys too).
+**Batches** (``batches.batches``, also the survey's rule): CSV rows in order
+until :attr:`batch_size` distinct keys are pending, one ``SAPQuery`` for
+them; keys the answer did not hold are read once more on their own before
+they count as missing (an answer cut by ARC-1's byte limit must not read as
+"Missing in ECC"). ``rows_done`` counts the data rows dealt with.
 
 **Heartbeat.** After every batch, and from a ticker every
 :data:`HEARTBEAT_SECONDS` while a read waits on ARC-1 or the report is built,
@@ -49,8 +47,10 @@ engine's counters and the report file; ``failed`` with the reader's code
 ``report_too_large``, or ``internal`` for anything unexpected (the exception
 class is logged, never its text: it may quote a cell value or a URL);
 ``interrupted`` when the app cancels the run at shutdown (:func:`cancel_all`,
-the save shielded). The report is stored before ``finish_run``; when that
-finds the row no longer running, the stored file is removed again.
+the save shielded and bounded by :data:`FINISH_SECONDS`). The report is
+stored before ``finish_run``; on every exit but ``done`` it is removed again.
+Refused at start as well: ``too_many_runs`` (``RECONCILE_MAX_RUNS``, default
+2, per process) and ``shutting_down`` (after :func:`cancel_all`).
 
 **What another instance knows.** The row: status, ``rows_total``,
 ``rows_done`` as of the last heartbeat, the outcome. :func:`progress` (rows
@@ -62,7 +62,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -71,15 +70,21 @@ from sqlalchemy import delete
 
 import agents.db as agents_db
 from agents.auth import current_principal
+from agents.ide.store import env_int
 from agents.reconcile import runs_store
 from agents.reconcile.arc1_reader import MAX_BATCH_KEYS, Arc1Reader, Arc1ReadError
+from agents.reconcile.batches import ReopeningReader, batches, survey
+from agents.reconcile.counts import (  # noqa: F401  (re-exported: they lived here)
+    COLUMN_METRICS,
+    COLUMN_PREFIX,
+    column_counts,
+    run_counts,
+    split_counts,
+)
 from agents.reconcile.engine import (
-    ColumnStats,
     Comparer,
     CsvError,
-    EngineResult,
     iter_csv,
-    normalise_key,
 )
 from agents.reconcile.report import (
     REPORT_MEDIA_TYPE,
@@ -98,9 +103,12 @@ logger = logging.getLogger(__name__)
 # for a whole read still stamps its row three times in that window.
 HEARTBEAT_SECONDS = 60.0
 READ_TIMEOUT_SECONDS = 180.0
-# Rows compared between two yields to the event loop (a batch of invalid keys
-# sends no query, so nothing else would yield).
-_YIELD_EVERY = 1_000
+# A run's last row write (outcome) may take this long at most; at shutdown it
+# runs shielded from the cancel, so it must be bounded itself.
+FINISH_SECONDS = 10.0
+# Runs at the same time in one process (each holds a CSV, its code tables and
+# an ARC-1 session); read at every start.
+MAX_RUNS_ENV, DEFAULT_MAX_RUNS = "RECONCILE_MAX_RUNS", 2
 
 _MESSAGES = {
     "already_running": "A reconciliation run of this conversation is still running.",
@@ -109,6 +117,9 @@ _MESSAGES = {
     "csv_empty": "The CSV file has no data rows.",
     "xref_required": "The spec translates values through code tables, "
     "but no code-table workbook was given.",
+    "too_many_runs": "Too many reconciliation runs are in progress on this app "
+    "instance; try again when one has finished.",
+    "shutting_down": "The app is stopping; start the run again in a moment.",
 }
 
 
@@ -156,11 +167,21 @@ class _Job:
     rows_done: int = 0
     lost: bool = False
     extra: dict[str, int] = field(default_factory=dict)
+    # The stored report, until the row says done: removed on any other exit.
+    report_file_id: str | None = None
+    done: bool = False
 
 
 _tasks: dict[str, asyncio.Task] = {}
 _jobs: dict[str, _Job] = {}
 _starting: set[str] = set()
+# Set by cancel_all: a start still in its checks must not start a task after it.
+_closing = False
+
+
+def max_runs() -> int:
+    """``RECONCILE_MAX_RUNS`` (default 2, at least 1), read at every start."""
+    return env_int(MAX_RUNS_ENV, DEFAULT_MAX_RUNS, minimum=1)
 
 
 def _now() -> datetime:
@@ -204,26 +225,6 @@ def _whole(value: Any, name: str, low: int, high: int | None = None) -> int:
     return value
 
 
-def _survey(data: bytes, spec: ReconcileSpec, batch_size: int) -> tuple[int, int]:
-    """``(data rows, batches)`` of the CSV, by the batching rule of :func:`_drive`.
-
-    A full pass, so a CSV error late in the file is refused before the run;
-    CPU-bound (worker thread)."""
-    _, rows = iter_csv(data)
-    total = batches = 0
-    pending: set[str] = set()
-    for _row_no, row in rows:
-        total += 1
-        key = normalise_key(row.get(spec.key.csv_column), spec.key)
-        if key is None:
-            continue
-        pending.add(key)
-        if len(pending) >= batch_size:
-            batches += 1
-            pending.clear()
-    return total, batches + (1 if pending else 0)
-
-
 async def start(
     *, conversation_id: str, principal: str, message_id: str, spec: ReconcileSpec,
     spec_file_id: str | None, csv_data: bytes, xref_data: bytes | None,
@@ -241,8 +242,12 @@ async def start(
     _whole(mismatch_cap, "mismatch_cap", 1)
     if not principal or current_principal.get() != principal:
         raise RunError("not_signed_in")
+    if _closing:
+        raise RunError("shutting_down")
     if _running(conversation_id) or conversation_id in _starting:
         raise RunError("already_running")
+    if in_flight() >= max_runs():
+        raise RunError("too_many_runs")
     _starting.add(conversation_id)
     try:
         return await _start(
@@ -276,7 +281,7 @@ async def _start(
     if missing:
         raise RunError("csv_invalid", csv_code="column_missing", columns=missing)
     try:
-        rows_total, batches = await asyncio.to_thread(_survey, csv_data, spec, batch_size)
+        rows_total, batch_count = await asyncio.to_thread(survey, csv_data, spec, batch_size)
     except CsvError as err:
         raise RunError("csv_invalid", csv_code=err.code) from None
     if rows_total == 0:
@@ -286,6 +291,8 @@ async def _start(
                         check_fields=check_fields)
     async with reader:
         await reader.preflight()
+    if _closing:
+        raise RunError("shutting_down")
     async with agents_db.SessionLocal() as db:
         run_id = await runs_store.create_run(
             db, conversation_id=conversation_id, principal=principal,
@@ -295,6 +302,12 @@ async def _start(
     if run_id is None:
         # Another tool call or instance won the row lock, or the conversation is gone.
         raise RunError("already_running")
+    if _closing:
+        # cancel_all ran while the row was written: close it as a cancelled run would.
+        async with agents_db.SessionLocal() as db:
+            await runs_store.finish_run(db, run_id, status="interrupted",
+                                        error_code=runs_store.INTERRUPTED)
+        raise RunError("shutting_down")
     job = _Job(
         run_id=run_id, conversation_id=conversation_id, principal=principal,
         message_id=message_id, spec=spec, spec_name=spec_name, csv_data=csv_data,
@@ -305,83 +318,8 @@ async def _start(
     # Created here, in the caller's context: the task keeps its principal and JWT.
     _tasks[conversation_id] = asyncio.create_task(_run(job), name=f"reconcile-{run_id}")
     logger.info("[reconcile] run %s of %s started: %d rows, %d batches",
-                run_id, spec.table, rows_total, batches)
-    return {"run_id": run_id, "rows_total": rows_total, "batches": batches}
-
-
-def _counts(result: EngineResult, lookups: dict[tuple[str, int], Lookup]) -> dict[str, int]:
-    """Counters only (``runs_store`` refuses anything else)."""
-    tables = {id(t): t for t in lookups.values()}.values()
-    return {
-        "rows_total": result.rows_total,
-        "rows_compared": result.rows_compared,
-        "malformed_rows": result.malformed_rows,
-        "invalid_keys": result.invalid_keys,
-        "duplicate_keys": result.duplicate_keys,
-        "missing_in_ecc": result.missing_count,
-        "missing_in_ecc_dropped": result.missing_in_ecc_dropped,
-        "mismatches": result.mismatch_count,
-        "mismatches_dropped": result.mismatches_dropped,
-        "not_checked": len(result.not_checked),
-        "columns": len(result.stats),
-        "lookups": len(tables),
-        "lookups_truncated": sum(1 for t in tables if t.truncated),
-        "lookup_duplicates": sum(t.duplicates for t in tables),
-        **column_counts(result.stats),
-    }
-
-
-COLUMN_PREFIX = "col."
-COLUMN_METRICS = ("checked", "matched", "mismatched", "not_checked")
-_KIND_MARK = ".kind."
-_RULE_KINDS = frozenset(
-    {"direct", "constant", "value_map", "expression", "not_needed", "unresolved"})
-
-
-def column_counts(stats: Mapping[str, ColumnStats]) -> dict[str, int]:
-    """Per-column counters flattened for ``runs_store`` (counters only):
-    ``col.<column>.<metric>`` per metric, plus ``col.<column>.kind.<kind>: 1``
-    so the status can say a column's rule kind without reading the spec file.
-    One entry per spec column, so at most ``5 * MAX_COLUMNS`` keys.
-    """
-    out: dict[str, int] = {}
-    for column, stat in stats.items():
-        for metric in COLUMN_METRICS:
-            out[f"{COLUMN_PREFIX}{column}.{metric}"] = int(getattr(stat, metric))
-        out[f"{COLUMN_PREFIX}{column}{_KIND_MARK}{stat.kind}"] = 1
-    return out
-
-
-def split_counts(counts: Mapping[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """A stored ``counts`` back into ``(totals, columns)``, the inverse of
-    :func:`column_counts`; columns sorted by mismatches, most first, then name.
-
-    A column name may hold dots, so the metric (or ``kind.<kind>``) is read
-    from the end; a ``col.`` key of any other form, or a value that is no
-    whole number, is dropped rather than guessed.
-    """
-    totals: dict[str, Any] = {}
-    columns: dict[str, dict[str, Any]] = {}
-    for key, value in counts.items():
-        if not key.startswith(COLUMN_PREFIX):
-            totals[key] = value
-            continue
-        if isinstance(value, bool) or not isinstance(value, int):
-            continue
-        head, _, last = key[len(COLUMN_PREFIX):].rpartition(".")
-        if head and last in COLUMN_METRICS:
-            columns.setdefault(head, {})[last] = value
-        elif head.endswith(_KIND_MARK[:-1]) and last in _RULE_KINDS:
-            name = head[: -len(_KIND_MARK) + 1]
-            if name:
-                columns.setdefault(name, {})["kind"] = last
-    listed = [
-        {"column": name, "kind": seen.get("kind"),
-         **{metric: seen.get(metric, 0) for metric in COLUMN_METRICS}}
-        for name, seen in columns.items()
-    ]
-    listed.sort(key=lambda c: (-c["mismatched"], c["column"]))
-    return totals, listed
+                run_id, spec.table, rows_total, batch_count)
+    return {"run_id": run_id, "rows_total": rows_total, "batches": batch_count}
 
 
 async def _heartbeat(job: _Job) -> bool:
@@ -425,44 +363,34 @@ async def _drive(job: _Job) -> None:
     """Read, compare, report, store; raises on any outcome but ``done``."""
     spec, comparer = job.spec, job.comparer
     _, rows = iter_csv(job.csv_data)
-    reader = Arc1Reader(job.server, table=spec.table, key_field=spec.key.ecc_field,
-                        fields=comparer.needed_fields(), target=job.target,
-                        check_fields=False)
-    async with reader:
-        pending: list[tuple[str, int, dict[str, str]]] = []
-        distinct: dict[str, None] = {}
-        done = 0
+    def new_reader() -> Arc1Reader:
+        return Arc1Reader(job.server, table=spec.table, key_field=spec.key.ecc_field,
+                          fields=comparer.needed_fields(), target=job.target,
+                          check_fields=False)
 
-        async def flush() -> None:
+    async with ReopeningReader(new_reader, _read, job.run_id) as session:
+        for done, pending in batches(rows, comparer.key_of, job.batch_size):
+            if pending is None:  # a stretch without a query: let the loop run
+                job.rows_done = done
+                await asyncio.sleep(0)
+                continue
             if pending:
-                found = await _read(reader, list(distinct))
+                keys = list(dict.fromkeys(key for key, _, _ in pending))
+                found = await session.read(keys)
                 # An answer cut below its keys (ARC-1's byte limit) looks like
                 # keys that are not there: read those once more on their own.
-                absent = [k for k in distinct if k not in found]
+                absent = [k for k in keys if k not in found]
                 if absent:
-                    found.update(await _read(reader, absent))
+                    found.update(await session.read(absent))
                 for key, row_no, row in pending:
                     comparer.compare(key, row_no, row, found.get(key))
-                pending.clear()
-                distinct.clear()
             job.rows_done = done
             await _beat_or_stop(job)
-
-        for row_no, row in rows:
-            done += 1
-            key = comparer.key_of(row, row_no)
-            if key is not None:
-                pending.append((key, row_no, row))
-                distinct[key] = None
-                if len(distinct) >= job.batch_size:
-                    await flush()
-            if done % _YIELD_EVERY == 0:
-                await asyncio.sleep(0)
-        await flush()
     result = comparer.result(malformed_rows=rows.malformed)
-    job.extra = _counts(result, job.lookups)
+    job.extra = run_counts(result, job.lookups)
     meta = ReportMeta(run_id=job.run_id, spec_name=job.spec_name,
-                      started_at=job.started_at, finished_at=_now())
+                      started_at=job.started_at, finished_at=_now(),
+                      lookups_truncated=job.extra.get("lookups_truncated", 0))
     data = await asyncio.to_thread(build_report, spec, result, meta)
     await _beat_or_stop(job)
     async with agents_db.SessionLocal() as db:
@@ -471,31 +399,47 @@ async def _drive(job: _Job) -> None:
             principal=job.principal, name=report_file_name(spec, meta),
             media_type=REPORT_MEDIA_TYPE, data=data,
         )
-    file_id = stored["file_id"]
+    job.report_file_id = stored["file_id"]
     async with agents_db.SessionLocal() as db:
         finished = await runs_store.finish_run(
-            db, job.run_id, status="done", counts=job.extra, report_file_id=file_id)
-        if not finished:
-            await db.execute(delete(agents_db.ChatFile).where(agents_db.ChatFile.id == file_id)
-                             .execution_options(synchronize_session=False))
-            await db.commit()
-            raise _Lost
+            db, job.run_id, status="done", counts=job.extra,
+            report_file_id=job.report_file_id)
+    if not finished:
+        raise _Lost
+    job.done = True
     logger.info("[reconcile] run %s of %s done", job.run_id, spec.table)
+
+
+async def _drop_report(job: _Job) -> None:
+    """Remove the stored report of a run that did not end ``done`` (bounded)."""
+    file_id, job.report_file_id = job.report_file_id, None
+    try:
+        async with asyncio.timeout(FINISH_SECONDS):
+            async with agents_db.SessionLocal() as db:
+                await db.execute(delete(agents_db.ChatFile)
+                                 .where(agents_db.ChatFile.id == file_id)
+                                 .execution_options(synchronize_session=False))
+                await db.commit()
+    except Exception as exc:  # noqa: BLE001 - logged by class; the row says not done
+        logger.warning("[reconcile] could not remove the report of run %s (%s)",
+                       job.run_id, type(exc).__name__)
 
 
 def _partial_counts(job: _Job) -> dict[str, int]:
     try:
-        return job.extra or _counts(job.comparer.result(), job.lookups)
+        return job.extra or run_counts(job.comparer.result(), job.lookups)
     except Exception:  # noqa: BLE001 - counters are a courtesy on a failed row
         return {}
 
 
 async def _finish(job: _Job, status: str, error_code: str) -> None:
     try:
-        async with agents_db.SessionLocal() as db:
-            moved = await runs_store.finish_run(
-                db, job.run_id, status=status, counts=_partial_counts(job),
-                error_code=error_code)
+        # Bounded: at shutdown this runs shielded from the cancel.
+        async with asyncio.timeout(FINISH_SECONDS):
+            async with agents_db.SessionLocal() as db:
+                moved = await runs_store.finish_run(
+                    db, job.run_id, status=status, counts=_partial_counts(job),
+                    error_code=error_code)
     except Exception as exc:  # noqa: BLE001 - the stale check closes the row later
         logger.warning("[reconcile] could not close run %s as %s (%s)",
                        job.run_id, status, type(exc).__name__)
@@ -524,13 +468,19 @@ async def _run(job: _Job) -> None:
     finally:
         ticker.cancel()
         await asyncio.gather(ticker, return_exceptions=True)
+        if job.report_file_id is not None and not job.done:
+            await asyncio.shield(_drop_report(job))
         if _tasks.get(job.conversation_id) is asyncio.current_task():
             _tasks.pop(job.conversation_id, None)
             _jobs.pop(job.conversation_id, None)
 
 
 async def cancel_all() -> None:
-    """Cancel every run in flight and wait for each to close its row (shutdown)."""
+    """Cancel every run in flight and wait for each to close its row (shutdown).
+
+    A start still in its checks sees ``_closing`` and starts no task."""
+    global _closing
+    _closing = True
     tasks = [t for t in _tasks.values() if not t.done()]
     for task in tasks:
         task.cancel()
@@ -546,3 +496,5 @@ def reset() -> None:
     for cid in [c for c in _jobs if c not in _tasks]:
         _jobs.pop(cid, None)
     _starting.clear()
+    global _closing
+    _closing = False

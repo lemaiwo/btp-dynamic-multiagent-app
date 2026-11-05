@@ -199,3 +199,56 @@ def test_media_type_and_file_name() -> None:
     assert REPORT_MEDIA_TYPE == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     spec = _spec().model_copy(update={"wave": "W 2"})
     assert report_file_name(spec, META) == "reconcile-ZTAB-W_2-run-0001.xlsx"
+
+
+# --- final review: truncated code tables, formulas, empty runs, reasons, long text ---
+
+
+def test_a_truncated_code_table_gets_a_summary_line() -> None:
+    texts = [r[0] for r in _rows(_book(build_report(_spec(), _result(), META))["Summary"]) if r]
+    assert not any(isinstance(t, str) and t.startswith("Code tables cut") for t in texts)
+    meta = ReportMeta(run_id="r", spec_name="s", started_at=None, finished_at=None,
+                      lookups_truncated=2)
+    texts = [r[0] for r in _rows(_book(build_report(_spec(), _result(), meta))["Summary"]) if r]
+    assert report.TRUNCATED_LOOKUPS_LINE.format(n=2) in texts
+
+
+@pytest.mark.parametrize("lead", ["=", "+", "-", "@", "\t", "\r"])
+def test_no_leading_character_makes_a_formula(lead: str) -> None:
+    text = f"{lead}1+1"
+    result = _result(mismatches=[_mismatch(1, actual=text)])
+    ws = _book(build_report(_spec(), result, META))["Mismatches"]
+    cell = ws.cell(row=2, column=6)
+    assert cell.data_type == "s"
+    # XML reads a CR back as a line feed; either way it is text, not a formula.
+    assert cell.value == text.replace("\r", "\n")
+
+
+def test_an_empty_result_still_writes_every_sheet() -> None:
+    result = EngineResult(rows_total=0, rows_compared=0, malformed_rows=0, invalid_keys=0,
+                          duplicate_keys=0, missing_in_ecc=[], stats={}, mismatches=[],
+                          mismatches_dropped=0, not_checked=[])
+    book = _book(build_report(_spec(), result, META))
+    assert book.sheetnames == ["Summary", "Mismatches", "Missing in ECC", "Not checked"]
+    assert len(_rows(book["Mismatches"])) == 1
+    assert _summary_map(book["Summary"])["Rows total"] == 0
+
+
+def test_the_first_reason_comes_from_the_stats_when_the_list_was_capped() -> None:
+    stats = {
+        "Kind": ColumnStats(kind="direct", checked=7, matched=5, mismatched=2,
+                            first_reason="must_be_blank"),
+        "Flag": ColumnStats(kind="constant", checked=7, matched=7),
+        "Other": ColumnStats(kind="unresolved", not_checked=7),
+    }
+    result = _result(stats=stats, mismatches=[], mismatches_dropped=2)
+    rows = _rows(_book(build_report(_spec(), result, META))["Summary"])
+    (kind_row,) = [r for r in rows if r and r[0] == "Kind" and r[1] == "direct"]
+    assert kind_row[-1] == "Must be blank"
+
+
+def test_long_cell_text_is_clipped_below_the_excel_limit() -> None:
+    result = _result(mismatches=[_mismatch(1, actual="x" * 40_000)])
+    ws = _book(build_report(_spec(), result, META))["Mismatches"]
+    value = ws.cell(row=2, column=6).value
+    assert len(value) == report.MAX_CELL_CHARS == 32_000

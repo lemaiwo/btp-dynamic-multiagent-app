@@ -108,8 +108,12 @@ class Arc1ReadError(Exception):
         *,
         fields: list[str] | None = None,
         request_id: str | None = None,
+        transport: bool = False,
     ):
         self.code = code
+        # The MCP session itself failed (no answer from ARC-1 at all): a new
+        # session may work where this one cannot. Never set for an answer.
+        self.transport = transport
         self.message = message or _MESSAGES.get(code, "Reading the source system failed.")
         self.fields = list(fields or [])
         self.request_id = request_id
@@ -286,7 +290,7 @@ def _exception_error(exc: BaseException, target: str) -> tuple[Arc1ReadError, bo
         return Arc1ReadError("arc1_failed"), True
     if _find(exc, DestinationError) is not None:
         return Arc1ReadError("arc1_failed"), False  # configuration: a retry cannot fix it
-    return Arc1ReadError("arc1_failed"), True
+    return Arc1ReadError("arc1_failed", transport=True), True
 
 
 class Arc1Reader:

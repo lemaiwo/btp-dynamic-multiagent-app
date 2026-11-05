@@ -455,6 +455,47 @@ async def test_sign_in_needed_mid_run_fails_the_row_without_a_report():
     assert await files_of(cid) == []
 
 
+async def test_a_broken_session_is_reopened_once_and_the_run_goes_on(monkeypatch):
+    from agents.reconcile import arc1_reader
+
+    monkeypatch.setattr(arc1_reader, "BACKOFF_SECONDS", 0.0)
+    cid, mid = await conversation()
+    server = StubServer()
+    # Every attempt of batch 1 on the first session fails at the transport.
+    server.fail_at = {n: ConnectionError("gone") for n in (1, 2, 3)}
+    answer = await start(cid, mid, server)
+    await wait(cid)
+    got = await row_of(answer["run_id"])
+    assert (got.status, got.error_code) == ("done", None)
+    assert server.sessions == 3  # the preflight, the run, the one reopen
+    assert server.closed == server.sessions
+
+
+async def test_a_session_that_breaks_again_after_the_reopen_fails_the_run(monkeypatch):
+    from agents.reconcile import arc1_reader
+
+    monkeypatch.setattr(arc1_reader, "BACKOFF_SECONDS", 0.0)
+    cid, mid = await conversation()
+    server = StubServer()
+    server.fail_at = {n: ConnectionError("gone") for n in range(1, 7)}
+    answer = await start(cid, mid, server)
+    await wait(cid)
+    got = await row_of(answer["run_id"])
+    assert (got.status, got.error_code) == ("failed", "arc1_failed")
+    assert server.sessions == 3 and server.closed == 3
+
+
+async def test_a_refusal_by_arc1_is_not_a_reason_to_reopen(monkeypatch):
+    cid, mid = await conversation()
+    server = StubServer()
+    server.fail_at = {1: OAuthAuthorizationRequired("https://arc1.example/mcp")}
+    answer = await start(cid, mid, server)
+    await wait(cid)
+    got = await row_of(answer["run_id"])
+    assert (got.status, got.error_code) == ("failed", "sign_in_needed")
+    assert server.sessions == 2
+
+
 async def test_an_unexpected_exception_is_failed_internal_with_the_class_only(
     monkeypatch, caplog,
 ):
@@ -528,6 +569,108 @@ async def test_a_lost_finish_removes_the_stored_report(monkeypatch):
     await start(cid, mid, StubServer())
     await wait(cid)
     assert await files_of(cid) == []
+
+
+async def test_a_finish_that_raises_after_the_report_was_stored_removes_it(monkeypatch):
+    cid, mid = await conversation()
+    real = runs_store.finish_run
+
+    async def broken(db: Any, run_id: str, *, status: str, **k: Any) -> bool:
+        if status == "done":
+            raise RuntimeError("database went away")
+        return await real(db, run_id, status=status, **k)
+
+    monkeypatch.setattr(runs_store, "finish_run", broken)
+    answer = await start(cid, mid, StubServer())
+    await wait(cid)
+    assert await files_of(cid) == []
+    got = await row_of(answer["run_id"])
+    assert (got.status, got.error_code, got.report_file_id) == ("failed", "internal", None)
+
+
+async def test_a_finish_is_bounded(monkeypatch):
+    monkeypatch.setattr(run, "FINISH_SECONDS", 0.05)
+    cid, mid = await conversation()
+
+    async def hangs(*a: Any, **k: Any) -> bool:
+        await asyncio.sleep(5)
+        return True
+
+    server = StubServer()
+    server.fail_at = {1: OAuthAuthorizationRequired("https://arc1.example/mcp")}
+    monkeypatch.setattr(runs_store, "finish_run", hangs)
+    await start(cid, mid, server)
+    task = run.task_of(cid)
+    await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 2)
+
+
+async def test_a_start_after_cancel_all_is_refused_as_shutting_down():
+    cid, mid = await conversation()
+    await run.cancel_all()
+    with pytest.raises(run.RunError) as info:
+        await start(cid, mid, StubServer())
+    assert info.value.code == "shutting_down"
+    assert run.task_of(cid) is None
+
+
+async def test_cancel_all_during_the_preflight_starts_no_task():
+    cid, mid = await conversation()
+    server = StubServer()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    real_list = StubRun.list_tools
+
+    async def slow_list(self: StubRun) -> list[Any]:
+        entered.set()
+        await release.wait()
+        return await real_list(self)
+
+    StubRun.list_tools = slow_list  # type: ignore[method-assign]
+    try:
+        starting = asyncio.create_task(start(cid, mid, server))
+        await asyncio.wait_for(entered.wait(), 2)
+        await run.cancel_all()
+        release.set()
+        with pytest.raises(run.RunError) as info:
+            await starting
+    finally:
+        StubRun.list_tools = real_list  # type: ignore[method-assign]
+    assert info.value.code == "shutting_down"
+    assert run.task_of(cid) is None
+    async with SessionLocal() as s:
+        rows = (await s.execute(select(ReconcileRun).where(
+            ReconcileRun.conversation_id == cid))).scalars().all()
+    assert rows == []
+
+
+async def test_runs_per_process_are_capped(monkeypatch):
+    monkeypatch.setenv("RECONCILE_MAX_RUNS", "1")
+    first_cid, first_mid = await conversation()
+    server = StubServer()
+    server.gate = asyncio.Event()
+    await start(first_cid, first_mid, server)
+    cid, mid = await conversation()
+    with pytest.raises(run.RunError) as info:
+        await start(cid, mid, StubServer())
+    assert info.value.code == "too_many_runs"
+    assert "Too many" in info.value.message
+    server.gate.set()
+    await wait(first_cid)
+    monkeypatch.delenv("RECONCILE_MAX_RUNS")
+    assert run.max_runs() == run.DEFAULT_MAX_RUNS == 2
+
+
+def test_the_survey_and_the_run_batch_by_one_rule():
+    from agents.reconcile import batches
+
+    sp = plain_spec()
+    data = csv_bytes(header="Object,Kind,Code,Flag")
+    total, count = batches.survey(data, sp, 200)
+    assert (total, count) == (ROWS, 6)
+    _, rows = iter_csv(data)
+    comparer = Comparer(sp, {})
+    seen = [p for _, p in batches.batches(rows, comparer.key_of, 200) if p]
+    assert len(seen) == count and sum(len(p) for p in seen) == ROWS
 
 
 # --- heartbeat, progress, cancel -------------------------------------------------
@@ -617,6 +760,28 @@ def test_column_counters_are_flattened_plain_counters_and_read_back():
         {"column": "Free", "kind": "unresolved", "checked": 0, "matched": 0, "mismatched": 0,
          "not_checked": 5},
     ]
+
+
+def test_tricky_column_names_survive_the_counter_round_trip():
+    from agents.reconcile.counts import _RULE_KINDS, column_counts, split_counts
+    from agents.reconcile.engine import ColumnStats
+
+    assert _RULE_KINDS == {"direct", "constant", "value_map", "expression", "not_needed",
+                           "unresolved"}
+    stats = {
+        "A.kind.direct": ColumnStats(kind="value_map", checked=4, matched=1, mismatched=3),
+        "A": ColumnStats(kind="direct", checked=4, matched=4),
+        "rows_total": ColumnStats(kind="constant", checked=4, matched=2, mismatched=2),
+        "x.checked": ColumnStats(kind="expression", checked=1, matched=1),
+    }
+    totals, columns = split_counts({"rows_total": 4, **column_counts(stats)})
+    assert totals == {"rows_total": 4}
+    by_name = {c["column"]: c for c in columns}
+    assert set(by_name) == set(stats)
+    for name, stat in stats.items():
+        assert by_name[name] == {"column": name, "kind": stat.kind, "checked": stat.checked,
+                                 "matched": stat.matched, "mismatched": stat.mismatched,
+                                 "not_checked": stat.not_checked}
 
 
 async def test_a_finished_run_stores_per_column_counters():

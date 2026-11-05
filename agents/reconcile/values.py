@@ -68,7 +68,6 @@ def same(
     return left == right
 
 
-
 def pad_key(raw: str, length: int) -> str:
     """Zero-pad an all-digit key shorter than ``length`` (as SAP stores it); others unchanged."""
     if _DIGITS.fullmatch(raw) and len(raw) < length:

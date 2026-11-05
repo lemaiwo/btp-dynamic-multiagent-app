@@ -27,9 +27,15 @@ from agents.reconcile.spec import ReconcileSpec
 from agents.webchat.docgen import XLSX, xml_text
 
 REPORT_MEDIA_TYPE = XLSX
-# Above this the file is refused rather than stored: a chat file this large
-# would not open usefully anyway, and the engine's caps keep real runs far below.
+# A storage guard, not an Excel limit: above this the file is refused rather
+# than stored as a chat file (a row of the database); a file this large would
+# not open usefully anyway, and the engine's caps keep real runs far below.
 REPORT_MAX_BYTES = 64 * 1024 * 1024
+# Excel holds at most 32,767 characters in a cell; longer text is clipped.
+MAX_CELL_CHARS = 32_000
+TRUNCATED_LOOKUPS_LINE = (
+    "Code tables cut at the row cap: {n} (values beyond the cap were not read)"
+)
 
 SHEET_SUMMARY = "Summary"
 SHEET_MISMATCHES = "Mismatches"
@@ -71,6 +77,8 @@ class ReportMeta:
     spec_name: str
     started_at: datetime | None
     finished_at: datetime | None
+    # Code tables whose reading stopped at the row cap (``Lookup.truncated``).
+    lookups_truncated: int = 0
 
 
 def report_file_name(spec: ReconcileSpec, meta: ReportMeta) -> str:
@@ -105,7 +113,7 @@ class _Writer:
                 out.append(None)
                 continue
             if isinstance(value, bool) or not isinstance(value, int):
-                cell = self._cell(self._ws, value=xml_text(str(value)))
+                cell = self._cell(self._ws, value=xml_text(str(value))[:MAX_CELL_CHARS])
                 cell.data_type = "s"  # never a formula, whatever the text starts with
             else:
                 cell = self._cell(self._ws, value=int(value))
@@ -155,12 +163,16 @@ def _write_summary(book: Any, spec: ReconcileSpec, result: EngineResult, meta: R
         _cap_line("Mismatch", len(result.mismatches), result.mismatches_dropped),
         _cap_line("Missing", len(result.missing_in_ecc), result.missing_in_ecc_dropped),
     ]
+    if meta.lookups_truncated > 0:
+        caps.append(TRUNCATED_LOOKUPS_LINE.format(n=meta.lookups_truncated))
     for line in caps:
         if line:
             out.row((line,))
     out.row(())
     out.row(COLUMN_HEADER, bold=True)
-    first_reason: dict[str, str] = {}
+    # The engine's own record first: the list stops at the cap.
+    first_reason: dict[str, str] = {
+        c: s.first_reason for c, s in result.stats.items() if s.first_reason}
     for m in result.mismatches:
         first_reason.setdefault(m.column, m.reason)
     # Spec order first (the order the tester wrote), then any column only the
@@ -169,7 +181,7 @@ def _write_summary(book: Any, spec: ReconcileSpec, result: EngineResult, meta: R
     for column in columns:
         stats = result.stats.get(column)
         kind = stats.kind if stats else spec.columns[column].kind
-        reason = first_reason.get(column)
+        reason = first_reason.get(column) if (stats is None or stats.mismatched) else None
         out.row((
             column,
             kind,

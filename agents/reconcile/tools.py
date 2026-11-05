@@ -264,7 +264,8 @@ def _register(toolset: ReconcileToolset, context: ReconcileContext) -> None:
         once from `xref_file_id` (`lookup_failed` names the sheet and header
         row). On success the spec is stored as a file of this conversation:
         `{file_id, name, download_url, columns_by_kind, lookups: [{sheet,
-        header_row, entries, duplicates}], rows_in_csv}`. Show the user this
+        header_row, entries, duplicates, truncated}], rows_in_csv}` (a
+        `truncated` code table stopped at the row cap: tell the user). Show the user this
         summary and get their confirmation before start_reconciliation.
         """
         try:
@@ -303,7 +304,8 @@ def _register(toolset: ReconcileToolset, context: ReconcileContext) -> None:
                 seen.add(id(table))
                 ref = parsed.columns[column].lookups[index]
                 summary.append({"sheet": ref.sheet, "header_row": ref.header_row,
-                                "entries": len(table.entries), "duplicates": table.duplicates})
+                                "entries": len(table.entries), "duplicates": table.duplicates,
+                                "truncated": table.truncated})
             stored = await store_generated(ctx, spec_file_name(parsed), JSON,
                                            parsed.to_json)
             if "error" in stored:

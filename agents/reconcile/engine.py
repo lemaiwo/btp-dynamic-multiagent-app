@@ -153,14 +153,16 @@ def normalise_key(raw: str | None, key: KeySpec) -> str | None:
     """The source key for a CSV key cell, or ``None`` when it cannot be one.
 
     All-digit keys are zero-padded to ``key.length`` (as SAP stores them) when
-    ``pad_numeric``. A key outside :data:`KEY_RE` or longer than the field is
-    refused: it could not exist in the source and must never reach a query.
+    ``pad_numeric``, after their leading zeros are dropped (ALPHA), so a key
+    written with more zeros than the field holds is still that key. A key
+    outside :data:`KEY_RE` or longer than the field is refused: it could not
+    exist in the source and must never reach a query.
     """
     text = clean(raw)
     if not text or not KEY_RE.fullmatch(text):
         return None
     if key.pad_numeric:
-        text = pad_key(text, key.length)
+        text = pad_key(alpha(text), key.length)
     return text if len(text) <= key.length else None
 
 
@@ -169,11 +171,16 @@ def normalise_key(raw: str | None, key: KeySpec) -> str | None:
 
 @dataclass
 class ColumnStats:
+    """Exact per-column counters. ``first_reason`` is the reason code of the
+    column's first mismatch, kept here because the mismatch list stops at the
+    cap and may not hold one of the column's mismatches at all."""
+
     kind: str
     checked: int = 0
     matched: int = 0
     mismatched: int = 0
     not_checked: int = 0
+    first_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -358,6 +365,8 @@ class Comparer:
                 stats.matched += 1
                 continue
             stats.mismatched += 1
+            if stats.first_reason is None:
+                stats.first_reason = reason
             if len(self._mismatches) < self._cap:
                 self._mismatches.append(
                     Mismatch(
