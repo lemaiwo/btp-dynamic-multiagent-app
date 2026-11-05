@@ -1763,8 +1763,8 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
         for key in ("arc1_server", "target", "batch_size", "mismatch_cap"):
             check(f"reconcile field {key} is on the form",
                   f'dest-field-{key}"' in html and f'class="dest-{key}"' in html)
-        check("the hint list says where builtin:reconcile runs",
-              'builtin:reconcile runs on "None (public)" only.' in js)
+        check("the unknown-builtin hint does not carry a reconcile sentence",
+              'builtin:reconcile runs on "None (public)" only.' not in js)
         check("api() call discovered: GET /admin/api/odata/services",
               ("GET", "/admin/api/odata/services") in discovered)
         for opener in ("openAgentModal", "editAgent"):
@@ -2470,6 +2470,24 @@ assert.strictEqual(row.querySelector('.mcp-destination').style.display, 'block')
 row.querySelector('.dest-arc1_server').value = 'https://arc1.example.com/mcp';
 assert.deepStrictEqual(collectMcpServers()[0], { url: 'builtin:reconcile', auth_mode: 'none',
     oauth: { arc1_server: 'https://arc1.example.com/mcp' } });
+// B1: a new row typed as builtin:reconcile moves from another mode to none, once.
+document.getElementById('agent-mcp-servers').innerHTML = '';
+addMcpServerRow();
+row = document.querySelector('.mcp-server-row');
+row.querySelector('.mcp-auth-mode').value = 'oauth2';
+toggleOauthFields(row.querySelector('.mcp-auth-mode'));
+row.querySelector('.mcp-url').value = 'builtin:reconcile';
+syncDestinationFields(row);
+assert.strictEqual(row.querySelector('.mcp-auth-mode').value, 'none', 'new reconcile row set to none');
+assert.strictEqual(row.querySelector('.mcp-destination').style.display, 'block');
+row.querySelector('.mcp-auth-mode').value = 'jwt';
+toggleOauthFields(row.querySelector('.mcp-auth-mode'));
+assert.strictEqual(row.querySelector('.mcp-auth-mode').value, 'jwt', 'a later choice is kept');
+// B2: two builtin:reconcile rows are refused before the save.
+document.getElementById('agent-mcp-servers').innerHTML = '';
+addMcpServerRow({ url: 'builtin:reconcile', auth_mode: 'none' });
+addMcpServerRow({ url: 'Builtin:Reconcile/', auth_mode: 'none' });
+assert.throws(() => collectMcpServers(), /Two builtin:reconcile rows/);
 // 4b. Confluence keeps its space pin and api_base; nothing of Jira's, no user switch.
 ({ row, out } = addAndCollect({
     url: 'builtin:confluence', auth_mode: 'destination',

@@ -946,6 +946,9 @@ function collectMcpServers() {
     if (rows.filter(r => destinationBuiltinOf(r) === BITBUCKET_BUILTIN).length > 1) {
         throw new Error('Two builtin:bitbucket rows: an agent takes one. Keep one and remove the other.');
     }
+    if (rows.filter(r => destinationBuiltinOf(r) === RECONCILE_BUILTIN).length > 1) {
+        throw new Error('Two builtin:reconcile rows: an agent takes one. Keep one and remove the other.');
+    }
     if (rows.filter(r => destinationBuiltinOf(r) === GIT_BUILTIN).length > 1) {
         throw new Error('Two builtin:git rows: an agent takes one. Keep one, with all its repositories, and remove the other.');
     }
@@ -2984,6 +2987,18 @@ function syncDestinationFields(row) {
     // The url may have become, or stopped being, builtin:reconcile on none.
     syncFieldBox(row);
     const builtin = destinationBuiltinOf(row);
+    // A NEW row typed as builtin:reconcile moves to "None (public)", the only
+    // mode it takes; once, so a later choice of the user is not overridden.
+    if (row.dataset.newServer === '1' && builtin === RECONCILE_BUILTIN
+        && row.dataset.reconcileModeSet !== '1') {
+        row.dataset.reconcileModeSet = '1';
+        const modeSelect = row.querySelector('.mcp-auth-mode');
+        if (modeSelect.value !== 'none') {
+            modeSelect.value = 'none';
+            toggleOauthFields(modeSelect);
+            return;
+        }
+    }
     // "Allow commenting" is ONE checkbox for builtin:jira and
     // builtin:bitbucket. When the URL is edited into the OTHER of the two, a
     // tick that was set for the old one must not be sent for the new one; and
@@ -3035,7 +3050,7 @@ function syncDestinationFields(row) {
     let hint = '';
     if (!known) {
         hint = 'A destination works with an https MCP server or a built-in toolset (builtin:gmail, builtin:outlook, '
-            + 'builtin:teams, builtin:slack, builtin:jira, builtin:confluence, builtin:smtp, builtin:sharepoint, builtin:bitbucket, builtin:git, builtin:sapnotes, builtin:sapnotedetail, builtin:odata). builtin:reconcile runs on "None (public)" only.';
+            + 'builtin:teams, builtin:slack, builtin:jira, builtin:confluence, builtin:smtp, builtin:sharepoint, builtin:bitbucket, builtin:git, builtin:sapnotes, builtin:sapnotedetail, builtin:odata).';
     } else if (builtin === ODATA_BUILTIN) {
         hint = 'Destination and identity come from each catalogue service. Edit services in the UI5 admin (OData services).';
     } else if (builtin === INA_BUILTIN) {
