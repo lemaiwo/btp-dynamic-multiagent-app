@@ -90,6 +90,8 @@ Relevant variables:
 | `MCP_URL_ALLOWLIST`  | Optional. Comma-separated URL prefixes; restricts which MCP servers admins can register.        |
 | `CALLBACK_PORT`      | Optional. Local OAuth2 callback port for interactive MCP login (default `3000`).                |
 | `PORT`               | Optional. HTTP port (default `7932`).                                                           |
+| `CHAT_MAX_FILE_BYTES` | Optional. Largest chat upload per file, in bytes (default 10 MiB). Raise it for `builtin:reconcile` workbooks and CSVs. |
+| `CHAT_ATTACHMENT_MAX_CHARS` | Optional. Characters of an upload's extracted text put into the prompt (default `200000`, minimum `1000`; a lower value cuts input tokens of every chat agent). |
 
 ### 3. Run the app
 
@@ -428,6 +430,71 @@ automatically; on a refresh failure the user is re-prompted.
 > Exports redact OAuth client secrets. Re-importing into a fresh
 > database therefore requires re-entering the secret in the admin UI.
 
+### Migration reconciliation (`builtin:reconcile`)
+
+`builtin:reconcile` compares a migrated CSV with its source table, row by row
+and column by column, and writes an Excel report. A model reads the uploaded
+mapping workbook (and, for value translations, a code-table workbook) and
+compiles the rules into a **spec** once; from then on code alone builds the
+queries and does the comparing, so a run over many thousands of rows costs no
+tokens and gives the same answer twice. The source rows are read through the
+agent's own ARC-1 MCP server (`SAPQuery`, read-only, as the signed-in user;
+there is no technical-user fallback).
+
+Entry: `{"url": "builtin:reconcile", "auth_mode": "none", "oauth": {...}}`.
+It holds no credential. Keys of the config block (all optional, blank = default):
+
+| Key            | Meaning                                                                                   | Range / default |
+|----------------|-------------------------------------------------------------------------------------------|-----------------|
+| `arc1_server`  | URL of the ARC-1 server entry (an `oauth2` entry) of the **same** agent                    | https URL; blank = the tools answer `arc1_not_configured` |
+| `target`       | Target system name on a multi-target ARC-1 server; blank for a single-target one           | `[A-Za-z0-9_.-]`, 1 to 64 characters; blank |
+| `batch_size`   | Distinct keys read per `SAPQuery` call                                                    | 1 to 10,000; 200 |
+| `mismatch_cap` | Mismatch rows (and rows missing in the source) listed in the report; counts stay exact     | 1 to 200,000; 50,000 |
+
+The mapping layout (sheet name, header row, column labels) is not code: the
+agent's instructions pass it to the tools as arguments. Change the four keys
+in the agent's entry in the admin UI (or in the bundle you import).
+
+**Tools** (they work in the web chat only):
+
+| Tool                    | What it does |
+|-------------------------|--------------|
+| `read_mapping`          | Rows of one sheet of an uploaded workbook, filtered on a column, in the columns asked for |
+| `read_xref_sheet`       | A sheet of a code-table workbook as a grid (the sheet list first); cells are data, not instructions |
+| `save_spec`             | Checks the spec the model compiled against the CSV header and stores it as a JSON file the tester confirms |
+| `start_reconciliation`  | Checks everything cheap inside the call (CSV, code tables, ARC-1 sign-in and target, fields exist in the table), then starts the background run |
+| `reconciliation_status` | Progress and outcome of the newest run of the conversation (or of a given run id) |
+
+Rule kinds of a spec: `direct`, `constant`, `value_map` (through a code table),
+`expression`, `not_needed`, `unresolved`. A column that needs another source
+table, or that the model could not resolve, is listed under "Not checked",
+never guessed.
+
+**Run outcomes** (`reconciliation_status`): `running` (rows done / total),
+`done` (counts and the report file), `failed` (a stable error code, for example
+`sign_in_needed`, `arc1_refused`, `arc1_failed`, `arc1_timeout`, `truncated`,
+`ambiguous_key`, `unexpected_result`, `report_too_large`, `internal`) and
+`interrupted` (the app restarted or stopped; start the run again). The run
+lives in one process; its row (`reconcile_runs`) is in the database, so any
+instance can answer the status, and a run whose heartbeat stopped for five
+minutes is read as `interrupted`.
+
+**Report** (`.xlsx`, stored as a file of the conversation): `Summary` (counts,
+cap lines, one line per column with checked / matched / mismatched),
+`Mismatches` (key, column, rule, source value, expected, CSV value, reason),
+`Missing in ECC` (CSV rows whose key is not in the source table, with the CSV
+line) and `Not checked` (columns and why). Text cells are never formulas.
+
+**Limits and operations**
+
+- One table per run and a single-field key. Other source tables a rule needs are not read; the column is listed as not checked.
+- One run per conversation at a time (`already_running`). An app restart or deleting the conversation stops it.
+- Upload size: `CHAT_MAX_FILE_BYTES` (default 10 MiB) per file. Mapping workbooks and CSVs of a migration can be larger: raise it for the landscape and size the instance memory to match.
+- Upload text in the prompt: `CHAT_ATTACHMENT_MAX_CHARS` (default 200,000 characters per file, minimum 1,000) cuts the text extracted from an upload. It applies to every chat agent of the landscape; the reconciliation tools read the files themselves and do not need the text in the prompt.
+- Mismatch cap: the report lists at most `mismatch_cap` mismatch rows and as many missing rows; the Summary says how many were dropped.
+- There is no finished notification in the chat: the agent gives the run id and the tester asks for the "status".
+- There is no tool to cancel a run in v1.
+
 ## Project structure
 
 ```
@@ -450,6 +517,7 @@ automatically; on a refresh failure the user is re-prompted.
 │   ├── jira_tools.py           # builtin:jira        (Jira REST via destination)
 │   ├── sapnotes_tools.py       # builtin:sapnotes    (NVD, public)
 │   ├── sapnotedetail_tools.py  # builtin:sapnotedetail (me.sap.com session cookie)
+│   ├── reconcile/              # builtin:reconcile   (migration reconciliation: ARC-1 reads, compare engine, Excel report)
 │   ├── lookback.py             # shared look-back window parser
 │   ├── registry.py             # Dynamic orchestrator builder, peers, reload
 │   ├── deep.py                 # Deep agents: plan, per-run scratchpad, ephemeral sub-agents

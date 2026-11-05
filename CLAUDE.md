@@ -425,7 +425,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   write switches Jira `allow_comment` and the `allow_send` of oauth2 and
   app_only Outlook/Teams/Gmail are stored true only for the JSON boolean
   `true` (`is True`, never `bool()`: the string `"false"` is truthy).
-  `builtin:odata` and `builtin:ina` are the two whose entry
+  `builtin:reconcile` (`agents/reconcile/`, `auth_mode=none`) gets only
+  `server_for`, the lookup of the agent's other MCP servers filled in the same
+  registry pass. `builtin:odata` and `builtin:ina` are the two whose entry
   names no destination (each catalogue service or registered query names its
   own) and the two factories that also receive the snapshot the registry
   loaded (catalogue services, `context["ina_queries"]`); `builtin:odata` is
@@ -1560,6 +1562,79 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   one member plus the "not assigned" one), both with synthetic keys and
   amounts, and `run_sia_variables_missing.json` (the refusal of a read
   without a submit)
+- `agents/reconcile/` — **migration reconciliation** as an in-process toolset
+  (`builtin:reconcile`; `auth_mode="none"`, any other mode is a 422): a model
+  compiles the mapping rules into a `ReconcileSpec` once, code then compares every
+  row of a migrated CSV with its source row, read through the SAME agent's ARC-1
+  MCP server (`SAPQuery` only, read-only, as the signed-in tester; no technical
+  user), and stores an Excel report. Entry config (`config.py`,
+  `validate_reconcile_block` shared by the admin gate, `agents.db._clean_builtin_public`
+  and the factory; standard library only): `arc1_server` (https URL of the sibling
+  entry, blank = `arc1_not_configured`), `target` (`TARGET_RE`, blank for a
+  single-target ARC-1), `batch_size` (1..10,000, default 200), `mismatch_cap`
+  (1..200,000, default 50,000); the numbers are strings in the stored block.
+  - `spec.py` — `ReconcileSpec` and its rule models (`direct`, `constant`,
+    `value_map`, `expression`, `not_needed`, `unresolved`; `KeySpec`,
+    `XrefLookup`), all `extra="forbid"`; the spec is model output, so every
+    identifier is upper-cased and checked against `IDENT_RE` (no namespaces in v1),
+    every list and text is capped, `SpecError` and `validation_errors` carry fixed
+    texts and never echo input
+  - `values.py` — what "the same" means: blank vs. space, ALPHA leading zeros,
+    numbers written differently (ASCII digits only)
+  - `workbook.py` / `mapping_reader.py` / `xref_reader.py` — the uploaded workbooks
+    through the guarded reader of `builtin:sharepoint` (`sharepoint_workbook`);
+    labels compared after `norm_label` (unique prefix allowed); the layout is a tool
+    argument, no customer layout in code; `Refused(code, message, hint)` texts are
+    fixed and never quote a cell; `xref_reader` has the grid view for the model
+    (`list_sheets`, `read_grid`) and `build_lookups` for the run; CPU-bound, run in
+    `asyncio.to_thread`
+  - `engine.py` — `iter_csv` and `Comparer.compare`: no I/O; exact counters, lists
+    of mismatches and of keys missing in the source stop at `mismatch_cap` and count
+    what they dropped; keys compared case-sensitively; `CsvError` codes
+  - `arc1_reader.py` — `Arc1Reader`: the only code that talks to ARC-1 for a run.
+    `build_sql` from checked identifiers and `KEY_RE` literals (no `MANDT`, always
+    `maxRows`); a DD03L preflight (`field_not_in_table`); the multi-target
+    `target` argument detected from the tool schema (`target_required`,
+    `target_not_supported`); `Arc1ReadError` carries a stable code and a fixed
+    message (`sign_in_needed`, `query_tool_missing`, `preflight_refused`,
+    `arc1_refused`, `arc1_failed`, `unexpected_result`, `truncated`,
+    `ambiguous_key`), never ARC-1's text
+  - `runs_store.py` — table `reconcile_runs` (`ReconcileRun` in `agents/db.py`,
+    **HANA schema generation 11**, one new table, nothing undeployed): one row per
+    run (status `running` | `done` | `failed` | `interrupted`, `counts`,
+    `error_code`, `report_file_id`, owner principal, heartbeat `updated_at`).
+    Conditional `UPDATE ... WHERE status='running'` with a rowcount check (no
+    `RETURNING`), `create_run` under a lock (conversation row `FOR UPDATE` on
+    Postgres/HANA, up-front write lock on SQLite) so a conversation has one live
+    run, `STALE_SECONDS` (300) reads a silent `running` row as `interrupted`,
+    `latest_run` is owner-scoped, `sweep_running_at_startup`; no cell value or
+    message text in the row
+  - `report.py` — own openpyxl write-only writer (docgen's `build_xlsx` caps at
+    10,000 rows / 10 MiB): sheets `Summary`, `Mismatches`, `Missing in ECC`,
+    `Not checked`; text cells are never formulas; `REPORT_MAX_BYTES`
+    (`report_too_large`)
+  - `run.py` — `start(...)` refuses cheaply inside the tool call (`not_signed_in`,
+    `already_running`, `csv_invalid`, `csv_empty`, `xref_required`, the preflight)
+    and then starts ONE background task per conversation in a copy of the caller's
+    context (so `current_principal` and the JWT stay the tester's); two ARC-1
+    sessions (preflight, and one for the whole task); batches by distinct keys;
+    heartbeat every `HEARTBEAT_SECONDS`; each read bounded by
+    `READ_TIMEOUT_SECONDS` (`arc1_timeout`); `app.py` lifespan calls
+    `sweep_running_at_startup` and `cancel_all()` (rows become `interrupted`)
+  - `tool_support.py` / `tools.py` — the five tools (`read_mapping`,
+    `read_xref_sheet`, `save_spec`, `start_reconciliation`, `reconciliation_status`);
+    errors are `{"error": {code, message, ...}}` with fixed `MESSAGES`; the
+    conversation comes from `docgen.current_chat_run` (`no_chat` outside the web
+    chat), files only through `store.get_file` AND of this conversation;
+    `activity_summary` keeps counts and codes only and is hooked into
+    `registry._short_tool_output`. The ARC-1 sibling is looked up at call time
+    (`ReconcileContext.arc1_server()` via `server_for`, filled by
+    `build_orchestrator` in the same pass, URL normalised with
+    `mcp_endpoint_url`). Known limits: one table, single-field key, other source
+    tables not checked, no chat-side "finished" signal (the tester asks for the
+    status), no cancel tool. Related: `CHAT_ATTACHMENT_MAX_CHARS`
+    (`agents/webchat/uploads.py`, `MAX_TEXT_CHARS`, default 200,000, minimum 1,000)
+    cuts upload text put into the prompt for every chat agent
 - `agents/data_catalog/` — the **data catalogue graph** (design addendum j, part 1):
   one graph of every data source attached to at least one enabled agent, built once
   and scoped at query time, so an agent finds the right source without a prompt that
@@ -2417,7 +2492,7 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   - `uploads.py` — media type by content, never by the declared type: PNG,
     JPEG, PDF (≤ 50 pages) by magic bytes; `.docx`/`.xlsx` by `PK\x03\x04` +
     extension + main part, text extracted with defusedxml / the SharePoint
-    reader's guarded archive, cut at 200,000 chars with a marker; `.txt`/
+    reader's guarded archive, cut at `CHAT_ATTACHMENT_MAX_CHARS` (default 200,000, minimum 1,000) with a marker; `.txt`/
     `.md`/`.csv`/`.json` only when UTF-8. Limits `CHAT_MAX_FILE_BYTES` (10 MiB),
     `CHAT_MAX_FILES_PER_MESSAGE` (5), text 64 KiB; refusals are fixed texts
     (413/415/422). The multipart reader is `agents/multipart_form.py`, shared
