@@ -387,15 +387,22 @@ async def test_run_query_answers_the_not_assigned_member_as_a_null_key():
         "hint": NOT_ASSIGNED_HINT,
     }
     assert NOT_ASSIGNED_HINT == (
-        "a null key is SAP's 'not assigned' member of that dimension (no value): "
+        "a null key is SAP's 'not assigned' member of that dimension; its number is real: "
         "report it as not assigned, never leave it out")
     assert activity_summary("run_query", answer) == "run_query: 2 rows"
 
 
 def test_the_tool_description_says_how_order_and_a_null_key_read():
     description = " ".join(world().toolset.tools["run_query"].function.__doc__.split())
-    assert "a measure sorts the rows by its value" in description
+    # A mixed list was never recorded: sent in that order, not "applied".
+    assert "sent to SAP in that order" in description
+    assert "applied by SAP" not in description
+    # Seen on the system with one row dimension and once with two, where SAP
+    # sorted the whole result, not within the first dimension's groups.
+    assert ("a measure sorts all rows by its value, across the groups of every "
+            "group_by dimension") in description
     assert "not_assigned" in description and "null key" in description
+    assert 'a filter on the value "" (the not assigned member) is unverified' in description
 
 
 async def test_the_defaults_of_the_optional_arguments():

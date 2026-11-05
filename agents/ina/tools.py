@@ -73,7 +73,7 @@ TOOL_NAMES = ("list_queries", "describe_query", "run_query")
 MAX_RESULT_CHARS = 60_000
 TRUNCATED_HINT = f"more rows than top: narrow the filters or raise top (max {MAX_TOP})"
 NOT_ASSIGNED_HINT = (
-    "a null key is SAP's 'not assigned' member of that dimension (no value): "
+    "a null key is SAP's 'not assigned' member of that dimension; its number is real: "
     "report it as not assigned, never leave it out"
 )
 # The one code of this module: the registration holds no usable description.
@@ -418,12 +418,15 @@ def ina_toolset(
                 gives one total row.
             filters: Up to 30 filters, each {"dimension": <name>, "operator":
                 "=", "<>", ">=", "<=", "between" or "in", "value": one value,
-                [low, high] for between, or a list of 1 to 50 values for in}.
+                [low, high] for between, or a list of 1 to 50 values for in};
+                a filter on the value "" (the not assigned member) is
+                unverified.
             top: How many rows, 1 to 2000.
             order: Up to 10 entries {"by": <a group_by or measure name>,
-                "direction": "asc" or "desc"}, applied by SAP in that order:
-                a measure sorts the rows by its value (with top, the top n),
-                a dimension by its key.
+                "direction": "asc" or "desc"}, sent to SAP in that order: a
+                measure sorts all rows by its value, across the groups of
+                every group_by dimension (with top, the top n overall); a
+                dimension sorts by its key.
             variables: Variable name to value: one value for a single
                 variable, [low, high] for an interval, a list for a multiple
                 one. Every mandatory variable must be given.

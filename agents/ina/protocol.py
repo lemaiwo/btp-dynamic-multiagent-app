@@ -50,8 +50,11 @@ stateful SAP session (``agents/ina/client.py`` sends them):
 A ``Sort`` (recorded 2026-11-05): SIA applied a measure sort in SAP's own
 client's form, without a ``Dimension`` (with the measure structure as
 ``Dimension``, the 2.37.1 form, it was ignored), and a dimension sort by
-``MemberKey`` (:func:`_sort_entry`); each was seen alone, a list of several
-is sent in the order given, as that client sends it. The submit carries the
+``MemberKey`` (:func:`_sort_entry`). Verified with one row dimension; with
+two, SIA sorted the whole result by the measure, across the first
+dimension's groups (seen once; no ``PreserveGrouping`` is sent, SIA lists no
+``SortTypesBreakGrouping``). Each kind was seen alone: a list of several is
+sent in the order given, as that client sends it. The submit carries the
 sort too.
 
 Not seen on SIA: a read of several measures (the column order would be
@@ -345,7 +348,9 @@ def _sort_entry(name: str, direction: str, *, measure: bool) -> dict[str, str]:
     ``QInASort.exportMeasureSorting``: ``SortType`` ``Measure``,
     ``MeasureName``, ``Direction``) and with NO ``Dimension``: a measure sort
     has none of its own, and with the measure structure named there (what
-    2.37.1 sent) SIA ignored the sort and answered in key order. A row
+    2.37.1 sent) SIA ignored the sort and answered in key order. With two
+    row dimensions SIA sorted all rows by the measure, not within the first
+    dimension's groups (seen once). A row
     dimension is sorted by its key (``SortType`` ``MemberKey``, its name as
     ``Dimension``). ``direction`` is ``asc`` or ``desc`` (checked by the
     caller)."""
