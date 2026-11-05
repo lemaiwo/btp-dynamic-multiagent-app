@@ -1792,6 +1792,44 @@ class ChatFile(Base):
     )
 
 
+class ReconcileRun(Base):
+    """One run of builtin:reconcile (agents/reconcile/run.py), so a finished or
+    failed run is visible from any instance. ``error_code`` is a fixed code,
+    never a text; ``counts_json`` holds counters only, never cell values.
+
+    ``status`` is ``running | done | failed | interrupted``; it leaves
+    ``running`` only in a conditional UPDATE (``agents/reconcile/runs_store.py``).
+    A child of the conversation: ``agents.webchat.store`` deletes it with it.
+    """
+
+    __tablename__ = "reconcile_runs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_chat_uuid)
+    conversation_id: Mapped[str] = mapped_column(
+        String(36), _chat_conversation_fk(), nullable=False, index=True
+    )
+    principal: Mapped[str] = mapped_column(String(255), nullable=False)
+    message_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    table_name: Mapped[str] = mapped_column(String(30), nullable=False)
+    wave: Mapped[str] = mapped_column(String(32), nullable=False)
+    spec_file_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="running")
+    rows_total: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    rows_done: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    counts_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    report_file_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_chat_now,
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_chat_now,
+        server_default=func.now(),
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class ChatUserAgent(Base):
     """A personal agent of the web chat: prompt-level only (instructions,
     attached skills, a model, the admin specialists it may consult), owned by

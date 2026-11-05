@@ -29,7 +29,7 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agents.auth import current_principal
-from agents.db import ChatConversation, ChatFile, ChatMessage
+from agents.db import ChatConversation, ChatFile, ChatMessage, ReconcileRun
 from agents.ide.models import iso_utc
 from agents.ide.store import _chunks, env_int
 from agents.notifications import _marker_key as principal_key
@@ -188,7 +188,7 @@ async def update_conversation(
 
 
 async def _delete_children(db: AsyncSession, ids: list[str]) -> None:
-    for model in (ChatFile, ChatMessage):
+    for model in (ReconcileRun, ChatFile, ChatMessage):
         await db.execute(
             delete(model).where(model.conversation_id.in_(ids))
             .execution_options(synchronize_session=False)

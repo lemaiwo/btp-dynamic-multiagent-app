@@ -124,6 +124,34 @@ def test_generation_10_appends_the_embedding_setting_to_the_orchestrator_row():
     ]
 
 
+def test_generation_11_adds_the_reconcile_runs_table():
+    """The reconciliation run store (``agents/reconcile/runs_store.py``): a
+    new column table whose foreign key to the conversation and whose index
+    on ``conversation_id`` are artifacts of their own, as for every table."""
+    assert GEN >= 11
+    table = FILES["src/reconcile_runs.hdbtable"]
+    assert table.startswith("COLUMN TABLE reconcile_runs (")
+    for line in (
+        "conversation_id NVARCHAR(36) NOT NULL",
+        "status NVARCHAR(16) DEFAULT 'running' NOT NULL",
+        "rows_done INTEGER DEFAULT '0' NOT NULL",
+        "counts_json NCLOB",
+        "started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL",
+        "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL",
+        "finished_at TIMESTAMP",
+        "PRIMARY KEY (id)",
+    ):
+        assert line in table, line
+    assert "FOREIGN KEY" not in table
+    assert FILES["src/fk_reconcile_runs_conversation_id.hdbconstraint"] == (
+        "CONSTRAINT fk_reconcile_runs_conversation_id ON reconcile_runs FOREIGN KEY "
+        "(conversation_id) REFERENCES chat_conversations (id) ON DELETE CASCADE\n"
+    )
+    assert FILES["src/ix_reconcile_runs_conversation_id.hdbindex"] == (
+        "INDEX ix_reconcile_runs_conversation_id ON reconcile_runs (conversation_id)\n"
+    )
+
+
 def test_a_unique_constraint_and_a_partial_index_are_plain_unique_indexes():
     assert FILES["src/uq_agent_configs_name.hdbindex"] == (
         "UNIQUE INDEX uq_agent_configs_name ON agent_configs (name)\n"
