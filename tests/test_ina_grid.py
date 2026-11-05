@@ -595,7 +595,8 @@ def no_value_key(payload: dict[str, Any]) -> dict[str, Any]:
 
 def test_the_ordered_answer_keeps_saps_order_and_says_truncated(caplog):
     """Top 5 cost centres by value, descending (recorded order-1): SAP sent
-    top + 1 rows in value order and ``TupleCountTotal`` 352, so five rows
+    top + 1 rows in value order and a ``TupleCountTotal`` above top (40 in
+    the fixture, synthetic), so five rows
     come back, in that order, and ``truncated`` is true. The first is the
     cost centre SAP marks as having no value."""
     plan = one_dimension_plan(COSTCENTER, 5, [{"by": "ELTUIDCMP1", "direction": "desc"}])
@@ -689,3 +690,27 @@ def test_a_no_value_mark_on_a_cell_is_still_refused(caplog):
         error = refused(payload, one_dimension_plan(PRODUCTTYPE, 20))
     assert error.message == ina_grid.VALUE_REFUSED
     assert logged_refusal(caplog) == ("cell_exception", 1)
+
+
+def test_a_real_empty_key_is_a_key_not_the_not_assigned_member():
+    """Only the mark says "not assigned": a member whose key is ``""`` with
+    mark 0 keeps its key and is not counted."""
+    payload = fixture("run_sia_not_assigned.json")
+    no_value_key(payload)["ValuesException"] = [0, 0]
+    out = read_grid(payload, one_dimension_plan(PRODUCTTYPE, 20))
+    assert out["rows"] == [["PT1", 1250.75], ["", 3400.5]]
+    assert "not_assigned" not in out
+
+
+@pytest.mark.parametrize("mark", [True, 1.0, "1"], ids=["true", "one point zero", "text"])
+def test_a_mark_that_only_looks_like_one_is_refused(mark, caplog):
+    """``True == 1`` and ``1.0 == 1`` in Python: a mark must be the whole
+    number 1 to be read as "not assigned". Anything else is a form this
+    reader does not know (``key_exception_list``, the fixed UNREADABLE
+    text), never a null key."""
+    payload = fixture("run_sia_not_assigned.json")
+    no_value_key(payload)["ValuesException"][1] = mark
+    with caplog.at_level("INFO", logger="agents.ina.grid"):
+        error = refused(payload, one_dimension_plan(PRODUCTTYPE, 20))
+    assert (error.code, error.message) == ("sap_error", protocol.UNREADABLE)
+    assert logged_refusal(caplog) == ("key_exception_list", 1)
