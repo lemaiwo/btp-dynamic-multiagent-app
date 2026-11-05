@@ -523,6 +523,7 @@ line) and `Not checked` (columns and why). Text cells are never formulas.
 │   ├── teams_tools.py          # builtin:teams       (Microsoft Graph, oauth2 / app_only)
 │   ├── slack_tools.py          # builtin:slack       (Slack Web API via destination)
 │   ├── jira_tools.py           # builtin:jira        (Jira REST via destination)
+│   ├── confluence_tools.py     # builtin:confluence  (Confluence REST via destination, read-only; get_page reads a long page in 60,000-character parts: start / next_start)
 │   ├── sapnotes_tools.py       # builtin:sapnotes    (NVD, public)
 │   ├── sapnotedetail_tools.py  # builtin:sapnotedetail (me.sap.com session cookie)
 │   ├── reconcile/              # builtin:reconcile   (migration reconciliation: ARC-1 reads, compare engine, Excel report)

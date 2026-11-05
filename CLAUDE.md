@@ -1942,11 +1942,15 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   limit=10)` builds the CQL server side (`type = page AND text ~ "<q>"` or
   `title ~`, `AND space in (...)` from the pin, `ORDER BY lastmodified
   DESC`; `"` and `\` escaped; 1-200 characters; `limit` 1..25; excerpt at
-  most 300 characters), `get_page(page_id)` (`^[0-9]{1,20}$`; a page outside
+  most 300 characters), `get_page(page_id, start=0)` (`^[0-9]{1,20}$`; a page outside
   the pin, or without a space key while pinned, is `space_not_allowed`
   without its body; the storage-format body becomes plain text through
-  `agents/confluence_text.py`, cut at `MAX_BODY_CHARS` = 60,000 with
-  `truncated` and `body_chars`; `last_modified_by` is the display name only;
+  `agents/confluence_text.py` and is read in parts of `MAX_BODY_CHARS` =
+  60,000 characters from `start` (plain character slicing, fetched again per
+  part), with `body_chars` (the whole page), `truncated` (this part does not
+  reach the end), `start` and `next_start` (null at the end); a `start` that
+  is not a real int, negative, over 50,000,000 or not below `body_chars` is
+  `invalid_start` (fixed text, the value not echoed); `last_modified_by` is the display name only;
   `url` is `_links.webui` on the destination's host) and
   `list_children(page_id, start=0, limit=100)` (`start` 0..10,000; the
   parent's space is checked first, cached 300 s per toolset; `next_start`).
@@ -1954,7 +1958,7 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   the closed list `ERROR_CODES` (`destination_error`, `unauthorized`,
   `forbidden`, `not_found`, `throttled`, `confluence_error`, `unreachable`,
   `not_json`, `invalid_id`, `invalid_query`, `space_not_allowed`,
-  `too_large`), never an exception and never Confluence's text; a 401 is
+  `too_large`, `invalid_start`), never an exception and never Confluence's text; a 401 is
   retried once after the destination is invalidated; the body of an error
   status is never read; a 2xx body over 8 MB is `too_large`; a destination
   that is OnPremise or not `https` is `destination_error` before anything is

@@ -128,7 +128,7 @@ def test_error_result_shape_and_closed_code_list():
     assert ERROR_CODES == {
         "destination_error", "unauthorized", "forbidden", "not_found", "throttled",
         "confluence_error", "unreachable", "not_json", "invalid_id", "invalid_query",
-        "space_not_allowed", "too_large"}
+        "space_not_allowed", "too_large", "invalid_start"}
     with pytest.raises(AssertionError):
         ConfluenceError("made_up", "x")
 
@@ -315,7 +315,7 @@ async def test_get_page_answers_text_metadata_and_a_url_on_the_sites_host():
         "url": f"{SITE}/wiki/spaces/shERPa/pages/1795129715/Action+boxes",
         "body": ("## Functional Context\n\nCreates an \"inspection lot\".\n\n"
                  "| Object | Type |\n| --- | --- |\n| Z_QM06_FA_CREATE_INSP_LOT | FUNC |"),
-        "body_chars": len(out["body"]), "truncated": False,
+        "body_chars": len(out["body"]), "truncated": False, "start": 0, "next_start": None,
     }
     assert "acc-1" not in json.dumps(out) and "a@example.com" not in json.dumps(out)
 
@@ -367,6 +367,77 @@ async def test_get_page_body_is_cut_at_the_cap_and_said_so():
         out = await client.get_page("1")
     assert len(out["body"]) == MAX_BODY_CHARS
     assert out["body_chars"] == MAX_BODY_CHARS + 5 and out["truncated"] is True
+
+
+_LONG = ("abcdefghij" * 15_000)  # 150,000 characters, no whitespace to collapse
+
+
+def _long_page_client(server: Server):
+    server.routes["/content/1"] = _page(pid="1", body="<p>" + _LONG + "</p>")
+    return _client(server)
+
+
+async def test_get_page_reads_a_long_page_in_parts():
+    server = Server()
+    client, http, _ = _long_page_client(server)
+    async with http:
+        first = await client.get_page("1")
+        second = await client.get_page("1", start=60_000)
+        third = await client.get_page("1", start=120_000)
+    assert first["body"] == _LONG[:60_000]
+    assert (first["start"], first["body_chars"], first["truncated"], first["next_start"]) == (
+        0, 150_000, True, 60_000)
+    assert second["body"] == _LONG[60_000:120_000]
+    assert (second["start"], second["body_chars"], second["truncated"],
+            second["next_start"]) == (60_000, 150_000, True, 120_000)
+    assert third["body"] == _LONG[120_000:]
+    assert (third["start"], third["body_chars"], third["truncated"], third["next_start"]) == (
+        120_000, 150_000, False, None)
+    assert len(server.requests) == 3  # one fetch per call
+
+
+async def test_get_page_a_short_page_has_no_next_part():
+    server = Server()
+    server.routes["/content/1"] = _page(pid="1", body="<p>short</p>")
+    client, http, _ = _client(server)
+    async with http:
+        out = await client.get_page("1")
+    assert (out["body"], out["start"], out["truncated"], out["next_start"]) == (
+        "short", 0, False, None)
+
+
+@pytest.mark.parametrize("start", [-1, "60000", 1.5, True, False, None, 10**12, 50_000_001])
+async def test_get_page_refuses_a_bad_start_before_any_request(start):
+    server = Server()
+    client, http, _ = _long_page_client(server)
+    async with http:
+        err = await _refused(client.get_page("1", start=start))
+    assert err.code == "invalid_start" and server.requests == []
+    assert str(start) not in err.message and str(start) not in (err.hint or "")
+
+
+@pytest.mark.parametrize("start", [150_000, 150_001, 49_999_999])
+async def test_get_page_refuses_a_start_at_or_past_the_end_without_echoing_it(start):
+    server = Server()
+    client, http, _ = _long_page_client(server)
+    async with http:
+        err = await _refused(client.get_page("1", start=start))
+    assert err.code == "invalid_start"
+    assert str(start) not in err.message and str(start) not in (err.hint or "")
+    assert _LONG[:20] not in err.message
+
+
+async def test_the_get_page_tool_passes_start_and_answers_a_bad_one_as_a_result(monkeypatch):
+    server = Server()
+    server.routes["/content/1"] = _page(pid="1", body="<p>" + _LONG + "</p>")
+    _patch_resolver(monkeypatch)
+    http = httpx.AsyncClient(transport=httpx.MockTransport(server.handler))
+    toolset = confluence_toolset({"destination": "JIRA"}, http=http)
+    async with http:
+        part = await toolset.tools["get_page"].function("1", start=120_000)
+        bad = await toolset.tools["get_page"].function("1", start=-5)
+    assert part["body"] == _LONG[120_000:] and part["next_start"] is None
+    assert bad["error"]["code"] == "invalid_start" and "-5" not in json.dumps(bad)
 
 
 async def test_get_page_over_the_html_cap_is_too_large(monkeypatch):
