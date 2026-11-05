@@ -83,6 +83,9 @@ from agents.pg_schema import (  # noqa: F401  (re-exported: they lived here)
     plan_schema_adoption,
     required_columns,
 )
+from agents.reconcile import BUILTIN_RECONCILE_URL
+from agents.reconcile.config import RECONCILE_KEYS  # noqa: F401  (re-export)
+from agents.reconcile.config import validate_reconcile_block as _validate_reconcile_block
 
 # Supported MCP auth modes
 AUTH_MODE_JWT = "jwt"
@@ -2623,20 +2626,32 @@ _SLACK_DEST_KEYS = ("destination", "channels", "lookback")
 # boundary, and the two lists drifting apart would mean an admin could save a
 # key that is then silently dropped on the way to storage.
 BUILTIN_PUBLIC_KEYS = ("min_score", "lookback")
+# builtin:reconcile is the other built-in on 'none', with a whitelist of its
+# own (`RECONCILE_KEYS`, from agents.reconcile.config, re-exported here for
+# agents.admin): the link to the agent's ARC-1 server entry and the run's
+# knobs. No credential either: the ARC-1 entry's own auth carries the user.
 
 
-def _clean_builtin_public(oauth: Any) -> dict[str, Any] | None:
+def _clean_builtin_public(oauth: Any, url: str | None = None) -> dict[str, Any] | None:
     """Normalize the config block of a built-in on ``auth_mode='none'``.
 
     Returns None when nothing survives, so an unconfigured server stores no
-    block at all rather than an empty dict.
+    block at all rather than an empty dict. ``url`` picks the whitelist:
+    ``RECONCILE_KEYS`` for ``builtin:reconcile``, whose kept values are
+    checked again here (storage is the last gate: `scripts/import_bundle.py`
+    and direct `upsert_agent` callers never pass the admin payload),
+    ``BUILTIN_PUBLIC_KEYS`` for every other one.
     """
+    reconcile = str(url or "").strip().rstrip("/").lower() == BUILTIN_RECONCILE_URL
+    keys = RECONCILE_KEYS if reconcile else BUILTIN_PUBLIC_KEYS
     src = oauth if isinstance(oauth, dict) else {}
     cleaned: dict[str, Any] = {}
-    for k in BUILTIN_PUBLIC_KEYS:
+    for k in keys:
         v = src.get(k)
         if v is not None and str(v).strip() != "":
             cleaned[k] = str(v).strip()
+    if reconcile:
+        _validate_reconcile_block(cleaned)
     return cleaned or None
 
 
@@ -2871,14 +2886,16 @@ def _clean_oauth_block(
     because nobody visits a browser.
 
     A built-in on ``none`` takes a fourth shape: ``{min_score?, lookback?}``.
-    Public data source, no credential, filtering knobs only.
+    Public data source, no credential, filtering knobs only. For
+    ``builtin:reconcile`` it is ``{arc1_server?, target?, batch_size?,
+    mismatch_cap?}`` instead.
 
     Returns None for modes that carry no oauth block.
     """
     if mode == AUTH_MODE_NONE:
         from agents.builtins import is_builtin_url
 
-        return _clean_builtin_public(oauth) if is_builtin_url(url) else None
+        return _clean_builtin_public(oauth, url) if is_builtin_url(url) else None
     if mode == AUTH_MODE_DESTINATION:
         return _clean_destination(oauth, url)
     if mode == AUTH_MODE_APP_ONLY:
@@ -3095,6 +3112,13 @@ def prepare_servers(
             if git_seen:
                 raise ValueError(GIT_SINGLE_ENTRY_MESSAGE)
             git_seen = True
+        elif url.rstrip("/").lower() == BUILTIN_RECONCILE_URL:
+            # Stored under exactly this spelling, as builtin:git is. On 'none'
+            # only: the factory refuses any other mode, so such a row would
+            # drop the whole agent at the next registry build.
+            url = BUILTIN_RECONCILE_URL
+            if mode != AUTH_MODE_NONE:
+                raise ValueError(RECONCILE_MODE_MESSAGE)
         oauth = _clean_oauth(s.get("oauth"), mode, prev_oauth_by_url.get(url), url=url)
         entry: dict[str, Any] = {"url": url, "auth_mode": mode}
         if oauth is not None:
@@ -5450,6 +5474,12 @@ _DEST_KEYS_BY_URL: dict[str, tuple[str, ...]] = {
 # Public because `agents.admin` refuses every other key at the payload
 # boundary (the reason `BUILTIN_PUBLIC_KEYS` is public).
 ODATA_ENTRY_KEYS = ("services", "allow_write")
+# Public for the admin gate, which refuses with the same text.
+RECONCILE_MODE_MESSAGE = (
+    f"{BUILTIN_RECONCILE_URL} requires auth_mode=none: it holds no credential; "
+    "ECC is read through the agent's own ARC-1 server entry named in "
+    "oauth.arc1_server"
+)
 MAX_ODATA_ENTRY_SERVICES = 50
 # builtin:ina likewise stores no destination: each registered query
 # (`InaQuery`) names its own destination and identity, and the entry only

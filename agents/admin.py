@@ -79,6 +79,8 @@ from agents.db import (
     OAUTH_CONFIG_MODES,
     ODATA_ENTRY_KEYS,
     ODATA_SINGLE_ENTRY_MESSAGE,
+    RECONCILE_KEYS,
+    RECONCILE_MODE_MESSAGE,
     VALID_AUTH_MODES,
     SessionLocal,
     agent_referrers,
@@ -150,6 +152,8 @@ from agents.mail_render import MailTheme
 from agents.odata import BUILTIN_ODATA_URL
 from agents.odata.models import MAX_DEFINITION_BYTES, SERVICE_NAME_RE
 from agents.outlook_tools import BUILTIN_OUTLOOK_URL
+from agents.reconcile import BUILTIN_RECONCILE_URL
+from agents.reconcile.config import validate_reconcile_block
 from agents.registry import registry
 from agents.sapnotedetail_tools import BUILTIN_SAPNOTEDETAIL_URL
 from agents.shared import available_models, default_model_name
@@ -379,6 +383,13 @@ class OAuthClientPayload(BaseModel):
     branch_prefix: StrictStr = Field(default="", max_length=41)
     allow_push: StrictBool = False
     allow_pull_request: StrictBool = False
+    # builtin:reconcile only (auth_mode=none). `arc1_server` names the
+    # agent's own ARC-1 server entry by URL; the rest are the run's knobs.
+    # Strings like `min_score`; agents/reconcile/config.py is the gate.
+    arc1_server: StrictStr = Field(default="", max_length=512)
+    target: StrictStr = Field(default="", max_length=64)
+    batch_size: StrictStr = Field(default="", max_length=6)
+    mismatch_cap: StrictStr = Field(default="", max_length=7)
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -393,7 +404,8 @@ class OAuthClientPayload(BaseModel):
         return v
 
     @field_validator("site", "library", "path", "workspace", "branch", "provider",
-                     "base_branch", "branch_prefix", mode="before")
+                     "base_branch", "branch_prefix", "arc1_server", "target",
+                     "batch_size", "mismatch_cap", mode="before")
     @classmethod
     def _null_pin_is_absent(cls, v: Any) -> Any:
         """``null`` means "not set", as for ``services`` and ``views``: a
@@ -533,6 +545,10 @@ class OAuthClientPayload(BaseModel):
             "provider": self.provider,
             "base_branch": self.base_branch,
             "branch_prefix": self.branch_prefix,
+            "arc1_server": self.arc1_server.strip(),
+            "target": self.target.strip(),
+            "batch_size": self.batch_size.strip(),
+            "mismatch_cap": self.mismatch_cap.strip(),
         }
         config = {k: v for k, v in fields.items() if v}
         if self.theme:
@@ -789,6 +805,21 @@ class McpServerPayload(BaseModel):
                 f"oauth.queries belongs to a {BUILTIN_INA_URL} entry only; no other "
                 "server reads it"
             )
+        is_reconcile = _server_key(self.url) == BUILTIN_RECONCILE_URL
+        if is_reconcile and self.auth_mode != AUTH_MODE_NONE:
+            raise ValueError(RECONCILE_MODE_MESSAGE)
+        if not is_reconcile and self.oauth is not None and (
+            self.oauth.arc1_server or self.oauth.target or self.oauth.batch_size
+            or self.oauth.mismatch_cap
+        ):
+            # Checked on the fields, not on `to_config()`: the oauth2 DCR
+            # branch of `to_config` hands on `dcr` and `scope` only, so a
+            # stray key there would be dropped without a word.
+            raise ValueError(
+                "oauth.arc1_server, oauth.target, oauth.batch_size and "
+                f"oauth.mismatch_cap belong to a {BUILTIN_RECONCILE_URL} entry only; "
+                "no other server reads them"
+            )
         if self.oauth is not None and self.oauth.theme:
             _validate_mail_theme(self.url, self.oauth.theme)
         is_sharepoint = _server_key(self.url) == BUILTIN_SHAREPOINT_URL
@@ -982,14 +1013,19 @@ class McpServerPayload(BaseModel):
             # becoming a place to stash settings on any server. Mirrors
             # BUILTIN_PUBLIC_KEYS in agents/db.py, which drops the rest on
             # the way to storage; refusing here is what tells the caller why.
+            # builtin:reconcile has its own list (RECONCILE_KEYS, the same
+            # list storage keeps) and its own value rules.
             cfg = self.oauth.to_config() if self.oauth else {}
-            stray = sorted(set(cfg) - set(BUILTIN_PUBLIC_KEYS))
+            allowed = RECONCILE_KEYS if is_reconcile else BUILTIN_PUBLIC_KEYS
+            stray = sorted(set(cfg) - set(allowed))
             if stray:
                 raise ValueError(
                     f"a public built-in on auth_mode=none stores no credential; "
                     f"remove oauth.{', oauth.'.join(stray)} "
-                    f"(allowed: {', '.join(BUILTIN_PUBLIC_KEYS)})"
+                    f"(allowed: {', '.join(allowed)})"
                 )
+            if is_reconcile:
+                validate_reconcile_block(cfg)
         elif self.oauth is not None and self.oauth.to_config():
             raise ValueError(
                 "oauth config is only valid when auth_mode=oauth2, app_only "
@@ -1307,7 +1343,13 @@ def _servers_list(servers: list[Any]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for s in servers:
         entry: dict[str, Any] = {"url": s.url, "auth_mode": s.auth_mode}
-        if s.auth_mode in OAUTH_CONFIG_MODES and s.oauth is not None:
+        # builtin:reconcile is the one entry on auth_mode=none whose block
+        # reaches storage from here: it holds the link to the agent's ARC-1
+        # entry, not a credential (checked by `_validate_oauth`).
+        carries_block = s.auth_mode in OAUTH_CONFIG_MODES or (
+            s.auth_mode == AUTH_MODE_NONE and _server_key(s.url) == BUILTIN_RECONCILE_URL
+        )
+        if carries_block and s.oauth is not None:
             entry["oauth"] = s.oauth.to_config()
         out.append(entry)
     return out

@@ -49,6 +49,7 @@ from agents.shared import (
     create_mcp_server,
     default_model_name,
     get_model,
+    mcp_endpoint_url,
     run_usage_limits,
 )
 from agents.sharepoint_tools import activity_summary as sharepoint_activity_summary
@@ -174,6 +175,21 @@ def _server_key_of(spec: dict) -> str:
     """A server entry's URL as storage compares it (trimmed, no trailing
     slash, lower case)."""
     return str(spec.get("url") or "").strip().rstrip("/").lower()
+
+
+def _sibling_lookup(by_endpoint: dict[str, Any]) -> Callable[[str], Any | None]:
+    """``mcp_server_for`` of one agent: its remote MCP servers by endpoint.
+
+    A function of its own so each agent's lookup is bound to that agent's
+    table (a lambda in the build loop would see the LAST agent's table).
+    The table fills while the loop builds the servers, so a built-in asks
+    at call time, not at build: an entry may precede its sibling.
+    """
+
+    def server_for(url: str) -> Any | None:
+        return by_endpoint.get(mcp_endpoint_url(str(url or "").strip()))
+
+    return server_for
 
 
 def _approves(specs: list) -> bool:
@@ -1000,6 +1016,12 @@ async def build_orchestrator() -> BuildResult:
                 "the agent is built without the InA tools",
                 row.name,
             )
+        # This agent's remote MCP servers by endpoint, for a built-in that
+        # works through a sibling entry (builtin:reconcile reads ECC through
+        # the agent's ARC-1 server, whose own auth carries the user). Per
+        # row: a built-in never reaches another agent's server.
+        by_endpoint: dict[str, Any] = {}
+        server_for = _sibling_lookup(by_endpoint)
         for idx, (spec, prefix) in enumerate(zip(specs, prefixes)):
             if no_bitbucket and _is_bitbucket_entry(spec):
                 continue
@@ -1020,6 +1042,7 @@ async def build_orchestrator() -> BuildResult:
                             "odata_services": odata_by_name,
                             "ina_queries": ina_by_name,
                             "agent_name": row.name,
+                            "mcp_server_for": server_for,
                         },
                     )
                     servers.append(toolset.prefixed(prefix) if prefix else toolset)
@@ -1055,6 +1078,12 @@ async def build_orchestrator() -> BuildResult:
                     tool_prefix=prefix,
                     oauth=spec.get("oauth"),
                 )
+                # The raw server, not the ReadOnlyGuard wrapper added after
+                # the loop: the reconcile reader enforces its own read-only
+                # rule (only SAPQuery, only the SQL it builds), and the
+                # reconcile tools themselves are denied in ABAP Assistant
+                # sessions (not in READONLY_POLICY).
+                by_endpoint[mcp_endpoint_url(str(spec["url"]).strip())] = server
                 servers.append(server)
                 closable.append(server)
             except NoUsableQueryError:

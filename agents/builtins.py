@@ -34,6 +34,7 @@ builtin:sharepoint --        app (ro)  app (ro)      --       --
 builtin:bitbucket  --        --        app           --       --
 builtin:confluence --        --        app           --       --
 builtin:git        --        --        app           --       --
+builtin:reconcile  --        --        --            default  --
 ================== ========= ========= ============= ======== ========
 
 ``destination`` reaches the API through a BTP destination. The config block's
@@ -82,6 +83,19 @@ repositories, the base branch and the branch prefix, and holds the two
 switches ``allow_push`` and ``allow_pull_request``. Its factory is the one
 besides ``builtin:odata`` that gets something from ``context``: the agent's
 name, which goes into the trailer of every commit; see :mod:`agents.git_tools`.
+
+``builtin:reconcile`` compares a migrated CSV with its source table, row by
+row, and holds no credential (``none`` only). It reads the uploads of the
+current web chat conversation only, and it reaches ECC through a sibling
+entry of the SAME agent: the ARC-1 MCP server named in ``arc1_server``,
+whose own auth (``oauth2``) carries the signed-in user. Its config block is
+``arc1_server`` (that sibling's URL), ``target`` (the ARC-1 target, blank =
+the server's own), ``batch_size`` (rows per SAPQuery, default 200, at most
+10,000) and ``mismatch_cap`` (default 50,000, at most 200,000); see
+:mod:`agents.reconcile.config`. Its factory gets two things from
+``context``: the agent's name and ``mcp_server_for``, the registry's lookup
+of that agent's own remote MCP servers by endpoint; see
+:mod:`agents.reconcile.tools`.
 """
 
 from __future__ import annotations
@@ -101,6 +115,8 @@ from agents.odata import BUILTIN_ODATA_URL
 from agents.odata.audit import stored_recorder
 from agents.odata.tools import odata_toolset
 from agents.outlook_tools import BUILTIN_OUTLOOK_URL, outlook_toolset
+from agents.reconcile import BUILTIN_RECONCILE_URL
+from agents.reconcile.tools import reconcile_toolset
 from agents.sapnotedetail_tools import BUILTIN_SAPNOTEDETAIL_URL, sapnotedetail_toolset
 from agents.sapnotes_tools import BUILTIN_SAPNOTES_URL, sapnotes_toolset
 from agents.sharepoint_tools import BUILTIN_SHAREPOINT_URL, sharepoint_toolset
@@ -124,6 +140,7 @@ _FACTORIES: dict[str, Callable[..., Any]] = {
     BUILTIN_BITBUCKET_URL: bitbucket_toolset,
     BUILTIN_CONFLUENCE_URL: confluence_toolset,
     BUILTIN_GIT_URL: git_toolset,
+    BUILTIN_RECONCILE_URL: reconcile_toolset,
 }
 
 BUILTIN_URLS = frozenset(_FACTORIES)
@@ -151,10 +168,13 @@ def build_builtin_toolset(
     ``context`` is what the registry knows and an entry does not hold:
     ``odata_services`` (the catalogue snapshot, by service name),
     ``ina_queries`` (the registered InA queries, by name) and
-    ``agent_name``. Only ``builtin:odata`` and ``builtin:ina`` receive their
-    snapshot and the agent name, and ``builtin:git`` the agent name alone;
-    every other factory is called exactly as before, so none has to accept
-    keywords it ignores.
+    ``agent_name`` and ``mcp_server_for`` (a callable: an endpoint URL of
+    one of this agent's remote MCP servers to the server object the
+    registry built for it, ``None`` for any other URL). Only ``builtin:odata``
+    and ``builtin:ina`` receive their snapshot and the agent name,
+    ``builtin:git`` the agent name alone, and ``builtin:reconcile`` the agent
+    name and ``mcp_server_for``; every other factory is called exactly as
+    before, so none has to accept keywords it ignores.
 
     ``builtin:odata`` is always built with the storing audit recorder of
     this process. It is not read from ``context``: no caller can build the
@@ -188,4 +208,9 @@ def build_builtin_toolset(
     if key == BUILTIN_GIT_URL:
         return factory(oauth or {}, server_key=key, auth_mode=auth_mode,
                        agent_name=(context or {}).get("agent_name") or "")
+    if key == BUILTIN_RECONCILE_URL:
+        context = context or {}
+        return factory(oauth or {}, server_key=key, auth_mode=auth_mode,
+                       server_for=context.get("mcp_server_for"),
+                       agent_name=context.get("agent_name") or "")
     return factory(oauth or {}, server_key=key, auth_mode=auth_mode)
