@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 from decimal import Decimal, InvalidOperation
 
-_DIGITS = re.compile(r"^[0-9]+$")
+_DIGITS = re.compile(r"[0-9]+")  # used with fullmatch: `$` would accept "12\n"
 _MAX_NUMBER_CHARS = 64  # longer is not a number SAP stores; skip the Decimal work
 
 
@@ -25,9 +25,12 @@ def clean(v: object, *, trim: bool = True) -> str:
 
 def alpha(v: str) -> str:
     """Drop leading zeros of an all-digit value (``"0"`` stays ``"0"``); others unchanged."""
-    if _DIGITS.match(v):
+    if _DIGITS.fullmatch(v):
         return v.lstrip("0") or "0"
     return v
+
+
+_alpha = alpha  # `same` takes a keyword named `alpha`
 
 
 def as_decimal(v: object) -> Decimal | None:
@@ -65,11 +68,9 @@ def same(
     return left == right
 
 
-_alpha = alpha  # `same` takes a keyword named `alpha`
-
 
 def pad_key(raw: str, length: int) -> str:
     """Zero-pad an all-digit key shorter than ``length`` (as SAP stores it); others unchanged."""
-    if _DIGITS.match(raw) and len(raw) < length:
+    if _DIGITS.fullmatch(raw) and len(raw) < length:
         return raw.zfill(length)
     return raw

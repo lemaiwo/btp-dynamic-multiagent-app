@@ -18,11 +18,13 @@ from agents.reconcile import BUILTIN_RECONCILE_URL, values
 from agents.reconcile.spec import (
     MAX_COLUMNS,
     MAX_SPEC_BYTES,
+    MAX_VALUE,
     ColumnRef,
     Condition,
     ReconcileSpec,
     SpecError,
     Value,
+    validation_hint,
 )
 
 
@@ -142,7 +144,7 @@ def test_extra_key_anywhere_refused(path: tuple[Any, ...]) -> None:
         ReconcileSpec.model_validate(data)
 
 
-BAD_IDENTS = ["MARA; DROP", "mara x", "A" * 31, "/ABC/X", "", "1ABC"]
+BAD_IDENTS = ["MARA; DROP", "mara x", "A" * 31, "/ABC/X", "", "1ABC", "MARA\n", "mara\n"]
 
 
 @pytest.mark.parametrize("bad", BAD_IDENTS)
@@ -197,7 +199,7 @@ def test_column_ref_needs_exactly_one(data: dict[str, Any]) -> None:
         ColumnRef.model_validate(data)
 
 
-@pytest.mark.parametrize("bad", ["AAAA", "", "1", "A1"])
+@pytest.mark.parametrize("bad", ["AAAA", "", "1", "A1", "B\n", "b\n"])
 def test_column_ref_bad_letter(bad: str) -> None:
     with pytest.raises(ValidationError):
         ColumnRef.model_validate({"letter": bad})
@@ -247,6 +249,62 @@ def test_value_map_two_keys_two_sources_ok() -> None:
 def test_condition_value_counts(op: str, vals: list[str]) -> None:
     with pytest.raises(ValidationError):
         Condition.model_validate({"field": "A", "op": op, "values": vals})
+
+
+def test_condition_value_length_capped() -> None:
+    with pytest.raises(ValidationError):
+        Condition.model_validate({"field": "A", "op": "in", "values": ["x" * (MAX_VALUE + 1)]})
+    ok = Condition.model_validate({"field": "A", "op": "equals", "values": ["x" * MAX_VALUE]})
+    assert ok.values == ["x" * MAX_VALUE]
+
+
+def test_key_csv_column_capped_like_column_names() -> None:
+    with pytest.raises(ValidationError):
+        ReconcileSpec.model_validate(
+            _spec(key={"csv_column": "x" * 65, "ecc_field": "OBJNR", "length": 18})
+        )
+
+
+def _hint_for(data: dict[str, Any]) -> str:
+    with pytest.raises(ValidationError) as exc:
+        ReconcileSpec.model_validate(data)
+    return validation_hint(exc.value)
+
+
+def test_validation_hint_names_location_not_input() -> None:
+    hint = _hint_for(_spec(table="SECRETVALUE; DROP"))
+    assert "table" in hint
+    assert "SECRETVALUE" not in hint
+
+
+def test_validation_hint_does_not_echo_unknown_kind_tag() -> None:
+    hint = _hint_for(_spec(columns={"Col A": {"kind": "secretkind"}}))
+    assert "Col A" in hint
+    assert "secretkind" not in hint
+
+
+def test_validation_hint_does_not_echo_extra_keys_or_values() -> None:
+    data = _spec()
+    data["columns"]["Direct col"]["secretkey"] = "secretvalue"
+    data["key"]["length"] = "secretlength"
+    hint = _hint_for(data)
+    assert "secretvalue" not in hint
+    assert "secretlength" not in hint
+    assert "key.length" in hint
+
+
+def test_validation_hint_keeps_own_fixed_messages() -> None:
+    rule = {"kind": "value_map", "sources": ["A"], "lookups": [_lookup()], "on_miss": "default"}
+    hint = _hint_for(_spec(columns={"C": rule}))
+    assert "on_miss 'default' needs a default" in hint
+
+
+def test_validation_hint_is_bounded() -> None:
+    cols = {f"C{i}" + "\n" * 3 + "y" * 200: {"kind": "nope"} for i in range(50)}
+    hint = _hint_for(_spec(columns=cols))
+    assert len(hint) <= 4000
+    assert "\n" not in hint.replace("; ", "")
+    assert "more" in hint
 
 
 def test_condition_ok_shapes() -> None:
@@ -338,6 +396,7 @@ def test_alpha() -> None:
     assert values.alpha("00A1") == "00A1"
     assert values.alpha("") == ""
     assert values.alpha("٠١") == "٠١"  # non-ASCII digits stay
+    assert values.alpha("012\n") == "012\n"  # not all-digit: a trailing newline counts
 
 
 def test_as_decimal() -> None:
@@ -367,3 +426,8 @@ def test_pad_key() -> None:
     assert values.pad_key("AB-1", 18) == "AB-1"
     assert values.pad_key("123", 3) == "123"
     assert values.pad_key("12345", 3) == "12345"
+    assert values.pad_key("12\n", 5) == "12\n"
+
+
+def test_same_trailing_newline_not_trimmed() -> None:
+    assert values.same("012\n", "12\n", trim=False, alpha=True) is False

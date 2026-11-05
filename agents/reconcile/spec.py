@@ -29,8 +29,8 @@ from pydantic import (
     model_validator,
 )
 
-IDENT_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,29}$")  # SAP table / field, no namespaces in v1
-LETTER_RE = re.compile(r"^[A-Z]{1,3}$")
+IDENT_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,29}\Z")  # SAP table / field, no namespaces in v1
+LETTER_RE = re.compile(r"^[A-Z]{1,3}\Z")
 MAX_TEXT, MAX_VALUE, MAX_LIST = 2000, 255, 200
 MAX_COLUMNS, MAX_LOOKUPS, MAX_CASES, MAX_SPEC_BYTES = 300, 5, 20, 1024 * 1024
 MAX_COLUMN_NAME = 64
@@ -40,18 +40,22 @@ class SpecError(ValueError):
     """A spec that cannot be used. The message is one of a few fixed texts."""
 
 
-def _ident(value: str | None) -> str | None:
+def _ident_required(value: str) -> str:
     """Upper-case an SAP identifier and refuse anything :data:`IDENT_RE` does not match.
 
     Upper-casing first lets a model write ``mara``; the regex then guarantees the
-    value can be pasted into ABAP SQL as a bare name.
+    value can be pasted into ABAP SQL as a bare name. ``fullmatch``, not ``match``:
+    ``$`` also matches before a trailing newline, which would let ``"MARA\\n"`` through.
     """
-    if value is None:
-        return None
     upper = value.upper()
-    if not IDENT_RE.match(upper):
+    if not IDENT_RE.fullmatch(upper):
         raise ValueError("not an SAP identifier (A-Z, 0-9, _; at most 30 characters)")
     return upper
+
+
+def _ident(value: str | None) -> str | None:
+    """:func:`_ident_required` for an optional field."""
+    return None if value is None else _ident_required(value)
 
 
 class _Strict(BaseModel):
@@ -70,7 +74,7 @@ class ColumnRef(_Strict):
         if value is None:
             return None
         upper = value.upper()
-        if not LETTER_RE.match(upper):
+        if not LETTER_RE.fullmatch(upper):
             raise ValueError("a column letter is one to three letters A-Z")
         return upper
 
@@ -110,7 +114,9 @@ class Condition(_Strict):
 
     field: str
     op: Literal["equals", "in", "blank", "not_blank"]
-    values: list[str] = Field(default_factory=list, max_length=MAX_LIST)
+    values: list[Annotated[str, Field(max_length=MAX_VALUE)]] = Field(
+        default_factory=list, max_length=MAX_LIST
+    )
 
     _field = field_validator("field")(_ident)
 
@@ -167,7 +173,7 @@ class ValueMapRule(_Rule):
     @field_validator("sources")
     @classmethod
     def _sources(cls, value: list[str]) -> list[str]:
-        return [_ident(item) for item in value]  # type: ignore[misc]
+        return [_ident_required(item) for item in value]
 
     @model_validator(mode="after")
     def _consistent(self) -> ValueMapRule:
@@ -212,7 +218,7 @@ Rule = Annotated[
 class KeySpec(_Strict):
     """How a CSV row finds its source row."""
 
-    csv_column: str = Field(min_length=1, max_length=64)
+    csv_column: str = Field(min_length=1, max_length=MAX_COLUMN_NAME)
     ecc_field: str
     length: int = Field(ge=1, le=40)
     pad_numeric: bool = True  # all-digit CSV keys are zero-padded to `length`
@@ -280,3 +286,37 @@ class ReconcileSpec(_Strict):
             return cls.model_validate(raw)
         except ValidationError:
             raise SpecError("The spec does not match the reconciliation spec schema.") from None
+
+
+# Error types whose pydantic message quotes part of the input (the tag a model
+# wrote); they get a fixed text instead.
+_ECHOING_TYPES = {"union_tag_invalid": "Unknown rule kind."}
+_MAX_HINT_ERRORS = 10
+_MAX_HINT_PART = 160
+
+
+def _hint_text(text: str) -> str:
+    """One line, no control characters, bounded: the location may hold a model-written key."""
+    flat = "".join("?" if unicodedata.category(ch)[0] == "C" else ch for ch in text)
+    return flat if len(flat) <= _MAX_HINT_PART else flat[: _MAX_HINT_PART - 3] + "..."
+
+
+def validation_hint(exc: ValidationError) -> str:
+    """What is wrong with a spec, by location and message, without any input value.
+
+    For a caller that runs ``ReconcileSpec.model_validate`` itself and wants to
+    tell the model what to fix. ``str(exc)`` is no good for that: it prints every
+    offending input, and a spec holds values from the customer's files.
+    """
+    lines: list[str] = []
+    errors = exc.errors(include_url=False, include_context=False)
+    for err in errors[:_MAX_HINT_ERRORS]:
+        loc = ".".join(str(part) for part in err["loc"]) or "spec"
+        msg = _ECHOING_TYPES.get(err["type"], err["msg"])
+        value = err.get("input")
+        if isinstance(value, str) and value and value in msg:
+            msg = err["type"]
+        lines.append(f"{_hint_text(loc)}: {_hint_text(msg)}")
+    if len(errors) > _MAX_HINT_ERRORS:
+        lines.append(f"(and {len(errors) - _MAX_HINT_ERRORS} more)")
+    return "; ".join(lines)
