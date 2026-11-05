@@ -479,6 +479,11 @@ lives in one process; its row (`reconcile_runs`) is in the database, so any
 instance can answer the status, and a run whose heartbeat stopped for five
 minutes is read as `interrupted`.
 
+A `value_map` lookup may set its own `sources` (a fallback across different
+ECC fields); the mismatch `source` text then joins the rule's fields and the
+override fields. The `reconciliation_status` of a finished run returns per-column
+`columns`, while `counts` holds the totals only.
+
 **Report** (`.xlsx`, stored as a file of the conversation): `Summary` (counts,
 cap lines, one line per column with checked / matched / mismatched),
 `Mismatches` (key, column, rule, source value, expected, CSV value, reason),

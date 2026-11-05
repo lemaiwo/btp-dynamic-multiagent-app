@@ -3362,7 +3362,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   (key `ValuesException` 1) is a row with a null key, counted in
   `not_assigned`, instead of refusing the whole run as `sap_error`; every
   other mark is still refused. No new resource, environment variable, table,
-  column or HANA generation
+  column, HANA generation unchanged (still 10 there); 2.38.0 adds `builtin:reconcile`
+  (migration reconciliation, `agents/reconcile/`) with the table `reconcile_runs`, HANA
+  schema generation 11 (one new table, nothing undeployed), `CHAT_ATTACHMENT_MAX_CHARS` and
+  both admin UIs
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets
