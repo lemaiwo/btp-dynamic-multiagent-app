@@ -24,7 +24,9 @@ first ``run_query``; one ``InaSessionStore`` per toolset, keyed by identity
 
 What a run answers is the client's (``agents.ina.client``), passed through:
 the numbers come from SAP, nothing here computes or completes one. An answer
-with more rows than ``top`` says so (``truncated`` plus a hint); one over
+with more rows than ``top`` says so (``truncated`` plus a hint), one with a
+row of a dimension's "not assigned" member as well (a null key, counted in
+``not_assigned``, plus a hint to report it as such; ``agents.ina.grid``); one over
 ``MAX_RESULT_CHARS`` is refused, never cut, for the reason a cut list reads
 as a complete one. Every failure is ``{"error": {code, message, hint?}}``;
 the codes are the client's closed list (``agents.ina.errors``) plus this
@@ -70,6 +72,10 @@ TOOL_NAMES = ("list_queries", "describe_query", "run_query")
 # tools, a result the model cannot take whole is refused, not cut.
 MAX_RESULT_CHARS = 60_000
 TRUNCATED_HINT = f"more rows than top: narrow the filters or raise top (max {MAX_TOP})"
+NOT_ASSIGNED_HINT = (
+    "a null key is SAP's 'not assigned' member of that dimension (no value): "
+    "report it as not assigned, never leave it out"
+)
 # The one code of this module: the registration holds no usable description.
 NOT_DESCRIBED = "not_described"
 _NOT_DESCRIBED_HINT = "ask an admin to describe the query"
@@ -79,6 +85,7 @@ _CODE_RE = re.compile(r"[a-z][a-z0-9_]{0,39}")
 
 __all__ = [
     "MAX_RESULT_CHARS",
+    "NOT_ASSIGNED_HINT",
     "NOT_DESCRIBED",
     "TOOL_NAMES",
     "TRUNCATED_HINT",
@@ -393,10 +400,13 @@ def ina_toolset(
     ) -> dict:
         """Read an analytical query: one measure, grouped by the dimensions.
 
-        Answers {columns, rows, units, row_count, truncated}. The numbers are
-        SAP's: report them as they are and never estimate a missing one.
-        truncated true means SAP had more rows than top: narrow the filters
-        or raise top, never present the rows as complete.
+        Answers {columns, rows, units, row_count, truncated, not_assigned?}.
+        The numbers are SAP's: report them as they are and never estimate a
+        missing one. truncated true means SAP had more rows than top: narrow
+        the filters or raise top, never present the rows as complete. A null
+        key in a dimension column is SAP's "not assigned" member of that
+        dimension (its number is real); not_assigned counts those rows per
+        dimension.
 
         Args:
             query: A query name from list_queries.
@@ -411,7 +421,9 @@ def ina_toolset(
                 [low, high] for between, or a list of 1 to 50 values for in}.
             top: How many rows, 1 to 2000.
             order: Up to 10 entries {"by": <a group_by or measure name>,
-                "direction": "asc" or "desc"}.
+                "direction": "asc" or "desc"}, applied by SAP in that order:
+                a measure sorts the rows by its value (with top, the top n),
+                a dimension by its key.
             variables: Variable name to value: one value for a single
                 variable, [low, high] for an interval, a list for a multiple
                 one. Every mandatory variable must be given.
@@ -471,9 +483,15 @@ def ina_toolset(
                     hint="narrow the filters, group by fewer dimensions or lower top",
                 )
             )
-        if result.get("truncated") is True:
-            return {**result, "hint": TRUNCATED_HINT}
-        return result
+        hints = [
+            hint
+            for hint, applies in (
+                (TRUNCATED_HINT, result.get("truncated") is True),
+                (NOT_ASSIGNED_HINT, bool(result.get("not_assigned"))),
+            )
+            if applies
+        ]
+        return {**result, "hint": "; ".join(hints)} if hints else result
 
     toolset.add_function(list_queries)
     toolset.add_function(describe_query)

@@ -1,0 +1,628 @@
+{
+ "Grids": [
+  {
+   "DataSource": {
+    "ObjectName": "2CCMMPURORDQUERY",
+    "Type": "Query",
+    "Description": "Analyse des dépenses",
+    "InstanceId": "ina0123456789abcdef",
+    "DataArea": "DEFAULT",
+    "DataLastRefresh": "20260101000000",
+    "DataRollupMin": "00000000000000",
+    "DataRollupMax": "00000000000000"
+   },
+   "DocumentsInfo": {
+    "SupportsDocuments": "None",
+    "IsBasedOnCDSView": false,
+    "DocumentsServicePath": "",
+    "DefaultDocumentsDirectory": "",
+    "ActiveDocumentsDirectory": "",
+    "DocumentsDirectories": []
+   },
+   "Axes": [
+    {
+     "Name": "ROWS",
+     "Type": "Rows",
+     "Dimensions": [
+      {
+       "Name": "2CCMMPURORDSPND-PRODUCTTYPE",
+       "Description": "Type de produit",
+       "DimensionType": 3,
+       "Attributes": [
+        {
+         "Name": "2CCMMPURORDSPND-PRODUCTTYPE.KEY",
+         "Description": "Internal Key",
+         "IsKey": true,
+         "PresentationType": "Key",
+         "Obtainability": "Always",
+         "ValueType": "String",
+         "Values": [
+          "PT1",
+          ""
+         ],
+         "ValuesException": [
+          0,
+          1
+         ]
+        }
+       ],
+       "MemberTypes": {
+        "Encoding": "None",
+        "Size": 2,
+        "Values": [
+         0,
+         0
+        ]
+       }
+      }
+     ],
+     "TupleCount": 2,
+     "TupleCountTotal": 2,
+     "ExceptionAlertLevel": {
+      "Encoding": "",
+      "Size": 2,
+      "Values": [
+       0,
+       0
+      ]
+     },
+     "ExceptionName": {
+      "Encoding": "",
+      "Size": 2,
+      "Values": [
+       "",
+       ""
+      ]
+     },
+     "Tuples": [
+      {
+       "MemberIndexes": {
+        "Encoding": "None",
+        "Size": 2,
+        "Values": [
+         0,
+         1
+        ]
+       },
+       "ParentIndexes": {
+        "Encoding": "None",
+        "Size": 2,
+        "Values": [
+         -1,
+         -1
+        ]
+       },
+       "DisplayLevel": {
+        "Encoding": "None",
+        "Size": 2,
+        "Values": [
+         0,
+         0
+        ]
+       },
+       "Level": {
+        "Encoding": "None",
+        "Size": 2,
+        "Values": [
+         0,
+         0
+        ]
+       },
+       "DrillState": {
+        "Encoding": "None",
+        "Size": 2,
+        "Values": [
+         0,
+         0
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "Name": "COLUMNS",
+     "Type": "Columns",
+     "Dimensions": [
+      {
+       "Name": "ELTUIDSTRCMMPURORDQUERY",
+       "Description": "Ratios",
+       "DimensionType": 2,
+       "Attributes": [],
+       "MemberTypes": {
+        "Encoding": "None",
+        "Size": 1,
+        "Values": [
+         0
+        ]
+       }
+      }
+     ],
+     "TupleCount": 1,
+     "TupleCountTotal": 1,
+     "ExceptionAlertLevel": {
+      "Encoding": "",
+      "Size": 1,
+      "Values": [
+       0
+      ]
+     },
+     "ExceptionName": {
+      "Encoding": "",
+      "Size": 1,
+      "Values": [
+       ""
+      ]
+     },
+     "Tuples": [
+      {
+       "MemberIndexes": {
+        "Encoding": "None",
+        "Size": 1,
+        "Values": [
+         0
+        ]
+       },
+       "ParentIndexes": {
+        "Encoding": "None",
+        "Size": 1,
+        "Values": [
+         -1
+        ]
+       },
+       "DisplayLevel": {
+        "Encoding": "None",
+        "Size": 1,
+        "Values": [
+         0
+        ]
+       },
+       "DrillState": {
+        "Encoding": "None",
+        "Size": 1,
+        "Values": [
+         0
+        ]
+       }
+      }
+     ]
+    }
+   ],
+   "Units": [
+    {
+     "Type": [
+      "CUR"
+     ],
+     "Value": [
+      "EUR"
+     ],
+     "Description": [
+      "EUR"
+     ],
+     "Exp": [
+      1
+     ]
+    }
+   ],
+   "Cells": {
+    "Exceptions": {
+     "Encoding": "None",
+     "Size": 2,
+     "Values": [
+      0,
+      0
+     ]
+    },
+    "LockedValue": {
+     "Encoding": "None",
+     "Size": 2,
+     "Values": [
+      0,
+      0
+     ]
+    },
+    "InputEnabled": {
+     "Encoding": "None",
+     "Size": 2,
+     "Values": [
+      0,
+      0
+     ]
+    },
+    "ExceptionAlertLevel": {
+     "Encoding": "None",
+     "Size": 2,
+     "Values": [
+      0,
+      0
+     ]
+    },
+    "ExceptionName": {
+     "Encoding": "None",
+     "Size": 2,
+     "Values": [
+      "",
+      ""
+     ]
+    },
+    "Values": {
+     "Encoding": "None",
+     "Size": 2,
+     "Values": [
+      1250.75,
+      3400.5
+     ]
+    },
+    "ValuesFormatted": {
+     "Encoding": "None",
+     "Size": 2,
+     "Values": [
+      "1.250,75",
+      "3.400,50"
+     ]
+    },
+    "ValuesRounded": {
+     "Encoding": "None",
+     "Size": 2,
+     "Values": [
+      "1250.75000",
+      "3400.50000"
+     ]
+    },
+    "QueryDataCellReferences": {
+     "Encoding": "None",
+     "Size": 2,
+     "Values": [
+      "1",
+      "1"
+     ]
+    },
+    "CellValueTypes": {
+     "Encoding": "None",
+     "Size": 2,
+     "Values": [
+      0,
+      0
+     ]
+    },
+    "Units": {
+     "Encoding": "None",
+     "Size": 2,
+     "Values": [
+      "EUR",
+      "EUR"
+     ]
+    },
+    "UnitDescriptions": {
+     "Encoding": "None",
+     "Size": 2,
+     "Values": [
+      "EUR",
+      "EUR"
+     ]
+    },
+    "UnitTypes": {
+     "Encoding": "None",
+     "Size": 2,
+     "Values": [
+      1,
+      1
+     ]
+    },
+    "UnitPositions": {
+     "Encoding": "None",
+     "Size": 2,
+     "Values": [
+      1,
+      1
+     ]
+    },
+    "UnitIndex": {
+     "Encoding": "None",
+     "Size": 2,
+     "Values": [
+      0,
+      0
+     ]
+    },
+    "NumericRounding": {
+     "Encoding": "None",
+     "Size": 2,
+     "Values": [
+      2,
+      2
+     ]
+    },
+    "NumericShift": {
+     "Encoding": "None",
+     "Size": 2,
+     "Values": [
+      0,
+      0
+     ]
+    },
+    "CellFormat": {
+     "Encoding": "None",
+     "Size": 2,
+     "Values": [
+      "#.##0,00",
+      "#.##0,00"
+     ]
+    }
+   },
+   "CellArraySizes": [
+    2,
+    1
+   ],
+   "DataEntryMask": {
+    "NumberofInputEnabledCells": 0,
+    "QueryCellNames": []
+   }
+  }
+ ],
+ "DataAreas": [
+  {
+   "Name": "DEFAULT",
+   "Environment": "",
+   "Model": "",
+   "CellLocking": "",
+   "IsWorkStatusActive": false,
+   "HasChangedData": false,
+   "ChangeCounter": 0
+  }
+ ],
+ "Messages": [],
+ "PerformanceData": {
+  "SessionId": "SESSION",
+  "StepId": "STEP",
+  "Runtime": 0.445408,
+  "Timestamp": "2026-01-01 00:00:00.000000",
+  "Measurements": [
+   {
+    "Description": "ABAP BICS: Get Rs Data",
+    "Calls": 1,
+    "Time": 0.432701
+   },
+   {
+    "Description": "ABAP BICS: Render Result Set",
+    "Calls": 1,
+    "Time": 0.004013
+   },
+   {
+    "Description": "Execution",
+    "Calls": 1,
+    "Time": 0.441218
+   },
+   {
+    "Description": "InA: Create Members Table",
+    "Calls": 1,
+    "Time": 0.000175
+   },
+   {
+    "Description": "InA: Render Columns Axis",
+    "Calls": 1,
+    "Time": 6.1e-05
+   },
+   {
+    "Description": "InA: Render Data Cells",
+    "Calls": 1,
+    "Time": 0.00067
+   },
+   {
+    "Description": "InA: Render Rows Axis",
+    "Calls": 1,
+    "Time": 0.00019
+   },
+   {
+    "Description": "InA: Transform Axis Objects",
+    "Calls": 1,
+    "Time": 0.001421
+   },
+   {
+    "Description": "InA: Transform Texts",
+    "Calls": 1,
+    "Time": 0.00052
+   },
+   {
+    "Description": "JSON Parser",
+    "Calls": 1,
+    "Time": 0.00111
+   },
+   {
+    "Description": "Prepare",
+    "Calls": 1,
+    "Time": 0.000211
+   },
+   {
+    "Description": "RSBOLAP: GetResultSet",
+    "Calls": 1,
+    "Time": 0.432636
+   },
+   {
+    "Description": "RSBOLAP: OLAP Accesses",
+    "Calls": 4,
+    "Time": 0.422422
+   },
+   {
+    "Description": "Usage",
+    "Calls": 1,
+    "Time": 0.002869
+   }
+  ],
+  "PerformanceAnalysis": {
+   "Messages": [
+    {
+     "Type": 1,
+     "Number": 3,
+     "Status": "GREEN",
+     "Text": "Number of Elements in Structure 1: 1",
+     "Details": {
+      "Placeholders": [
+       1
+      ]
+     }
+    },
+    {
+     "Type": 1,
+     "Number": 8,
+     "Status": "YELLOW",
+     "Text": "Free Chars.: 29",
+     "Details": {
+      "Placeholders": [
+       29
+      ]
+     }
+    },
+    {
+     "Type": 1,
+     "Number": 9,
+     "Status": "RED",
+     "Text": "Dimension Attributes: 143",
+     "Details": {
+      "Placeholders": [
+       143
+      ]
+     }
+    },
+    {
+     "Type": 1,
+     "Number": 10,
+     "Status": "GREEN",
+     "Text": "Ratios de base: 1",
+     "Details": {
+      "Placeholders": [
+       1
+      ]
+     }
+    },
+    {
+     "Type": 1,
+     "Number": 11,
+     "Status": "GREEN",
+     "Text": "Formula Components: 0",
+     "Details": {
+      "Placeholders": [
+       0
+      ]
+     }
+    },
+    {
+     "Type": 1,
+     "Number": 12,
+     "Status": "GREEN",
+     "Text": "Hiérarchies: 0",
+     "Details": {
+      "Placeholders": [
+       0
+      ]
+     }
+    },
+    {
+     "Type": 1,
+     "Number": 13,
+     "Status": "GREEN",
+     "Text": "Noeud de hiérarchie: 0",
+     "Details": {
+      "Placeholders": [
+       0
+      ]
+     }
+    },
+    {
+     "Type": 1,
+     "Number": 14,
+     "Status": "GREEN",
+     "Text": "Variables: 6",
+     "Details": {
+      "Placeholders": [
+       6
+      ]
+     }
+    },
+    {
+     "Type": 1,
+     "Number": 15,
+     "Status": "GREEN",
+     "Text": "Variable User Exits: 0",
+     "Details": {
+      "Placeholders": [
+       0
+      ]
+     }
+    },
+    {
+     "Type": 1,
+     "Number": 16,
+     "Status": "GREEN",
+     "Text": "Use Selection of Structure Elements: active",
+     "Details": {
+      "Placeholders": []
+     }
+    },
+    {
+     "Type": 1,
+     "Number": 18,
+     "Status": "RED",
+     "Text": "Parallel Processing: inactive",
+     "Details": {
+      "Placeholders": []
+     }
+    },
+    {
+     "Type": 1,
+     "Number": 101,
+     "Status": "",
+     "Text": "Init+prepare processing time: 4043",
+     "Details": {
+      "Placeholders": [
+       4043
+      ]
+     }
+    },
+    {
+     "Type": 1,
+     "Number": 102,
+     "Status": "",
+     "Text": "Variable processing time: 12",
+     "Details": {
+      "Placeholders": [
+       12
+      ]
+     }
+    },
+    {
+     "Type": 1,
+     "Number": 103,
+     "Status": "",
+     "Text": "Dynamic structure processing time: 179",
+     "Details": {
+      "Placeholders": [
+       179
+      ]
+     }
+    },
+    {
+     "Type": 1,
+     "Number": 104,
+     "Status": "",
+     "Text": "Resultset processing time: 436984",
+     "Details": {
+      "Placeholders": [
+       436984
+      ]
+     }
+    },
+    {
+     "Type": 1,
+     "Number": 200,
+     "Status": "",
+     "Text": "Total backend processing time: 441218",
+     "Details": {
+      "Placeholders": [
+       441218
+      ]
+     }
+    }
+   ]
+  }
+ }
+}

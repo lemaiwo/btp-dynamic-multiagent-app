@@ -626,9 +626,9 @@ class InaClient:
         variables: Any = None,
     ) -> dict[str, Any]:
         """One ``Analytics`` read: ``{columns, rows, units, row_count,
-        truncated}``, ``truncated`` true when SAP had more than ``top`` rows
-        (the rows beyond are not returned). Checked in full before anything
-        is sent."""
+        truncated, not_assigned?}`` (``grid.read_grid``), ``truncated`` true
+        when SAP had more than ``top`` rows (not returned). Checked in full
+        before anything is sent."""
         definition = self._definition
         if definition is None:
             # What fails without the description is refused before it is read.
