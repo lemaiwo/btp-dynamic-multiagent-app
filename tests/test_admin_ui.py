@@ -1755,6 +1755,16 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
         check("a new row is not offered builtin:ina",
               "builtin:odata)" in js and hint_line != "" and "builtin:ina" not in hint_line
               and '<option value="builtin:ina"' not in html)
+        # builtin:reconcile (migration reconciliation): auth mode none, its own
+        # four keys, edited here as plain fields.
+        check("reconcile's four keys are in the field map",
+              re.search(r"'builtin:reconcile':\s+\['arc1_server', 'target', 'batch_size', "
+                        r"'mismatch_cap'\]", html) is not None)
+        for key in ("arc1_server", "target", "batch_size", "mismatch_cap"):
+            check(f"reconcile field {key} is on the form",
+                  f'dest-field-{key}"' in html and f'class="dest-{key}"' in html)
+        check("the hint list says where builtin:reconcile runs",
+              'builtin:reconcile runs on "None (public)" only.' in js)
         check("api() call discovered: GET /admin/api/odata/services",
               ("GET", "/admin/api/odata/services") in discovered)
         for opener in ("openAgentModal", "editAgent"):
@@ -1772,6 +1782,8 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
         odata_names = ["purchase-requisitions", "business-partners"]
         ina_agent_id = None
         ina_query_name = "ui-test-sales"
+        reconcile_agent_id = None
+        stored_reconcile = None
         try:
             # A stored entry, as GET /agents/{id} answers it, for the round trip
             # below: load it into the row, collect it, PUT it back unchanged.
@@ -1845,9 +1857,38 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
                       and stored_ina[0]["oauth"].get("queries") == [ina_query_name],
                       str(stored_ina))
 
+            # builtin:reconcile: an agent with the entry and the ARC-1 server
+            # entry it names, as the API stores it. Loaded into the rows below,
+            # collected and saved again, it must come back unchanged.
+            reconcile_entry = {"url": "builtin:reconcile", "auth_mode": "none",
+                               "oauth": {"arc1_server": "https://arc1.example.hana.ondemand.com/mcp",
+                                         "target": "SRC_1", "batch_size": "500",
+                                         "mismatch_cap": "20000"}}
+            reconcile_agent = {
+                "name": "uirecon", "description": "UI test agent with a reconciliation entry.",
+                "instructions": "You are a UI test agent.", "enabled": True,
+                "mcp_servers": [reconcile_entry,
+                                {"url": "https://arc1.example.hana.ondemand.com/mcp", "auth_mode": "oauth2",
+                                 "oauth": {"dcr": True}}],
+            }
+            r = await client.post("/admin/api/agents", json=reconcile_agent)
+            check("fixture agent with a builtin:reconcile entry created",
+                  r.status_code == 201, r.text[:300])
+            reconcile_agent_id = r.json().get("id") if r.status_code == 201 else None
+            if reconcile_agent_id is not None:
+                r = await client.get(f"/admin/api/agents/{reconcile_agent_id}")
+                stored_reconcile = r.json()["mcp_servers"]
+                check("the stored reconcile entry holds the four keys",
+                      stored_reconcile[0]["url"] == "builtin:reconcile"
+                      and stored_reconcile[0]["auth_mode"] == "none"
+                      and {k: stored_reconcile[0]["oauth"].get(k)
+                           for k in reconcile_entry["oauth"]} == reconcile_entry["oauth"],
+                      str(stored_reconcile))
+
             if shutil.which("node") is not None:
                 dest_harness = ("const STORED_ODATA = " + json.dumps(stored_odata) + ";\n"
-                                + "const STORED_INA = " + json.dumps(stored_ina) + ";\n") + r"""
+                                + "const STORED_INA = " + json.dumps(stored_ina) + ";\n"
+                                + "const STORED_RECONCILE = " + json.dumps(stored_reconcile) + ";\n") + r"""
 'use strict';
 const assert = require('node:assert');
 const { JSDOM } = require('jsdom');
@@ -2337,6 +2378,98 @@ assert.throws(() => collectMcpServers(), e => {
 // ... also with a stored row next to it: the typed one is not a stored one.
 addMcpServerRow(JSON.parse(JSON.stringify(INA_ENTRY)));
 assert.throws(() => collectMcpServers(), /builtin:ina is edited in the UI5 admin/);
+// 7g. builtin:reconcile (migration reconciliation) on auth mode none: its
+//     four fields are shown, filled from the stored block and posted back
+//     exactly; nothing of another type, no destination name, no blank key.
+const RECON_ENTRY = { url: 'builtin:reconcile', auth_mode: 'none',
+    oauth: { arc1_server: 'https://arc1.example.com/mcp', target: 'SRC_1', batch_size: '500',
+             mismatch_cap: '20000' } };
+({ row, out } = addAndCollect(JSON.parse(JSON.stringify(RECON_ENTRY))));
+assert.deepStrictEqual(out, RECON_ENTRY, 'load, save unchanged: the same four keys');
+assert.strictEqual(row.querySelector('.mcp-auth-mode').value, 'none');
+assert.strictEqual(row.querySelector('.mcp-destination').style.display, 'block', 'the fields are shown on none');
+for (const k of ['arc1_server', 'target', 'batch_size', 'mismatch_cap']) {
+    assert.strictEqual(row.querySelector('.dest-field-' + k).style.display, '', k + ' is shown');
+}
+for (const k of ['destination', 'user_context', 'min_score', 'lookback', 'project', 'allow_send', 'queries']) {
+    assert.strictEqual(row.querySelector('.dest-field-' + k).style.display, 'none', k + ' is hidden');
+}
+assert.ok(/ARC-1/.test(row.querySelector('.dest-hint').textContent), 'the hint names the ARC-1 server');
+console.log('RECON:' + JSON.stringify(out));
+// The API's read-only marker and another type's keys never ride along.
+({ row, out } = addAndCollect({ url: 'builtin:reconcile', auth_mode: 'none',
+    oauth: { ...RECON_ENTRY.oauth, has_client_secret: false, min_score: '9.0', destination: 'X' } }));
+assert.deepStrictEqual(out, RECON_ENTRY);
+// Blank is the default: the key is left out; all blank, no block at all.
+({ row } = addAndCollect(JSON.parse(JSON.stringify(RECON_ENTRY))));
+row.querySelector('.dest-target').value = '  ';
+row.querySelector('.dest-batch_size').value = ' 300 ';
+row.querySelector('.dest-mismatch_cap').value = '';
+assert.deepStrictEqual(collectMcpServers()[0].oauth,
+    { arc1_server: 'https://arc1.example.com/mcp', batch_size: '300' });
+({ row, out } = addAndCollect({ url: 'builtin:reconcile', auth_mode: 'none' }));
+assert.deepStrictEqual(out, { url: 'builtin:reconcile', auth_mode: 'none' });
+// The server's ranges, refused before the save with a text naming the
+// field, never the value.
+const reconRefused = [
+    ['arc1_server', 'http://arc1.example.com/mcp', /^ARC-1 server:/],
+    ['arc1_server', 'https://user:pw@arc1.example.com/mcp', /^ARC-1 server:/],
+    ['arc1_server', 'https://arc1.example.com/mcp?token=abc', /^ARC-1 server:/],
+    ['arc1_server', 'https://arc1.example.com/mcp#frag', /^ARC-1 server:/],
+    ['arc1_server', 'https://h.example.com/' + 'a'.repeat(491), /^ARC-1 server:/],
+    ['target', 'two words', /^Target:/],
+    ['target', 'a'.repeat(65), /^Target:/],
+    ['batch_size', '0', /^Batch size:/],
+    ['batch_size', '10001', /^Batch size:/],
+    ['batch_size', '1.5', /^Batch size:/],
+    ['mismatch_cap', '200001', /^Mismatch cap:/],
+    ['mismatch_cap', 'abc', /^Mismatch cap:/],
+];
+for (const [key, value, said] of reconRefused) {
+    ({ row } = addAndCollect(JSON.parse(JSON.stringify(RECON_ENTRY))));
+    row.querySelector('.dest-' + key).value = value;
+    assert.throws(() => collectMcpServers(), e => {
+        assert.ok(said.test(e.message), key + ': ' + e.message);
+        // (A short number like '0' may occur in the rule's own range.)
+        if (value.length > 4) assert.ok(!e.message.includes(value), 'the value is not repeated');
+        return true;
+    });
+}
+for (const [key, value] of [['batch_size', '10000'], ['mismatch_cap', '200000'], ['batch_size', '1'],
+                            ['target', 'a'.repeat(64)], ['arc1_server', 'https://h.example.com/' + 'a'.repeat(490)]]) {
+    ({ row } = addAndCollect(JSON.parse(JSON.stringify(RECON_ENTRY))));
+    row.querySelector('.dest-' + key).value = value;
+    assert.strictEqual(collectMcpServers()[0].oauth[key], value, key + ' at the edge is accepted');
+}
+// Another auth mode is refused before the save, never posted with the keys.
+for (const mode of ['destination', 'oauth2', 'jwt']) {
+    ({ row } = addAndCollect(JSON.parse(JSON.stringify(RECON_ENTRY))));
+    row.querySelector('.mcp-auth-mode').value = mode;
+    toggleOauthFields(row.querySelector('.mcp-auth-mode'));
+    assert.throws(() => collectMcpServers(), /builtin:reconcile needs the auth mode "None \(public\)"/, mode);
+}
+// A row made another built-in drops the four keys; a remote server on none
+// sends no block and its destination box stays hidden.
+({ row } = addAndCollect(JSON.parse(JSON.stringify(RECON_ENTRY))));
+row.querySelector('.mcp-url').value = 'builtin:sapnotes';
+syncDestinationFields(row);
+assert.strictEqual(row.querySelector('.mcp-destination').style.display, 'none');
+assert.deepStrictEqual(collectMcpServers()[0], { url: 'builtin:sapnotes', auth_mode: 'none' });
+row.querySelector('.mcp-auth-mode').value = 'destination';
+toggleOauthFields(row.querySelector('.mcp-auth-mode'));
+row.querySelector('.dest-destination').value = 'NVD';
+assert.deepStrictEqual(collectMcpServers()[0].oauth, { destination: 'NVD' });
+// A new row typed as builtin:reconcile on none shows its fields.
+document.getElementById('agent-mcp-servers').innerHTML = '';
+addMcpServerRow();
+row = document.querySelector('.mcp-server-row');
+row.querySelector('.mcp-url').value = 'builtin:reconcile';
+row.querySelector('.mcp-auth-mode').value = 'none';
+toggleOauthFields(row.querySelector('.mcp-auth-mode'));
+assert.strictEqual(row.querySelector('.mcp-destination').style.display, 'block');
+row.querySelector('.dest-arc1_server').value = 'https://arc1.example.com/mcp';
+assert.deepStrictEqual(collectMcpServers()[0], { url: 'builtin:reconcile', auth_mode: 'none',
+    oauth: { arc1_server: 'https://arc1.example.com/mcp' } });
 // 4b. Confluence keeps its space pin and api_base; nothing of Jira's, no user switch.
 ({ row, out } = addAndCollect({
     url: 'builtin:confluence', auth_mode: 'destination',
@@ -2960,6 +3093,14 @@ assert.ok(errText({ detail: [{ loc: ['body', 'mcp_servers', 0], type: 'value_err
         assert.ok(!('has_client_secret' in inaAgain[0].oauth));
         console.log('INAROUNDTRIP:' + JSON.stringify(inaAgain));
     }
+    // 25c. The builtin:reconcile entry as the live API stored it: load, collect, same entry.
+    if (STORED_RECONCILE) {
+        document.getElementById('agent-mcp-servers').innerHTML = '';
+        renderMcpServers(STORED_RECONCILE);
+        const reconAgain = collectMcpServers();
+        assert.ok(!('has_client_secret' in reconAgain[0].oauth));
+        console.log('RECONROUNDTRIP:' + JSON.stringify(reconAgain));
+    }
     console.log('destination server round-trip scenarios passed');
 })().catch(e => { console.error(e && e.stack || e); process.exit(1); });
 """
@@ -3119,6 +3260,25 @@ assert.ok(errText({ detail: [{ loc: ['body', 'mcp_servers', 0], type: 'value_err
                               and after["mcp_servers"][0]["oauth"].get("queries")
                               == [ina_query_name],
                               str(after["mcp_servers"]))
+                    # builtin:reconcile: what the form posts for the untouched
+                    # rows is accepted and leaves the stored entries as they were.
+                    recon_collected = next((json.loads(line[len("RECONROUNDTRIP:"):])
+                                            for line in result.stdout.splitlines()
+                                            if line.startswith("RECONROUNDTRIP:")), None)
+                    check("the form collected the stored builtin:reconcile entry",
+                          recon_collected is not None
+                          and recon_collected[0] == reconcile_entry, str(recon_collected))
+                    if recon_collected is not None and reconcile_agent_id is not None:
+                        before = (await client.get(
+                            f"/admin/api/agents/{reconcile_agent_id}")).json()
+                        r = await client.put(f"/admin/api/agents/{reconcile_agent_id}",
+                                             json={**reconcile_agent, "mcp_servers": recon_collected})
+                        check("saving the collected builtin:reconcile entry is accepted",
+                              r.status_code == 200, r.text[:300])
+                        after = (await client.get(
+                            f"/admin/api/agents/{reconcile_agent_id}")).json()
+                        check("load, save without changes: the same stored builtin:reconcile entry",
+                              after["mcp_servers"] == before["mcp_servers"], str(after["mcp_servers"]))
                     if collected is not None and odata_agent_id is not None:
                         r = await client.put(f"/admin/api/agents/{odata_agent_id}",
                                              json={**odata_agent, "mcp_servers": collected})
@@ -3150,6 +3310,8 @@ assert.ok(errText({ detail: [{ loc: ['body', 'mcp_servers', 0], type: 'value_err
                 await client.delete(f"/admin/api/agents/{odata_agent_id}")
             if ina_agent_id is not None:
                 await client.delete(f"/admin/api/agents/{ina_agent_id}")
+            if reconcile_agent_id is not None:
+                await client.delete(f"/admin/api/agents/{reconcile_agent_id}")
             from agents.db import SessionLocal, delete_ina_query, get_ina_query
             async with SessionLocal() as s_ina:
                 ina_row = await get_ina_query(s_ina, ina_query_name)

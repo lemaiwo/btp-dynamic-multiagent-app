@@ -28,6 +28,7 @@ sap.ui.define(function () {
             "unit/inaQueries": { title: "Unit: inaQueries, the analytical queries pages" },
             "unit/odataEntry": { title: "Unit: odataEntry, the agent's OData services entry" },
             "unit/inaEntry": { title: "Unit: inaEntry, the agent's analytical queries entry" },
+            "unit/reconcileEntry": { title: "Unit: reconcileEntry, the migration reconciliation entry" },
             "unit/bitbucketEntry": { title: "Unit: bitbucketEntry" },
             "unit/gitEntry": { title: "Unit: gitEntry" },
             "unit/invokeSettings": { title: "Unit: invokeSettings, the agent's invoke API panel" },

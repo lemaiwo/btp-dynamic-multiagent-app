@@ -337,7 +337,7 @@ export default class AgentDetail extends BaseController {
         // --- git --- Likewise: its own state, its canonical spelling.
         const isGit = gitEntry.isGitUrl(server.url);
         const git = ((isGit ? server.oauth : undefined) ?? {}) as Record<string, unknown>;
-        const blankOAuth = { dcr: false, client_id: "", client_secret: "", uaa_url: "", authorize_url: "", token_url: "", scope: "", mailbox: "", allow_send: false, lookback: "", destination: "", project: "", status: "", api_base: "", labels: "", spaces: "", allow_comment: false, min_score: "", recipients: "", from: "", team: "", channels: "", user_context: false };
+        const blankOAuth = { dcr: false, client_id: "", client_secret: "", uaa_url: "", authorize_url: "", token_url: "", scope: "", mailbox: "", allow_send: false, lookback: "", destination: "", project: "", status: "", api_base: "", labels: "", spaces: "", allow_comment: false, min_score: "", recipients: "", from: "", team: "", channels: "", user_context: false, arc1_server: "", target: "", batch_size: "", mismatch_cap: "" };
         const opening = ++this.odataOpening;
         this.odataCatalogue = null;
         this.odataDefinitions = {};

@@ -6,6 +6,7 @@ import odataEntry from "./odataEntry";
 import bitbucketEntry from "./bitbucketEntry";
 import gitEntry from "./gitEntry";
 import inaEntry from "./inaEntry";
+import reconcileEntry from "./reconcileEntry";
 
 /**
  * Turns the server dialog's flat form model into the config block the API
@@ -304,6 +305,12 @@ export default {
             // Jira-shaped default would send project, status and a false
             // allow_comment, all of which the server refuses for this entry.
             return gitEntry.clean(raw) as McpServer["oauth"];
+        }
+        if (key === reconcileEntry.RECONCILE_URL) {
+            // --- reconcile --- Before the generic `none` branch: its block is
+            // the four keys of agents/reconcile/config.py, not min_score and
+            // lookback, and nothing else the dialog model holds.
+            return reconcileEntry.clean(raw) as McpServer["oauth"];
         }
         if (authMode === "none") {
             // Whitelisted, not "everything that isn't blank": this block goes

@@ -426,6 +426,65 @@
                 placeholder="{i18n>minScorePlaceholder}"
                 visible="{= ${server>/url} === 'builtin:sapnotes' }" />
 
+            <!-- builtin:reconcile (auth mode none): the four keys of
+                 agents/reconcile/config.py, kept by oauthConfig.cleanOAuth and
+                 checked by model/reconcileEntry.ts. Blank means the default. -->
+            <Label text="{i18n>reconcileArc1ServerLabel}" labelFor="oauthReconcileArc1Server"
+                   visible="{= ${server>/url} === 'builtin:reconcile' }" />
+            <VBox visible="{= ${server>/url} === 'builtin:reconcile' }">
+                <Input
+                    id="oauthReconcileArc1Server"
+                    value="{server>/oauth/arc1_server}"
+                    type="Url"
+                    maxLength="512"
+                    placeholder="{i18n>reconcileArc1ServerPlaceholder}"
+                    ariaDescribedBy="oauthReconcileArc1ServerHint" />
+                <Text id="oauthReconcileArc1ServerHint" text="{i18n>reconcileArc1ServerHint}"
+                      class="sapUiTinyMarginTop" />
+            </VBox>
+
+            <Label text="{i18n>reconcileTargetLabel}" labelFor="oauthReconcileTarget"
+                   visible="{= ${server>/url} === 'builtin:reconcile' }" />
+            <VBox visible="{= ${server>/url} === 'builtin:reconcile' }">
+                <Input
+                    id="oauthReconcileTarget"
+                    value="{server>/oauth/target}"
+                    type="Text"
+                    maxLength="64"
+                    placeholder="{i18n>reconcileTargetPlaceholder}"
+                    ariaDescribedBy="oauthReconcileTargetHint" />
+                <Text id="oauthReconcileTargetHint" text="{i18n>reconcileTargetHint}"
+                      class="sapUiTinyMarginTop" />
+            </VBox>
+
+            <Label text="{i18n>reconcileBatchSizeLabel}" labelFor="oauthReconcileBatchSize"
+                   visible="{= ${server>/url} === 'builtin:reconcile' }" />
+            <VBox visible="{= ${server>/url} === 'builtin:reconcile' }">
+                <Input
+                    id="oauthReconcileBatchSize"
+                    value="{server>/oauth/batch_size}"
+                    type="Text"
+                    maxLength="6"
+                    placeholder="{i18n>reconcileBatchSizePlaceholder}"
+                    ariaDescribedBy="oauthReconcileBatchSizeHint" />
+                <Text id="oauthReconcileBatchSizeHint" text="{i18n>reconcileBatchSizeHint}"
+                      class="sapUiTinyMarginTop" />
+            </VBox>
+
+            <Label text="{i18n>reconcileMismatchCapLabel}" labelFor="oauthReconcileMismatchCap"
+                   visible="{= ${server>/url} === 'builtin:reconcile' }" />
+            <VBox visible="{= ${server>/url} === 'builtin:reconcile' }">
+                <Input
+                    id="oauthReconcileMismatchCap"
+                    value="{server>/oauth/mismatch_cap}"
+                    type="Text"
+                    maxLength="7"
+                    placeholder="{i18n>reconcileMismatchCapPlaceholder}"
+                    ariaDescribedBy="oauthReconcileMismatchCapHint" />
+                <Text id="oauthReconcileMismatchCapHint" text="{i18n>reconcileMismatchCapHint}"
+                      class="sapUiTinyMarginTop" />
+            </VBox>
+
             <!-- builtin:odata and builtin:ina name no destination: each catalogue
                  service and each registered query has its own. -->
             <Label text="{i18n>destinationName}" required="true"

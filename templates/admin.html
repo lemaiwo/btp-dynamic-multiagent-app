@@ -913,10 +913,17 @@ function addMcpServerRow(server) {
     updateEndpointHint();
 }
 
+/** The field box is the destination's, and builtin:reconcile's on "None (public)". */
+function syncFieldBox(row) {
+    const mode = row.querySelector('.mcp-auth-mode').value;
+    row.querySelector('.mcp-destination').style.display = mode === 'destination'
+        || (mode === 'none' && destinationBuiltinOf(row) === RECONCILE_BUILTIN) ? 'block' : 'none';
+}
+
 function toggleOauthFields(select) {
     const row = select.closest('.mcp-server-row');
     row.querySelector('.mcp-oauth').style.display = select.value === 'oauth2' ? 'block' : 'none';
-    row.querySelector('.mcp-destination').style.display = select.value === 'destination' ? 'block' : 'none';
+    syncFieldBox(row);
     row.querySelector('.mcp-kept-note').style.display =
         row.dataset.keptMode && select.value === row.dataset.keptMode ? '' : 'none';
     toggleDcr(row.querySelector('.oauth-dcr'));
@@ -972,6 +979,12 @@ function collectMcpServers() {
             // hand, or left on another mode) is refused before the save.
             if (mode !== 'destination' || !r.dataset.keptIna) throw new Error(INA_REFUSAL);
             server.oauth = JSON.parse(r.dataset.keptIna);
+        } else if (destinationBuiltinOf(r) === RECONCILE_BUILTIN) {
+            // Refused here rather than posted: the server answers 422 for any
+            // other mode. Blank fields are left out (the defaults).
+            if (mode !== 'none') throw new Error(RECONCILE_MODE_REFUSAL);
+            const block = collectReconcileConfig(r);
+            if (Object.keys(block).length) server.oauth = block;
         } else if (mode === 'oauth2') {
             const scope = r.querySelector('.oauth-scope').value.trim();
             if (r.querySelector('.oauth-dcr').checked) {
@@ -2676,6 +2689,12 @@ const DESTINATION_FIELDS = {
     // as it was loaded (`addMcpServerRow` / `collectMcpServers`). The entry
     // is {queries: [...]} and nothing else, and no field here edits it.
     'builtin:ina':           ['queries'],
+    // Migration reconciliation, on auth mode "None (public)" only: it holds no
+    // credential and reads the source table through the agent's own ARC-1
+    // server entry, named by URL in `arc1_server`. The block is these four
+    // strings, blank meaning the default (agents/reconcile/config.py is the
+    // gate). Collected by `collectReconcileConfig`, not the destination branch.
+    'builtin:reconcile':     ['arc1_server', 'target', 'batch_size', 'mismatch_cap'],
 };
 const ODATA_BUILTIN = 'builtin:odata';
 const INA_BUILTIN = 'builtin:ina';
@@ -2684,6 +2703,20 @@ const INA_NOTE = 'Edited in the UI5 admin (Analytical queries)';
 const INA_REFUSAL = 'builtin:ina is edited in the UI5 admin (Analytical queries); this page only keeps a stored entry.';
 const BITBUCKET_BUILTIN = 'builtin:bitbucket';
 const GIT_BUILTIN = 'builtin:git';
+// --- builtin:reconcile ---
+const RECONCILE_BUILTIN = 'builtin:reconcile';
+const RECONCILE_KEYS = ['arc1_server', 'target', 'batch_size', 'mismatch_cap'];
+const RECONCILE_NOTE = 'Migration reconciliation reads the source table through this agent\'s ARC-1 server entry: '
+    + 'name that entry\'s URL in "ARC-1 server". Blank fields use the defaults.';
+// Fixed texts, mirrors of `validate_reconcile_block` in agents/reconcile/config.py:
+// each names the field and the rule, never the value (a URL could carry a token).
+const RECONCILE_MODE_REFUSAL = 'builtin:reconcile needs the auth mode "None (public)": it holds no credential.';
+const RECONCILE_RULES = {
+    arc1_server: 'ARC-1 server: the https URL of this agent\'s ARC-1 server entry, with a host and without user, query or fragment, at most 512 characters.',
+    target: 'Target: 1 to 64 letters, digits, \'_\', \'.\' or \'-\'.',
+    batch_size: 'Batch size: a whole number from 1 to 10000.',
+    mismatch_cap: 'Mismatch cap: a whole number from 1 to 200000.',
+};
 // The toolset's name, as the UI5 admin's dropdown shows it.
 const GIT_TOOLSET_LABEL = 'Git repositories (GitHub, Bitbucket, GitLab)';
 const GIT_PROVIDERS = ['github', 'bitbucket', 'gitlab'];
@@ -2705,7 +2738,8 @@ function destinationFieldsFor(builtin) {
 
 // Text fields, in the order they appear; the two switches are checkboxes.
 const DESTINATION_TEXT_KEYS = ['destination', 'mailbox', 'team', 'channels', 'recipients', 'from',
-    'lookback', 'project', 'status', 'labels', 'spaces', 'api_base', 'min_score'];
+    'lookback', 'project', 'status', 'labels', 'spaces', 'api_base', 'min_score',
+    'arc1_server', 'target', 'batch_size', 'mismatch_cap'];
 // The pins of builtin:sharepoint, and the workspace and branch of
 // builtin:bitbucket, are sent exactly as typed, never trimmed: the server
 // refuses a pin with edge whitespace instead of repairing it, so what is
@@ -2796,6 +2830,31 @@ function destinationFieldsHtml() {
                 </label>
                 <label class="dest-field-min_score">Minimum CVSS score
                     <input type="text" class="dest-min_score" placeholder="9.0">
+                </label>
+                <label class="full dest-field-arc1_server">ARC-1 server
+                    <input type="url" class="dest-arc1_server" maxlength="512" placeholder="https://arc1.example.com/mcp">
+                    <span style="display:block;color:var(--muted);font-size:12px;font-weight:normal">
+                        The URL of this agent's ARC-1 MCP server entry, exactly as listed among its servers
+                        (https, no user, query or fragment).
+                    </span>
+                </label>
+                <label class="dest-field-target">Target
+                    <input type="text" class="dest-target" maxlength="64" placeholder="blank means the ARC-1 server's own target">
+                    <span style="display:block;color:var(--muted);font-size:12px;font-weight:normal">
+                        Only for an ARC-1 server with several targets: letters, digits, '_', '.' or '-', at most 64.
+                    </span>
+                </label>
+                <label class="dest-field-batch_size">Batch size
+                    <input type="text" class="dest-batch_size" inputmode="numeric" maxlength="6" placeholder="200">
+                    <span style="display:block;color:var(--muted);font-size:12px;font-weight:normal">
+                        Rows read from the source table per call, 1 to 10000. Blank means 200.
+                    </span>
+                </label>
+                <label class="dest-field-mismatch_cap">Mismatch cap
+                    <input type="text" class="dest-mismatch_cap" inputmode="numeric" maxlength="7" placeholder="50000">
+                    <span style="display:block;color:var(--muted);font-size:12px;font-weight:normal">
+                        The most mismatches a report lists, 1 to 200000. Blank means 50000.
+                    </span>
                 </label>
                 <label class="full dest-field-allow_send">
                     <input type="checkbox" class="dest-allow_send"> Allow sending / posting
@@ -2922,6 +2981,8 @@ function userContextToggled(row) {
 function syncDestinationFields(row) {
     const box = row.querySelector('.mcp-destination');
     if (!box) return;
+    // The url may have become, or stopped being, builtin:reconcile on none.
+    syncFieldBox(row);
     const builtin = destinationBuiltinOf(row);
     // "Allow commenting" is ONE checkbox for builtin:jira and
     // builtin:bitbucket. When the URL is edited into the OTHER of the two, a
@@ -2963,7 +3024,8 @@ function syncDestinationFields(row) {
         // Every type names its destination, except builtin:odata and
         // builtin:ina: there the destination belongs to each catalogue
         // service or registered query.
-        if (key === 'destination') show = builtin !== ODATA_BUILTIN && builtin !== INA_BUILTIN;
+        if (key === 'destination') show = builtin !== ODATA_BUILTIN && builtin !== INA_BUILTIN
+            && builtin !== RECONCILE_BUILTIN;
         // A destination resolved as the user reads /me: no mailbox to name.
         if (key === 'mailbox' && userContext) show = false;
         // Graph refuses application posts, so Teams posts only as the user.
@@ -2973,11 +3035,13 @@ function syncDestinationFields(row) {
     let hint = '';
     if (!known) {
         hint = 'A destination works with an https MCP server or a built-in toolset (builtin:gmail, builtin:outlook, '
-            + 'builtin:teams, builtin:slack, builtin:jira, builtin:confluence, builtin:smtp, builtin:sharepoint, builtin:bitbucket, builtin:git, builtin:sapnotes, builtin:sapnotedetail, builtin:odata).';
+            + 'builtin:teams, builtin:slack, builtin:jira, builtin:confluence, builtin:smtp, builtin:sharepoint, builtin:bitbucket, builtin:git, builtin:sapnotes, builtin:sapnotedetail, builtin:odata). builtin:reconcile runs on "None (public)" only.';
     } else if (builtin === ODATA_BUILTIN) {
         hint = 'Destination and identity come from each catalogue service. Edit services in the UI5 admin (OData services).';
     } else if (builtin === INA_BUILTIN) {
         hint = INA_NOTE;
+    } else if (builtin === RECONCILE_BUILTIN) {
+        hint = RECONCILE_NOTE;
     } else if (isRemoteMcpUrl(builtin)) {
         hint = 'The destination names the MCP server\'s host and holds its credential; the URL above contributes only its path. '
             + (userContext
@@ -3311,6 +3375,35 @@ function collectGitConfig(row) {
     if (prefix !== '') oauth.branch_prefix = prefix;
     if (row.querySelector('.dest-allow_push').checked) oauth.allow_push = true;
     if (row.querySelector('.dest-allow_pull_request').checked) oauth.allow_pull_request = true;
+    return oauth;
+}
+
+/** True for an https URL with a host and without user, query or fragment. */
+function reconcileUrlOk(value) {
+    if (value.length > 512 || value.includes('?') || value.includes('#')) return false;
+    let parsed;
+    try {
+        parsed = new URL(value);
+    } catch (e) {
+        return false;
+    }
+    const authority = value.slice(value.indexOf('//') + 2).split('/')[0];
+    return parsed.protocol === 'https:' && !!parsed.hostname && !authority.includes('@');
+}
+
+/** The block of a builtin:reconcile row: the four keys, trimmed, the blank ones left out. */
+function collectReconcileConfig(row) {
+    const oauth = {};
+    RECONCILE_KEYS.forEach(k => {
+        const v = row.querySelector('.dest-' + k).value.trim();
+        if (v) oauth[k] = v;
+    });
+    const whole = (v, digits, max) => new RegExp('^[0-9]{1,' + digits + '}$').test(v)
+        && Number(v) >= 1 && Number(v) <= max;
+    if (oauth.arc1_server && !reconcileUrlOk(oauth.arc1_server)) throw new Error(RECONCILE_RULES.arc1_server);
+    if (oauth.target && !/^[A-Za-z0-9_.-]{1,64}$/.test(oauth.target)) throw new Error(RECONCILE_RULES.target);
+    if (oauth.batch_size && !whole(oauth.batch_size, 6, 10000)) throw new Error(RECONCILE_RULES.batch_size);
+    if (oauth.mismatch_cap && !whole(oauth.mismatch_cap, 7, 200000)) throw new Error(RECONCILE_RULES.mismatch_cap);
     return oauth;
 }
 

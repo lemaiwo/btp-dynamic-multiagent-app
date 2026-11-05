@@ -146,6 +146,18 @@ export type OAuthClient =
            */
           min_score?: string;
           /**
+           * `builtin:reconcile` only, on `auth_mode: "none"`
+           * (agents/reconcile/config.py, model/reconcileEntry.ts). The URL of
+           * this agent's ARC-1 server entry, the ARC-1 target name, the rows
+           * read per SAPQuery call (1..10000, default 200) and the most
+           * mismatches the report keeps (1..200000, default 50000). Strings,
+           * blank meaning the default.
+           */
+          arc1_server?: string;
+          target?: string;
+          batch_size?: string;
+          mismatch_cap?: string;
+          /**
            * `builtin:outlook` only. Comma-separated fixed audience for mail
            * the agent originates. Not a tool argument by design: every other
            * mail tool acts on a message that already exists, so the audience

@@ -40,11 +40,14 @@ QUnit.test("restricted built-ins offer only what the server accepts", function (
     assert.deepEqual(authModesFor("builtin:bitbucket"), ["destination"]);
     assert.deepEqual(authModesFor("builtin:confluence"), ["destination"]);
     assert.deepEqual(authModesFor("builtin:git"), ["destination"]);
+    assert.deepEqual(authModesFor("builtin:reconcile"), ["none"]);
 });
 
 // --- destinations ---
-QUnit.test("every built-in can run through a BTP destination", function (assert) {
-    BUILTINS.forEach((b) => {
+QUnit.test("every built-in but builtin:reconcile can run through a BTP destination", function (assert) {
+    // builtin:reconcile holds no credential of its own: it reads through the
+    // agent's ARC-1 server entry, so the server accepts it on 'none' only.
+    BUILTINS.filter((b) => b.url !== "builtin:reconcile").forEach((b) => {
         assert.ok(authModesFor(b.url).indexOf("destination") > -1, `${b.url} offers destination`);
     });
     // The default stays what it was: a destination is an option, not the

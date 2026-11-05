@@ -5,6 +5,7 @@ import odataEntry from "./odataEntry";
 import bitbucketEntry from "./bitbucketEntry";
 import gitEntry from "./gitEntry";
 import inaEntry, { INA_TEXTS } from "./inaEntry";
+import reconcileEntry from "./reconcileEntry";
 
 // --- odata ---
 /** `SERVICE_NAME_RE` in agents/odata/models.py: the slug of a catalogue service. */
@@ -344,6 +345,11 @@ export default {
         if (bitbucketEntry.isBitbucketUrl(url)) {
             // --- bitbucket --- Its own rules and none of the Jira ones below.
             return bitbucketEntry.validate(oauth, authMode);
+        }
+        if (reconcileEntry.isReconcileUrl(url)) {
+            // --- reconcile --- Its own four keys on 'none', not the
+            // public-builtin whitelist below (min_score, lookback).
+            return reconcileEntry.validate(oauth as Record<string, unknown> | undefined, authMode);
         }
         if (gitEntry.isGitUrl(url)) {
             // --- git --- Its own rules and none of the Jira ones below.

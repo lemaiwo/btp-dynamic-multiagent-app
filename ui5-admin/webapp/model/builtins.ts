@@ -119,6 +119,15 @@ export const BUILTINS: BuiltinToolset[] = [
     {
         url: "builtin:git", titleKey: "builtinGit", descriptionKey: "builtinGitDesc",
         defaultAuthMode: "destination", authModes: ["destination"]
+    },
+    // --- reconcile --- reconcile_toolset holds no credential: it reads the
+    // source table through the agent's own ARC-1 server entry, named by URL
+    // in `arc1_server`, so the server accepts it on `none` only. Its block
+    // (arc1_server, target, batch_size, mismatch_cap) is checked by
+    // agents/reconcile/config.py and model/reconcileEntry.ts.
+    {
+        url: "builtin:reconcile", titleKey: "builtinReconcile", descriptionKey: "builtinReconcileDesc",
+        defaultAuthMode: "none", authModes: ["none"]
     }
 ];
 
