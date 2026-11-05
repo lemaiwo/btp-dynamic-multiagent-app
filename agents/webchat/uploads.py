@@ -70,7 +70,9 @@ MAX_FILE_BYTES = env_int("CHAT_MAX_FILE_BYTES", 10 * 1024 * 1024, minimum=1)
 MAX_FILES = env_int("CHAT_MAX_FILES_PER_MESSAGE", 5, minimum=1)
 TEXT_MAX_BYTES = 64 * 1024
 MODEL_FIELD_BYTES = 256
-MAX_TEXT_CHARS = 200_000
+# How much of an extracted upload goes into the prompt; the bytes stay in
+# chat_files in full for tools that read them (builtin:reconcile).
+MAX_TEXT_CHARS = env_int("CHAT_ATTACHMENT_MAX_CHARS", 200_000, minimum=1_000)
 MAX_PDF_PAGES = 50
 TRUNCATED = "\n\n[... cut here: the file holds more text than is passed on]"
 

@@ -208,3 +208,31 @@ def test_count_pdf_pages_still_reads_object_streams():
     data = (b"%%PDF-1.7\n9 0 obj << /Type /ObjStm /Length %d >>\nstream\n" % len(body)
             + body + b"\nendstream\nendobj\n")
     assert count_pdf_pages(data) == 2
+
+
+def _reload_with_cap(monkeypatch, value):
+    """Reload ``uploads`` with CHAT_ATTACHMENT_MAX_CHARS set (None = unset)."""
+    import importlib
+
+    if value is None:
+        monkeypatch.delenv("CHAT_ATTACHMENT_MAX_CHARS", raising=False)
+    else:
+        monkeypatch.setenv("CHAT_ATTACHMENT_MAX_CHARS", value)
+    return importlib.reload(uploads)
+
+
+def test_attachment_text_cap_is_configurable(monkeypatch):
+    import importlib
+
+    try:
+        mod = _reload_with_cap(monkeypatch, "5000")
+        assert mod.MAX_TEXT_CHARS == 5000
+        assert mod.cap_text("x" * 6000).endswith(mod.TRUNCATED)
+        assert mod.cap_text("x" * 5000) == "x" * 5000
+
+        assert _reload_with_cap(monkeypatch, None).MAX_TEXT_CHARS == 200_000
+        # env_int raises a value below the minimum to the minimum.
+        assert _reload_with_cap(monkeypatch, "10").MAX_TEXT_CHARS == 1000
+    finally:
+        monkeypatch.delenv("CHAT_ATTACHMENT_MAX_CHARS", raising=False)
+        importlib.reload(uploads)
