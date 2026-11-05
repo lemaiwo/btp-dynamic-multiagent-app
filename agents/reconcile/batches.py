@@ -2,7 +2,9 @@
 
 :func:`batches` is the one batching rule: the survey inside the tool call
 counts batches with it and the background run reads with it, so the number
-the tester is told is the number the run sends. :class:`ReopeningReader`
+of batches the tester is told is the number of batches the run reads (a
+batch may send a second, smaller query for keys a short answer left out).
+:class:`ReopeningReader`
 holds the run's one ARC-1 session and reopens it once when the session
 breaks at the transport.
 """
@@ -80,23 +82,27 @@ class ReopeningReader:
     reader's own retries). A refusal, a sign-in or an odd answer is never a
     reason to reopen. Entered and left in the run's own task (MCP's session
     is). ``new`` builds a reader, ``read_batch(reader, keys)`` reads with the
-    run's deadline."""
+    run's deadline, ``open_reader(reader)`` opens a session (the first one
+    and the reopen) with the run's deadline: opening a session can hang as
+    long as a read can."""
 
     def __init__(
         self,
         new: Callable[[], Arc1Reader],
         read_batch: Callable[[Arc1Reader, list[str]], Awaitable[dict[str, dict[str, str]]]],
         label: str,
+        open_reader: Callable[[Arc1Reader], Awaitable[Any]] | None = None,
     ) -> None:
         self._new = new
         self._read_batch = read_batch
+        self._open = open_reader or (lambda reader: reader.__aenter__())
         self._label = label
         self._reader: Arc1Reader | None = None
         self.reopened = False
 
     async def __aenter__(self) -> ReopeningReader:
         reader = self._new()
-        await reader.__aenter__()
+        await self._open(reader)
         self._reader = reader
         return self
 
@@ -117,6 +123,6 @@ class ReopeningReader:
             broken, self._reader = self._reader, None
             await broken.__aexit__(type(err), err, None)  # never raises over err
             reader = self._new()
-            await reader.__aenter__()
+            await self._open(reader)
             self._reader = reader
             return await self._read_batch(reader, keys)

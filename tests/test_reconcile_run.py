@@ -109,6 +109,8 @@ class StubRun:
     async def __aenter__(self) -> StubRun:
         self.server.check_caller()
         self.server.sessions += 1
+        if self.server.sessions == self.server.hang_on_session:
+            await asyncio.sleep(30)
         return self
 
     async def __aexit__(self, *exc: Any) -> None:
@@ -159,6 +161,8 @@ class StubServer:
         self.fail_at: dict[int, BaseException] = {}
         # Keys left out of the first answer that asks for them (a silently short answer).
         self.drop_once: set[str] = set()
+        # The session (1-based, the preflight's included) whose opening hangs.
+        self.hang_on_session: int | None = None
 
     def check_caller(self) -> None:
         who = current_principal.get()
@@ -796,3 +800,69 @@ async def test_a_finished_run_stores_per_column_counters():
             assert isinstance(counts[f"col.{column}.{metric}"], int)
     per_column = sum(counts[f"col.{c}.mismatched"] for c in sp.columns)
     assert per_column == counts["mismatches"]
+
+
+# --- re-review ------------------------------------------------------------------
+
+
+async def test_a_done_row_keeps_its_report_when_the_session_close_fails(monkeypatch):
+    from agents import db as agents_db
+
+    cid, mid = await conversation()
+    real_finish, real_session = runs_store.finish_run, agents_db.SessionLocal
+    closed_done = {"armed": False}
+
+    async def finish(db: Any, run_id: str, *, status: str, **k: Any) -> bool:
+        moved = await real_finish(db, run_id, status=status, **k)
+        if status == "done" and moved:
+            closed_done["armed"] = True
+        return moved
+
+    class Session:
+        def __init__(self) -> None:
+            self._cm = real_session()
+
+        async def __aenter__(self) -> Any:
+            return await self._cm.__aenter__()
+
+        async def __aexit__(self, *exc: Any) -> bool:
+            await self._cm.__aexit__(*exc)
+            if closed_done["armed"]:
+                closed_done["armed"] = False
+                raise RuntimeError("close failed after the commit")
+            return False
+
+    monkeypatch.setattr(runs_store, "finish_run", finish)
+    monkeypatch.setattr(run.agents_db, "SessionLocal", Session)
+    answer = await start(cid, mid, StubServer())
+    await wait(cid)
+    monkeypatch.setattr(run.agents_db, "SessionLocal", real_session)
+    got = await row_of(answer["run_id"])
+    assert got.status == "done" and got.report_file_id is not None
+    assert [f.id for f in await files_of(cid)] == [got.report_file_id]
+
+
+async def test_a_reopen_that_hangs_is_bounded_as_arc1_timeout(monkeypatch):
+    from agents.reconcile import arc1_reader
+
+    monkeypatch.setattr(arc1_reader, "BACKOFF_SECONDS", 0.0)
+    monkeypatch.setattr(run, "READ_TIMEOUT_SECONDS", 0.2)
+    cid, mid = await conversation()
+    server = StubServer()
+    server.fail_at = {n: ConnectionError("gone") for n in (1, 2, 3)}
+    server.hang_on_session = 3  # the preflight, the run, then the reopen hangs
+    answer = await start(cid, mid, server)
+    await asyncio.wait_for(asyncio.gather(run.task_of(cid), return_exceptions=True), 5)
+    got = await row_of(answer["run_id"])
+    assert (got.status, got.error_code) == ("failed", "arc1_timeout")
+
+
+async def test_the_first_session_of_the_run_is_bounded_too(monkeypatch):
+    monkeypatch.setattr(run, "READ_TIMEOUT_SECONDS", 0.2)
+    cid, mid = await conversation()
+    server = StubServer()
+    server.hang_on_session = 2  # the run's own session, after the preflight
+    answer = await start(cid, mid, server)
+    await asyncio.wait_for(asyncio.gather(run.task_of(cid), return_exceptions=True), 5)
+    got = await row_of(answer["run_id"])
+    assert (got.status, got.error_code) == ("failed", "arc1_timeout")

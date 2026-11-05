@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -80,11 +81,7 @@ from agents.reconcile.counts import (  # noqa: F401  (re-exported: they lived he
     run_counts,
     split_counts,
 )
-from agents.reconcile.engine import (
-    Comparer,
-    CsvError,
-    iter_csv,
-)
+from agents.reconcile.engine import Comparer, CsvError, iter_csv
 from agents.reconcile.report import (
     REPORT_MEDIA_TYPE,
     ReportError,
@@ -348,14 +345,19 @@ async def _beat_or_stop(job: _Job) -> None:
         raise _Lost
 
 
-async def _read(reader: Arc1Reader, keys: list[str]) -> dict[str, dict[str, str]]:
+async def _bounded(step: Awaitable[Any]) -> Any:
+    """A batch read or a session opening, within :data:`READ_TIMEOUT_SECONDS`."""
     try:
         async with asyncio.timeout(READ_TIMEOUT_SECONDS) as deadline:
-            return await reader.read(keys)
+            return await step
     except TimeoutError:
         if deadline.expired():
             raise _ReadTimeout from None
         raise
+
+
+async def _read(reader: Arc1Reader, keys: list[str]) -> dict[str, dict[str, str]]:
+    return await _bounded(reader.read(keys))
 
 
 async def _drive(job: _Job) -> None:
@@ -367,7 +369,8 @@ async def _drive(job: _Job) -> None:
                           fields=comparer.needed_fields(), target=job.target,
                           check_fields=False)
 
-    async with ReopeningReader(new_reader, _read, job.run_id) as session:
+    opener = lambda r: _bounded(r.__aenter__())  # noqa: E731
+    async with ReopeningReader(new_reader, _read, job.run_id, open_reader=opener) as session:
         for done, pending in batches(rows, comparer.key_of, job.batch_size):
             if pending is None:  # a stretch without a query: let the loop run
                 job.rows_done = done
@@ -403,9 +406,11 @@ async def _drive(job: _Job) -> None:
         finished = await runs_store.finish_run(
             db, job.run_id, status="done", counts=job.extra,
             report_file_id=job.report_file_id)
+        # Set at once: the row says done from here, so a failing session
+        # close must not make the finally drop the report it points at.
+        job.done = finished
     if not finished:
         raise _Lost
-    job.done = True
     logger.info("[reconcile] run %s of %s done", job.run_id, spec.table)
 
 

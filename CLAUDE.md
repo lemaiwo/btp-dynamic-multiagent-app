@@ -1632,8 +1632,8 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     `activity_summary` keeps counts and codes only and is hooked into
     `registry._short_tool_output`. The ARC-1 sibling is looked up at call time
     (`ReconcileContext.arc1_server()` via `server_for`, filled by
-    `build_orchestrator` in the same pass, URL normalised with
-    `mcp_endpoint_url`). Known limits: one table, single-field key, other source
+    `build_orchestrator` in the same pass, both sides of the lookup keyed by
+    `config.endpoint_key`: scheme and host case folded). Known limits: one table, single-field key, other source
     tables not checked, no chat-side "finished" signal (the tester asks for the
     status), no cancel tool. Related: `CHAT_ATTACHMENT_MAX_CHARS`
     (`agents/webchat/uploads.py`, `MAX_TEXT_CHARS`, default 200,000, minimum 1,000)
