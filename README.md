@@ -496,6 +496,7 @@ line) and `Not checked` (columns and why). Text cells are never formulas.
 - One run per conversation at a time (`already_running`). An app restart or deleting the conversation stops it.
 - An agent has at most one `builtin:reconcile` entry. A registry reload during a run (an agent save, a catalogue edit, a bundle import) is safe: the run keeps the ARC-1 connection of the build it started on until it ends.
 - Keys a batch's answer did not hold are read once more on their own before they count as missing in the source.
+- Runs per app instance: `RECONCILE_MAX_RUNS` (default 2); a further start is refused with `too_many_runs`. A run whose ARC-1 session breaks at the transport reopens it once.
 - Upload size: `CHAT_MAX_FILE_BYTES` (default 10 MiB) per file. Mapping workbooks and CSVs of a migration can be larger: raise it for the landscape and size the instance memory to match.
 - Upload text in the prompt: `CHAT_ATTACHMENT_MAX_CHARS` (default 200,000 characters per file, minimum 1,000) cuts the text extracted from an upload. It applies to every chat agent of the landscape; the reconciliation tools read the files themselves and do not need the text in the prompt.
 - Mismatch cap: the report lists at most `mismatch_cap` mismatch rows and as many missing rows; the Summary says how many were dropped.

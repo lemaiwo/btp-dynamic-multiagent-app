@@ -49,8 +49,7 @@ class is logged, never its text: it may quote a cell value or a URL);
 ``interrupted`` when the app cancels the run at shutdown (:func:`cancel_all`,
 the save shielded and bounded by :data:`FINISH_SECONDS`). The report is
 stored before ``finish_run``; on every exit but ``done`` it is removed again.
-Refused at start as well: ``too_many_runs`` (``RECONCILE_MAX_RUNS``, default
-2, per process) and ``shutting_down`` (after :func:`cancel_all`).
+Also refused at start: ``too_many_runs`` (``RECONCILE_MAX_RUNS``), ``shutting_down``.
 
 **What another instance knows.** The row: status, ``rows_total``,
 ``rows_done`` as of the last heartbeat, the outcome. :func:`progress` (rows
