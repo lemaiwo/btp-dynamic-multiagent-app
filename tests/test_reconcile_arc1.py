@@ -845,3 +845,149 @@ def test_keys_equal_but_for_trailing_blanks_send_one_literal_and_get_both() -> N
     sql = server.calls[0][1]["sql"]
     assert sql.count("'AB'") == 1 and "'AB '" not in sql
     assert out["AB"] == out["AB "] == {"MATNR": "AB", "MATKL": "A"}
+
+
+# --- wide field lists: several statements per batch ---------------------------
+#
+# ARC-1's IN-list chunker splits only the key list, so a statement whose fixed
+# part (SELECT ... FROM ... WHERE key IN () plus one key) is wider than about
+# 255 characters cannot be sent at all (SAP answers 400). The reader splits a
+# wide field list over several statements, each with the key field first.
+
+WIDE = [f"F{i:04d}" for i in range(1, 31)]  # 30 fields of 5 characters
+
+
+def _wide_reader(server: StubServer, fields: list[str] = WIDE, **kw: Any) -> Arc1Reader:
+    kw.setdefault("sleep", Sleeps())
+    return Arc1Reader(
+        server, table="MARA", key_field="MATNR", fields=fields, check_fields=False, **kw
+    )
+
+
+def _prefix(sql: str) -> str:
+    """The statement without its key literals: what ARC-1 cannot split."""
+    head, _, _ = sql.partition(" IN (")
+    return head + " IN ()"
+
+
+def _answer_by_select(rows_per_key: dict[str, dict[str, str]], **envelope: Any) -> Any:
+    """A fake SAPQuery that answers the selected columns of the keys asked for."""
+
+    def answer(name: str, args: dict[str, Any]) -> str:
+        sql = args["sql"]
+        cols = sql[len("SELECT "):sql.index(" FROM ")].split(", ")
+        keys = [k.strip("'") for k in sql[sql.index(" IN (") + 5:-1].split(", ")]
+        rows = [[rows_per_key[k][c] for c in cols] for k in keys if k in rows_per_key]
+        return json.dumps({"columns": cols, "rows": rows, **envelope})
+
+    return answer
+
+
+def _full_row(key: str) -> dict[str, str]:
+    return {"MATNR": key, **{f: f"{f}-{key}" for f in WIDE}}
+
+
+def test_a_wide_field_list_is_split_over_statements_and_merged() -> None:
+    server = StubServer()
+    server.default = _answer_by_select({"1": _full_row("1"), "2": _full_row("2")})
+
+    async def go() -> dict[str, dict[str, str]]:
+        async with _wide_reader(server) as reader:
+            await reader.preflight()
+            server.calls.clear()
+            return await reader.read(["1", "2", "3"])
+
+    out = _run(go())
+    assert out == {"1": _full_row("1"), "2": _full_row("2")}
+    assert len(server.calls) == 2  # one statement per group, per batch
+    sent_fields: list[str] = []
+    for name, args in server.calls:
+        assert name == "SAPQuery" and args["maxRows"] == 4
+        sql = args["sql"]
+        assert sql.startswith("SELECT MATNR, ")
+        assert len(_prefix(sql)) + arc1_reader.KEY_LITERAL_MAX <= (
+            arc1_reader.MAX_STATEMENT_PREFIX_CHARS
+        )
+        cols = sql[len("SELECT "):sql.index(" FROM ")].split(", ")
+        assert cols.count("MATNR") == 1
+        sent_fields += cols[1:]
+    assert sent_fields == WIDE  # every field once, in the spec's order
+
+
+def test_ten_fields_stay_one_statement_per_batch() -> None:
+    fields = WIDE[:10]
+    server = StubServer()
+    server.default = _answer_by_select({"1": _full_row("1")})
+
+    async def go() -> dict[str, dict[str, str]]:
+        async with _wide_reader(server, fields) as reader:
+            await reader.preflight()
+            server.calls.clear()
+            return await reader.read(["1"])
+
+    out = _run(go())
+    assert out == {"1": {"MATNR": "1", **{f: f"{f}-1" for f in fields}}}
+    assert len(server.calls) == 1
+    assert server.calls[0][1]["sql"].startswith("SELECT MATNR, F0001, ")
+
+
+def test_a_key_missing_from_the_second_statement_is_unexpected() -> None:
+    first = _answer_by_select({"1": _full_row("1"), "2": _full_row("2")})
+    second = _answer_by_select({"1": _full_row("1")})  # "2" changed in between
+    server = StubServer()
+
+    async def go() -> Any:
+        async with _wide_reader(server) as reader:
+            await reader.preflight()
+            server.answers[:] = [first, second]
+            return await reader.read(["1", "2"])
+
+    with pytest.raises(Arc1ReadError) as info:
+        _run(go())
+    assert info.value.code == "unexpected_result"
+
+
+def test_a_field_that_does_not_fit_alone_is_refused_at_construction(monkeypatch) -> None:
+    monkeypatch.setattr(arc1_reader, "MAX_STATEMENT_PREFIX_CHARS", 90)
+    with pytest.raises(ValueError, match="fields too wide"):
+        _wide_reader(StubServer(), ["A" * 30])
+
+
+def test_the_grouping_is_logged_once_without_field_names(caplog) -> None:
+    with caplog.at_level("INFO", logger="agents.reconcile.arc1_reader"):
+        _wide_reader(StubServer())
+    lines = [r.getMessage() for r in caplog.records if "statements per batch" in r.getMessage()]
+    assert lines == ["[reconcile] MARA: 31 fields in 2 statements per batch"]
+    assert not any("F0001" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize(
+    ("second", "code"),
+    [
+        ({"truncated": True}, "truncated"),
+        ({"duplicate": True}, "ambiguous_key"),
+    ],
+)
+def test_truncated_and_ambiguous_on_the_second_statement(second: dict[str, Any], code: str) -> None:
+    rows = {"1": _full_row("1"), "2": _full_row("2")}
+    first = _answer_by_select(rows)
+
+    def second_answer(name: str, args: dict[str, Any]) -> str:
+        data = json.loads(_answer_by_select(rows)(name, args))
+        if second.get("duplicate"):
+            data["rows"].append(list(data["rows"][0]))
+        else:
+            data.update(second)
+        return json.dumps(data)
+
+    server = StubServer()
+
+    async def go() -> Any:
+        async with _wide_reader(server) as reader:
+            await reader.preflight()
+            server.answers[:] = [first, second_answer]
+            return await reader.read(["1", "2", "3"])
+
+    with pytest.raises(Arc1ReadError) as info:
+        _run(go())
+    assert info.value.code == code

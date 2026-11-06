@@ -1586,8 +1586,8 @@ async def api_create_agent(payload: AgentPayload) -> dict[str, Any]:
 
 
 def _entry_signature(servers: Any, enabled: Any = True) -> list[Any]:
-    """What an agent's ``builtin:odata``, ``builtin:ina``, ``builtin:bitbucket``
-    and ``builtin:git`` entries let it do: the part of an agent row whose
+    """What an agent's ``builtin:odata``, ``builtin:ina``, ``builtin:bitbucket``,
+    ``builtin:git`` and ``builtin:reconcile`` entries let it do: the part of an agent row whose
     change must reach the running build at once. ``[]`` for an agent with
     none of these entries.
 
@@ -1655,7 +1655,20 @@ def _entry_signature(servers: Any, enabled: Any = True) -> list[Any]:
             queries, list
         ) else []
         ina.append((BUILTIN_INA_URL, tuple(names)))
-    return sorted(odata) + sorted(bitbucket) + sorted(git) + sorted(ina)
+    # A ``builtin:reconcile`` entry's config is read from the build too: a
+    # changed ARC-1 target must not keep the old one until a manual reload.
+    # The ARC-1 sibling itself is looked up at call time, so its URL is enough.
+    reconcile = []
+    for server in servers:
+        if not isinstance(server, dict) or _server_key(server.get("url")) != BUILTIN_RECONCILE_URL:
+            continue
+        block = server.get("oauth")
+        block = block if isinstance(block, dict) else {}
+        reconcile.append(("reconcile", *(
+            "" if block.get(k) is None else str(block.get(k))
+            for k in ("arc1_server", "target", "batch_size", "mismatch_cap")
+        )))
+    return sorted(odata) + sorted(bitbucket) + sorted(git) + sorted(ina) + sorted(reconcile)
 
 
 async def _reload_for_changed_entry(before: Any, after: Any, what: str) -> dict[str, bool]:

@@ -1601,7 +1601,13 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     `target_not_supported`); `Arc1ReadError` carries a stable code and a fixed
     message (`sign_in_needed`, `query_tool_missing`, `preflight_refused`,
     `arc1_refused`, `arc1_failed`, `unexpected_result`, `truncated`,
-    `ambiguous_key`), never ARC-1's text
+    `ambiguous_key`), never ARC-1's text. ARC-1's IN-list chunker splits only the
+    key list (~255 characters a statement), so a wide field list is split at
+    construction into groups whose fixed part stays within
+    `MAX_STATEMENT_PREFIX_CHARS` (200, key field first in each); a batch sends one
+    statement per group and merges by key (a key one group lacks is
+    `unexpected_result`). An agent save that changes the entry's four keys reloads
+    the registry (`_entry_signature`)
   - `runs_store.py` — table `reconcile_runs` (`ReconcileRun` in `agents/db.py`,
     **HANA schema generation 11**, one new table, nothing undeployed): one row per
     run (status `running` | `done` | `failed` | `interrupted`, `counts`,

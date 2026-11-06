@@ -35,6 +35,16 @@ keys once more on their own before it counts them missing. A short answer is
 caught where ARC-1 says so: an envelope with ``truncated``/``hasMore`` true or
 a ``total``/``totalRows``/``rowCount`` above the rows returned is ``truncated``.
 
+**Statement width.** ARC-1 splits a statement with an ``IN`` list into
+chunks of about 255 characters by cutting the KEY list only; when the fixed
+part (``SELECT <fields> FROM <table> WHERE <key> IN ()`` plus one key) is
+already wider, no chunk fits and SAP answers HTTP 400 (seen live with 30
+fields). So the field list is split once, at construction, into groups whose
+fixed part stays within :data:`MAX_STATEMENT_PREFIX_CHARS` (the key field
+first in each); a batch sends one statement per group and merges the rows by
+key. A key that one statement found and another did not is
+``unexpected_result`` (the source changed in between).
+
 CHAR keys: ABAP compares CHAR values ignoring trailing blanks, so rows are
 matched to the requested keys after ``rstrip()`` and the result is keyed by
 the key *as the caller passed it*.
@@ -73,6 +83,11 @@ MAX_ROWS = 10_000  # ARC-1's SAPQuery ceiling for maxRows
 # A batch asks for one row more than it has keys, so it holds at most this many.
 MAX_BATCH_KEYS = MAX_ROWS - 1
 DD03L_MAX_ROWS = 1000
+# The fixed part of every statement we send (SELECT ... IN () plus the widest
+# key literal) stays below ARC-1's ~255-character chunk limit, with room.
+MAX_STATEMENT_PREFIX_CHARS = 200
+# KEY_RE's 40 characters plus the two quotes, a comma and a space.
+KEY_LITERAL_MAX = 40 + 4
 REFUSED_MARKERS = ("policy", "forbidden", "not_allowed", "blocked")
 BACKOFF_SECONDS = 0.5
 
@@ -152,6 +167,36 @@ def build_sql(table: str, fields: list[str], key_field: str, keys: list[str]) ->
         f"SELECT {', '.join(fields)} FROM {table} "
         f"WHERE {key_field} IN ({', '.join(_literal(k) for k in keys)})"
     )
+
+
+def _prefix_len(table: str, key_field: str, fields: list[str]) -> int:
+    """Width of a statement's fixed part: what ARC-1's chunker cannot split."""
+    return len(
+        f"SELECT {', '.join(fields)} FROM {table} WHERE {key_field} IN ()"
+    ) + KEY_LITERAL_MAX
+
+
+def field_groups(table: str, key_field: str, fields: list[str]) -> list[list[str]]:
+    """``fields`` (key field first, no repeats) split greedily, in order, into
+    groups that each start with the key field and whose fixed statement part
+    fits :data:`MAX_STATEMENT_PREFIX_CHARS`. A field that does not fit next
+    to the key alone is a ``ValueError``."""
+    limit = MAX_STATEMENT_PREFIX_CHARS
+    rest = [f for f in fields if f != key_field]
+    groups: list[list[str]] = []
+    current = [key_field]
+    for f in rest:
+        if _prefix_len(table, key_field, [*current, f]) <= limit:
+            current.append(f)
+            continue
+        if len(current) == 1 or _prefix_len(table, key_field, [key_field, f]) > limit:
+            raise ValueError("fields too wide for one ARC-1 statement")
+        groups.append(current)
+        current = [key_field, f]
+    if _prefix_len(table, key_field, current) > limit:
+        raise ValueError("fields too wide for one ARC-1 statement")
+    groups.append(current)
+    return groups
 
 
 def _cell(value: object) -> str:
@@ -321,6 +366,14 @@ class Arc1Reader:
         self.key_field = _check_ident(key_field)
         ordered = [self.key_field, *(_check_ident(f) for f in fields)]
         self.fields = list(dict.fromkeys(ordered))
+        # Settled once: a field list that cannot be sent is refused here,
+        # never in the middle of a run.
+        self._field_groups = field_groups(self.table, self.key_field, self.fields)
+        if len(self._field_groups) > 1:
+            logger.info(
+                "[reconcile] %s: %d fields in %d statements per batch",
+                self.table, len(self.fields), len(self._field_groups),
+            )
         target = (target or "").strip()
         if not TARGET_RE.fullmatch(target):
             raise ValueError("not a target name")
@@ -464,9 +517,13 @@ class Arc1Reader:
             raise
 
     async def read(self, keys: list[str]) -> dict[str, dict[str, str]]:
-        """``{key: row}`` for the keys found; one ``SAPQuery`` per call.
+        """``{key: row}`` for the keys found; one ``SAPQuery`` per field group.
 
         The caller sizes the batch (at most :data:`MAX_BATCH_KEYS` unique keys).
+        A wide field list is sent as several statements (ARC-1's statement
+        width limit, see the module docstring); the row of a key is the union
+        of its rows, and a key found by one statement and not by another is
+        ``unexpected_result``. With one group this is one call, as before.
         """
         for k in keys:
             if not isinstance(k, str) or not KEY_RE.fullmatch(k):
@@ -479,31 +536,50 @@ class Arc1Reader:
             return {}
         if len(wanted) > MAX_BATCH_KEYS:
             raise ValueError("a batch holds at most 9999 keys")
-        sql = build_sql(
-            self.table, self.fields, self.key_field, [ks[0] for ks in wanted.values()]
-        )
+        literals = [ks[0] for ks in wanted.values()]
+        statements = [
+            build_sql(self.table, group, self.key_field, literals)
+            for group in self._field_groups
+        ]
         self._require_run()
         if self._target_args is None:
             await self.preflight()
+        merged: dict[str, dict[str, str]] | None = None
+        for sql in statements:
+            found = await self._read_statement(sql, wanted)
+            if merged is None:
+                merged = found
+                continue
+            if found.keys() != merged.keys():
+                self._fail("unexpected_result")  # the source changed in between
+            for key, row in found.items():
+                merged[key] = {**merged[key], **row}
+        out: dict[str, dict[str, str]] = {}
+        for found_key, row in (merged or {}).items():
+            for requested in wanted[found_key]:
+                out[requested] = row
+        return out
+
+    async def _read_statement(
+        self, sql: str, wanted: dict[str, list[str]]
+    ) -> dict[str, dict[str, str]]:
+        """One statement of a batch: ``{trimmed key: row}``, checked."""
         answer = self._parse(await self._query(sql, len(wanted) + 1))
         if answer.short:
             self._fail("truncated")
         if len(answer.rows) > len(wanted):
             self._fail("ambiguous_key" if self._has_duplicate(answer.rows) else "unexpected_result")
-        out: dict[str, dict[str, str]] = {}
-        seen: set[str] = set()
+        found_rows: dict[str, dict[str, str]] = {}
         for row in answer.rows:
             if self.key_field not in row:
                 self._fail("unexpected_result")
             found = row[self.key_field].rstrip()
-            if found in seen:
+            if found in found_rows:
                 self._fail("ambiguous_key")
             if found not in wanted:
                 self._fail("unexpected_result")  # a row we did not ask for
-            seen.add(found)
-            for requested in wanted[found]:
-                out[requested] = row
-        return out
+            found_rows[found] = row
+        return found_rows
 
     def _has_duplicate(self, rows: list[dict[str, str]]) -> bool:
         found = [row.get(self.key_field, "").rstrip() for row in rows]

@@ -602,3 +602,50 @@ async def test_export_import_and_seed_keep_the_four_reconcile_keys(client, tmp_p
     seed.write_text(json.dumps({"agents": [agent]}))
     await seed_from_file_if_empty(seed)
     assert await _stored("recon-trip") == stored
+
+
+# --- a changed entry reaches the running build ---------------------------------
+
+def test_the_reconcile_entry_is_part_of_the_entry_signature():
+    from agents.admin import _entry_signature
+
+    base = _entry_signature([_reconcile(dict(BLOCK)), _arc1()])
+    assert base != []
+    for key, value in (("target", "OTHER/100"), ("arc1_server", OTHER_ARC1),
+                       ("batch_size", "100"), ("mismatch_cap", "10")):
+        assert _entry_signature([_reconcile({**BLOCK, key: value}), _arc1()]) != base
+    assert _entry_signature([_reconcile(dict(BLOCK)), _arc1()]) == base
+    assert _entry_signature([_reconcile(dict(BLOCK))], enabled=False) == []
+
+
+async def test_a_save_with_a_changed_target_reloads_and_an_unchanged_one_does_not(
+    client, monkeypatch
+):
+    from agents.chat_app import dynamic_chat_app
+    from agents.odata import admin_routes
+
+    reloads: list[int] = []
+
+    class FakeRegistry:
+        async def reload(self) -> None:
+            reloads.append(1)
+
+    monkeypatch.setattr(admin_routes, "_live_registry", lambda: FakeRegistry())
+    monkeypatch.setattr(dynamic_chat_app, "refresh", lambda: None)
+
+    r = await client.post("/admin/api/agents",
+                          json=_agent("recon-r", [_reconcile(dict(BLOCK)), _arc1()]))
+    assert r.status_code in (200, 201), r.text
+    agent_id = r.json()["id"]
+    reloads.clear()
+
+    same = _agent("recon-r", [_reconcile(dict(BLOCK)), _arc1()])
+    r = await client.put(f"/admin/api/agents/{agent_id}", json=same)
+    assert r.status_code == 200, r.text
+    assert r.json()["reloaded"] is False and reloads == []
+
+    changed = _agent("recon-r", [_reconcile({**BLOCK, "target": "OTHER/100"}), _arc1()])
+    r = await client.put(f"/admin/api/agents/{agent_id}", json=changed)
+    assert r.status_code == 200, r.text
+    assert r.json()["reloaded"] is True and r.json()["reload_failed"] is False
+    assert reloads == [1]
