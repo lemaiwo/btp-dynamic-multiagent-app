@@ -13,7 +13,7 @@ import { createAgentEditor } from './render/agentEditor.js';
 import { createContextDrawer } from './render/contextDrawer.js';
 import { createViewer } from './render/viewer.js';
 import { pickerGroups, agentNameOf, refOffered, isAdvanced } from './myagents.js';
-import { initTheme, toggleTheme, onThemeChange } from './theme.js';
+import { initTheme, setTheme, onSkinChange, THEMES } from './theme.js';
 import { titleFromText, formatTokens, formatPct, fillLevel, contextIndicatorText, normalizeAccess, rememberedAccess, rememberAccess } from './util.js';
 import { excludedFileIds } from './state.js';
 
@@ -43,10 +43,11 @@ root.innerHTML = `
         </div>
         <label class="model-pick agent-pick"><span class="sr-only">Agent</span><select id="agent" aria-label="Agent"></select></label>
         <label class="model-pick"><span class="sr-only">Model</span><select id="model" aria-label="Model"></select></label>
-        <button type="button" class="icon-btn theme" id="theme" aria-label="Switch to dark theme" title="Theme">
+        <button type="button" class="icon-btn theme" id="theme" aria-label="Theme" title="Theme" aria-haspopup="menu" aria-expanded="false" aria-controls="theme-menu">
           <svg class="sun" viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
           <svg class="moon" viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M20 14.5A8 8 0 019.5 4a8 8 0 1010.5 10.5z"/></svg>
         </button>
+        <div class="menu theme-menu" id="theme-menu" role="menu" aria-label="Theme" hidden></div>
         <a class="classic" href="/">Classic chat</a>
       </div>
     </header>
@@ -109,13 +110,84 @@ function notify(text, kind = 'info') {
 }
 
 // ---------- theme ----------
-function reflectTheme(theme) {
-  themeBtn.setAttribute('aria-label', theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme');
-  themeBtn.dataset.theme = theme;
+// The button opens a menu of radio items (THEMES, grouped); the choice is
+// remembered in localStorage by theme.js.
+const themeMenu = $('#theme-menu');
+// In <body>, not the top bar: its backdrop-filter would make a fixed menu
+// position against the bar instead of the viewport.
+document.body.appendChild(themeMenu);
+const themeItems = [];
+{
+  let group = null;
+  for (const t of THEMES) {
+    if (t.group !== group) {
+      group = t.group;
+      const h = document.createElement('div');
+      h.className = 'menu-group';
+      h.setAttribute('role', 'presentation');
+      h.textContent = group;
+      themeMenu.appendChild(h);
+    }
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.setAttribute('role', 'menuitemradio');
+    b.dataset.themeId = t.id;
+    b.tabIndex = -1;
+    const sw = document.createElement('span');
+    sw.className = 'theme-swatch';
+    sw.dataset.swatch = t.id;
+    sw.setAttribute('aria-hidden', 'true');
+    const label = document.createElement('span');
+    label.textContent = t.label;
+    b.append(sw, label);
+    themeMenu.appendChild(b);
+    themeItems.push(b);
+  }
 }
-reflectTheme(initTheme());
-onThemeChange(reflectTheme);
-themeBtn.addEventListener('click', () => toggleTheme());
+function reflectTheme(id, mode) {
+  const t = THEMES.find((x) => x.id === id);
+  themeBtn.setAttribute('aria-label', `Theme: ${t ? t.label : id}`);
+  themeBtn.title = `Theme: ${t ? t.label : id}`;
+  themeBtn.dataset.theme = mode;
+  for (const b of themeItems) b.setAttribute('aria-checked', String(b.dataset.themeId === id));
+}
+onSkinChange(reflectTheme);
+initTheme();
+function closeThemeMenu(refocus = false) {
+  if (themeMenu.hidden) return;
+  themeMenu.hidden = true;
+  themeBtn.setAttribute('aria-expanded', 'false');
+  if (refocus) themeBtn.focus();
+}
+function openThemeMenu() {
+  themeMenu.hidden = false;
+  themeBtn.setAttribute('aria-expanded', 'true');
+  const r = themeBtn.getBoundingClientRect();
+  themeMenu.style.top = `${Math.max(8, Math.min(r.bottom + 4, window.innerHeight - themeMenu.offsetHeight - 8))}px`;
+  themeMenu.style.left = `${Math.max(8, Math.min(r.right - themeMenu.offsetWidth, window.innerWidth - themeMenu.offsetWidth - 8))}px`;
+  (themeItems.find((b) => b.getAttribute('aria-checked') === 'true') || themeItems[0]).focus();
+}
+themeBtn.addEventListener('click', () => { if (themeMenu.hidden) openThemeMenu(); else closeThemeMenu(); });
+themeMenu.addEventListener('click', (e) => {
+  const b = e.target.closest('[data-theme-id]');
+  if (!b) return;
+  setTheme(b.dataset.themeId);
+  closeThemeMenu(true);
+});
+themeMenu.addEventListener('keydown', (e) => {
+  const i = themeItems.indexOf(document.activeElement);
+  const n = themeItems.length;
+  if (e.key === 'Escape') { e.preventDefault(); closeThemeMenu(true); }
+  else if (e.key === 'ArrowDown') { e.preventDefault(); themeItems[(i + 1) % n].focus(); }
+  else if (e.key === 'ArrowUp') { e.preventDefault(); themeItems[(i - 1 + n) % n].focus(); }
+  else if (e.key === 'Home') { e.preventDefault(); themeItems[0].focus(); }
+  else if (e.key === 'End') { e.preventDefault(); themeItems[n - 1].focus(); }
+  else if (e.key === 'Tab') closeThemeMenu();
+});
+document.addEventListener('pointerdown', (e) => {
+  if (!themeMenu.hidden && !themeMenu.contains(e.target) && !themeBtn.contains(e.target)) closeThemeMenu();
+});
+window.addEventListener('resize', () => closeThemeMenu());
 
 // ---------- session expiry ----------
 api.setUnauthorizedHandler(() => {

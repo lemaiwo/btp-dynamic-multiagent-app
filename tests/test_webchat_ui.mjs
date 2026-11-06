@@ -901,5 +901,33 @@ console.log('\n== dashboards (addendum i) ==');
   v.el.remove();
 }
 
+console.log('\n== themes ==');
+{
+  const T = await import('../static/chat/theme.js');
+  const css = (await import('node:fs')).readFileSync(new URL('../static/chat/styles.css', import.meta.url), 'utf8');
+  const html = document.documentElement;
+  localStorage.removeItem('chat.theme');
+  check('themes: system by default, light mode without a dark preference', T.initTheme() === 'light' && T.currentTheme() === 'system' && !('skin' in html.dataset));
+  const modes = [];
+  const skins = [];
+  const offMode = T.onThemeChange((m) => modes.push(m));
+  const offSkin = T.onSkinChange((id, m) => skins.push(`${id}/${m}`));
+  check('themes: Evening Horizon is a dark skin', T.setTheme('horizon-dark') === 'dark' && html.dataset.theme === 'dark' && html.dataset.skin === 'horizon-dark' && localStorage.getItem('chat.theme') === 'horizon-dark');
+  T.setTheme('quartz-dark');
+  check('themes: a skin change within one mode does not re-notify mode listeners', eq(modes, ['dark']) && eq(skins, ['horizon-dark/dark', 'quartz-dark/dark']));
+  check('themes: SAP GUI classic is light with its own skin', T.setTheme('sapgui') === 'light' && html.dataset.skin === 'sapgui' && eq(modes, ['dark', 'light']));
+  check('themes: plain dark drops the skin', T.setTheme('dark') === 'dark' && !('skin' in html.dataset));
+  check('themes: an unknown id changes nothing', T.setTheme('nope') === 'dark' && localStorage.getItem('chat.theme') === 'dark');
+  localStorage.setItem('chat.theme', '<script>');
+  check('themes: an unknown stored value reads as system', T.currentTheme() === 'system' && T.effectiveTheme() === 'light');
+  check('themes: system clears the stored choice', T.setTheme('system') === 'light' && localStorage.getItem('chat.theme') === null);
+  check('themes: toggle still flips light/dark', T.toggleTheme() === 'dark' && T.toggleTheme() === 'light');
+  const skinned = T.THEMES.filter((t) => !['system', 'light', 'dark'].includes(t.id));
+  check('themes: every SAP theme has a CSS block and a swatch', skinned.every((t) => css.includes(`:root[data-skin="${t.id}"] {`)) && T.THEMES.every((t) => css.includes(`.theme-swatch[data-swatch="${t.id}"]`)));
+  check('themes: every SAP theme has a mode', skinned.every((t) => t.mode === 'light' || t.mode === 'dark'));
+  offMode(); offSkin();
+  T.setTheme('system');
+}
+
 console.log(failed ? `\n${failed} FAILED` : '\nall passed');
 process.exit(failed ? 1 : 0);

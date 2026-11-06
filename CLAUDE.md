@@ -3381,7 +3381,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   column, HANA generation unchanged (still 10 there); 2.38.0 adds `builtin:reconcile`
   (migration reconciliation, `agents/reconcile/`) with the table `reconcile_runs`, HANA
   schema generation 11 (one new table, nothing undeployed), `CHAT_ATTACHMENT_MAX_CHARS` and
-  both admin UIs
+  both admin UIs; 2.39.0 adds the web chat's theme menu (`static/chat/theme.js`: System,
+  Light, Dark, the SAP Fiori themes Horizon (morning, evening, high contrast black and white),
+  Quartz Light / Dark and Belize, and SAP GUI classic, as `data-skin` blocks of CSS variables
+  over the light or dark mode): front end only, no new resource, variable, table or column
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets
