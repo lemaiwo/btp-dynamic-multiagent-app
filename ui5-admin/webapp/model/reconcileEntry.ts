@@ -9,7 +9,8 @@ import type { AuthMode } from "../service/types";
  * `agents/reconcile/config.py` (`RECONCILE_KEYS`, `validate_reconcile_block`)
  * and the gate in `agents/admin.py`: the entry is `auth_mode: "none"` (it
  * holds no credential; ARC-1's own entry carries the signed-in user) and its
- * block holds at most these four strings, blank meaning the default. The
+ * block holds at most these four strings, blank meaning the default (the API's
+ * `has_client_secret: false` echo on a loaded block is tolerated, `true` is not). The
  * texts below name the field and the rule, never the value: a URL could
  * carry a token.
  */
@@ -27,7 +28,7 @@ export const MAX_MISMATCH_CAP = 200000;
 const MAX_URL_CHARS = 512;
 
 /** `TARGET_RE` in agents/reconcile/config.py. */
-const TARGET_RE = /^[A-Za-z0-9_.-]{1,64}$/;
+const TARGET_RE = /^[A-Za-z0-9_./-]{1,64}$/;
 
 /** Whole numbers, as long as the payload's `max_length` allows (6 and 7). */
 const BATCH_RE = /^[0-9]{1,6}$/;
@@ -41,7 +42,7 @@ export const RECONCILE_TEXTS = {
         + "and the mismatch cap.",
     arc1Server: `ARC-1 server: the https URL of this agent's ARC-1 server entry, with a host and without `
         + `user, query or fragment, at most ${MAX_URL_CHARS} characters.`,
-    target: "Target: 1 to 64 letters, digits, '_', '.' or '-'.",
+    target: "Target: 1 to 64 letters, digits, '_', '.', '-' or '/' (as in SID/CLIENT).",
     batchSize: `Batch size: a whole number from 1 to ${MAX_BATCH_SIZE}.`,
     mismatchCap: `Mismatch cap: a whole number from 1 to ${MAX_MISMATCH_CAP}.`
 };
@@ -106,7 +107,9 @@ export default {
         }
         const block = oauth ?? {};
         const keys = RECONCILE_KEYS as readonly string[];
-        if (Object.keys(block).some((k) => keys.indexOf(k) === -1)) {
+        // The API echoes `has_client_secret: false` on every block it answers; that is not stray.
+        if (Object.keys(block).some((k) => keys.indexOf(k) === -1
+                && !(k === "has_client_secret" && block[k] === false))) {
             return RECONCILE_TEXTS.stray;
         }
         const arc1 = text(block.arc1_server);

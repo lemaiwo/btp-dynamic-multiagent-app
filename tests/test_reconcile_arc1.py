@@ -252,6 +252,26 @@ def test_read_adds_target_from_schema() -> None:
     }
 
 
+def test_target_sid_slash_client_is_sent_verbatim() -> None:
+    schema = {
+        "type": "object",
+        "properties": {"sql": {}, "maxRows": {}, "target": {"type": "string"}},
+        "required": ["sql"],
+    }
+    server = StubServer(schema=schema)
+
+    async def go() -> None:
+        async with _reader(server, target="SBQ/200") as reader:
+            await reader.preflight()
+            server.answers.append(_rows(["MATNR", "MATKL"], []))
+            await reader.read(["1"])
+
+    _run(go())
+    assert all(args["target"] == "SBQ/200" for _, args in server.calls)
+    with pytest.raises(ValueError):
+        Arc1Reader(server, table="MARA", key_field="MATNR", fields=["MATNR"], target="SBQ/200\nx")
+
+
 def test_read_uses_schema_spelling_of_target_property() -> None:
     schema = {"type": "object", "properties": {"sql": {}, "SapSystem": {}}, "required": ["sql"]}
     server = StubServer(schema=schema)

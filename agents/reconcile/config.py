@@ -23,7 +23,7 @@ RECONCILE_KEYS = ("arc1_server", "target", "batch_size", "mismatch_cap")
 # asks for one row more than it has keys (arc1_reader.MAX_BATCH_KEYS).
 DEFAULT_BATCH_SIZE, MAX_BATCH_SIZE = 200, 9_999
 DEFAULT_MISMATCH_CAP, MAX_MISMATCH_CAP = 50_000, 200_000
-TARGET_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+TARGET_RE = re.compile(r"^[A-Za-z0-9_./-]{1,64}\Z")
 # The sibling must act as the signed-in tester: per-user OAuth or the
 # forwarded JWT. A technical identity (app_only, destination) or none would
 # read the source system as somebody else.
@@ -128,10 +128,10 @@ def validate_reconcile_block(cfg: dict[str, Any]) -> None:
     _check_arc1_server(cfg.get("arc1_server"))
     target = cfg.get("target")
     if not _blank(target) and not (
-        isinstance(target, str) and TARGET_RE.match(target.strip())
+        isinstance(target, str) and TARGET_RE.fullmatch(target.strip())
     ):
         raise ValueError(
-            "oauth.target: 1 to 64 letters, digits, '_', '.' or '-'"
+            "oauth.target: 1 to 64 letters, digits, '_', '.', '-' or '/'"
         )
     _check_number("batch_size", cfg.get("batch_size"), MAX_BATCH_SIZE)
     _check_number("mismatch_cap", cfg.get("mismatch_cap"), MAX_MISMATCH_CAP)

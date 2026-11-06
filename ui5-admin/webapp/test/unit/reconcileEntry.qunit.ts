@@ -54,6 +54,14 @@ QUnit.test("the dialog's other fields never ride along", function (assert) {
     assert.deepEqual(Object.keys(out).sort(), ["arc1_server", "batch_size", "mismatch_cap", "target"]);
 });
 
+QUnit.test("the server's has_client_secret: false echo is not a stray key", function (assert) {
+    assert.strictEqual(check(stored({ has_client_secret: false })), "");
+    assert.strictEqual(check(stored({ has_client_secret: true })), reconcileEntry.RECONCILE_TEXTS.stray);
+    assert.deepEqual(oauthConfig.cleanOAuth(stored({ has_client_secret: false }), "none", URL), {
+        arc1_server: "https://arc1.example.com/mcp", target: "SRC_SYSTEM", batch_size: "500", mismatch_cap: "20000"
+    });
+});
+
 QUnit.test("values are trimmed and a blank one is left out (the default)", function (assert) {
     const out = oauthConfig.cleanOAuth(stored({ target: "  ", batch_size: " 300 ", mismatch_cap: "" }), "none", URL);
     assert.deepEqual(out, { arc1_server: "https://arc1.example.com/mcp", batch_size: "300" });
@@ -101,11 +109,11 @@ QUnit.test("the ARC-1 server: an https URL with a host, no user, query or fragme
     assert.strictEqual(check(stored({ arc1_server: "https://h.example.com/" + "a".repeat(490) })), "", "512 is fine");
 });
 
-QUnit.test("the target: 1 to 64 letters, digits, '_', '.' or '-'", function (assert) {
-    for (const ok of ["ECC", "src.system-1_A", "a".repeat(64)]) {
+QUnit.test("the target: 1 to 64 letters, digits, '_', '.', '-' or '/'", function (assert) {
+    for (const ok of ["ECC", "src.system-1_A", "SBQ/200", "a".repeat(64)]) {
         assert.strictEqual(check(stored({ target: ok })), "", ok);
     }
-    for (const bad of ["two words", "a".repeat(65), "x/y", "ä"]) {
+    for (const bad of ["two words", "a".repeat(65), "ä"]) {
         assert.strictEqual(check(stored({ target: bad })), reconcileEntry.RECONCILE_TEXTS.target, bad);
     }
 });

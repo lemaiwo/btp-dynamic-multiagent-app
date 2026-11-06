@@ -447,7 +447,7 @@ It holds no credential. Keys of the config block (all optional, blank = default)
 | Key            | Meaning                                                                                   | Range / default |
 |----------------|-------------------------------------------------------------------------------------------|-----------------|
 | `arc1_server`  | URL of the ARC-1 server entry of the **same** agent; that entry must be `oauth2` or `jwt` (a save is refused otherwise) | https URL; blank = the tools answer `arc1_not_configured` |
-| `target`       | Target system name on a multi-target ARC-1 server; blank for a single-target one           | `[A-Za-z0-9_.-]`, 1 to 64 characters; blank |
+| `target`       | Target system name on a multi-target ARC-1 server; blank for a single-target one           | `[A-Za-z0-9_./-]` (for example `SID/CLIENT`), 1 to 64 characters; blank |
 | `batch_size`   | Distinct keys read per `SAPQuery` call (each call asks for one row more than its keys)    | 1 to 9,999; 200 |
 | `mismatch_cap` | Mismatch rows (and rows missing in the source) listed in the report; counts stay exact     | 1 to 200,000; 50,000 |
 

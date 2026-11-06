@@ -178,6 +178,23 @@ def _refusal(oauth: Any, mode: str = "none", url: str = URL) -> str:
     return " | ".join(msgs)
 
 
+def test_the_apis_has_client_secret_echo_is_accepted_and_not_stored():
+    # GET answers every oauth block with `has_client_secret: false`; the admin UI sends the
+    # loaded block back on save.
+    payload = _payload({**BLOCK, "has_client_secret": False})
+    assert payload.oauth.to_config() == BLOCK
+
+
+def test_a_target_may_be_sid_slash_client():
+    from agents.reconcile.config import validate_reconcile_block
+
+    validate_reconcile_block({**BLOCK, "target": "SBQ/200"})
+    for bad in ("SBQ/200\nx", "SB Q"):
+        with pytest.raises(ValueError, match="oauth.target"):
+            validate_reconcile_block({**BLOCK, "target": bad})
+    assert _payload({**BLOCK, "target": "SBQ/200"}).oauth.to_config()["target"] == "SBQ/200"
+
+
 def test_the_gate_hands_storage_exactly_the_four_keys():
     assert _payload(dict(BLOCK)).oauth.to_config() == BLOCK
     assert _payload({**BLOCK, "arc1_server": f"  {ARC1} "}).oauth.to_config() == BLOCK

@@ -68,7 +68,7 @@ logger = logging.getLogger(__name__)
 QUERY_TOOL = "SAPQuery"
 TARGET_PROPERTIES = ("target", "system", "sapsystem", "targetid")
 KEY_RE = re.compile(r"^[A-Za-z0-9 _\-./']{1,40}\Z")
-TARGET_RE = re.compile(r"^[A-Za-z0-9_.\-]{0,64}\Z")
+TARGET_RE = re.compile(r"^[A-Za-z0-9_./\-]{0,64}\Z")
 MAX_ROWS = 10_000  # ARC-1's SAPQuery ceiling for maxRows
 # A batch asks for one row more than it has keys, so it holds at most this many.
 MAX_BATCH_KEYS = MAX_ROWS - 1

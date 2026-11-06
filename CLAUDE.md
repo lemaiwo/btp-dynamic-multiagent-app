@@ -1573,7 +1573,7 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   entry, blank = `arc1_not_configured`; `check_reconcile_entries`, at the gate and
   in `prepare_servers`: that entry must be in the same agent with `auth_mode`
   `oauth2` or `jwt`, `ARC1_SIBLING_MESSAGE`, and an agent has at most one
-  reconcile entry, `RECONCILE_SINGLE_ENTRY_MESSAGE`), `target` (`TARGET_RE`, blank for a
+  reconcile entry, `RECONCILE_SINGLE_ENTRY_MESSAGE`), `target` (`TARGET_RE`, letters, digits, `_ . - /` such as `SID/CLIENT`, blank for a
   single-target ARC-1), `batch_size` (1..9,999, default 200), `mismatch_cap`
   (1..200,000, default 50,000); the numbers are strings in the stored block.
   - `spec.py` — `ReconcileSpec` and its rule models (`direct`, `constant`,
