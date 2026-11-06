@@ -1,4 +1,5 @@
-/* SAP BTP Multi-Agent chat. Light by default, dark by preference or toggle. */
+/* SAP BTP Multi-Agent chat. Light by default, dark by preference; SAP themes
+   (data-skin) from the theme menu, see theme.js. */
 
 :root {
   --canvas: #f6f7f9;
@@ -52,6 +53,106 @@
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 12px 32px -16px rgba(0, 0, 0, 0.7);
   color-scheme: dark;
 }
+
+/* ---------- SAP themes (data-skin, theme.js) ----------
+   Each block approximates the SAP theme of that name with its theme
+   parameters (background, shell, brand, text, borders, semantic colours);
+   data-theme still carries the mode, which charts and highlight.js follow.
+   The font stack names SAP's "72" first: used where it is installed, never
+   loaded from anywhere. */
+:root[data-skin="horizon"] {
+  --canvas: #f5f6f7; --rail: #eff1f2; --surface: #ffffff; --surface-2: #eaecee;
+  --ink: #1d2d3e; --ink-2: #364a5e; --muted: #556b82; --faint: #758ca4;
+  --line: #e5e5e5; --line-strong: #bcc3ca;
+  --accent: #0070f2; --accent-ink: #ffffff; --accent-tint: #ebf8ff; --accent-tint-2: #d1efff;
+  --ok: #256f3a; --warn: #e76500; --danger: #aa0808; --danger-tint: #ffeaf4;
+  --code-bg: #f5f6f7;
+  --shadow: 0 0 0.125rem rgba(34, 53, 72, 0.16), 0 0.5rem 1rem rgba(34, 53, 72, 0.16);
+  --font: "72", "72full", -apple-system, "Segoe UI", Arial, Helvetica, sans-serif;
+}
+:root[data-skin="horizon-dark"] {
+  --canvas: #12171c; --rail: #1a2026; --surface: #1d232a; --surface-2: #28303a;
+  --ink: #eaecee; --ink-2: #d5dadd; --muted: #a9b4be; --faint: #8396a9;
+  --line: #2b343e; --line-strong: #44576a;
+  --accent: #4db1ff; --accent-ink: #0d1d2f; --accent-tint: #0e2b4b; --accent-tint-2: #12365f;
+  --ok: #5dc122; --warn: #ffb349; --danger: #ff8888; --danger-tint: #3b1414;
+  --code-bg: #0e1216;
+  --shadow: 0 0 0.125rem rgba(0, 0, 0, 0.5), 0 0.5rem 1rem rgba(0, 0, 0, 0.6);
+  --font: "72", "72full", -apple-system, "Segoe UI", Arial, Helvetica, sans-serif;
+}
+:root[data-skin="horizon-hcb"] {
+  --canvas: #000000; --rail: #000000; --surface: #000000; --surface-2: #1a1a1a;
+  --ink: #ffffff; --ink-2: #ffffff; --muted: #ffffff; --faint: #c8c8c8;
+  --line: #ffffff; --line-strong: #ffffff;
+  --accent: #ffde00; --accent-ink: #000000; --accent-tint: #2a2500; --accent-tint-2: #3d3600;
+  --ok: #6be38b; --warn: #ffab1d; --danger: #ff5c77; --danger-tint: #2a0008;
+  --code-bg: #000000; --shadow: none;
+  --font: "72", "72full", -apple-system, "Segoe UI", Arial, Helvetica, sans-serif;
+}
+:root[data-skin="horizon-hcw"] {
+  --canvas: #ffffff; --rail: #ffffff; --surface: #ffffff; --surface-2: #ececec;
+  --ink: #000000; --ink-2: #000000; --muted: #000000; --faint: #3b3b3b;
+  --line: #000000; --line-strong: #000000;
+  --accent: #0040b0; --accent-ink: #ffffff; --accent-tint: #e1ebff; --accent-tint-2: #c8dbff;
+  --ok: #107e3e; --warn: #9b4a00; --danger: #b00000; --danger-tint: #ffe5e5;
+  --code-bg: #ffffff; --shadow: none;
+  --font: "72", "72full", -apple-system, "Segoe UI", Arial, Helvetica, sans-serif;
+}
+:root[data-skin="quartz"] {
+  --canvas: #f7f7f7; --rail: #eff4f9; --surface: #ffffff; --surface-2: #f2f2f2;
+  --ink: #32363a; --ink-2: #4a4f54; --muted: #6a6d70; --faint: #89919a;
+  --line: #e5e5e5; --line-strong: #bfbfbf;
+  --accent: #0a6ed1; --accent-ink: #ffffff; --accent-tint: #e5f0fa; --accent-tint-2: #d1e8ff;
+  --ok: #107e3e; --warn: #e9730c; --danger: #bb0000; --danger-tint: #ffebeb;
+  --code-bg: #f7f7f7;
+  --shadow: 0 0 0.125rem rgba(0, 0, 0, 0.1), 0 0.5rem 1rem rgba(0, 0, 0, 0.1);
+  --font: "72", "72full", Arial, Helvetica, sans-serif;
+}
+:root[data-skin="quartz-dark"] {
+  --canvas: #1c2228; --rail: #232a31; --surface: #29313a; --surface-2: #333c46;
+  --ink: #fafafa; --ink-2: #e5e7e9; --muted: #d3d7d9; --faint: #8b9399;
+  --line: #3a4552; --line-strong: #5b6873;
+  --accent: #91c8f6; --accent-ink: #1c2228; --accent-tint: #23384d; --accent-tint-2: #2b4a68;
+  --ok: #8bc95a; --warn: #fabd64; --danger: #ff8888; --danger-tint: #3d2224;
+  --code-bg: #161b20;
+  --shadow: 0 0 0.125rem rgba(0, 0, 0, 0.6), 0 0.5rem 1rem rgba(0, 0, 0, 0.5);
+  --font: "72", "72full", Arial, Helvetica, sans-serif;
+}
+:root[data-skin="belize"] {
+  --canvas: #fafafa; --rail: #eff4f9; --surface: #ffffff; --surface-2: #f2f2f2;
+  --ink: #333333; --ink-2: #4c4c4c; --muted: #666666; --faint: #8c8c8c;
+  --line: #e5e5e5; --line-strong: #c0c0c0;
+  --accent: #427cac; --accent-ink: #ffffff; --accent-tint: #e5f0fa; --accent-tint-2: #cfe1f1;
+  --ok: #2b7d2b; --warn: #e78c07; --danger: #bb0000; --danger-tint: #ffebeb;
+  --code-bg: #f7f7f7;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.15), 0 4px 12px -6px rgba(0, 0, 0, 0.25);
+  --font: "72", Arial, Helvetica, sans-serif;
+}
+/* SAP GUI classic: the Windows-era blue-grey of SAP GUI's Enjoy look, square
+   corners, a denser Tahoma/Arial, flat dark-navy selection. */
+:root[data-skin="sapgui"] {
+  --canvas: #dfe6ec; --rail: #c9d6e2; --surface: #f4f7fa; --surface-2: #e4ebf1;
+  --ink: #000000; --ink-2: #1a2b3c; --muted: #3c4f63; --faint: #6b7e92;
+  --line: #9fb2c5; --line-strong: #7f95ab;
+  --accent: #10508c; --accent-ink: #ffffff; --accent-tint: #c4d8ec; --accent-tint-2: #a9c6e3;
+  --ok: #007a00; --warn: #a86300; --danger: #c00000; --danger-tint: #fbe2e2;
+  --code-bg: #ffffff; --shadow: 1px 1px 0 rgba(0, 0, 0, 0.25);
+  --font: Tahoma, "Segoe UI", Arial, Helvetica, sans-serif;
+  --mono: "Courier New", Consolas, monospace;
+}
+:root[data-skin="sapgui"] body { font-size: 13px; }
+:root[data-skin="sapgui"] :is(.shell, .menu, dialog) :not(.dot, .switch, .theme-swatch),
+:root[data-skin="sapgui"] :is(.menu, dialog) { border-radius: 0; }
+/* Quartz and Belize: the small corners of those themes (Horizon keeps the
+   page's own rounder ones). */
+:root:is([data-skin="quartz"], [data-skin="quartz-dark"], [data-skin="belize"]) :is(.shell, .menu, dialog) :not(.dot, .switch, .theme-swatch),
+:root:is([data-skin="quartz"], [data-skin="quartz-dark"], [data-skin="belize"]) :is(.menu, dialog) { border-radius: 4px; }
+:root[data-skin="sapgui"] .topbar { background: linear-gradient(#e8eef4, #c9d6e2); backdrop-filter: none; }
+:root[data-skin="sapgui"] :is(input:not([type="checkbox"], [type="radio"]), textarea, select, .sb-search):not(.composer textarea) { background-color: #ffffff; border: 1px solid var(--line-strong); }
+:root[data-skin="sapgui"] .sb-new { background: linear-gradient(#fdfefe, #d5e0ea); border-color: var(--line-strong); }
+/* High contrast: every border is visible and focus is unmistakable. */
+:root[data-skin^="horizon-hc"] :focus-visible { outline-width: 3px; }
+:root[data-skin^="horizon-hc"] :is(.conv.active, .sb-new, .icon-btn:hover) { outline: 1px solid var(--accent); }
 
 * { box-sizing: border-box; }
 html, body { height: 100%; margin: 0; }
@@ -377,6 +478,23 @@ div.tool-head { grid-template-columns: 10px minmax(0, 1fr) auto; }
 .menu button { text-align: left; padding: 8px 12px; border: 0; border-radius: 7px; background: transparent; color: var(--ink); font-size: 14px; }
 .menu button:hover, .menu button:focus-visible { background: var(--surface-2); outline: none; }
 .menu button.danger { color: var(--danger); }
+.menu-group { padding: 8px 12px 2px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; color: var(--faint); }
+.theme-menu { min-width: 230px; max-height: calc(100vh - 80px); overflow-y: auto; }
+.theme-menu button { display: flex; align-items: center; gap: 10px; }
+.theme-menu button[aria-checked="true"] { font-weight: 600; color: var(--accent); }
+.theme-menu button[aria-checked="true"]::after { content: "\2713"; margin-left: auto; }
+.theme-swatch { flex: none; width: 18px; height: 18px; border-radius: 50%; border: 1px solid var(--line-strong); background: linear-gradient(135deg, var(--sw-bg) 50%, var(--sw-ac) 50%); }
+.theme-swatch[data-swatch="system"] { --sw-bg: #ffffff; --sw-ac: #15191e; }
+.theme-swatch[data-swatch="light"] { --sw-bg: #f6f7f9; --sw-ac: #0a6ed1; }
+.theme-swatch[data-swatch="dark"] { --sw-bg: #15191e; --sw-ac: #5aa5f0; }
+.theme-swatch[data-swatch="horizon"] { --sw-bg: #f5f6f7; --sw-ac: #0070f2; }
+.theme-swatch[data-swatch="horizon-dark"] { --sw-bg: #12171c; --sw-ac: #4db1ff; }
+.theme-swatch[data-swatch="horizon-hcb"] { --sw-bg: #000000; --sw-ac: #ffde00; }
+.theme-swatch[data-swatch="horizon-hcw"] { --sw-bg: #ffffff; --sw-ac: #0040b0; }
+.theme-swatch[data-swatch="quartz"] { --sw-bg: #354a5f; --sw-ac: #0a6ed1; }
+.theme-swatch[data-swatch="quartz-dark"] { --sw-bg: #1c2228; --sw-ac: #91c8f6; }
+.theme-swatch[data-swatch="belize"] { --sw-bg: #3f5161; --sw-ac: #427cac; }
+.theme-swatch[data-swatch="sapgui"] { --sw-bg: #c9d6e2; --sw-ac: #10508c; }
 dialog.confirm { border: 1px solid var(--line); border-radius: 14px; background: var(--surface); color: var(--ink); padding: 20px 22px; max-width: 420px; box-shadow: var(--shadow); }
 dialog.confirm::backdrop { background: rgba(10, 20, 30, 0.45); }
 dialog.confirm h3 { margin: 0 0 8px; font-size: 17px; }
