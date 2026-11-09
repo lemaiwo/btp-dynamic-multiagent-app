@@ -95,7 +95,13 @@ DATA_PRIVILEGES = frozenset(
     {"SELECT", "INSERT", "UPDATE", "DELETE", "EXECUTE", "ALTER", "DROP", "CREATE ANY",
      "INDEX", "TRIGGER", "DEBUG", "UNMASKED"}
 )
+# Exempt by exact name only: no _SYS_* prefix rule, because _SYS_BIC (activated
+# calculation views) and _SYS_BI can hold business data, and _SYS_REPO's
+# procedures grant roles.
 SYSTEM_SCHEMAS = frozenset({"SYS", "PUBLIC", "_SYS_STATISTICS"})
+# System privileges (no schema) that reach business data of every schema.
+# DATA ADMIN authorises reading all data in the system views and any DDL.
+BROAD_SYSTEM_PRIVILEGES = frozenset({"DATA ADMIN"})
 
 
 class ProbeError(Exception):
@@ -381,8 +387,15 @@ def socks5_connect_request(host: str, port: int) -> bytes:
         address = None
     if isinstance(address, ipaddress.IPv4Address):
         target = b"\x01" + address.packed
+    elif address is not None or ":" in host:
+        raise ProbeError("socks5: the host is not a domain name or IPv4 address")
     else:
-        name = host.encode("idna")
+        # The proxy takes DOMAIN and IPv4 only; an IPv6 literal or a label over
+        # 63 characters does not encode, and must not end the run.
+        try:
+            name = host.encode("idna")
+        except UnicodeError:
+            raise ProbeError("socks5: the host is not a domain name or IPv4 address") from None
         if len(name) > 255:
             raise ProbeError("socks5: the host name is too long")
         target = b"\x03" + bytes([len(name)]) + name
@@ -493,26 +506,28 @@ def tls_fact(logins: Mapping[tuple[str, bool], bool]) -> str:
 # ---- S10 privileges -------------------------------------------------------------------------
 
 
-def _system_schema(schema: str) -> bool:
-    return schema in SYSTEM_SCHEMAS or schema.startswith("_SYS_")
-
-
 def classify_privileges(
     rows: Iterable[tuple[object, object]], own_schema: str | None = None
 ) -> str:
-    """``too_wide`` when a data privilege names a non-system schema, ``ok`` else.
+    """``too_wide`` when a data privilege names a schema outside ``SYSTEM_SCHEMAS``
+    or a system privilege of ``BROAD_SYSTEM_PRIVILEGES`` is held; ``ok`` else.
 
-    System privileges (no schema) are fine. The user's own schema is exempt: it
-    holds nothing of the system's data. No rows at all is ``unknown``.
+    The user's own schema is exempt: it holds nothing of the system's data. No
+    rows at all is ``unknown``. Only these fixed words leave this function.
     """
     rows = list(rows)
     if not rows:
         return "unknown"
     for privilege, schema in rows:
-        if schema is None or str(privilege or "").upper() not in DATA_PRIVILEGES:
+        name = str(privilege or "").upper()
+        if schema is None:
+            if name in BROAD_SYSTEM_PRIVILEGES:
+                return "too_wide"
             continue
-        name = str(schema)
-        if _system_schema(name) or (own_schema and name == own_schema):
+        if name not in DATA_PRIVILEGES:
+            continue
+        schema = str(schema)
+        if schema in SYSTEM_SCHEMAS or (own_schema and schema == own_schema):
             continue
         return "too_wide"
     return "ok"
@@ -588,8 +603,16 @@ def exit_code(facts: Facts) -> int:
     return 0 if facts.version_ok and facts.privileges == "ok" else 1
 
 
+class QuietParser(argparse.ArgumentParser):
+    """argparse echoes the offending argument (``unrecognized arguments:
+    --password hunter2``); this parser answers a fixed text and exits 2."""
+
+    def error(self, message: str):  # noqa: ARG002 - the message holds the values
+        self.exit(2, f"{self.prog}: invalid arguments (no value is shown); see --help\n")
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = QuietParser(
         prog="probe_hana_connectivity.py",
         description="Probe an on-premise SAP HANA through the Cloud Connector SOCKS5 proxy. "
         "Prints step results and yes/no facts, never a credential, token, host or row.",
@@ -606,10 +629,13 @@ def build_parser() -> argparse.ArgumentParser:
 # ---- the run --------------------------------------------------------------------------------
 
 
-def _hdbcli_connect(**kwargs):  # pragma: no cover - needs a real HANA
-    from hdbcli import dbapi
-
-    return dbapi.connect(**kwargs)
+def load_hdbcli_connect() -> Callable[..., object]:
+    """``hdbcli.dbapi.connect``, imported once before the attempts."""
+    try:
+        from hdbcli import dbapi
+    except ImportError:
+        raise ProbeError("hdbcli: not importable") from None
+    return dbapi.connect
 
 
 def run(
@@ -619,7 +645,7 @@ def run(
     transport: httpx.BaseTransport | None = None,
     open_socket: Callable[[str, int, float], socket.socket] = open_tcp,
     handshake: Callable[..., int] = socks5_handshake,
-    connect: Callable[..., object] = _hdbcli_connect,
+    connect: Callable[..., object] | None = None,
 ) -> int:
     """Run the probe. The keyword arguments replace the network in tests."""
     facts = Facts()
@@ -682,6 +708,8 @@ def _run(args, environ, facts, transport, open_socket, handshake, connect) -> No
         say("SKIP", "socks5_handshake", "no TCP connection")
 
     # S6
+    if connect is None:
+        connect = load_hdbcli_connect()
     variants = VARIANTS if args.variant == "both" else (args.variant,)
     modes = {"yes": (True,), "no": (False,), "both": (True, False)}[args.encrypt]
     logins: dict[tuple[str, bool], bool] = {}
@@ -759,8 +787,12 @@ def _sql_steps(conn, args, facts: Facts, checks: list[dict]) -> None:
     except Exception as exc:  # noqa: BLE001
         say("FAIL", "database", sql_code_of(exc))
 
-    # S8
+    # S8: S7 opened a transaction (autocommit is off). End it, so SET
+    # TRANSACTION READ ONLY is the first statement of the transaction S9-S12
+    # then run in; mid-transaction it could be refused, and A5 would be judged
+    # on a transaction that never was read-only.
     try:
+        conn.rollback()
         cursor.execute("SET TRANSACTION READ ONLY")
         facts.read_only = True
         say("PASS", "read_only", "accepted")
@@ -810,7 +842,9 @@ def _sql_steps(conn, args, facts: Facts, checks: list[dict]) -> None:
         say("FAIL", "explain_plan", sql_code_of(exc))
 
     # S12
-    if checks:
+    if checks and not facts.read_only:
+        say("SKIP", "checks", "not read-only")
+    elif checks:
         passed, failed = run_checks(cursor, checks)
         say("PASS" if not failed else "FAIL", "checks", f"passed={passed} failed={failed}")
     else:

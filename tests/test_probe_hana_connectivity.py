@@ -269,17 +269,34 @@ def test_printable_kwargs_masks_every_value():
 def test_privileges_are_classified():
     assert probe.classify_privileges([("SELECT", "SAPHANADB"), ("SELECT", "SYS")]) == "too_wide"
     assert probe.classify_privileges([("CATALOG READ", None), ("MONITORING", None)]) == "ok"
-    assert (
-        probe.classify_privileges(
-            [("SELECT", "SYS"), ("SELECT", "_SYS_STATISTICS"), ("EXECUTE", "_SYS_REPO")]
-        )
-        == "ok"
-    )
+    assert probe.classify_privileges([("SELECT", "SYS"), ("SELECT", "_SYS_STATISTICS")]) == "ok"
     assert probe.classify_privileges([("SELECT", "PUBLIC")]) == "ok"
     assert probe.classify_privileges([("DELETE", "ZAPP")]) == "too_wide"
     # The user's own schema holds nothing of the system's data.
     assert probe.classify_privileges([("SELECT", "PROBEUSER")], own_schema="PROBEUSER") == "ok"
     assert probe.classify_privileges([]) == "unknown"
+
+
+@pytest.mark.parametrize("schema", ["_SYS_BIC", "_SYS_BI", "_SYS_REPO", "_SYS_OTHER"])
+def test_only_named_system_schemas_are_exempt(schema):
+    # Activated calculation views (_SYS_BIC) and BI metadata (_SYS_BI) can hold
+    # business data; no _SYS_* schema is exempt by its prefix alone.
+    assert probe.classify_privileges([("SELECT", schema)]) == "too_wide"
+
+
+def test_broad_system_privileges_are_too_wide():
+    assert probe.classify_privileges([("DATA ADMIN", None)]) == "too_wide"
+    assert probe.classify_privileges([("data admin", None), ("MONITORING", None)]) == "too_wide"
+    assert probe.classify_privileges([("CATALOG READ", None)]) == "ok"
+
+
+def test_privilege_step_prints_fixed_words_only(capsys):
+    code, _, _ = _run(HTTP_DESTINATION, privileges=[("DATA ADMIN", None), ("SELECT", "ZSECRET")])
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "FAIL privileges: too_wide (rows=2)" in out
+    assert "ZSECRET" not in out
+    assert "DATA ADMIN" not in out
 
 
 # ---- checks file ---------------------------------------------------------------------
@@ -349,12 +366,29 @@ def test_sql_code_of_other_exceptions_is_the_class():
 # ---- arguments -----------------------------------------------------------------------
 
 
-def test_password_is_never_an_argument():
+def test_password_is_never_an_argument(capsys):
     with pytest.raises(SystemExit) as raised:
         probe.build_parser().parse_args(["--password", "x"])
     assert raised.value.code == 2
-    with pytest.raises(SystemExit):
-        probe.build_parser().parse_args(["--destination", "d", "--password", "x"])
+    with pytest.raises(SystemExit) as raised:
+        probe.build_parser().parse_args(["--destination", "d", "--password", "hunter2"])
+    assert raised.value.code == 2
+    captured = capsys.readouterr()
+    assert "hunter2" not in captured.err + captured.out
+    assert "invalid arguments" in captured.err
+
+
+def test_argument_errors_never_echo_values(capsys):
+    for argv in (
+        ["--destination", "d", "--variant", "s3cr3t-variant"],
+        ["--destination", "d", "--timeout", "s3cr3t-timeout"],
+        ["s3cr3t-positional"],
+    ):
+        with pytest.raises(SystemExit) as raised:
+            probe.build_parser().parse_args(argv)
+        assert raised.value.code == 2
+        captured = capsys.readouterr()
+        assert "s3cr3t" not in captured.err + captured.out
 
 
 def test_parser_defaults():
@@ -428,9 +462,10 @@ def _mock_transport(destination: dict) -> httpx.MockTransport:
 
 
 class FakeConnection:
-    def __init__(self, privileges, explain_fails=False):
+    def __init__(self, privileges, explain_fails=False, read_only_fails=False):
         self.privileges = privileges
         self.explain_fails = explain_fails
+        self.read_only_fails = read_only_fails
         self.closed = False
         self.rolled_back = False
         self.statements: list[str] = []
@@ -454,6 +489,8 @@ class FakeConnection:
                     self.result = [("TENANTDB", "2.00.079.00.1234567890")]
                 elif "EFFECTIVE_PRIVILEGES" in sql:
                     self.result = list(conn.privileges)
+                elif sql.startswith("SET TRANSACTION") and conn.read_only_fails:
+                    raise dbapi.Error(7, "feature not supported: secret text")
                 elif sql.startswith("EXPLAIN PLAN") and conn.explain_fails:
                     raise dbapi.Error(258, "insufficient privilege: secret text")
                 elif "EXPLAIN_PLAN_TABLE" in sql:
@@ -477,6 +514,7 @@ class FakeConnection:
 
     def rollback(self):
         self.rolled_back = True
+        self.statements.append("ROLLBACK")
 
     def close(self):
         self.closed = True
@@ -488,10 +526,15 @@ class FakeSocket:
 
 
 def _run(
-    destination: dict, *, privileges, extra: list[str] | None = None, connect=None, capsys=None
+    destination: dict,
+    *,
+    privileges,
+    extra: list[str] | None = None,
+    connect=None,
+    read_only_fails: bool = False,
 ):
     calls: list[dict] = []
-    conn = FakeConnection(privileges)
+    conn = FakeConnection(privileges, read_only_fails=read_only_fails)
 
     def fake_connect(**kwargs):
         calls.append(kwargs)
@@ -590,3 +633,75 @@ def test_a_cloud_destination_is_refused(capsys):
 
 def test_namespace_type():
     assert isinstance(probe.build_parser().parse_args(["--destination", "d"]), argparse.Namespace)
+
+
+# ---- fix round 1 ---------------------------------------------------------------------------
+
+
+def test_read_only_starts_a_fresh_transaction(capsys):
+    _, _, conn = _run(HTTP_DESTINATION, privileges=[("MONITORING", None)])
+    capsys.readouterr()
+    s = conn.statements
+    database = next(i for i, x in enumerate(s) if "M_DATABASE" in x)
+    read_only = s.index("SET TRANSACTION READ ONLY")
+    # S7 opened a transaction (autocommit off): it is rolled back right before S8,
+    # so S8 is the first statement of the transaction S9-S11 then run in.
+    assert database < read_only
+    assert s[read_only - 1] == "ROLLBACK"
+    between = s[read_only + 1 :]
+    assert any("EXPLAIN PLAN" in x for x in between)
+    explain = next(i for i, x in enumerate(s) if x.startswith("EXPLAIN PLAN"))
+    assert "ROLLBACK" not in s[read_only:explain]
+
+
+def test_checks_are_skipped_when_the_transaction_is_not_read_only(tmp_path, capsys):
+    checks = tmp_path / "checks.json"
+    checks.write_text(json.dumps([{"name": "alerts", "sql": "SELECT * FROM M_ALERTS"}]))
+    _, _, conn = _run(
+        HTTP_DESTINATION,
+        privileges=[("MONITORING", None)],
+        extra=["--checks-file", str(checks)],
+        read_only_fails=True,
+    )
+    out = capsys.readouterr().out
+    assert "FAIL read_only: sql_code=7" in out
+    assert "SKIP checks: not read-only" in out
+    assert "READ_ONLY no" in out
+    assert not any("M_ALERTS" in x for x in conn.statements)
+    assert "secret text" not in out
+
+
+def test_checks_run_in_the_read_only_transaction(tmp_path, capsys):
+    checks = tmp_path / "checks.json"
+    checks.write_text(json.dumps([{"name": "alerts", "sql": "SELECT * FROM M_ALERTS"}]))
+    _, _, conn = _run(
+        HTTP_DESTINATION, privileges=[("MONITORING", None)], extra=["--checks-file", str(checks)]
+    )
+    out = capsys.readouterr().out
+    assert "PASS alerts" in out
+    assert "PASS checks: passed=1 failed=0" in out
+    assert "SELECT TOP 1 * FROM (SELECT * FROM M_ALERTS)" in conn.statements
+
+
+def test_a_missing_hdbcli_stops_before_any_attempt(monkeypatch, capsys):
+    monkeypatch.setitem(sys.modules, "hdbcli", None)
+    monkeypatch.setitem(sys.modules, "hdbcli.dbapi", None)
+    args = probe.build_parser().parse_args(["--destination", "hana-dest"])
+    code = probe.run(
+        args,
+        {"VCAP_SERVICES": json.dumps(VCAP)},
+        transport=_mock_transport(HTTP_DESTINATION),
+        open_socket=lambda host, port, timeout: FakeSocket(),
+        handshake=lambda sock, token, loc, host, port: 0,
+    )
+    out = capsys.readouterr().out
+    assert code == 2
+    assert out.count("FAIL hdbcli: not importable") == 1
+    assert "ImportError" not in out
+    _assert_clean(out)
+
+
+@pytest.mark.parametrize("host", ["::1", "fe80::1", "a" * 64 + ".example"])
+def test_unencodable_hosts_are_a_probe_error(host):
+    with pytest.raises(probe.ProbeError):
+        probe.socks5_connect_request(host, 30013)
