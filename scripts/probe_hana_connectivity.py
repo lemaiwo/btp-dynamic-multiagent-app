@@ -59,8 +59,26 @@ The final block holds one fixed value per key: ``DEST_SHAPE``,
 ``EXPLAIN_PLAN``, ``PRIVILEGES``. ``QUERY_TIMEOUT yes`` says the driver
 accepted the timeout and ran a statement under it, not that it fired.
 
-Exit code: 0 when S7 passed and ``PRIVILEGES`` is ``ok``, 1 otherwise, 2 when
-the probe could not get as far as an attempt.
+S10 judges the effective privileges of the user (own grants plus what PUBLIC
+and roles such as MONITORING give it). ``PRIVILEGES`` is:
+
+  * ``too_wide``: a grant on a schema that is not ``_SYS_*`` (other than SYS,
+    PUBLIC, ``_SYS_STATISTICS`` and the user's own schema), or ``DATA ADMIN``;
+  * ``review``: grants only on ``_SYS_*`` schemas such as ``_SYS_BIC``,
+    ``_SYS_BI``, ``_SYS_REPO``: the listed ``_SYS_*`` schemas must be judged by
+    a human at the gate (whether PUBLIC / MONITORING grant there by default is
+    not verified, and ``_SYS_BIC`` can hold business data);
+  * ``ok``: neither; ``unknown``: the query answered nothing or failed.
+
+S10 is NOT a full audit: ``DATA ADMIN`` is the only system privilege on its
+broad list; every other system privilege is not judged. It prints counts and,
+per listed schema (at most 10), ``schema=<NAME> privileges=<KIND>:<n>,...``;
+a name or kind of an unexpected form is printed as ``<unprintable>``. Object
+names, grantors and user names are never printed.
+
+Exit code: 0 when S7 passed and ``PRIVILEGES`` is ``ok`` or ``review``, 1
+otherwise (``too_wide``, ``unknown``, or no database answer), 2 when the probe
+could not get as far as an attempt.
 """
 
 from __future__ import annotations
@@ -89,16 +107,15 @@ CHECK_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 VERSION_RE = re.compile(r"^[0-9A-Za-z._ ()-]{1,64}$")
 MAX_CHECKS = 200
 QUERY_TIMEOUT_SECONDS = 20
-# Object privileges that read or change data: on a non-system schema they make
-# the technical user too wide (assumption A7).
-DATA_PRIVILEGES = frozenset(
-    {"SELECT", "INSERT", "UPDATE", "DELETE", "EXECUTE", "ALTER", "DROP", "CREATE ANY",
-     "INDEX", "TRIGGER", "DEBUG", "UNMASKED"}
-)
 # Exempt by exact name only: no _SYS_* prefix rule, because _SYS_BIC (activated
 # calculation views) and _SYS_BI can hold business data, and _SYS_REPO's
-# procedures grant roles.
+# procedures grant roles. A grant on another _SYS_* schema is "review".
 SYSTEM_SCHEMAS = frozenset({"SYS", "PUBLIC", "_SYS_STATISTICS"})
+# What S10 may print of a schema name / privilege kind; anything else is UNPRINTABLE.
+SCHEMA_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_#$]{0,126}$")
+PRIVILEGE_KIND_RE = re.compile(r"^[A-Z ]{1,40}$")
+UNPRINTABLE = "<unprintable>"
+MAX_SCHEMA_LINES = 10
 # System privileges (no schema) that reach business data of every schema.
 # DATA ADMIN authorises reading all data in the system views and any DDL.
 BROAD_SYSTEM_PRIVILEGES = frozenset({"DATA ADMIN"})
@@ -506,31 +523,79 @@ def tls_fact(logins: Mapping[tuple[str, bool], bool]) -> str:
 # ---- S10 privileges -------------------------------------------------------------------------
 
 
-def classify_privileges(
-    rows: Iterable[tuple[object, object]], own_schema: str | None = None
-) -> str:
-    """``too_wide`` when a data privilege names a schema outside ``SYSTEM_SCHEMAS``
-    or a system privilege of ``BROAD_SYSTEM_PRIVILEGES`` is held; ``ok`` else.
+@dataclass
+class PrivilegeSummary:
+    """What S10 found: a verdict and counts. Holds schema names and privilege
+    kinds as SAP sent them; ``schema_lines`` is the only printable form."""
 
-    The user's own schema is exempt: it holds nothing of the system's data. No
-    rows at all is ``unknown``. Only these fixed words leave this function.
+    verdict: str
+    rows: int = 0
+    data_grants: int = 0
+    broad_system: int = 0
+    schemas: dict[str, dict[str, int]] = field(default_factory=dict)
+
+    def schema_lines(self) -> list[str]:
+        lines = []
+        for schema in sorted(self.schemas)[:MAX_SCHEMA_LINES]:
+            kinds: dict[str, int] = {}
+            for kind, count in self.schemas[schema].items():
+                shown = kind if PRIVILEGE_KIND_RE.fullmatch(kind) else UNPRINTABLE
+                kinds[shown] = kinds.get(shown, 0) + count
+            name = schema if SCHEMA_NAME_RE.fullmatch(schema) else UNPRINTABLE
+            listed = ",".join(f"{k}:{kinds[k]}" for k in sorted(kinds))
+            lines.append(f"schema={name} privileges={listed}")
+        if len(self.schemas) > MAX_SCHEMA_LINES:
+            lines.append(f"and {len(self.schemas) - MAX_SCHEMA_LINES} more")
+        return lines
+
+
+def summarize_privileges(
+    rows: Iterable[tuple[object, ...]], own_schema: str | None = None
+) -> PrivilegeSummary:
+    """Judge the rows of EFFECTIVE_PRIVILEGES (PRIVILEGE, SCHEMA_NAME, ...).
+
+    A data grant is any privilege on a schema (an object or schema privilege)
+    outside ``SYSTEM_SCHEMAS`` and the user's own schema. ``too_wide``: a data
+    grant on a schema that is not ``_SYS_*``, or a system privilege of
+    ``BROAD_SYSTEM_PRIVILEGES``. ``review``: data grants only on ``_SYS_*``
+    schemas (PUBLIC and MONITORING may grant there by default; unverified), so a
+    human judges them. ``ok``: neither. No rows: ``unknown``. Columns after the
+    second (object names) are never read.
     """
     rows = list(rows)
+    summary = PrivilegeSummary(verdict="unknown", rows=len(rows))
     if not rows:
-        return "unknown"
-    for privilege, schema in rows:
-        name = str(privilege or "").upper()
+        return summary
+    business = False
+    for row in rows:
+        kind = str(row[0] or "").upper()
+        schema = row[1]
         if schema is None:
-            if name in BROAD_SYSTEM_PRIVILEGES:
-                return "too_wide"
-            continue
-        if name not in DATA_PRIVILEGES:
+            if kind in BROAD_SYSTEM_PRIVILEGES:
+                summary.broad_system += 1
             continue
         schema = str(schema)
         if schema in SYSTEM_SCHEMAS or (own_schema and schema == own_schema):
             continue
-        return "too_wide"
-    return "ok"
+        summary.data_grants += 1
+        kinds = summary.schemas.setdefault(schema, {})
+        kinds[kind] = kinds.get(kind, 0) + 1
+        if not schema.startswith("_SYS_"):
+            business = True
+    if business or summary.broad_system:
+        summary.verdict = "too_wide"
+    elif summary.data_grants:
+        summary.verdict = "review"
+    else:
+        summary.verdict = "ok"
+    return summary
+
+
+def classify_privileges(
+    rows: Iterable[tuple[object, ...]], own_schema: str | None = None
+) -> str:
+    """The verdict of ``summarize_privileges``: ok | review | too_wide | unknown."""
+    return summarize_privileges(rows, own_schema).verdict
 
 
 # ---- S12 checks --------------------------------------------------------------------------
@@ -600,7 +665,7 @@ def report_block(facts: Facts) -> str:
 
 
 def exit_code(facts: Facts) -> int:
-    return 0 if facts.version_ok and facts.privileges == "ok" else 1
+    return 0 if facts.version_ok and facts.privileges in ("ok", "review") else 1
 
 
 class QuietParser(argparse.ArgumentParser):
@@ -819,12 +884,16 @@ def _sql_steps(conn, args, facts: Facts, checks: list[dict]) -> None:
             "WHERE USER_NAME = CURRENT_USER"
         )
         rows = [(r[0], r[1]) for r in cursor.fetchall()]
-        facts.privileges = classify_privileges(rows, own_schema=own)
+        summary = summarize_privileges(rows, own_schema=own)
+        facts.privileges = summary.verdict
         say(
-            "PASS" if facts.privileges == "ok" else "FAIL",
+            "PASS" if summary.verdict in ("ok", "review") else "FAIL",
             "privileges",
-            f"{facts.privileges} (rows={len(rows)})",
+            f"{summary.verdict} (rows={summary.rows}, data_grants={summary.data_grants}, "
+            f"broad_system={summary.broad_system})",
         )
+        for line in summary.schema_lines():
+            print(line)
     except Exception as exc:  # noqa: BLE001
         say("FAIL", "privileges", sql_code_of(exc))
 

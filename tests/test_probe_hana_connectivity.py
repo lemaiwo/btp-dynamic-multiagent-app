@@ -278,25 +278,93 @@ def test_privileges_are_classified():
 
 
 @pytest.mark.parametrize("schema", ["_SYS_BIC", "_SYS_BI", "_SYS_REPO", "_SYS_OTHER"])
-def test_only_named_system_schemas_are_exempt(schema):
-    # Activated calculation views (_SYS_BIC) and BI metadata (_SYS_BI) can hold
-    # business data; no _SYS_* schema is exempt by its prefix alone.
-    assert probe.classify_privileges([("SELECT", schema)]) == "too_wide"
+def test_non_exempt_sys_schemas_need_review(schema):
+    # _SYS_BIC (activated calculation views) and _SYS_BI can hold business data,
+    # but default grants through PUBLIC / MONITORING may land there too: a human
+    # judges them at the gate. No _SYS_* schema is exempt by its prefix alone.
+    assert probe.classify_privileges([("SELECT", schema)]) == "review"
 
 
 def test_broad_system_privileges_are_too_wide():
     assert probe.classify_privileges([("DATA ADMIN", None)]) == "too_wide"
     assert probe.classify_privileges([("data admin", None), ("MONITORING", None)]) == "too_wide"
     assert probe.classify_privileges([("CATALOG READ", None)]) == "ok"
+    # too_wide wins over review
+    assert (
+        probe.classify_privileges([("SELECT", "_SYS_BI"), ("SELECT", "SAPHANADB")]) == "too_wide"
+    )
 
 
-def test_privilege_step_prints_fixed_words_only(capsys):
-    code, _, _ = _run(HTTP_DESTINATION, privileges=[("DATA ADMIN", None), ("SELECT", "ZSECRET")])
+def test_any_object_privilege_on_a_business_schema_is_too_wide():
+    assert probe.classify_privileges([("CREATE ANY", "ZAPP")]) == "too_wide"
+    assert probe.classify_privileges([("REFERENCES", "ZAPP", "OBJ")]) == "too_wide"
+
+
+# Rows as EFFECTIVE_PRIVILEGES might carry them; the third column (an object
+# name) must never reach the output.
+MONITORING_ROWS = [
+    ("MONITORING", None, None),
+    ("CATALOG READ", None, None),
+    ("SELECT", "SYS", "M_DATABASE"),
+    ("SELECT", "_SYS_BI", "OBJ_NAME_MUST_NOT_PRINT_1"),
+    ("SELECT", "_SYS_BI", "OBJ_NAME_MUST_NOT_PRINT_2"),
+    ("EXECUTE", "_SYS_REPO", "OBJ_NAME_MUST_NOT_PRINT_3"),
+    ("SELECT", "PROBEUSER", "OWN_TABLE"),
+]
+
+
+def test_monitoring_and_public_grants_on_sys_schemas_are_review(capsys):
+    code, _, _ = _run(HTTP_DESTINATION, privileges=MONITORING_ROWS)
+    out = capsys.readouterr().out
+    assert code == 0, out
+    assert "PASS privileges: review (rows=7, data_grants=3, broad_system=0)" in out
+    assert "schema=_SYS_BI privileges=SELECT:2" in out
+    assert "schema=_SYS_REPO privileges=EXECUTE:1" in out
+    assert "PRIVILEGES review" in out
+    assert "OBJ_NAME_MUST_NOT_PRINT" not in out
+    assert "PROBEUSER" not in out
+    assert "OWN_TABLE" not in out
+    assert "schema=SYS " not in out
+
+
+def test_a_business_schema_is_too_wide_and_named(capsys):
+    rows = [*MONITORING_ROWS, ("SELECT", "SAPHANADB", "OBJ_NAME_MUST_NOT_PRINT_4")]
+    rows.append(("INSERT", "SAPHANADB", "OBJ_NAME_MUST_NOT_PRINT_5"))
+    code, _, _ = _run(HTTP_DESTINATION, privileges=rows)
     out = capsys.readouterr().out
     assert code == 1
-    assert "FAIL privileges: too_wide (rows=2)" in out
-    assert "ZSECRET" not in out
-    assert "DATA ADMIN" not in out
+    assert "FAIL privileges: too_wide (rows=9, data_grants=5, broad_system=0)" in out
+    assert "schema=SAPHANADB privileges=INSERT:1,SELECT:1" in out
+    assert "OBJ_NAME_MUST_NOT_PRINT" not in out
+
+
+def test_data_admin_is_too_wide_and_counted(capsys):
+    code, _, _ = _run(HTTP_DESTINATION, privileges=[("DATA ADMIN", None, None)])
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "FAIL privileges: too_wide (rows=1, data_grants=0, broad_system=1)" in out
+
+
+def test_odd_schema_names_and_kinds_are_not_printed(capsys):
+    rows = [("SELECT", "zsecret", "o"), ("SELECT", "Z-ODD", "o"), ("evil\nkind", "ZAPP", "o")]
+    code, _, _ = _run(HTTP_DESTINATION, privileges=rows)
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "zsecret" not in out
+    assert "Z-ODD" not in out
+    assert "evil" not in out
+    assert out.count("schema=<unprintable> privileges=SELECT:1") == 2
+    assert "schema=ZAPP privileges=<unprintable>:1" in out
+
+
+def test_schema_lines_are_capped_at_ten(capsys):
+    rows = [("SELECT", f"_SYS_S{i:02d}", "o") for i in range(13)]
+    code, _, _ = _run(HTTP_DESTINATION, privileges=rows)
+    out = capsys.readouterr().out
+    assert code == 0
+    lines = [line for line in out.splitlines() if line.startswith("schema=")]
+    assert [line.split()[0] for line in lines] == [f"schema=_SYS_S{i:02d}" for i in range(10)]
+    assert "and 3 more" in out
 
 
 # ---- checks file ---------------------------------------------------------------------
@@ -431,7 +499,11 @@ def test_report_block_and_exit_code():
         "PRIVILEGES ok",
     ]
     assert probe.exit_code(facts) == 0
+    facts.privileges = "review"
+    assert probe.exit_code(facts) == 0
     facts.privileges = "too_wide"
+    assert probe.exit_code(facts) == 1
+    facts.privileges = "unknown"
     assert probe.exit_code(facts) == 1
     facts.privileges = "ok"
     facts.version_ok = False
