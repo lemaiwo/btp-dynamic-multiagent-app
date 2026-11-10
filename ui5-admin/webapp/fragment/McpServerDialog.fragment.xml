@@ -90,6 +90,17 @@
             class="sapUiTinyMarginBottom"
             visible="{= ${server>/url} === 'builtin:ina' &amp;&amp; !!${server>/ina/warning} }" />
         </VBox>
+        <!-- hana: a second entry is refused, said as soon as the toolset is picked. -->
+        <VBox class="sapUiSmallMarginBeginEnd sapUiSmallMarginTop"
+              visible="{= ${server>/url} === 'builtin:hana' &amp;&amp; !!${server>/hana/duplicate} }">
+        <MessageStrip
+            id="hanaEntryDuplicate"
+            type="Error"
+            showIcon="true"
+            text="{server>/hana/duplicate}"
+            class="sapUiTinyMarginBottom"
+            visible="{= ${server>/url} === 'builtin:hana' &amp;&amp; !!${server>/hana/duplicate} }" />
+        </VBox>
         <f:SimpleForm layout="ResponsiveGridLayout" editable="true">
 
             <Label text="{i18n>toolsetKind}" />
@@ -115,13 +126,13 @@
                 change=".onServerUrlChange"
                 visible="{= ${server>/kind} === 'mcp' }" />
 
-            <!-- builtin:odata and builtin:ina have one mode and nothing to choose: hidden there. -->
-            <Label text="{i18n>authMode}" visible="{= ${server>/url} !== 'builtin:odata' &amp;&amp; ${server>/url} !== 'builtin:ina' }" />
+            <!-- builtin:odata, builtin:ina and builtin:hana have one mode and nothing to choose: hidden there. -->
+            <Label text="{i18n>authMode}" visible="{= ${server>/url} !== 'builtin:odata' &amp;&amp; ${server>/url} !== 'builtin:ina' &amp;&amp; ${server>/url} !== 'builtin:hana' }" />
             <Select
                 id="serverAuthMode"
                 selectedKey="{server>/auth_mode}"
                 change=".onAuthModeChange"
-                visible="{= ${server>/url} !== 'builtin:odata' &amp;&amp; ${server>/url} !== 'builtin:ina' }"
+                visible="{= ${server>/url} !== 'builtin:odata' &amp;&amp; ${server>/url} !== 'builtin:ina' &amp;&amp; ${server>/url} !== 'builtin:hana' }"
                 items="{server>/authModes}">
                 <core:Item key="{server>key}" text="{server>text}" />
             </Select>
@@ -404,12 +415,12 @@
                 valueStateText="{server>/errors/theme}"
                 visible="{= (${server>/url} === 'builtin:outlook' &amp;&amp; (${server>/auth_mode} === 'oauth2' || ${server>/auth_mode} === 'app_only' || ${server>/auth_mode} === 'destination')) || (${server>/url} === 'builtin:smtp' &amp;&amp; ${server>/auth_mode} === 'destination') }" />
 
-            <Label text="{i18n>lookback}" visible="{= (${server>/auth_mode} === 'app_only' &amp;&amp; ${server>/url} !== 'builtin:sharepoint') || (${server>/auth_mode} === 'destination' &amp;&amp; ${server>/kind} !== 'mcp' &amp;&amp; ${server>/url} !== 'builtin:gmail' &amp;&amp; ${server>/url} !== 'builtin:sapnotedetail' &amp;&amp; ${server>/url} !== 'builtin:smtp' &amp;&amp; ${server>/url} !== 'builtin:odata' &amp;&amp; ${server>/url} !== 'builtin:ina' &amp;&amp; ${server>/url} !== 'builtin:sharepoint' &amp;&amp; ${server>/url} !== 'builtin:bitbucket' &amp;&amp; ${server>/url} !== 'builtin:git') || ${server>/url} === 'builtin:teams' || ${server>/url} === 'builtin:outlook' }" />
+            <Label text="{i18n>lookback}" visible="{= (${server>/auth_mode} === 'app_only' &amp;&amp; ${server>/url} !== 'builtin:sharepoint') || (${server>/auth_mode} === 'destination' &amp;&amp; ${server>/kind} !== 'mcp' &amp;&amp; ${server>/url} !== 'builtin:gmail' &amp;&amp; ${server>/url} !== 'builtin:sapnotedetail' &amp;&amp; ${server>/url} !== 'builtin:smtp' &amp;&amp; ${server>/url} !== 'builtin:odata' &amp;&amp; ${server>/url} !== 'builtin:ina' &amp;&amp; ${server>/url} !== 'builtin:sharepoint' &amp;&amp; ${server>/url} !== 'builtin:bitbucket' &amp;&amp; ${server>/url} !== 'builtin:git' &amp;&amp; ${server>/url} !== 'builtin:hana') || ${server>/url} === 'builtin:teams' || ${server>/url} === 'builtin:outlook' }" />
             <Input
                 id="oauthLookback"
                 value="{server>/oauth/lookback}"
                 placeholder="{i18n>lookbackHint}"
-                visible="{= (${server>/auth_mode} === 'app_only' &amp;&amp; ${server>/url} !== 'builtin:sharepoint') || (${server>/auth_mode} === 'destination' &amp;&amp; ${server>/kind} !== 'mcp' &amp;&amp; ${server>/url} !== 'builtin:gmail' &amp;&amp; ${server>/url} !== 'builtin:sapnotedetail' &amp;&amp; ${server>/url} !== 'builtin:smtp' &amp;&amp; ${server>/url} !== 'builtin:odata' &amp;&amp; ${server>/url} !== 'builtin:ina' &amp;&amp; ${server>/url} !== 'builtin:sharepoint' &amp;&amp; ${server>/url} !== 'builtin:bitbucket' &amp;&amp; ${server>/url} !== 'builtin:git') || ${server>/url} === 'builtin:teams' || ${server>/url} === 'builtin:outlook' }" />
+                visible="{= (${server>/auth_mode} === 'app_only' &amp;&amp; ${server>/url} !== 'builtin:sharepoint') || (${server>/auth_mode} === 'destination' &amp;&amp; ${server>/kind} !== 'mcp' &amp;&amp; ${server>/url} !== 'builtin:gmail' &amp;&amp; ${server>/url} !== 'builtin:sapnotedetail' &amp;&amp; ${server>/url} !== 'builtin:smtp' &amp;&amp; ${server>/url} !== 'builtin:odata' &amp;&amp; ${server>/url} !== 'builtin:ina' &amp;&amp; ${server>/url} !== 'builtin:sharepoint' &amp;&amp; ${server>/url} !== 'builtin:bitbucket' &amp;&amp; ${server>/url} !== 'builtin:git' &amp;&amp; ${server>/url} !== 'builtin:hana') || ${server>/url} === 'builtin:teams' || ${server>/url} === 'builtin:outlook' }" />
 
             <Label text="{i18n>allowSend}" visible="{= (${server>/auth_mode} === 'app_only' &amp;&amp; ${server>/url} !== 'builtin:teams' &amp;&amp; ${server>/url} !== 'builtin:sharepoint') || (${server>/auth_mode} === 'oauth2' &amp;&amp; (${server>/url} === 'builtin:teams' || ${server>/url} === 'builtin:outlook' || ${server>/url} === 'builtin:gmail')) || ${server>/url} === 'builtin:slack' || (${server>/auth_mode} === 'destination' &amp;&amp; (${server>/url} === 'builtin:outlook' || ${server>/url} === 'builtin:smtp' || (${server>/url} === 'builtin:teams' &amp;&amp; ${server>/oauth/user_context} === true))) }" />
             <CheckBox
@@ -485,15 +496,15 @@
                       class="sapUiTinyMarginTop" />
             </VBox>
 
-            <!-- builtin:odata and builtin:ina name no destination: each catalogue
-                 service and each registered query has its own. -->
+            <!-- builtin:odata, builtin:ina and builtin:hana name no destination of
+                 their own: each catalogue service, registered query and system has its own. -->
             <Label text="{i18n>destinationName}" required="true"
-                   visible="{= ${server>/auth_mode} === 'destination' &amp;&amp; ${server>/url} !== 'builtin:odata' &amp;&amp; ${server>/url} !== 'builtin:ina' }" />
+                   visible="{= ${server>/auth_mode} === 'destination' &amp;&amp; ${server>/url} !== 'builtin:odata' &amp;&amp; ${server>/url} !== 'builtin:ina' &amp;&amp; ${server>/url} !== 'builtin:hana' }" />
             <Input
                 id="oauthDestination"
                 value="{server>/oauth/destination}"
                 placeholder="{= ${server>/url} === 'builtin:slack' ? 'MY_SLACK_DESTINATION' : ${server>/url} === 'builtin:jira' ? 'MY_JIRA_DESTINATION' : ${server>/url} === 'builtin:gmail' ? 'MY_GMAIL_DESTINATION' : ${server>/url} === 'builtin:sapnotes' ? 'MY_NVD_DESTINATION' : ${server>/url} === 'builtin:sapnotedetail' ? 'MY_SAP_ME_DESTINATION' : ${server>/url} === 'builtin:smtp' ? 'MY_MAIL_DESTINATION' : ${server>/url} === 'builtin:confluence' ? 'MY_CONFLUENCE_DESTINATION' : ${server>/url} === 'builtin:bitbucket' ? 'MY_BITBUCKET_DESTINATION' : ${server>/url} === 'builtin:git' ? 'MY_GIT_DESTINATION' : ${server>/kind} === 'mcp' ? 'MY_MCP_DESTINATION' : 'MY_GRAPH_DESTINATION' }"
-                visible="{= ${server>/auth_mode} === 'destination' &amp;&amp; ${server>/url} !== 'builtin:odata' &amp;&amp; ${server>/url} !== 'builtin:ina' }" />
+                visible="{= ${server>/auth_mode} === 'destination' &amp;&amp; ${server>/url} !== 'builtin:odata' &amp;&amp; ${server>/url} !== 'builtin:ina' &amp;&amp; ${server>/url} !== 'builtin:hana' }" />
 
             <!-- destinations: whose credential the destination hands back.
                  Whatever is visible here must be kept by cleanOAuth too:
@@ -655,6 +666,85 @@
             </MultiComboBox>
 
         </f:SimpleForm>
+        <!-- hana: the agent's one SAP HANA (monitoring) entry (agents/hana/config.py,
+             model/hanaEntry.ts). Its state lives under server>/hana, apart from
+             server>/oauth, as for Git. Names and destinations are sent as typed;
+             the destination fields are the shared DestinationField (a help, never
+             a rule). Allow SELECT is asked before it is switched on. -->
+        <VBox id="hanaPart" class="sapUiSmallMarginBeginEnd sapUiSmallMarginBottom"
+              visible="{= ${server>/url} === 'builtin:hana' }">
+            <Table
+                id="hanaSystemsTable"
+                items="{server>/hana/rows}"
+                updateFinished=".onHanaRowsUpdated"
+                ariaLabelledBy="hanaSystemsTitle"
+                ariaDescribedBy="hanaSystemsHint">
+                <headerToolbar>
+                    <OverflowToolbar>
+                        <Title id="hanaSystemsTitle" text="{i18n>hanaSystems}" level="H3" />
+                        <ToolbarSpacer />
+                        <Button
+                            id="hanaAddSystem"
+                            text="{i18n>hanaAddSystem}"
+                            icon="sap-icon://add"
+                            enabled="{= (${server>/hana/rows} || []).length &lt; 10 }"
+                            press=".onHanaAddSystem" />
+                    </OverflowToolbar>
+                </headerToolbar>
+                <columns>
+                    <Column><Text id="hanaSystemNameHeader" text="{i18n>hanaSystemName}" /></Column>
+                    <Column><Text id="hanaSystemDestinationHeader" text="{i18n>hanaSystemDestination}" /></Column>
+                    <Column hAlign="End" width="3.5rem"><Text text="" /></Column>
+                </columns>
+                <items>
+                    <ColumnListItem>
+                        <cells>
+                            <Input
+                                value="{server>name}"
+                                required="true"
+                                placeholder="sib_tenant"
+                                valueState="{server>nameState}"
+                                valueStateText="{server>nameText}"
+                                liveChange=".onHanaSystemEdited"
+                                ariaLabelledBy="hanaSystemNameHeader" />
+                            <Input
+                                value="{server>destination}"
+                                required="true"
+                                placeholder="MY_HANA_DESTINATION"
+                                showSuggestion="{= !${device>/system/phone} }"
+                                autocomplete="false"
+                                showValueHelp="{= (${hanaDest>/items} || []).length > 0 }"
+                                suggestionItems="{ path: 'hanaDest>/items', templateShareable: false }"
+                                valueState="{server>destinationState}"
+                                valueStateText="{server>destinationText}"
+                                ariaLabelledBy="hanaSystemDestinationHeader">
+                                <suggestionItems>
+                                    <core:ListItem text="{hanaDest>name}" additionalText="{hanaDest>info}" />
+                                </suggestionItems>
+                            </Input>
+                            <Button
+                                icon="sap-icon://decline"
+                                type="Transparent"
+                                tooltip="{i18n>hanaRemoveSystem}"
+                                press=".onHanaRemoveSystem" />
+                        </cells>
+                    </ColumnListItem>
+                </items>
+            </Table>
+            <Text id="hanaSystemsHint" text="{i18n>hanaSystemsHint}" class="sapUiTinyMarginTop" />
+            <Text text="{hanaDest>/hint}" visible="{= !!${hanaDest>/hint} }" class="sapUiTinyMarginTop" />
+            <HBox alignItems="Center" class="sapUiSmallMarginTop">
+                <Switch
+                    id="hanaAllowSelect"
+                    state="{server>/hana/allowSelect}"
+                    change=".onHanaAllowSelectChange"
+                    ariaLabelledBy="hanaAllowSelectLabel"
+                    ariaDescribedBy="hanaAllowSelectHint" />
+                <Label id="hanaAllowSelectLabel" text="{i18n>hanaAllowSelect}" labelFor="hanaAllowSelect"
+                       class="sapUiTinyMarginBegin" wrapping="true" />
+            </HBox>
+            <Text id="hanaAllowSelectHint" text="{i18n>hanaAllowSelectHint}" />
+        </VBox>
         <beginButton>
             <Button id="serverConfirm" text="{i18n>ok}" type="Emphasized" press=".onConfirmServer" />
         </beginButton>

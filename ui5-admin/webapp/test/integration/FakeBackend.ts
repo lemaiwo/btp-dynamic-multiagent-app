@@ -29,6 +29,9 @@ export interface FailNext {
  * service, its error mapping and every controller then run unchanged, which is
  * what makes these journeys evidence of parity rather than of mocking.
  */
+/** One item of a FastAPI 422 `detail`. */
+interface HanaValidationDetail { loc: (string | number)[]; msg: string; type: string }
+
 export default class FakeBackend {
 
     public agents: Agent[] = [];
@@ -50,6 +53,14 @@ export default class FakeBackend {
     public embeddings = new FakeEmbeddings();
     /** The `ina/...` routes: the analytical queries of `builtin:ina`. */
     public ina = new FakeIna();
+    /**
+     * --- hana --- A refusal of the next agent save at
+     * `mcp_servers[server]` naming `oauth.systems[system].<field>`, as
+     * agents/hana/config.py words it: stands in for a refusal the client
+     * cannot foresee (a destination renamed meanwhile, a newer server rule).
+     * Used once, then cleared.
+     */
+    public hanaRefuseNext: { server: number; system: number; field: "name" | "destination" } | null = null;
     /** What POST odata/metadata answers, whatever the request names. */
     public metadataPreview!: ODataMetadataPreview;
     /** What POST odata/services/{name}/test answers. */
@@ -154,6 +165,7 @@ export default class FakeBackend {
         this.dataCatalog.reset();
         this.embeddings.reset();
         this.ina.reset();
+        this.hanaRefuseNext = null;
         this.requests = [];
         this.bodies = {};
         this.runNowCalls = [];
@@ -1654,6 +1666,69 @@ export default class FakeBackend {
         return { reloaded: this.reloadOutcome === "reloaded", reload_failed: this.reloadOutcome === "failed" };
     }
 
+    /**
+     * --- hana --- `builtin:hana` entries as the server's gate reads them
+     * (`_validate_raw_hana_entry` in agents/admin.py, agents/hana/config.py):
+     * at most one per agent, refused at `mcp_servers`; per entry the
+     * system rules, refused at `mcp_servers[i]` with the field in the
+     * message. An accepted entry is stored as the server stores it and
+     * answered with its `has_client_secret: false` echo. Rewrites `body`.
+     */
+    private checkHanaEntries(body: Record<string, unknown> | undefined): HanaValidationDetail[] | null {
+        type Server = { url: string; auth_mode?: string; oauth?: Record<string, unknown> };
+        const servers = (body?.mcp_servers ?? []) as Server[];
+        const isHana = (url: string) => String(url).trim().replace(/\/+$/, "").toLowerCase() === "builtin:hana";
+        const refuse = (loc: (string | number)[], msg: string): HanaValidationDetail[] => (
+            [{ loc: ["body", ...loc], msg: `Value error, ${msg}`, type: "value_error" }]);
+        if (servers.filter((server) => isHana(server.url)).length > 1) {
+            return refuse(["mcp_servers"], "mcp_servers: an agent may have at most one builtin:hana entry; "
+                + "list every system it reads in that entry's oauth.systems");
+        }
+        const scripted = this.hanaRefuseNext;
+        this.hanaRefuseNext = null;
+        for (let i = 0; i < servers.length; i++) {
+            if (!isHana(servers[i].url)) {
+                continue;
+            }
+            const cfg = (servers[i].oauth ?? {}) as Record<string, unknown>;
+            const systems = Array.isArray(cfg.systems) ? cfg.systems as Record<string, unknown>[] : [];
+            if (systems.length === 0 || systems.length > 10) {
+                return refuse(["mcp_servers", i], "oauth.systems: required, a list of 1 to 10 systems");
+            }
+            const seen: string[] = [];
+            for (let n = 0; n < systems.length; n++) {
+                const name = systems[n].name;
+                if (typeof name !== "string" || !/^[a-z][a-z0-9_]{0,31}$/.test(name)) {
+                    return refuse(["mcp_servers", i], `oauth.systems[${n}].name: required, 1-32 lower-case letters, `
+                        + "digits or '_', starting with a letter");
+                }
+                if (seen.indexOf(name) > -1) {
+                    return refuse(["mcp_servers", i], `oauth.systems[${n}].name: duplicate; each system name is listed once`);
+                }
+                seen.push(name);
+                if (typeof systems[n].destination !== "string" || !/^[A-Za-z0-9_.-]{1,200}$/.test(systems[n].destination as string)) {
+                    return refuse(["mcp_servers", i], `oauth.systems[${n}].destination: required, a destination name of `
+                        + "1-200 letters, digits, '_', '.' or '-' without surrounding spaces");
+                }
+            }
+            if (scripted && scripted.server === i) {
+                return refuse(["mcp_servers", i], scripted.field === "name"
+                    ? `oauth.systems[${scripted.system}].name: required, 1-32 lower-case letters, digits or '_', starting with a letter`
+                    : `oauth.systems[${scripted.system}].destination: required, a destination name of 1-200 letters, `
+                        + "digits, '_', '.' or '-' without surrounding spaces");
+            }
+            const stored: Record<string, unknown> = {
+                systems: systems.map((system) => ({ name: system.name, destination: system.destination })),
+                has_client_secret: false
+            };
+            if (cfg.allow_select === true) {
+                stored.allow_select = true;
+            }
+            servers[i] = { ...servers[i], url: "builtin:hana", oauth: stored };
+        }
+        return null;
+    }
+
     private handle(url: string, init?: RequestInit): Promise<Response> {
         const path = url.replace(/^backend\//, "").split("?")[0];
         const query = FakeBackend.queryOf(url);
@@ -1731,6 +1806,10 @@ export default class FakeBackend {
                 return this.json({ detail: [{ loc: ["body", "mcp_servers"],
                     msg: "Value error, mcp_servers: an agent may have at most one builtin:git entry",
                     type: "value_error" }] }, 422);
+            }
+            const hanaRefusal = this.checkHanaEntries(body);
+            if (hanaRefusal) {
+                return this.json({ detail: hanaRefusal }, 422);
             }
             const refusal = this.storeODataEntries(body);
             if (refusal) {
