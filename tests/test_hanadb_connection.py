@@ -587,3 +587,63 @@ async def test_call_deadline_raises_timeout_and_keeps_slot(monkeypatch, caplog):
     assert len(db.connect_kwargs) == 5
     assert db.peak <= MAX_CONCURRENT
     _logs_clean(caplog)
+
+
+async def _until(predicate, tries: int = 300) -> None:
+    for _ in range(tries):
+        if predicate():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("condition not reached")
+
+
+@pytest.mark.parametrize("outcome", ["failed", "rows"])
+async def test_a_thread_that_ends_as_the_deadline_passes_is_answered_by_its_outcome(
+        monkeypatch, caplog, outcome):
+    """The thread ends while the loop is busy and the deadline passes in the
+    same stretch: the caller gets the thread's outcome (a failure mapped like
+    any other), never the deadline's bare TimeoutError."""
+    import time
+
+    caplog.set_level(logging.DEBUG)
+    gate = threading.Event()
+    fail_at = {"connect": h.driver_error(339, "boom")} if outcome == "failed" else {}
+    db = h.install(monkeypatch, h.FakeDbapi(gate=gate, rows=[(1,)], fail_at=fail_at))
+    monkeypatch.setattr(connection, "CALL_DEADLINE_SECONDS", 0.3)
+    task = asyncio.create_task(run_query(_system(), "SELECT 1 FROM DUMMY", [], 1))
+    await _until(lambda: db.inside == 1)
+    gate.set()
+    time.sleep(0.6)  # blocks the loop: the thread ends and the deadline passes
+    if outcome == "failed":
+        with pytest.raises(HanaError) as info:
+            await task
+        assert info.value.code == "sql_error"
+    else:
+        _, rows, _ = await task
+        assert rows == [(1,)]
+    _logs_clean(caplog)
+
+
+async def test_the_deadline_covers_the_wait_for_a_free_slot(monkeypatch, caplog):
+    """Four threads hold every slot; a fifth caller whose deadline passes
+    while it still waits gets ``timeout`` and never takes or leaks a slot."""
+    caplog.set_level(logging.DEBUG)
+    gate = threading.Event()
+    db = h.install(monkeypatch, h.FakeDbapi(gate=gate))
+    held = [asyncio.create_task(run_query(_system(), "SELECT 1 FROM DUMMY", [], 1))
+            for _ in range(MAX_CONCURRENT)]
+    await _until(lambda: db.inside == MAX_CONCURRENT)
+    monkeypatch.setattr(connection, "CALL_DEADLINE_SECONDS", 0.1)
+    with pytest.raises(HanaError) as info:
+        await run_query(_system(), "SELECT 1 FROM DUMMY", [], 1)
+    assert info.value.code == "timeout"
+    assert len(db.connect_kwargs) == MAX_CONCURRENT  # the fifth never connected
+    monkeypatch.setattr(connection, "CALL_DEADLINE_SECONDS", 5)
+    gate.set()
+    await asyncio.gather(*held)
+    slot = connection._semaphore()
+    assert slot._value == MAX_CONCURRENT  # nothing leaked
+    await run_query(_system(), "SELECT 1 FROM DUMMY", [], 1)
+    assert slot._value == MAX_CONCURRENT
+    _logs_clean(caplog)
+    assert any("sib_tenant" in r.getMessage() for r in caplog.records)

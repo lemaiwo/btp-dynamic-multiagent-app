@@ -56,9 +56,10 @@ DEFAULT_ENCRYPT = True
 CONNECT_TIMEOUT_MS = 15000
 QUERY_TIMEOUT_SECONDS = 20
 CALL_DEADLINE_SECONDS = 45
-"""How long a caller waits for its connection thread. Above connectTimeout
-(15 s) plus the query timeout (20 s); on expiry the caller gets ``timeout``
-while the thread keeps its slot until it really ends."""
+"""How long a caller waits, for a free slot and its connection thread
+together. Above connectTimeout (15 s) plus the query timeout (20 s); on
+expiry the caller gets ``timeout`` while a thread that was started keeps its
+slot until it really ends."""
 MAX_CONCURRENT = 4
 """Connections at a time per process; a thread that runs on after its caller
 was cancelled keeps its slot until it ends."""
@@ -82,7 +83,6 @@ _MAX_LOCATION_ID = 100
 _LOGIN_CODES = frozenset({10, 414, 663})
 _NOT_AUTHORIZED_CODES = frozenset({258})
 _TIMEOUT_CODES = frozenset({1024, 613})
-# hdbcli's client-side codes of a connection that failed or broke.
 # hdbcli's client-side code of a connection that could not be made. The
 # probe saw it for a refused CONNECT at the Cloud Connector and for a TLS
 # login against a port without TLS (that one stays `unreachable`). Which
@@ -403,27 +403,43 @@ def _execute(system: str, kwargs: dict[str, Any], sql: str, binds: tuple,
 async def _in_slot(system: str, kwargs: dict[str, Any], sql: str, binds: tuple,
                    max_rows: int) -> tuple[list[str], list[tuple], bool]:
     slot = _semaphore()
-    await slot.acquire()
-    try:
-        future = asyncio.ensure_future(
-            asyncio.to_thread(_execute, system, kwargs, sql, binds, max_rows))
-    except BaseException:
-        slot.release()
-        raise
+    future: asyncio.Future | None = None
 
     def _done(fut: asyncio.Future) -> None:
         slot.release()
         if not fut.cancelled():
             fut.exception()  # retrieved: no "never retrieved" warning
 
-    future.add_done_callback(_done)
-    # The thread cannot be cancelled: a cancelled or timed-out caller leaves
-    # it running in its slot, so the cap counts connections, not callers.
+    # One deadline for the wait for a free slot and the run together.
     try:
-        return await asyncio.wait_for(asyncio.shield(future), CALL_DEADLINE_SECONDS)
+        async with asyncio.timeout(CALL_DEADLINE_SECONDS) as deadline:
+            # Cancelled while queued, asyncio.Semaphore hands a slot it was
+            # about to give on to the next waiter: nothing is taken or leaked.
+            await slot.acquire()
+            try:
+                future = asyncio.ensure_future(
+                    asyncio.to_thread(_execute, system, kwargs, sql, binds, max_rows))
+            except BaseException:
+                slot.release()
+                raise
+            future.add_done_callback(_done)
+            # The thread cannot be cancelled: a cancelled or timed-out caller
+            # leaves it running in its slot, so the cap counts connections,
+            # not callers.
+            return await asyncio.shield(future)
     except TimeoutError:
+        if not deadline.expired():
+            # Not this deadline. The thread wraps every failure in _Failed,
+            # so no TimeoutError of its own can arrive here.
+            raise
+        if future is None:
+            logger.warning("hana: no free connection within the call deadline "
+                           "for system %s", system)
+            raise HanaError("timeout") from None
         if future.done():
-            raise  # the thread's own TimeoutError: mapped like any failure
+            # The thread ended in the same stretch as the deadline: its own
+            # outcome stands (a _Failed propagates and is mapped by run_query).
+            return future.result()
         logger.warning("hana: call deadline passed for system %s", system)
         raise HanaError("timeout") from None
 
