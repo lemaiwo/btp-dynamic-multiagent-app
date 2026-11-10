@@ -20,8 +20,9 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
 
 from agents.hana.errors import HanaError
+from agents.hana.guard import FORBIDDEN_WORDS
 from agents.hana.masking import mask_statement
-from agents.hana.sqltokens import SelectRefused, tokenize
+from agents.hana.sqltokens import SelectRefused, Token, tokenize
 
 CATEGORIES: tuple[str, ...] = (
     "monitoring", "performance", "system", "backup", "security", "database", "schema")
@@ -177,6 +178,7 @@ def _validate_statement(check: Check, index: int, statement: Statement, refuse) 
         tokens = tokenize(sql)
     except SelectRefused:
         raise refuse(f"{where} is not readable SQL") from None
+    _require_read(tokens, where, refuse)
     params = [t for t in tokens if t.kind == "param"]
     if any(t.text != "?" for t in params):
         raise refuse(f"{where} has a named parameter: only ? is bound")
@@ -184,6 +186,27 @@ def _validate_statement(check: Check, index: int, statement: Statement, refuse) 
         raise refuse(f"{where} binds do not match its ? count")
     if not set(statement.binds) <= check.args:
         raise refuse(f"{where} binds an argument the check does not declare")
+
+
+def _require_read(tokens: list[Token], where: str, refuse) -> None:
+    """A registered statement is one read: strict, at registration, on tokens.
+
+    ``--dump`` hands every statement to the probe, which runs it on a landscape
+    whose database user may hold wide privileges, so a check that writes must
+    never get as far as the registry. Words inside a string literal or a quoted
+    identifier are tokens of another kind and do not count. Which views a read
+    may touch is the SELECT guard's job (``agents.hana.guard.check_select``),
+    run over every registered statement by the generic test.
+    """
+    if not tokens or not tokens[0].is_word("SELECT", "WITH"):
+        raise refuse(f"{where} does not start with SELECT or WITH")
+    for token in tokens:
+        if token.kind == "comment":
+            raise refuse(f"{where} holds a comment")
+        if token.is_symbol(";"):
+            raise refuse(f"{where} holds a ;: one statement only")
+        if token.kind == "word" and (token.value in FORBIDDEN_WORDS or token.value == "INTO"):
+            raise refuse(f"{where} holds a keyword that is no part of a read")
 
 
 # ---- the registry -------------------------------------------------------------------

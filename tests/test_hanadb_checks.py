@@ -26,7 +26,8 @@ from agents.hana.checks.base import (
     Statement,
 )
 from agents.hana.errors import HanaError
-from agents.hana.sqltokens import tokenize
+from agents.hana.guard import check_select
+from agents.hana.sqltokens import SelectRefused, tokenize
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -169,6 +170,21 @@ def _variant(**changes) -> Check:
         {"statements": (Statement("a", "SELECT 1 FROM DUMMY", ()),
                         Statement("a", "SELECT 2 FROM DUMMY", ()))},
         {"statements": (Statement("", "SELECT 1 FROM DUMMY \x00", ()),)},
+        # a registered check must be a read (token-based, at registration)
+        {"statements": (Statement("", "DELETE FROM SAPABAP1.VBAK WHERE MANDT = ?",
+                                  ("top",)),)},
+        {"statements": (Statement("", "UPDATE SYS.M_TABLES SET A = 1", ()),)},
+        {"statements": (Statement("", "SELECT A INTO B FROM DUMMY", ()),)},
+        {"statements": (Statement("", "SELECT 1 FROM DUMMY; DROP TABLE X", ()),)},
+        {"statements": (Statement("", "SELECT 1 FROM DUMMY;", ()),)},
+        {"statements": (Statement("", "SELECT 1 FROM DUMMY -- note", ()),)},
+        {"statements": (Statement("", "SELECT 1 /* note */ FROM DUMMY", ()),)},
+        {"statements": (Statement("", "SELECT 1 FROM DUMMY FOR UPDATE", ()),)},
+        {"statements": (Statement("", "SELECT NEXTVAL FROM DUMMY", ()),)},
+        {"statements": (Statement("", "CALL SYS.SOMETHING()", ()),)},
+        {"statements": (Statement("", "(SELECT 1 FROM DUMMY)", ()),)},
+        {"statements": (Statement("", "WITH A AS (SELECT 1 FROM DUMMY) "
+                                      "SELECT * FROM A; COMMIT", ()),)},
         {"args": frozenset({"top", "user"})},
         {"masked_columns": frozenset({"A B"})},
         {"max_rows_cap": 0},
@@ -178,6 +194,73 @@ def _variant(**changes) -> Check:
 def test_validate_check_refuses(changes) -> None:
     with pytest.raises(ValueError):
         base.validate_check(_variant(**changes))
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT 'DELETE; -- INTO' AS A FROM DUMMY",
+        'SELECT "UPDATE" FROM DUMMY',
+        "WITH A AS (SELECT 1 AS X FROM DUMMY) SELECT X FROM A",
+        "select 1 from dummy",
+    ],
+)
+def test_validate_check_ignores_words_inside_literals(sql) -> None:
+    base.validate_check(_variant(statements=(Statement("", sql, ()),)))
+
+
+def test_register_refuses_a_write(monkeypatch) -> None:
+    monkeypatch.setattr(base, "_REGISTRY", {})
+    with pytest.raises(ValueError):
+        registry.register(_variant(statements=(
+            Statement("", "DELETE FROM SAPABAP1.VBAK WHERE MANDT = ?", ("top",)),)))
+    assert registry.all_checks() == ()
+
+
+# ---- the SELECT guard over every statement --------------------------------------------
+
+GUARD_EXCEPTIONS: dict[tuple[str, str], str] = {}
+"""``(check name, statement label) -> one-line reason`` for a statement that may
+not pass ``guard.check_select`` (it reads outside the monitoring schemas). An
+entry whose statement passes the guard is stale and fails the test."""
+
+
+def _assert_guard(check: Check, statement: Statement,
+                  exceptions: dict[tuple[str, str], str]) -> None:
+    key = (check.name, statement.label)
+    try:
+        check_select(statement.sql)
+    except SelectRefused:
+        assert key in exceptions, f"{key} fails the SELECT guard and is not excepted"
+        assert exceptions[key].strip() and "\n" not in exceptions[key]
+        return
+    assert key not in exceptions, f"{key} passes the SELECT guard: stale exception"
+
+
+@pytest.mark.parametrize(
+    "check, statement",
+    [(c, s) for c in EVERY_CHECK for s in c.statements],
+    ids=lambda v: getattr(v, "name", None) or getattr(v, "label", None) or "single",
+)
+def test_every_statement_passes_the_select_guard(check: Check, statement: Statement) -> None:
+    _assert_guard(check, statement, GUARD_EXCEPTIONS)
+
+
+BUSINESS_READ = _variant(
+    name="dummyBusiness", source="bin/dummyBusiness.js",
+    statements=(Statement("", "SELECT TOP ? VBELN FROM SAPABAP1.VBAK", ("top",)),))
+
+
+def test_guard_exceptions_work_in_both_directions() -> None:
+    base.validate_check(BUSINESS_READ)  # a read, so registration accepts it
+    statement = BUSINESS_READ.statements[0]
+    excepted = {("dummyBusiness", ""): "reads a business table on purpose"}
+    _assert_guard(BUSINESS_READ, statement, excepted)
+    with pytest.raises(AssertionError, match="not excepted"):
+        _assert_guard(BUSINESS_READ, statement, {})
+    stale = {("dummyOne", ""): "no longer needed"}
+    with pytest.raises(AssertionError, match="stale exception"):
+        _assert_guard(DUMMY_ONE, DUMMY_ONE.statements[0], stale)
 
 
 # ---- the registry ---------------------------------------------------------------------
