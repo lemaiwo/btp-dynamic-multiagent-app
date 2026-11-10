@@ -9,7 +9,6 @@ The generic invariants (guard, row limit, binds) are in ``test_hanadb_checks.py`
 
 from __future__ import annotations
 
-import re
 from typing import Any
 
 import pytest
@@ -21,8 +20,38 @@ from agents.hana.guard import check_select
 from agents.hana.sqltokens import tokenize
 from tests import hanadb_helpers as h
 
-NAMED_COLUMNS_ONLY = re.compile(r"(?:\bSELECT|,|\.)\s*(?:TOP \?\s*)?\*")
-"""``SELECT *``, ``SELECT TOP ? *``, ``, *`` or ``T.*``: never in a check."""
+
+def star_columns(sql: str) -> int:
+    """How many ``*`` of ``sql`` stand for "every column" (``SELECT *``,
+    ``SELECT TOP ? *``, ``, *``, ``T.*``), read on tokens: a ``*`` after
+    ``(`` (``COUNT(*)``), a number, a column or a bind is arithmetic."""
+    tokens = tokenize(sql)
+    count = 0
+    for index, token in enumerate(tokens):
+        if not token.is_symbol("*") or index == 0:
+            continue
+        before = tokens[index - 1]
+        if before.is_word("SELECT", "DISTINCT") or before.is_symbol(",", "."):
+            count += 1
+        elif (before.kind == "param" and index >= 2
+              and tokens[index - 2].is_word("TOP")):
+            count += 1
+    return count
+
+
+@pytest.mark.parametrize("sql, stars", [
+    ("SELECT * FROM SYS.M_TABLES", 1),
+    ("SELECT TOP ? * FROM SYS.M_TABLES", 1),
+    ("SELECT DISTINCT * FROM SYS.M_TABLES", 1),
+    ("SELECT A, * FROM SYS.M_TABLES", 1),
+    ("SELECT T.* FROM SYS.M_TABLES T", 1),
+    ("SELECT COUNT(*) AS N FROM SYS.M_TABLES", 0),
+    ("SELECT 100 * A, A * B, ? * 2 FROM SYS.M_TABLES WHERE X > 3600 * ?", 0),
+    ("SELECT TOP ? A FROM SYS.M_TABLES WHERE B = '*'", 0),
+])
+def test_star_columns_reads_tokens(sql: str, stars: int) -> None:
+    assert star_columns(sql) == stars
+
 
 OAUTH = {"systems": [{"name": "sib_tenant", "destination": "hana-dest-one"}]}
 
@@ -56,7 +85,7 @@ def assert_registered(name: str, category: str, args: set[str], *,
     for statement in check.statements:
         assert tokenize(statement.sql)
         check_select(statement.sql)
-        assert not NAMED_COLUMNS_ONLY.search(statement.sql), "select named columns"
+        assert star_columns(statement.sql) == 0, "select named columns"
     return check
 
 
@@ -132,9 +161,20 @@ async def test_trace_contents(monkeypatch) -> None:
         monkeypatch, "traceContents", columns, rows, allow_select=True, object="f.trc")
     assert_single(answer, columns)
     assert executes[0][2] == (51, "f.trc")
+    assert "unmasked" in check.purpose
     answer, _ = await run_on_fake(
-        monkeypatch, "traceContents", columns, rows, allow_select=True, top=201)
+        monkeypatch, "traceContents", columns, rows, allow_select=True, object="f.trc",
+        top=201)
     assert answer["error"]["argument"] == "top"
+
+
+async def test_trace_contents_requires_the_file_name(monkeypatch) -> None:
+    assert registry.get_check("traceContents").required == frozenset({"object"})
+    answer, executes = await run_on_fake(
+        monkeypatch, "traceContents", ["A"], [(1,)], allow_select=True)
+    assert answer["error"]["code"] == "invalid_argument"
+    assert answer["error"]["argument"] == "object"
+    assert executes == []
 
 
 async def test_trace_contents_is_hidden_without_allow_select(monkeypatch) -> None:

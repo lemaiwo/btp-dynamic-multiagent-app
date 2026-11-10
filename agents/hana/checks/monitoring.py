@@ -23,6 +23,9 @@ from agents.hana.checks.base import Check, Statement, register
 # on-prem: the alerts of the statistics server live in _SYS_STATISTICS, not in
 # SYS.M_ALERTS (HANA Cloud). STATISTICS_CURRENT_ALERTS and the alert names of
 # STATISTICS_ALERT_INFORMATION: unverified.
+# ALERT_DETAILS is free text and is kept on purpose (lead's decision): an
+# alert without its text is not usable for monitoring, and it is the
+# statistics server that writes it, not a user.
 ALERTS = Check(
     name="alerts",
     category="monitoring",
@@ -117,7 +120,8 @@ TRACES = Check(
 TRACE_CONTENTS = Check(
     name="traceContents",
     category="monitoring",
-    purpose="The end of one trace file (object = file name from traces), newest chunk first.",
+    purpose=("End of one trace file (object = file name), newest first; unmasked, may"
+             " hold statement texts and names."),
     source="bin/traceContents.js",
     statements=(Statement(
         "",
@@ -128,11 +132,10 @@ TRACE_CONTENTS = Check(
         ("top_plus_one", "object"),
     ),),
     args=frozenset({"top", "object"}),
+    required=frozenset({"object"}),
     requires_select=True,
     max_rows_cap=200,
 )
-# The registry has no "required" flag: without `object` the bind is NULL,
-# `FILE_NAME = NULL` matches nothing and the answer is empty, never all files.
 
 # on-prem: SYS.M_CRASH_DUMPS is HANA Cloud only; on-premise a crash or
 # emergency dump is a trace file whose name says so (`*crashdump*.trc`,

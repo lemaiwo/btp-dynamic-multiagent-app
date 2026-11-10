@@ -436,6 +436,65 @@ def test_invalid_arguments_name_the_argument_not_the_value(argument, value) -> N
     assert SECRET not in json.dumps(info2.value.to_dict()) + str(info2.value)
 
 
+DUMMY_REQUIRED = Check(
+    name="dummyRequired", category="performance",
+    purpose="Dummy check with required arguments.", source="bin/dummyRequired.js",
+    statements=(Statement(
+        "", "SELECT TOP ? A FROM SYS.M_CS_COLUMNS WHERE SCHEMA_NAME = ? AND TABLE_NAME = ?",
+        ("top_plus_one", "schema", "object")),),
+    args=frozenset({"top", "schema", "object"}),
+    required=frozenset({"schema", "object"}),
+)
+
+
+@pytest.mark.parametrize("check", EVERY_CHECK + (DUMMY_REQUIRED,), ids=lambda c: c.name)
+def test_required_is_a_subset_of_args(check: Check) -> None:
+    assert isinstance(check.required, frozenset)
+    assert check.required <= check.args
+
+
+def test_a_missing_required_argument_is_refused_by_name() -> None:
+    base.validate_check(DUMMY_REQUIRED)
+    for given, missing in (({"object": "T"}, "schema"), ({"schema": "S"}, "object"),
+                           ({}, "schema")):
+        with pytest.raises(InvalidArgument) as info:
+            base.resolve_args(DUMMY_REQUIRED, **given)
+        err = info.value
+        assert err.code == "invalid_argument"
+        assert err.argument == missing
+        assert err.rule == "is required by this check"
+        assert err.to_dict()["argument"] == missing
+    resolved = base.resolve_args(DUMMY_REQUIRED, schema="S", object="T", top=3)
+    assert base.bind_values(DUMMY_REQUIRED.statements[0], resolved) == (4, "S", "T")
+
+
+def test_a_given_required_value_is_still_checked() -> None:
+    with pytest.raises(InvalidArgument) as info:
+        base.resolve_args(DUMMY_REQUIRED, schema=SECRET, object="T")
+    assert info.value.argument == "schema"
+    assert SECRET not in json.dumps(info.value.to_dict()) + str(info.value)
+
+
+@pytest.mark.parametrize("required", [
+    frozenset({"schema"}),            # not among the args
+    frozenset({"user"}),
+    {"top"},                          # not a frozenset
+    ("top",),
+])
+def test_validate_check_refuses_bad_required(required) -> None:
+    with pytest.raises(ValueError):
+        base.validate_check(_variant(required=required))
+
+
+def test_required_defaults_to_none_and_dump_is_unaffected(monkeypatch) -> None:
+    assert DUMMY_ONE.required == frozenset()
+    monkeypatch.setattr(base, "_REGISTRY", {})
+    registry.register(DUMMY_REQUIRED)
+    assert base.dump_entries() == [{"name": "dummyRequired",
+                                    "sql": DUMMY_REQUIRED.statements[0].sql,
+                                    "binds": [2, "SYS", "DUMMY"]}]
+
+
 def test_undeclared_argument_is_refused() -> None:
     for argument, value in (("hours", 24), ("object", "DUMMY"), ("hours", 1)):
         with pytest.raises(InvalidArgument) as info:

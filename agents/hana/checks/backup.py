@@ -25,7 +25,10 @@ _LOG_BACKUP_SETTINGS = (
     " 'parallel_data_backup_backint_channels'))"
 )
 
-# on-prem: M_BACKUP_CATALOG as in hana-cli (without COMMENT); successful log
+# on-prem: M_BACKUP_CATALOG as in hana-cli (without COMMENT and MESSAGE: a
+# failed backup's message quotes file or backint paths); `last_successful`
+# looks back 90 days in fixed SQL, so it never aggregates the whole
+# catalogue (a type not backed up for 90 days has no row); successful log
 # backups are left out of the recent list (one every few minutes per service
 # would fill it), failed ones stay. M_BACKUP_PROGRESS and its columns
 # TRANSFERRED_SIZE / TOTAL_SIZE: unverified. The log backup settings are read
@@ -33,8 +36,8 @@ _LOG_BACKUP_SETTINGS = (
 BACKUP_STATUS = Check(
     name="backupStatus",
     category="backup",
-    purpose=("Last successful backup per type, backups of the last hours (not successful"
-             " log backups), progress and log settings."),
+    purpose=("Last successful backup per type within 90 days, recent backups (not"
+             " successful log ones), progress, log settings."),
     source="bin/backupStatus.js",
     statements=(
         Statement(
@@ -43,6 +46,7 @@ BACKUP_STATUS = Check(
             " SECONDS_BETWEEN(MAX(SYS_END_TIME), CURRENT_TIMESTAMP) AS SECONDS_AGO"
             " FROM SYS.M_BACKUP_CATALOG"
             " WHERE STATE_NAME = 'successful'"
+            " AND SYS_END_TIME >= ADD_DAYS(CURRENT_TIMESTAMP, -90)"
             " GROUP BY ENTRY_TYPE_NAME"
             " ORDER BY ENTRY_TYPE_NAME",
             (),
@@ -50,7 +54,7 @@ BACKUP_STATUS = Check(
         Statement(
             "recent",
             "SELECT TOP ? BACKUP_ID, ENTRY_TYPE_NAME, STATE_NAME, SYS_START_TIME, SYS_END_TIME,"
-            " SECONDS_BETWEEN(SYS_START_TIME, SYS_END_TIME) AS DURATION_SECONDS, MESSAGE"
+            " SECONDS_BETWEEN(SYS_START_TIME, SYS_END_TIME) AS DURATION_SECONDS"
             " FROM SYS.M_BACKUP_CATALOG"
             " WHERE SYS_START_TIME >= ADD_SECONDS(CURRENT_TIMESTAMP, -3600 * ?)"
             " AND NOT (ENTRY_TYPE_NAME = 'log backup' AND STATE_NAME = 'successful')"
@@ -83,7 +87,9 @@ BACKUP_STATUS = Check(
 # here as the database's data backups (catalogue plus file sizes), so the
 # source names the upstream command it replaces. Log backups are left out
 # (backupStatus covers the failed ones). DESTINATION_PATH and
-# EXTERNAL_BACKUP_ID are left out: they name the backup server's paths.
+# EXTERNAL_BACKUP_ID are left out: they name the backup server's paths. The
+# `hours` window and the type filter apply to the catalogue in a subquery,
+# before the join, so the file rows of older backups are never joined.
 BACKUP_LIST = Check(
     name="backupList",
     category="backup",
@@ -96,10 +102,11 @@ BACKUP_LIST = Check(
         " C.SYS_END_TIME, SUM(F.BACKUP_SIZE) AS BACKUP_SIZE,"
         " COUNT(F.BACKUP_ID) AS FILE_COUNT,"
         " MAX(F.DESTINATION_TYPE_NAME) AS DESTINATION_TYPE_NAME"
-        " FROM SYS.M_BACKUP_CATALOG C"
+        " FROM (SELECT ENTRY_ID, BACKUP_ID, ENTRY_TYPE_NAME, STATE_NAME, SYS_START_TIME,"
+        " SYS_END_TIME FROM SYS.M_BACKUP_CATALOG"
+        " WHERE SYS_START_TIME >= ADD_SECONDS(CURRENT_TIMESTAMP, -3600 * ?)"
+        " AND ENTRY_TYPE_NAME <> 'log backup') C"
         " LEFT JOIN SYS.M_BACKUP_CATALOG_FILES F ON F.ENTRY_ID = C.ENTRY_ID"
-        " WHERE C.SYS_START_TIME >= ADD_SECONDS(CURRENT_TIMESTAMP, -3600 * ?)"
-        " AND C.ENTRY_TYPE_NAME <> 'log backup'"
         " GROUP BY C.BACKUP_ID, C.ENTRY_TYPE_NAME, C.STATE_NAME, C.SYS_START_TIME,"
         " C.SYS_END_TIME"
         " ORDER BY C.SYS_START_TIME DESC",

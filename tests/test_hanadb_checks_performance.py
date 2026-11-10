@@ -101,6 +101,17 @@ async def test_column_stats(monkeypatch) -> None:
     assert executes[0][2] == (51, "SAPHANADB", "ACDOCA")
 
 
+async def test_column_stats_requires_schema_and_object(monkeypatch) -> None:
+    assert registry.get_check("columnStats").required == frozenset({"schema", "object"})
+    for given, missing in (({"object": "ACDOCA"}, "schema"),
+                           ({"schema": "SAPHANADB"}, "object")):
+        answer, executes = await run_on_fake(monkeypatch, "columnStats", ["A"], [(1,)],
+                                             **given)
+        assert answer["error"]["code"] == "invalid_argument"
+        assert answer["error"]["argument"] == missing
+        assert executes == []
+
+
 async def test_fragmentation_check(monkeypatch) -> None:
     check = assert_registered("fragmentationCheck", "performance", {"top", "schema"})
     assert "MEMORY_SIZE_IN_DELTA" in check.statements[0].sql

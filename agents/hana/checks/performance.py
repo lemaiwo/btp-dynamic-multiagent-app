@@ -59,6 +59,7 @@ MEMORY_ANALYSIS = Check(
 # statistics server's history _SYS_STATISTICS.HOST_HEAP_ALLOCATORS
 # (history table and its SERVER_TIMESTAMP column: unverified). A leak is an
 # allocator that keeps growing, which one snapshot cannot show.
+# on-prem: unverified (time zone of SERVER_TIMESTAMP; cost with hours=720)
 MEMORY_LEAKS = Check(
     name="memoryLeaks",
     category="performance",
@@ -118,6 +119,7 @@ EXPENSIVE_STATEMENTS = Check(
 # read and write counters of a column table are in M_CS_TABLES (one row per
 # partition, summed here); row store tables are not covered. READ_COUNT and
 # WRITE_COUNT: unverified.
+# cost: unverified on a large system (whole M_CS_TABLES grouped when no schema)
 TABLE_HOTSPOTS = Check(
     name="tableHotspots",
     category="performance",
@@ -185,13 +187,13 @@ COLUMN_STATS = Check(
         ("top_plus_one", "schema", "object"),
     ),),
     args=frozenset({"top", "schema", "object"}),
+    required=frozenset({"schema", "object"}),
 )
-# The registry has no "required" flag: without `schema` / `object` the binds
-# are NULL, `SCHEMA_NAME = NULL` matches nothing and the answer is empty.
 
 # on-prem: M_CS_TABLES as in hana-cli: the share of a column table partition's
 # memory held in its delta store (LAST_MERGE_TIME and RAW_RECORD_COUNT_IN_DELTA:
 # unverified).
+# cost: unverified on a large system (whole M_CS_TABLES sorted when no schema)
 FRAGMENTATION_CHECK = Check(
     name="fragmentationCheck",
     category="performance",

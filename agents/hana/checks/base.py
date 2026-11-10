@@ -81,6 +81,7 @@ _DUMP_SAMPLES: dict[str, Any] = {
     **{name: arg.sample for name, arg in ARGS.items()}, TOP_PLUS_ONE: 2}
 
 UNDECLARED_RULE = "not an argument of this check"
+REQUIRED_RULE = "is required by this check"
 
 
 class InvalidArgument(HanaError):
@@ -129,6 +130,10 @@ class Check:
     """Listed and runnable only for an entry with ``allow_select``."""
     max_rows_cap: int = MAX_ROWS
     """The highest ``top`` this check accepts (at most :data:`MAX_ROWS`)."""
+    required: frozenset[str] = frozenset()
+    """Arguments the caller must give (a subset of ``args``). Without them a
+    ``WHERE X = ?`` would bind NULL and answer no rows, which reads like "no
+    data"; a refusal naming the argument tells the model what is missing."""
 
     @property
     def composite(self) -> bool:
@@ -157,6 +162,8 @@ def validate_check(check: Check) -> None:
         raise refuse("source is not bin/<name>.js")
     if not isinstance(check.args, frozenset) or not check.args <= set(ARGS):
         raise refuse("args are not a subset of ARGS")
+    if not isinstance(check.required, frozenset) or not check.required <= check.args:
+        raise refuse("required is not a subset of args")
     if not isinstance(check.masked_columns, frozenset) or not all(
             isinstance(c, str) and COLUMN_RE.fullmatch(c) for c in check.masked_columns):
         raise refuse("masked_columns are not column names")
@@ -291,7 +298,8 @@ def resolve_args(
     """The values of the arguments ``check`` declares, defaults filled in.
 
     ``None`` means "not given". An argument the check does not declare is
-    refused when given; a given value is checked against its :class:`Arg`
+    refused when given, a ``required`` one when not given; a given value is
+    checked against its :class:`Arg`
     rule, and ``top`` also against the check's ``max_rows_cap``. Every refusal
     is :class:`InvalidArgument` naming the argument and the rule only.
     """
@@ -304,6 +312,8 @@ def resolve_args(
                 raise InvalidArgument(name, UNDECLARED_RULE)
             continue
         arg = ARGS[name]
+        if value is None and name in check.required:
+            raise InvalidArgument(name, REQUIRED_RULE)
         if value is None:
             # Under a cap below the default, leaving top out means the cap.
             resolved[name] = (

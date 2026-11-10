@@ -38,6 +38,25 @@ def test_log_settings_read_named_keys_only() -> None:
     assert '"KEY" IN (' in sql
 
 
+def test_recent_backups_carry_no_message() -> None:
+    recent = registry.get_check("backupStatus").statements[1]
+    assert "MESSAGE" not in _words(recent.sql)
+
+
+def test_last_successful_is_bounded_to_90_days() -> None:
+    check = registry.get_check("backupStatus")
+    assert "ADD_DAYS(CURRENT_TIMESTAMP, -90)" in check.statements[0].sql
+    assert "90 days" in check.purpose
+
+
+def test_backup_list_windows_the_catalogue_before_the_join() -> None:
+    sql = registry.get_check("backupList").statements[0].sql
+    join = sql.index("JOIN SYS.M_BACKUP_CATALOG_FILES")
+    window = sql.index("ADD_SECONDS(CURRENT_TIMESTAMP, -3600 * ?)")
+    assert window < join
+    assert sql.index("FROM (SELECT") < window
+
+
 async def test_backup_status(monkeypatch) -> None:
     assert_registered("backupStatus", "backup", {"top", "hours"}, parts=PARTS)
     columns = ["ENTRY_TYPE_NAME", "STATE_NAME"]
