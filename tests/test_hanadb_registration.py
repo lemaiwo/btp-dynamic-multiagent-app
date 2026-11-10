@@ -502,8 +502,9 @@ async def test_credential_health_lists_one_entry_per_system(monkeypatch, caplog)
                                              "https://api"),
     )
     asked: list[str] = []
+    from tests import hanadb_helpers as hh
 
-    class FakeProps:
+    class FakeProps(dict):
         auth_type = "BasicAuthentication"
 
     class FakeResolverCls:
@@ -517,7 +518,7 @@ async def test_credential_health_lists_one_entry_per_system(monkeypatch, caplog)
             asked.append(self.name)
             if self.name == "HANA.SYS-DB":
                 raise DestinationError(f"500 from https://{SECRET}.example.com/destinations")
-            return FakeProps()
+            return FakeProps(hh.http_props())
 
     monkeypatch.setattr(dest_mod, "DestinationResolver", FakeResolverCls)
     entries = await admin._destination_health()
@@ -599,3 +600,54 @@ async def test_an_import_that_drops_allow_select_reloads(monkeypatch):
         agents[0]["description"] = "another text"
         r = await client.post("/admin/api/import", json={"agents": agents})
         assert r.status_code == 200 and r.json()["reloaded"] is False and reloads == [1]
+
+
+@pytest.mark.parametrize("override", [
+    {"ProxyType": "Internet"},
+    {"URL": "https://vhost-db:30015"},
+    {"Password": None},
+    {"User": None},
+    {"hana.sslTrustStore": "x"},
+    {"Type": "RFC"},
+])
+async def test_credential_health_reads_the_destination_as_the_toolset_does(
+        monkeypatch, caplog, override):
+    import agents.admin as admin
+    import agents.destination as dest_mod
+    from agents.destination import DestinationServiceConfig
+    from agents.hana.errors import MESSAGES
+    from tests import hanadb_helpers as hh
+
+    rows = [_Row("dba", [_server({"systems": [{"name": "prd", "destination": "HANA_PRD"}]})])]
+    monkeypatch.setattr(admin, "SessionLocal", lambda: _NoSession())
+
+    async def fake_list_agents(session):
+        return rows
+
+    monkeypatch.setattr(admin, "list_agents", fake_list_agents)
+    monkeypatch.setattr(
+        dest_mod, "config_from_environment",
+        lambda env: DestinationServiceConfig("id", "placeholder", "https://uaa/oauth/token",
+                                             "https://api"),
+    )
+
+    class FakeResolverCls:
+        def __init__(self, name, config, **kw):
+            pass
+
+        async def resolve_properties(self, **kw):
+            return dest_mod.DestinationProperties(hh.http_props(**override), expires_at=0)
+
+    monkeypatch.setattr(dest_mod, "DestinationResolver", FakeResolverCls)
+    (entry,) = await admin._destination_health()
+    assert entry["state"] == "error"
+    assert entry["error"] == f"{MESSAGES['destination_error']} (destination_error)"
+    text = json.dumps(entry) + caplog.text
+    for secret in (hh.HOST, hh.USER, hh.PASSWORD, "vhost-db"):
+        assert secret not in text
+
+
+def test_credential_health_docstring_no_longer_calls_it_a_tcp_destination():
+    import agents.admin as admin
+
+    assert "TCP destination (no URL" not in (admin._hana_destination_health.__doc__ or "")

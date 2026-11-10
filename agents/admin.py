@@ -3950,17 +3950,26 @@ async def _hana_destination_health(
     The block is read as the toolset reads it (`agents.hana.config.pins_of`);
     a block it refuses is ONE entry in state ``error`` whose text is the
     reading's own (field and rule, never a value) and that names no system.
-    A system's destination is a TCP destination (no URL to resolve): its
-    properties are read with the application's token, as the toolset does,
-    and only the ``Authentication`` type is reported. A failure is the fixed
-    text ending in a code (`agents.odata.destinations.destination_failure`),
-    and the log names the system, the destination and that code only; no
-    host, user, resolver or driver text reaches the answer or the log."""
+    A system's destination carries host, port and credential as properties
+    (an HTTP carrier URL or a TCP address, never called): they are read with
+    the application's token and then checked by
+    `agents.hana.connection.settings_from_properties`, exactly as the toolset
+    does before a login (ProxyType, the carrier, User and Password, the
+    ``hana.*`` keys), so a destination the toolset would refuse is not
+    reported ``resolvable``. No SQL login is made. Only the
+    ``Authentication`` type is reported. A resolve failure is the fixed text
+    ending in a code (`agents.odata.destinations.destination_failure`); a
+    refusal of the reading is the fixed text of its code plus the code; the
+    log names the system, the destination and that code (the reading's own
+    WARNING names the rule) only; no host, user, resolver or driver text
+    reaches the answer or the log."""
     from agents.destination import (
         MISSING_BINDING_MESSAGE,
         DestinationError,
         DestinationResolver,
     )
+    from agents.hana.connection import settings_from_properties
+    from agents.hana.errors import HanaError
     from agents.odata.destinations import destination_failure
 
     def _entry(system: str, destination: str) -> dict[str, Any]:
@@ -3996,7 +4005,15 @@ async def _hana_destination_health(
         try:
             props = await resolver.resolve_properties()
             entry["auth_type"] = str(getattr(props, "auth_type", "") or "")
+            settings_from_properties(props, system)
             entry["state"] = "resolvable"
+        except HanaError as e:
+            entry["error"] = f"{e.message} ({e.code})"
+            logger.warning(
+                "credential health: destination '%s' of system '%s' of agent '%s' "
+                "refused (%s)",
+                name, system, agent, e.code,
+            )
         except DestinationError as e:
             code, entry["error"] = destination_failure(str(e))
             # The code only: the resolver's text can quote the destination

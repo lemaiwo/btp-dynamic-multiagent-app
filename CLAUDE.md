@@ -1094,7 +1094,11 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     `top`, for the run activity, the web chat's tool card and the classic
     chat's tool card (`agents/chat_app.py`). Known limit: the web chat's
     stored history (`chat_messages.model_json`, the next turn's
-    `message_history`) holds the real tool-call arguments, SQL included
+    `message_history`, kept for `CHAT_RETENTION_DAYS`) holds the real
+    tool-call arguments, SQL included, and, in a conversation that runs an
+    admin agent straight (`agent_ref` `admin:<name>`), every tool RETURN of
+    that agent as well: session user names, client hosts, statement texts
+    and the rows of `run_select`
   - `checks/` — the closed check registry (`base.py`): a check is data, a
     hana-cli command name, a category, a one-line purpose,
     `source="bin/<name>.js"` and fixed statements whose only variable parts
@@ -1156,20 +1160,33 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   reloads the registry (`_entry_signature`). `GET
   /admin/api/credential-health` lists a `builtin:hana` entry once per system
   (`system`, `destination`, `state`, `auth_type`): the destination's
-  properties are read only, no SQL login is made; a block the reading
-  refuses is one `error` entry with the reading's text. Denied in ABAP
+  properties are read and then checked by
+  `agents.hana.connection.settings_from_properties`, as the toolset does
+  before a login (a wrong `ProxyType`, an `https` carrier, an unknown
+  `hana.*` key, no `User` / `Password`: `state: error` with the fixed text of
+  `destination_error` and the code), and no SQL login is made; a block the
+  reading refuses is one `error` entry with the reading's text. Denied in ABAP
   Assistant sessions (not in `READONLY_POLICY`). **Verified on a landscape**
   (2026-11-10, SAP HANA 2.0 SPS07 revision 79, a SYSTEMDB and a tenant of
   one on-premise system, through `scripts/probe_hana_connectivity.py
   --checks-file`): the connection path (unencrypted there: a TLS login was
-  refused, cause unknown), the read-only transaction, the statement timeout,
-  and 54 of the 55 statements of the 29 checks on both databases (the 55th,
-  `traceContents`, ran with the probe's host that does not exist, SQL code
-  8). **Not verified there**: the app's own client end to end (nothing is
-  deployed yet), `SET SCHEMA SYS` inside the read-only transaction,
+  refused, cause unknown), that `SET TRANSACTION READ ONLY` is accepted, the
+  statement timeout, and 54 of the 55 statements of the 29 checks on both
+  databases (the 55th, `traceContents`, ran with the probe's host that does
+  not exist, SQL code 8). Each statement ran in the PROBE'S wrapped form,
+  `SELECT TOP 1 * FROM (<statement>)` with the sample binds of `--dump`,
+  not as the exact statement the app sends. "Read-only verified" means only
+  that the statement was accepted: that a write is refused is what the
+  probe's `--write-test` step (`write_refused`, `WRITE_REFUSED`) proves, and
+  it has not run yet (it needs the customer's agreement). **Not verified
+  there**: the app's own client end to end (nothing is deployed yet), the
+  order `SET SCHEMA SYS` then `SET TRANSACTION READ ONLY` (the probe now
+  sends it as `schema_pin`), a refused write, the login breaker,
+  `communicationTimeout`, the run_select deny-list against the real views,
   `traceContents` with a real host and file, a NULL bind of an optional
-  filter, LOB values, a multi-line ini value, the word-based mapping of
-  -10709, TLS, a Cloud Connector location id, the `tcp` destination shape.
+  filter, LOB values (`read(size)` of hdbcli's LOB object), a multi-line ini
+  value, the word-based mapping of -10709, TLS, a Cloud Connector location
+  id, the `tcp` destination shape.
   The seed agent `hana-monitor` and skill `hana-monitoring`: see
   `agents.seed.json`. Tests: `tests/test_hanadb_config.py`,
   `_connection.py`, `_connectivity_config.py`, `_guard.py`, `_masking.py`,

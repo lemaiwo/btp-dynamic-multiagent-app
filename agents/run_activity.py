@@ -88,9 +88,12 @@ def redact_args(tool_name: Any, args: Any) -> Any:
 
     Known limit: the web chat also stores pydantic-ai's ``new_messages()`` of
     each turn (``chat_messages.model_json``, the conversation history the next
-    turn is given), which holds the real tool-call arguments, SQL included.
-    That history is not redacted here; it is the model's own context, not a
-    preview."""
+    turn is given, kept for ``CHAT_RETENTION_DAYS``), which holds the real
+    tool-call arguments, SQL included. In a conversation that runs an admin
+    agent straight (``agent_ref`` ``admin:<name>``) it also holds every tool
+    RETURN of that agent: for ``builtin:hana`` session user names, client
+    hosts, statement texts and the rows of ``run_select``. That history is not
+    redacted here; it is the model's own context, not a preview."""
     if not (isinstance(tool_name, str) and _SQL_LENGTH_ONLY.fullmatch(tool_name)):
         return args
     if args is None:
