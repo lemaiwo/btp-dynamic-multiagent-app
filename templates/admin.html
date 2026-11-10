@@ -867,9 +867,12 @@ function addMcpServerRow(server) {
     row.querySelector('.mcp-url').value = server.url || '';
     row.querySelector('.mcp-url').addEventListener('input', () => syncDestinationFields(row));
     row.querySelector('.mcp-url').addEventListener('change', () => odataUrlCommitted(row));
-    // Ticking "Allow SELECT" (builtin:hana) asks first; Cancel leaves it unticked.
+    // Ticking "Allow SELECT" (builtin:hana) asks first; Cancel leaves it
+    // unticked, OK covers the systems listed at that moment.
     row.querySelector('.dest-allow_select').addEventListener('change', e => {
-        if (e.target.checked && !confirm(HANA_ALLOW_SELECT_CONFIRM)) e.target.checked = false;
+        if (!e.target.checked) return;
+        if (!confirm(HANA_ALLOW_SELECT_CONFIRM)) e.target.checked = false;
+        else hanaCoverCurrent(row);
     });
     const modeSelect = row.querySelector('.mcp-auth-mode');
     const storedMode = server.auth_mode || 'jwt';
@@ -2252,6 +2255,8 @@ async function saveAgent() {
         toast('Add at least one MCP server', 'error');
         return;
     }
+    // Asked here, not in collectMcpServers (the unsaved-changes check calls it too).
+    if (!confirmHanaCoverage()) return;
     const body = JSON.stringify({
         name: document.getElementById('agent-name').value.trim(),
         description: document.getElementById('agent-description').value.trim(),
@@ -2722,14 +2727,19 @@ const BITBUCKET_BUILTIN = 'builtin:bitbucket';
 const GIT_BUILTIN = 'builtin:git';
 // --- builtin:hana ---
 const HANA_BUILTIN = 'builtin:hana';
-// The toolset's name, as the UI5 admin's dropdown shows it.
+// The toolset's name, as the UI5 admin's dropdown shows it; it opens the row's hint.
 const HANA_TOOLSET_LABEL = 'SAP HANA (monitoring)';
 const HANA_HINT = 'Reads monitoring and catalogue views of the listed on-premise HANA databases '
     + 'as the database user of each destination; read only.';
-// Same text as the UI5 admin's hanaAllowSelectConfirm; it names no system.
-const HANA_ALLOW_SELECT_CONFIRM = 'This lets the agent run its own SELECT statements on the monitoring views '
-    + '(SYS, _SYS_STATISTICS, M_*) and read trace file contents of the listed systems. '
-    + 'Statement texts come back unmasked. Continue?';
+// The question of the toggle and of the save; it names no system.
+const HANA_ALLOW_SELECT_CONFIRM = 'This lets the agent run its own SELECT statements on the system and '
+    + 'monitoring views (SYS, _SYS_STATISTICS, M_*) of the listed systems. Catalogue data, statement '
+    + 'texts with their values and trace file contents come back unmasked. Continue?';
+// Per hana row: the systems (exact name + destination pairs) an answer to
+// that question covers. Seeded from the stored systems of an entry loaded
+// with allow_select; replaced by the row's systems at every OK; emptied when
+// the row's URL turns into another toolset.
+const HANA_COVERED = new WeakMap();
 // --- builtin:reconcile ---
 const RECONCILE_BUILTIN = 'builtin:reconcile';
 const RECONCILE_KEYS = ['arc1_server', 'target', 'batch_size', 'mismatch_cap'];
@@ -2977,11 +2987,20 @@ function fillDestinationFields(row, oauth) {
     // builtin:hana. Systems and the switch of a hana row only, as stored
     // (never trimmed); the switch only when stored as the JSON boolean true.
     const isHana = destinationBuiltinOf(row) === HANA_BUILTIN;
-    row.querySelector('.dest-systems').value = isHana && Array.isArray(oauth.systems)
-        ? oauth.systems.filter(sys => sys && typeof sys.name === 'string' && typeof sys.destination === 'string')
-            .map(sys => sys.name + ' ' + sys.destination).join('\n')
-        : '';
+    // A stored system without a string name or destination is shown, the
+    // missing part empty, so a save refuses that line instead of dropping it;
+    // one with neither part is "?" (a blank line would be skipped).
+    const storedSystems = isHana && Array.isArray(oauth.systems) ? oauth.systems : [];
+    row.querySelector('.dest-systems').value = storedSystems.map(sys => {
+        const name = sys && typeof sys.name === 'string' ? sys.name : null;
+        const destination = sys && typeof sys.destination === 'string' ? sys.destination : null;
+        return name === null && destination === null ? '?' : (name || '') + ' ' + (destination || '');
+    }).join('\n');
     row.querySelector('.dest-allow_select').checked = isHana && oauth.allow_select === true;
+    HANA_COVERED.set(row, new Set(isHana && oauth.allow_select === true
+        ? storedSystems.filter(sys => sys && typeof sys.name === 'string' && typeof sys.destination === 'string')
+            .map(sys => hanaSystemKey(sys.name, sys.destination))
+        : []));
     row.querySelector('.dest-require_green_builds').checked = !(isBitbucket && oauth.require_green_builds === false);
     // builtin:odata. What a stored block of ANOTHER type holds under these
     // two keys is never loaded: making such a row an odata row later must not
@@ -3061,6 +3080,7 @@ function syncDestinationFields(row) {
     // changes nothing, as for "Allow commenting" above.
     if (builtin !== HANA_BUILTIN && destinationFieldsFor(builtin) !== null) {
         row.querySelector('.dest-allow_select').checked = false;
+        HANA_COVERED.set(row, new Set());
     }
     row.dataset.destBuiltin = builtin;
     // One repositories field for two toolsets with two shapes.
@@ -3110,7 +3130,7 @@ function syncDestinationFields(row) {
     } else if (builtin === 'builtin:sharepoint') {
         hint = 'The destination reaches Microsoft Graph with an application credential (OAuth2ClientCredentials) that is granted read on the one site. The agent can only name a view; site, file and views are pinned here. Site, library and file path are stored exactly as typed.';
     } else if (builtin === HANA_BUILTIN) {
-        hint = HANA_HINT;
+        hint = HANA_TOOLSET_LABEL + '. ' + HANA_HINT;
     } else if (builtin === GIT_BUILTIN) {
         hint = GIT_TOOLSET_LABEL + '. The destination\'s URL is the provider\'s API base (https://api.github.com, https://api.bitbucket.org/2.0, https://gitlab.com/api/v4 or a self-hosted GitLab\'s /api/v4) and its credential the technical user\'s token. The agent reads the listed repositories; with the switches it pushes only to branches that carry the prefix (never to the base branch) and opens pull requests against the base branch. Blank base branch and prefix mean main and agent/. Paths, base branch and prefix are stored exactly as typed.';
     } else if (builtin === BITBUCKET_BUILTIN) {
@@ -3441,16 +3461,55 @@ function collectGitConfig(row) {
 }
 
 /**
+ * The lines of a hana row's Systems field: per line its parts, split on
+ * spaces and tabs only (CRLF is one break). Any other whitespace (NBSP,
+ * U+2028, U+FEFF) stays in its part for the server to refuse, never repaired.
+ */
+function hanaSystemLines(row) {
+    return row.querySelector('.dest-systems').value.replace(/\r\n/g, '\n').split('\n')
+        .map(line => line.split(/[ \t]+/).filter(Boolean));
+}
+
+function hanaSystemKey(name, destination) {
+    return JSON.stringify([name, destination]);
+}
+
+/** OK to the Allow SELECT question: it covers the systems the row lists now. */
+function hanaCoverCurrent(row) {
+    HANA_COVERED.set(row, new Set(hanaSystemLines(row).filter(parts => parts.length === 2)
+        .map(parts => hanaSystemKey(parts[0], parts[1]))));
+}
+
+/**
+ * At save: Allow SELECT applies to every system of the entry, so a ticked
+ * row that lists a system no answer covered asks again, once. Cancel: false
+ * (nothing is sent, nothing changed); OK covers the current systems.
+ */
+function confirmHanaCoverage() {
+    const rows = [...document.querySelectorAll('#agent-mcp-servers .mcp-server-row')];
+    for (const row of rows) {
+        if (destinationBuiltinOf(row) !== HANA_BUILTIN) continue;
+        if (!row.querySelector('.dest-allow_select').checked) continue;
+        const covered = HANA_COVERED.get(row) || new Set();
+        const uncovered = hanaSystemLines(row).filter(parts => parts.length === 2)
+            .some(parts => !covered.has(hanaSystemKey(parts[0], parts[1])));
+        if (!uncovered) continue;
+        if (!confirm(HANA_ALLOW_SELECT_CONFIRM)) return false;
+        hanaCoverCurrent(row);
+    }
+    return true;
+}
+
+/**
  * The builtin:hana block, built from its own fields only: the systems (one
  * line each, a system name and a destination name; blank lines dropped, the
- * blank around and between the two names being the separator's, the names
- * sent as typed for the server to judge) and allow_select only as the JSON
- * boolean true. A refusal names the line, never its text.
+ * spaces and tabs around and between the two names being the separator's,
+ * the names sent as typed for the server to judge) and allow_select only as
+ * the JSON boolean true. A refusal names the line, never its text.
  */
 function collectHanaConfig(row) {
     const systems = [];
-    row.querySelector('.dest-systems').value.split('\n').forEach((line, i) => {
-        const parts = line.split(/\s+/).filter(Boolean);
+    hanaSystemLines(row).forEach((parts, i) => {
         if (!parts.length) return;
         if (parts.length !== 2) {
             throw new Error('SAP HANA: line ' + (i + 1) + ' of Systems needs a system name and a destination '
