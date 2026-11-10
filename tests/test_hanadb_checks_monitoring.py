@@ -9,6 +9,7 @@ The generic invariants (guard, row limit, binds) are in ``test_hanadb_checks.py`
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import pytest
@@ -19,6 +20,9 @@ from agents.hana.connection import HanaSystem
 from agents.hana.guard import check_select
 from agents.hana.sqltokens import tokenize
 from tests import hanadb_helpers as h
+
+NAMED_COLUMNS_ONLY = re.compile(r"(?:\bSELECT|,|\.)\s*(?:TOP \?\s*)?\*")
+"""``SELECT *``, ``SELECT TOP ? *``, ``, *`` or ``T.*``: never in a check."""
 
 OAUTH = {"systems": [{"name": "sib_tenant", "destination": "hana-dest-one"}]}
 
@@ -52,7 +56,7 @@ def assert_registered(name: str, category: str, args: set[str], *,
     for statement in check.statements:
         assert tokenize(statement.sql)
         check_select(statement.sql)
-        assert "*" not in statement.sql.split("FROM")[0].replace("COUNT(*)", "")
+        assert not NAMED_COLUMNS_ONLY.search(statement.sql), "select named columns"
     return check
 
 
