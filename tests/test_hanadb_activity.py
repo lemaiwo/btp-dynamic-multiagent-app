@@ -180,3 +180,15 @@ def test_the_classic_chat_sink_uses_the_card_helper():
     source = inspect.getsource(chat_app)
     assert "input=update.args" not in source
     assert "input=_tool_card_input(name, update.args)" in source
+
+
+def test_run_select_preview_shows_system_sql_length_and_top_only():
+    from agents.run_activity import _detail_for, redact_args
+
+    args = {"system": "sib", "sql": SQL, "top": 5, "note": "M_SERVICES leak",
+            "schema": "SAPABAP1"}
+    assert redact_args("run_select", args) == {"system": "sib", "sql": "<57 chars>",
+                                               "top": 5}
+    assert _detail_for("hana_run_select", {"sql": SQL, "other": "x"}) == "sql=<57 chars>"
+    said = _detail_for("hana_0_run_select", args)
+    assert said == "system=sib, sql=<57 chars>, top=5"

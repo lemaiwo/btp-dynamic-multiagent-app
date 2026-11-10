@@ -77,8 +77,10 @@ def redact_args(tool_name: Any, args: Any) -> Any:
     run activity (:func:`_detail_for`), the web chat's tool card and the
     classic chat's tool card (``agents/chat_app.py``).
 
-    For a HANA ``run_select`` (plain or prefixed) the ``sql`` value becomes
-    ``"<n chars>"`` in a new object (the caller's is not changed). It fails
+    For a HANA ``run_select`` (plain or prefixed) a new object holds only
+    ``system``, ``sql`` as ``"<n chars>"`` and ``top``, those present, in
+    that order; any other key is dropped (the caller's object is not
+    changed). It fails
     closed: arguments handed over as JSON text are read as such, and any
     shape other than an object with a string ``sql`` is shown as the length
     of the whole, ``"<n chars>"``. Every other tool's arguments are returned
@@ -100,7 +102,13 @@ def redact_args(tool_name: Any, args: Any) -> Any:
         except ValueError:
             return f"<{len(args)} chars>"
     if isinstance(shown, dict) and isinstance(shown.get("sql"), str):
-        return {**shown, "sql": f"<{len(shown['sql'])} chars>"}
+        kept: dict[str, Any] = {}
+        if "system" in shown:
+            kept["system"] = shown["system"]
+        kept["sql"] = f"<{len(shown['sql'])} chars>"
+        if "top" in shown:
+            kept["top"] = shown["top"]
+        return kept
     return f"<{_size(args)} chars>"
 
 

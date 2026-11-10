@@ -20,7 +20,7 @@ from agents.hana import tools
 from agents.hana.checks import base
 from agents.hana.checks.base import Check, Statement, register
 from agents.hana.connection import HanaSystem
-from agents.hana.errors import MESSAGES
+from agents.hana.errors import MESSAGES, HanaError
 from tests import hanadb_helpers as h
 
 SECRETS = (h.MARKER, h.HOST, h.USER, h.PASSWORD, h.TOKEN, "hana-dest-one", "hana-dest-two")
@@ -329,7 +329,9 @@ async def test_unexpected_failure_is_answered(monkeypatch: pytest.MonkeyPatch,
 
     monkeypatch.setattr(tools, "run_query", boom)
     answer = await call(build(OAUTH_SELECT), "run_check", system="sib_tenant", check="alerts")
-    assert answer["error"]["code"] == "call_failed"
+    assert answer == {"error": HanaError("call_failed").to_dict()}
+    assert answer["error"]["message"] == (
+        "The call could not be completed. Tell the user instead of retrying.")
     answer = await call(build(OAUTH_SELECT), "run_select", system="sib_tenant",
                         sql="SELECT * FROM SYS.DUMMY")
     assert answer["error"]["code"] == "call_failed"
@@ -396,3 +398,54 @@ async def test_run_select_result_too_large(db: h.FakeDbapi) -> None:
     answer = await call(build(OAUTH_SELECT), "run_select", system="sib_tenant",
                         sql="SELECT * FROM SYS.DUMMY", top=500)
     assert answer["error"]["code"] == "result_too_large"
+
+
+# ---- review minors ------------------------------------------------------------------------
+
+
+async def test_column_names_are_cut_and_carry_no_control_or_format_character(
+        db: h.FakeDbapi) -> None:
+    db.description = (("A\nB\u202eC\u2028D\u00adE",), ("N" * 300,), (7,))
+    db.rows = [(1, 2, 3)]
+    answer = await call(build(OAUTH_SELECT), "run_select", system="sib_tenant",
+                        sql="SELECT * FROM SYS.DUMMY")
+    assert answer["columns"] == ["A?B?C?D?E", "N" * 128, "7"]
+
+
+async def test_run_check_column_names_are_cleaned_too(db: h.FakeDbapi) -> None:
+    db.description = (("A\tB",), ("B",))
+    answer = await call(build(), "run_check", system="sib_tenant", check="alerts")
+    assert answer["columns"] == ["A?B", "B"]
+
+
+async def test_list_checks_marks_a_required_argument_and_gives_it_no_default() -> None:
+    register(Check(name="columnStats", category="performance", purpose="Columns.",
+                   source="bin/columnStats.js",
+                   statements=(Statement("", "SELECT A FROM SYS.M_CS_COLUMNS "
+                                             "WHERE SCHEMA_NAME = ? AND TABLE_NAME = ?",
+                                         ("schema", "object")),),
+                   args=frozenset({"schema", "object", "top"}),
+                   required=frozenset({"schema", "object"})))
+    answer = await call(build(), "list_checks", category="performance")
+    stats = next(c for c in answer["checks"] if c["name"] == "columnStats")
+    by_name = {a["name"]: a for a in stats["arguments"]}
+    assert by_name["schema"]["required"] is True and "default" not in by_name["schema"]
+    assert by_name["object"]["required"] is True and "default" not in by_name["object"]
+    assert "required" not in by_name["top"] and by_name["top"]["default"] == 50
+    long_running = next(c for c in answer["checks"] if c["name"] == "longRunning")
+    assert all("required" not in a and "default" in a for a in long_running["arguments"])
+
+
+def test_the_result_measure_is_the_neutral_module() -> None:
+    import ast
+    import pathlib
+
+    from agents import sharepoint_tools, tool_results
+
+    assert tools.result_chars is tool_results.result_chars
+    assert sharepoint_tools._result_chars is tool_results.result_chars
+    tree = ast.parse(pathlib.Path(tools.__file__).read_text(encoding="utf-8"))
+    imported = {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
+    imported |= {a.name for n in ast.walk(tree) if isinstance(n, ast.Import)
+                 for a in n.names}
+    assert "agents.sharepoint_tools" not in imported

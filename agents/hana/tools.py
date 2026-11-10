@@ -20,8 +20,9 @@ text, decimals as text, anything else as its type name, never its ``repr``.
 An answer over :data:`MAX_RESULT_CHARS` is refused (``result_too_large``),
 never cut: a list that ends early would read as complete. Every failure is
 ``{"error": {code, message, ...}}``, never an exception; something unexpected
-is the tool-level code ``call_failed`` (outside ``ERROR_CODES``), logged by
-exception class only.
+is ``call_failed``, logged by exception class only. A column name is cut to
+:data:`MAX_COLUMN_NAME_CHARS` with control and format characters replaced by
+``?`` (for ``run_select`` the model writes the aliases).
 
 **What is stored.** A run's activity keeps :func:`activity_summary` for these
 tools: counts, fixed words, a registered check name and a refusal's code.
@@ -33,6 +34,7 @@ import datetime as dt
 import logging
 import math
 import re
+import unicodedata
 from collections.abc import Awaitable, Callable
 from decimal import Decimal
 from typing import Any
@@ -56,15 +58,15 @@ from agents.hana.config import pins_of
 from agents.hana.connection import HanaSystem, run_query
 from agents.hana.errors import HanaError
 from agents.hana.guard import SelectRefused, check_select
-from agents.sharepoint_tools import _result_chars
+from agents.tool_results import result_chars
 
 logger = logging.getLogger(__name__)
 
 MAX_RESULT_CHARS = 60_000
 SELECT_DEFAULT_TOP = 100
 SELECT_MAX_TOP = 500
-CALL_FAILED = {"code": "call_failed",
-               "message": "The call could not be completed. Tell the user instead of retrying."}
+MAX_COLUMN_NAME_CHARS = 128
+_UNSAFE_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
 
 __all__ = ["MAX_RESULT_CHARS", "TOOL_NAMES", "activity_summary", "hana_toolset", "json_value"]
 
@@ -89,13 +91,22 @@ def json_value(value: Any) -> Any:
     return f"<{type(value).__name__}>"
 
 
+def _column_name(value: Any) -> str:
+    """One column name as the model sees it: at most
+    :data:`MAX_COLUMN_NAME_CHARS` characters, a control, format, line or
+    paragraph separator character as ``?``."""
+    text = str(value)[:MAX_COLUMN_NAME_CHARS]
+    return "".join("?" if unicodedata.category(ch) in _UNSAFE_CATEGORIES else ch
+                   for ch in text)
+
+
 def _safe_part(part: dict[str, Any]) -> None:
-    part["columns"] = [str(c) for c in part["columns"]]
+    part["columns"] = [_column_name(c) for c in part["columns"]]
     part["rows"] = [[json_value(v) for v in row] for row in part["rows"]]
 
 
-def _error(exc: HanaError | dict[str, Any]) -> dict[str, Any]:
-    return {"error": exc.to_dict() if isinstance(exc, HanaError) else dict(exc)}
+def _error(exc: HanaError) -> dict[str, Any]:
+    return {"error": exc.to_dict()}
 
 
 # ---- descriptions -------------------------------------------------------------------
@@ -161,6 +172,9 @@ def _argument_info(check: Check, name: str) -> dict[str, Any]:
         rule = f"a whole number from {arg.low} to {arg.high}"
     else:
         rule = "an identifier (letters, digits, _ $ # . /)"
+    if name in check.required:
+        # A required argument has no default: leaving it out is refused.
+        return {"name": name, "required": True, "rule": rule}
     return {"name": name, "default": arg.default, "rule": rule}
 
 
@@ -198,8 +212,8 @@ def hana_toolset(
         except Exception as exc:  # noqa: BLE001 - a tool answers, it does not raise
             # The class only: an exception text can hold a host, a user or a row.
             logger.warning("%s: call failed (%s)", server_key, type(exc).__name__)
-            return _error(CALL_FAILED)
-        if _result_chars(result) > MAX_RESULT_CHARS:
+            return _error(HanaError("call_failed"))
+        if result_chars(result) > MAX_RESULT_CHARS:
             return _error(HanaError("result_too_large"))
         return result
 
@@ -216,7 +230,9 @@ def hana_toolset(
 
     async def list_checks(category: str | None = None) -> dict[str, Any]:
         """List the monitoring checks `run_check` can run: `{checks: [{name,
-        category, purpose, arguments: [{name, default, rule}]}]}`.
+        category, purpose, arguments: [{name, default, rule}]}]}`. An argument
+        the check cannot run without has `required: true` instead of a
+        `default`: always pass it.
 
         Args:
             category: Only the checks of this category; all when left out.
@@ -257,6 +273,8 @@ def hana_toolset(
                          ) -> dict[str, Any]:
         async def body() -> dict[str, Any]:
             target = _system(system)
+            # pydantic-ai validates a model's call first and coerces true to
+            # 1, so the bool test only matters for a direct caller.
             if not isinstance(top, int) or isinstance(top, bool) or not (
                     1 <= top <= SELECT_MAX_TOP):
                 raise InvalidArgument(

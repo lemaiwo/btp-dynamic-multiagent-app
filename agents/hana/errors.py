@@ -32,6 +32,7 @@ MESSAGES: dict[str, str] = {
     "select_refused": "The statement is not a read of the allowed monitoring views.",
     "result_too_large": "The result is too large to return; narrow the query.",
     "sql_error": "The database refused the statement.",
+    "call_failed": "The call could not be completed. Tell the user instead of retrying.",
 }
 
 ERROR_CODES: frozenset[str] = frozenset(MESSAGES)

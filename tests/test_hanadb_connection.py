@@ -62,7 +62,8 @@ def test_error_codes_are_the_closed_list():
     assert ERROR_CODES == frozenset({
         "destination_error", "proxy_refused", "unreachable", "login_failed",
         "not_authorized", "timeout", "unknown_system", "unknown_check",
-        "invalid_argument", "select_refused", "result_too_large", "sql_error"})
+        "invalid_argument", "select_refused", "result_too_large", "sql_error",
+        "call_failed"})
     assert set(MESSAGES) == ERROR_CODES
 
 
