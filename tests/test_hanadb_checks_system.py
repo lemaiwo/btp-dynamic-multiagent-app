@@ -20,7 +20,7 @@ from agents.hana.connection import HanaSystem
 from agents.hana.sqltokens import tokenize
 from tests import hanadb_helpers as h
 
-OAUTH = {"systems": [{"name": "sib_tenant", "destination": "hana-dest-one"}]}
+OAUTH = {"systems": [{"name": "erp_tenant", "destination": "hana-dest-one"}]}
 
 # name -> (part labels, declared args); "" is the one label of a single statement
 EXPECTED: dict[str, tuple[tuple[str, ...], frozenset[str]]] = {
@@ -69,7 +69,7 @@ def _toolset():
 
 
 async def _run(**kw: Any) -> dict[str, Any]:
-    return await _toolset().tools["run_check"].function(system="sib_tenant", **kw)
+    return await _toolset().tools["run_check"].function(system="erp_tenant", **kw)
 
 
 @pytest.fixture
@@ -107,7 +107,7 @@ async def test_runs_on_the_fake_with_two_rows(name: str, db: h.FakeDbapi) -> Non
     db.rows = [(1, "x"), (2, "y")]
     answer = await _run(check=name, top=5)
     labels, _ = EXPECTED[name]
-    assert answer["system"] == "sib_tenant" and answer["check"] == name
+    assert answer["system"] == "erp_tenant" and answer["check"] == name
     parts = answer["parts"] if len(labels) > 1 else [answer]
     assert [p.get("label", "") for p in parts] == list(labels)
     for part in parts:

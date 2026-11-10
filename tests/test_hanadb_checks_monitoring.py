@@ -53,7 +53,7 @@ def test_star_columns_reads_tokens(sql: str, stars: int) -> None:
     assert star_columns(sql) == stars
 
 
-OAUTH = {"systems": [{"name": "sib_tenant", "destination": "hana-dest-one"}]}
+OAUTH = {"systems": [{"name": "erp_tenant", "destination": "hana-dest-one"}]}
 
 
 def _factory(name: str, destination: str) -> HanaSystem:
@@ -71,7 +71,7 @@ async def run_on_fake(monkeypatch: pytest.MonkeyPatch, check: str, columns: list
     oauth = {**OAUTH, "allow_select": True} if allow_select else OAUTH
     toolset = tools.hana_toolset(oauth, auth_mode="destination", system_factory=_factory)
     answer = await toolset.tools["run_check"].function(
-        system="sib_tenant", check=check, **args)
+        system="erp_tenant", check=check, **args)
     return answer, [c for c in db.calls if c[0] == "execute"]
 
 

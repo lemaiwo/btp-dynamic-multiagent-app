@@ -27,7 +27,7 @@ def _rows(n: int) -> list[list[str]]:
 
 @pytest.mark.parametrize("name", ["run_check", "hana_run_check", "hana_0_run_check"])
 def test_run_check_line(name: str) -> None:
-    result = {"system": "sib", "check": "alerts", "columns": [LEAK], "rows": _rows(12),
+    result = {"system": "erp", "check": "alerts", "columns": [LEAK], "rows": _rows(12),
               "row_count": 12, "truncated": False}
     assert activity_summary(name, result) == "run_check: alerts, 12 rows"
     result = {**result, "rows": _rows(500), "row_count": 500, "truncated": True}
@@ -49,7 +49,7 @@ def test_run_check_composite_line() -> None:
 
 
 def test_run_select_line() -> None:
-    result = {"system": "sib", "columns": [LEAK], "rows": _rows(40), "row_count": 40,
+    result = {"system": "erp", "columns": [LEAK], "rows": _rows(40), "row_count": 40,
               "truncated": False}
     assert activity_summary("run_select", result) == "run_select: 40 rows"
     assert activity_summary("hana_1_run_select", {**result, "truncated": True}) == \
@@ -85,13 +85,13 @@ def test_the_registry_preview_is_the_fixed_line():
 
     from agents.registry import _short_tool_output
 
-    result = {"system": "sib", "check": "alerts", "columns": [LEAK], "rows": _rows(12),
+    result = {"system": "erp", "check": "alerts", "columns": [LEAK], "rows": _rows(12),
               "row_count": 12, "truncated": False}
     for name in ("run_check", "hana_run_check", "hana_0_run_check"):
         said = _short_tool_output(SimpleNamespace(tool_name=name, content=result))
         assert said == "run_check: alerts, 12 rows"
     said = _short_tool_output(SimpleNamespace(
-        tool_name="run_select", content={"system": "sib", "columns": [LEAK],
+        tool_name="run_select", content={"system": "erp", "columns": [LEAK],
                                          "rows": _rows(3), "row_count": 3,
                                          "truncated": False}))
     assert LEAK not in said and said.startswith("run_select: 3 rows")
@@ -105,19 +105,19 @@ def test_the_argument_preview_of_run_select_keeps_the_length_of_the_sql(name):
     from agents.run_activity import _detail_for
 
     assert len(SQL) == 57
-    args = {"system": "sib", "sql": SQL, "top": 100}
-    assert _detail_for(name, args) == "system=sib, sql=<57 chars>, top=100"
+    args = {"system": "erp", "sql": SQL, "top": 100}
+    assert _detail_for(name, args) == "system=erp, sql=<57 chars>, top=100"
     # pydantic-ai may hand the arguments over as their JSON text.
     import json
 
-    assert _detail_for(name, json.dumps(args)) == "system=sib, sql=<57 chars>, top=100"
+    assert _detail_for(name, json.dumps(args)) == "system=erp, sql=<57 chars>, top=100"
     assert "M_SERVICES" not in _detail_for(name, f"not json {SQL}")
 
 
 def test_other_tools_keep_their_preview():
     from agents.run_activity import _detail, _detail_for
 
-    args = {"system": "sib", "sql": SQL}
+    args = {"system": "erp", "sql": SQL}
     for name in ("run_check", "other_run_select", "run_selection", None):
         assert _detail_for(name, args) == _detail(args)
 
@@ -130,16 +130,16 @@ def test_a_run_records_and_the_chat_card_shows_the_length_only():
     activity = RunActivity()
     activity.record(ProgressUpdate(kind="tool_start", agent="dba",
                                    tool_name="hana_run_select", tool_call_id="c1",
-                                   args={"system": "sib", "sql": SQL, "top": 100}))
-    assert activity.events[0]["detail"] == "system=sib, sql=<57 chars>, top=100"
-    shown = _preview_args("run_select", {"system": "sib", "sql": SQL, "top": 100})
-    assert shown == "system=sib, sql=<57 chars>, top=100"
+                                   args={"system": "erp", "sql": SQL, "top": 100}))
+    assert activity.events[0]["detail"] == "system=erp, sql=<57 chars>, top=100"
+    shown = _preview_args("run_select", {"system": "erp", "sql": SQL, "top": 100})
+    assert shown == "system=erp, sql=<57 chars>, top=100"
     assert "M_SERVICES" in _preview_args("run_check", {"sql": SQL})
 
 
 @pytest.mark.parametrize("args", [
-    ["SELECT", SQL], (SQL,), 42, {"sql": ["SELECT", SQL]}, {"system": "sib", "sql": None},
-    {"system": "sib", "query": SQL}, b"SELECT HOST FROM SYS.M_SERVICES"])
+    ["SELECT", SQL], (SQL,), 42, {"sql": ["SELECT", SQL]}, {"system": "erp", "sql": None},
+    {"system": "erp", "query": SQL}, b"SELECT HOST FROM SYS.M_SERVICES"])
 def test_run_select_of_any_other_shape_is_shown_as_its_length_only(args):
     from agents.run_activity import _detail_for, redact_args
 
@@ -152,8 +152,8 @@ def test_run_select_of_any_other_shape_is_shown_as_its_length_only(args):
 def test_redact_args_hands_back_the_object_to_show():
     from agents.run_activity import redact_args
 
-    args = {"system": "sib", "sql": SQL, "top": 100}
-    assert redact_args("hana_0_run_select", args) == {"system": "sib", "sql": "<57 chars>",
+    args = {"system": "erp", "sql": SQL, "top": 100}
+    assert redact_args("hana_0_run_select", args) == {"system": "erp", "sql": "<57 chars>",
                                                       "top": 100}
     assert args["sql"] == SQL  # the caller's object is not changed
     assert redact_args("run_check", args) is args
@@ -163,8 +163,8 @@ def test_redact_args_hands_back_the_object_to_show():
 def test_the_classic_chat_tool_card_shows_the_length_only():
     from agents.chat_app import _tool_card_input
 
-    shown = _tool_card_input("hana_run_select", {"system": "sib", "sql": SQL, "top": 100})
-    assert shown == {"system": "sib", "sql": "<57 chars>", "top": 100}
+    shown = _tool_card_input("hana_run_select", {"system": "erp", "sql": SQL, "top": 100})
+    assert shown == {"system": "erp", "sql": "<57 chars>", "top": 100}
     assert _tool_card_input("run_check", {"sql": SQL}) == {"sql": SQL}
     assert _tool_card_input("run_check", None) == {}
     assert "M_SERVICES" not in str(_tool_card_input("run_select", f"not json {SQL}"))
@@ -185,10 +185,10 @@ def test_the_classic_chat_sink_uses_the_card_helper():
 def test_run_select_preview_shows_system_sql_length_and_top_only():
     from agents.run_activity import _detail_for, redact_args
 
-    args = {"system": "sib", "sql": SQL, "top": 5, "note": "M_SERVICES leak",
+    args = {"system": "erp", "sql": SQL, "top": 5, "note": "M_SERVICES leak",
             "schema": "SAPABAP1"}
-    assert redact_args("run_select", args) == {"system": "sib", "sql": "<57 chars>",
+    assert redact_args("run_select", args) == {"system": "erp", "sql": "<57 chars>",
                                                "top": 5}
     assert _detail_for("hana_run_select", {"sql": SQL, "other": "x"}) == "sql=<57 chars>"
     said = _detail_for("hana_0_run_select", args)
-    assert said == "system=sib, sql=<57 chars>, top=5"
+    assert said == "system=erp, sql=<57 chars>, top=5"

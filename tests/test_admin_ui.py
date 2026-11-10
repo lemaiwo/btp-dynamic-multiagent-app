@@ -2315,8 +2315,8 @@ assert.strictEqual(row.querySelector('.dest-base_branch').value, '');
 const HANA_CONFIRM = 'This lets the agent run its own SELECT statements on the monitoring views '
     + '(SYS, _SYS_STATISTICS, M_*) and read trace file contents of the listed systems. '
     + 'Statement texts come back unmasked. Continue?';
-const HANA_OAUTH = { systems: [{ name: 'sib_tenant', destination: 'hana-sib-tenant' },
-                               { name: 'sib_systemdb', destination: 'HANA_SIB.SYS' }],
+const HANA_OAUTH = { systems: [{ name: 'erp_tenant', destination: 'hana-erp-tenant' },
+                               { name: 'erp_systemdb', destination: 'HANA_ERP.SYS' }],
                      allow_select: true };
 const hanaUrl = (r, v) => {
     r.querySelector('.mcp-url').value = v;
@@ -2339,7 +2339,7 @@ for (const k of ['destination', 'user_context', 'project', 'allow_write', 'repos
 // The stored systems load back, one line each; the stored switch is loaded
 // without asking (nothing was ticked by the admin).
 assert.strictEqual(row.querySelector('.dest-systems').value,
-    'sib_tenant hana-sib-tenant\nsib_systemdb HANA_SIB.SYS');
+    'erp_tenant hana-erp-tenant\nerp_systemdb HANA_ERP.SYS');
 assert.strictEqual(row.querySelector('.dest-allow_select').checked, true);
 assert.deepStrictEqual(hanaAsked, []);
 assert.deepStrictEqual(out, { url: 'builtin:hana', auth_mode: 'destination', oauth: HANA_OAUTH });
@@ -2350,13 +2350,13 @@ console.log('HANA:' + JSON.stringify(out));
 // Built from the fields as left: blank lines dropped, the blank around and
 // between the two names is the separator's, the names themselves as typed
 // (the server refuses an upper-case name: no repair here); unticked = absent.
-row.querySelector('.dest-systems').value = '  sib_tenant   hana-sib-tenant \n\n\tSib_X dest.2\n';
+row.querySelector('.dest-systems').value = '  erp_tenant   hana-erp-tenant \n\n\tErp_X dest.2\n';
 row.querySelector('.dest-allow_select').checked = false;
 assert.deepStrictEqual(collectMcpServers()[0].oauth,
-    { systems: [{ name: 'sib_tenant', destination: 'hana-sib-tenant' },
-                { name: 'Sib_X', destination: 'dest.2' }] });
+    { systems: [{ name: 'erp_tenant', destination: 'hana-erp-tenant' },
+                { name: 'Erp_X', destination: 'dest.2' }] });
 // A line that is not exactly two names is refused, naming the line, never its text.
-row.querySelector('.dest-systems').value = 'sib_tenant hana-sib-tenant\nSECRETVALUE';
+row.querySelector('.dest-systems').value = 'erp_tenant hana-erp-tenant\nSECRETVALUE';
 assert.throws(() => collectMcpServers(), e => {
     assert.strictEqual(e.message, 'SAP HANA: line 2 of Systems needs a system name and a destination '
         + 'name, separated by a space.');
@@ -2374,14 +2374,14 @@ assert.throws(() => collectMcpServers(), e => {
     return true;
 });
 // Ticking "Allow SELECT" asks first, naming no system; Cancel leaves it unticked.
-row.querySelector('.dest-systems').value = 'sib_tenant hana-sib-tenant';
+row.querySelector('.dest-systems').value = 'erp_tenant hana-erp-tenant';
 const selectBox = row.querySelector('.dest-allow_select');
 selectBox.checked = true;
 hanaFire(selectBox);
 assert.deepStrictEqual(hanaAsked, [HANA_CONFIRM]);
 assert.strictEqual(selectBox.checked, false, 'Cancel leaves it unticked');
 assert.deepStrictEqual(collectMcpServers()[0].oauth,
-    { systems: [{ name: 'sib_tenant', destination: 'hana-sib-tenant' }] });
+    { systems: [{ name: 'erp_tenant', destination: 'hana-erp-tenant' }] });
 hanaAnswer = true;
 selectBox.checked = true;
 hanaFire(selectBox);
@@ -2405,7 +2405,7 @@ hanaUrl(row, 'builtin:hana');
 assert.strictEqual(selectBox.checked, true, 'a half-typed URL back to hana keeps the tick');
 // Only the destination mode.
 ({ row } = addAndCollect({ url: 'builtin:hana', auth_mode: 'destination',
-    oauth: { systems: [{ name: 'sib_tenant', destination: 'hana-sib-tenant' }] } }));
+    oauth: { systems: [{ name: 'erp_tenant', destination: 'hana-erp-tenant' }] } }));
 row.querySelector('.mcp-auth-mode').value = 'jwt';
 assert.throws(() => collectMcpServers(), /builtin:hana needs the auth mode "BTP destination"/);
 // An agent takes one hana entry: two rows (in any spelling) are refused here, not posted.
@@ -2424,8 +2424,8 @@ assert.throws(() => collectMcpServers(), e => {
 assert.strictEqual(row.querySelector('.dest-systems').value, '');
 assert.strictEqual(row.querySelector('.dest-allow_select').checked, false);
 ({ row, out } = addAndCollect({ url: 'builtin:hana', auth_mode: 'destination',
-    oauth: { systems: [{ name: 'sib_tenant', destination: 'd' }], allow_select: 'true' } }));
-assert.deepStrictEqual(out.oauth, { systems: [{ name: 'sib_tenant', destination: 'd' }] });
+    oauth: { systems: [{ name: 'erp_tenant', destination: 'd' }], allow_select: 'true' } }));
+assert.deepStrictEqual(out.oauth, { systems: [{ name: 'erp_tenant', destination: 'd' }] });
 // A new row typed as builtin:hana starts empty and unticked.
 document.getElementById('agent-mcp-servers').innerHTML = '';
 addMcpServerRow();

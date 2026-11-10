@@ -26,8 +26,8 @@ from tests import hanadb_helpers as h
 SECRETS = (h.MARKER, h.HOST, h.USER, h.PASSWORD, h.TOKEN, "hana-dest-one", "hana-dest-two")
 STATEMENT = "SELECT * FROM SAPABAP1.KNA1 WHERE KUNNR = 'customer4711' AND X = 99"
 
-OAUTH = {"systems": [{"name": "sib_tenant", "destination": "hana-dest-one"},
-                     {"name": "sib_systemdb", "destination": "hana-dest-two"}]}
+OAUTH = {"systems": [{"name": "erp_tenant", "destination": "hana-dest-one"},
+                     {"name": "erp_systemdb", "destination": "hana-dest-two"}]}
 OAUTH_SELECT = {**OAUTH, "allow_select": True}
 
 
@@ -131,7 +131,7 @@ def test_descriptions_state_defaults_categories_and_select_rules() -> None:
 
 async def test_list_systems_names_only() -> None:
     answer = await call(build(), "list_systems")
-    assert answer == {"systems": [{"name": "sib_tenant"}, {"name": "sib_systemdb"}]}
+    assert answer == {"systems": [{"name": "erp_tenant"}, {"name": "erp_systemdb"}]}
     _clean(answer)
 
 
@@ -170,8 +170,8 @@ async def test_list_checks_refuses_unknown_category_without_echo() -> None:
 
 async def test_run_check_ok(db: h.FakeDbapi) -> None:
     db.rows = [(1, "x"), (2, "y")]
-    answer = await call(build(), "run_check", system="sib_tenant", check="alerts")
-    assert answer == {"system": "sib_tenant", "check": "alerts", "columns": ["A", "B"],
+    answer = await call(build(), "run_check", system="erp_tenant", check="alerts")
+    assert answer == {"system": "erp_tenant", "check": "alerts", "columns": ["A", "B"],
                       "rows": [[1, "x"], [2, "y"]], "row_count": 2, "truncated": False}
     assert ("fetchmany", 51) in db.calls  # default top 50, one more fetched
     assert "commit" not in db.steps()
@@ -179,18 +179,18 @@ async def test_run_check_ok(db: h.FakeDbapi) -> None:
 
 async def test_run_check_top_plus_one_and_truncated_exact(db: h.FakeDbapi) -> None:
     db.rows = [(i, "r") for i in range(5)]
-    answer = await call(build(), "run_check", system="sib_tenant", check="alerts", top=3)
+    answer = await call(build(), "run_check", system="erp_tenant", check="alerts", top=3)
     assert ("fetchmany", 4) in db.calls
     assert answer["row_count"] == 3 and answer["truncated"] is True
     db.rows = [(i, "r") for i in range(3)]
-    answer = await call(build(), "run_check", system="sib_tenant", check="alerts", top=3)
+    answer = await call(build(), "run_check", system="erp_tenant", check="alerts", top=3)
     assert answer["row_count"] == 3 and answer["truncated"] is False
 
 
 async def test_run_check_without_top_uses_the_check_cap(db: h.FakeDbapi) -> None:
     db.description = (("A",),)
     db.rows = [(1,)]
-    answer = await call(build(), "run_check", system="sib_tenant", check="version")
+    answer = await call(build(), "run_check", system="erp_tenant", check="version")
     assert answer["rows"] == [[1]]
     assert ("fetchmany", 6) in db.calls
 
@@ -198,7 +198,7 @@ async def test_run_check_without_top_uses_the_check_cap(db: h.FakeDbapi) -> None
 async def test_run_check_binds_defaults_and_masks(db: h.FakeDbapi) -> None:
     db.description = (("A",), ("STATEMENT_STRING",))
     db.rows = [(1, STATEMENT), (2, None)]
-    answer = await call(build(), "run_check", system="sib_tenant", check="longRunning")
+    answer = await call(build(), "run_check", system="erp_tenant", check="longRunning")
     executed = [c for c in db.calls if c[0] == "execute"][0]
     assert executed[2] == (None, None, 24)
     masked = answer["rows"][0][1]
@@ -208,7 +208,7 @@ async def test_run_check_binds_defaults_and_masks(db: h.FakeDbapi) -> None:
 
 async def test_run_check_binds_given_arguments(db: h.FakeDbapi) -> None:
     db.description = (("A",), ("STATEMENT_STRING",))
-    await call(build(), "run_check", system="sib_tenant", check="longRunning",
+    await call(build(), "run_check", system="erp_tenant", check="longRunning",
                schema="SAPABAP1", hours=2, top=10)
     executed = [c for c in db.calls if c[0] == "execute"][0]
     assert executed[2] == ("SAPABAP1", "SAPABAP1", 2)
@@ -217,8 +217,8 @@ async def test_run_check_binds_given_arguments(db: h.FakeDbapi) -> None:
 
 async def test_run_check_composite(db: h.FakeDbapi) -> None:
     db.rows = [(1, "a")]
-    answer = await call(build(), "run_check", system="sib_tenant", check="backups")
-    assert answer["system"] == "sib_tenant" and answer["check"] == "backups"
+    answer = await call(build(), "run_check", system="erp_tenant", check="backups")
+    assert answer["system"] == "erp_tenant" and answer["check"] == "backups"
     assert [p["label"] for p in answer["parts"]] == ["catalog", "size"]
     assert all(p["row_count"] == 1 for p in answer["parts"])
 
@@ -234,7 +234,7 @@ async def test_unknown_system_not_echoed(db: h.FakeDbapi) -> None:
 
 async def test_unknown_check_not_echoed(db: h.FakeDbapi) -> None:
     for name in ("evil_check_x", "traceContents", 7):
-        answer = await call(build(), "run_check", system="sib_tenant", check=name)
+        answer = await call(build(), "run_check", system="erp_tenant", check=name)
         assert answer == {"error": {"code": "unknown_check",
                                     "message": MESSAGES["unknown_check"]}}
         _clean(answer, "evil_check_x")
@@ -244,7 +244,7 @@ async def test_unknown_check_not_echoed(db: h.FakeDbapi) -> None:
 async def test_select_check_runs_with_allow_select(db: h.FakeDbapi) -> None:
     db.description = (("A",),)
     db.rows = [(1,)]
-    answer = await call(build(OAUTH_SELECT), "run_check", system="sib_tenant",
+    answer = await call(build(OAUTH_SELECT), "run_check", system="erp_tenant",
                         check="traceContents")
     assert answer["rows"] == [[1]]
 
@@ -256,7 +256,7 @@ async def test_select_check_runs_with_allow_select(db: h.FakeDbapi) -> None:
     ({"object": "SYS"}, "object"),
 ])
 async def test_run_check_bad_arguments(db: h.FakeDbapi, kw: dict, argument: str) -> None:
-    answer = await call(build(), "run_check", system="sib_tenant", check="longRunning", **kw)
+    answer = await call(build(), "run_check", system="erp_tenant", check="longRunning", **kw)
     assert answer["error"]["code"] == "invalid_argument"
     assert answer["error"]["argument"] == argument
     _clean(answer, "evil schema'x")
@@ -273,11 +273,11 @@ async def test_run_check_passes_host_as_a_bind(db: h.FakeDbapi) -> None:
                    required=frozenset({"host", "object"})))
     db.description = (("A",),)
     db.rows = [(1,)]
-    await call(build(), "run_check", system="sib_tenant", check="traceTail",
+    await call(build(), "run_check", system="erp_tenant", check="traceTail",
                host="h1", object="f.trc")
     executed = [c for c in db.calls if c[0] == "execute"][0]
     assert executed[2] == ("h1", "f.trc")
-    answer = await call(build(), "run_check", system="sib_tenant", check="traceTail",
+    answer = await call(build(), "run_check", system="erp_tenant", check="traceTail",
                         host="evil host'x", object="f.trc")
     assert answer["error"]["argument"] == "host"
     _clean(answer, "evil host'x")
@@ -289,7 +289,7 @@ async def test_run_check_passes_host_as_a_bind(db: h.FakeDbapi) -> None:
 
 
 async def test_run_check_refuses_host_on_a_check_without_it(db: h.FakeDbapi) -> None:
-    answer = await call(build(), "run_check", system="sib_tenant", check="alerts", host="h1")
+    answer = await call(build(), "run_check", system="erp_tenant", check="alerts", host="h1")
     assert answer["error"]["argument"] == "host"
     assert db.calls == []
 
@@ -300,7 +300,7 @@ def test_run_check_doc_describes_host() -> None:
 
 
 async def test_run_check_undeclared_argument(db: h.FakeDbapi) -> None:
-    answer = await call(build(), "run_check", system="sib_tenant", check="alerts", hours=3)
+    answer = await call(build(), "run_check", system="erp_tenant", check="alerts", hours=3)
     assert answer["error"]["code"] == "invalid_argument"
     assert answer["error"]["argument"] == "hours"
 
@@ -314,7 +314,7 @@ async def test_values_made_json_safe(db: h.FakeDbapi) -> None:
     db.rows = [(b"\x00\x01\x02", bytearray(b"ab"), memoryview(b"abcd"),
                 dt.datetime(2026, 11, 10, 8, 30, 1), dt.date(2026, 11, 10),
                 dt.time(8, 30), Decimal("12.50"), Odd(), 1.5, True, "text")]
-    answer = await call(build(), "run_check", system="sib_tenant", check="alerts")
+    answer = await call(build(), "run_check", system="erp_tenant", check="alerts")
     assert answer["rows"][0] == ["<3 bytes>", "<2 bytes>", "<4 bytes>",
                                  "2026-11-10T08:30:01", "2026-11-10", "08:30:00",
                                  "12.50", "<Odd>", 1.5, True, "text"]
@@ -324,7 +324,7 @@ async def test_values_made_json_safe(db: h.FakeDbapi) -> None:
 
 async def test_result_too_large_refused(db: h.FakeDbapi) -> None:
     db.rows = [(i, "y" * 1000) for i in range(70)]
-    answer = await call(build(), "run_check", system="sib_tenant", check="alerts", top=100)
+    answer = await call(build(), "run_check", system="erp_tenant", check="alerts", top=100)
     assert answer == {"error": {"code": "result_too_large",
                                 "message": MESSAGES["result_too_large"]}}
 
@@ -333,7 +333,7 @@ async def test_driver_failure_is_an_error_object(db: h.FakeDbapi,
                                                  caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level(logging.DEBUG)
     db.fail_at["execute"] = h.driver_error(258, "insufficient privilege")
-    answer = await call(build(), "run_check", system="sib_tenant", check="alerts")
+    answer = await call(build(), "run_check", system="erp_tenant", check="alerts")
     assert answer["error"]["code"] == "not_authorized"
     assert set(answer["error"]) <= {"code", "message", "sql_code"}
     _clean(answer)
@@ -350,7 +350,7 @@ async def test_destination_failure(caplog: pytest.LogCaptureFixture,
                           tokens=h.FakeTokens())
 
     answer = await call(build(system_factory=factory), "run_check",
-                        system="sib_tenant", check="alerts")
+                        system="erp_tenant", check="alerts")
     assert answer["error"]["code"] == "destination_error"
     _clean(answer)
     _logs_clean(caplog)
@@ -364,11 +364,11 @@ async def test_unexpected_failure_is_answered(monkeypatch: pytest.MonkeyPatch,
         raise RuntimeError(f"{h.MARKER} {h.HOST}")
 
     monkeypatch.setattr(tools, "run_query", boom)
-    answer = await call(build(OAUTH_SELECT), "run_check", system="sib_tenant", check="alerts")
+    answer = await call(build(OAUTH_SELECT), "run_check", system="erp_tenant", check="alerts")
     assert answer == {"error": HanaError("call_failed").to_dict()}
     assert answer["error"]["message"] == (
         "The call could not be completed. Tell the user instead of retrying.")
-    answer = await call(build(OAUTH_SELECT), "run_select", system="sib_tenant",
+    answer = await call(build(OAUTH_SELECT), "run_select", system="erp_tenant",
                         sql="SELECT * FROM SYS.DUMMY")
     assert answer["error"]["code"] == "call_failed"
     _clean(answer)
@@ -381,9 +381,9 @@ async def test_unexpected_failure_is_answered(monkeypatch: pytest.MonkeyPatch,
 async def test_run_select_ok_unmasked(db: h.FakeDbapi) -> None:
     db.description = (("STATEMENT_STRING",),)
     db.rows = [(STATEMENT,)]
-    answer = await call(build(OAUTH_SELECT), "run_select", system="sib_tenant",
+    answer = await call(build(OAUTH_SELECT), "run_select", system="erp_tenant",
                         sql="SELECT STATEMENT_STRING FROM M_EXPENSIVE_STATEMENTS")
-    assert answer == {"system": "sib_tenant", "columns": ["STATEMENT_STRING"],
+    assert answer == {"system": "erp_tenant", "columns": ["STATEMENT_STRING"],
                       "rows": [[STATEMENT]], "row_count": 1, "truncated": False}
     assert ("fetchmany", 101) in db.calls
     executed = [c for c in db.calls if c[0] == "execute"]
@@ -392,7 +392,7 @@ async def test_run_select_ok_unmasked(db: h.FakeDbapi) -> None:
 
 async def test_run_select_top(db: h.FakeDbapi) -> None:
     db.rows = [(i, i) for i in range(4)]
-    answer = await call(build(OAUTH_SELECT), "run_select", system="sib_tenant",
+    answer = await call(build(OAUTH_SELECT), "run_select", system="erp_tenant",
                         sql="SELECT * FROM SYS.DUMMY", top=2)
     assert answer["row_count"] == 2 and answer["truncated"] is True
     assert ("fetchmany", 3) in db.calls
@@ -400,7 +400,7 @@ async def test_run_select_top(db: h.FakeDbapi) -> None:
 
 @pytest.mark.parametrize("top", [0, 501, True, "5", 2.0])
 async def test_run_select_bad_top(db: h.FakeDbapi, top: Any) -> None:
-    answer = await call(build(OAUTH_SELECT), "run_select", system="sib_tenant",
+    answer = await call(build(OAUTH_SELECT), "run_select", system="erp_tenant",
                         sql="SELECT * FROM SYS.DUMMY", top=top)
     assert answer["error"]["code"] == "invalid_argument"
     assert answer["error"]["argument"] == "top"
@@ -415,7 +415,7 @@ async def test_run_select_bad_top(db: h.FakeDbapi, top: Any) -> None:
     (12, "unreadable"),
 ])
 async def test_run_select_guard_refusal(db: h.FakeDbapi, sql: Any, rule: str) -> None:
-    answer = await call(build(OAUTH_SELECT), "run_select", system="sib_tenant", sql=sql)
+    answer = await call(build(OAUTH_SELECT), "run_select", system="erp_tenant", sql=sql)
     assert answer["error"]["code"] == "select_refused"
     assert answer["error"]["rule"] == rule
     _clean(answer, "customer4711", "KNA1")
@@ -431,7 +431,7 @@ async def test_run_select_unknown_system(db: h.FakeDbapi) -> None:
 
 async def test_run_select_result_too_large(db: h.FakeDbapi) -> None:
     db.rows = [("y" * 1000, i) for i in range(70)]
-    answer = await call(build(OAUTH_SELECT), "run_select", system="sib_tenant",
+    answer = await call(build(OAUTH_SELECT), "run_select", system="erp_tenant",
                         sql="SELECT * FROM SYS.DUMMY", top=500)
     assert answer["error"]["code"] == "result_too_large"
 
@@ -443,14 +443,14 @@ async def test_column_names_are_cut_and_carry_no_control_or_format_character(
         db: h.FakeDbapi) -> None:
     db.description = (("A\nB\u202eC\u2028D\u00adE",), ("N" * 300,), (7,))
     db.rows = [(1, 2, 3)]
-    answer = await call(build(OAUTH_SELECT), "run_select", system="sib_tenant",
+    answer = await call(build(OAUTH_SELECT), "run_select", system="erp_tenant",
                         sql="SELECT * FROM SYS.DUMMY")
     assert answer["columns"] == ["A?B?C?D?E", "N" * 128, "7"]
 
 
 async def test_run_check_column_names_are_cleaned_too(db: h.FakeDbapi) -> None:
     db.description = (("A\tB",), ("B",))
-    answer = await call(build(), "run_check", system="sib_tenant", check="alerts")
+    answer = await call(build(), "run_check", system="erp_tenant", check="alerts")
     assert answer["columns"] == ["A?B", "B"]
 
 

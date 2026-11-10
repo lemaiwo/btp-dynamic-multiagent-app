@@ -49,7 +49,7 @@ def _logs_clean(caplog: pytest.LogCaptureFixture) -> None:
 
 def _system(**kw) -> HanaSystem:
     return HanaSystem(
-        "sib_tenant", "hana-test",
+        "erp_tenant", "hana-test",
         resolver=kw.pop("resolver", h.FakeResolver()),
         tokens=kw.pop("tokens", h.FakeTokens()),
     )
@@ -90,7 +90,7 @@ def test_hana_error_refuses_an_unknown_code():
 
 
 def test_http_shape_gives_target():
-    target = settings_from_properties(h.http_props(), "sib")
+    target = settings_from_properties(h.http_props(), "erp")
     assert isinstance(target, HanaTarget)
     assert (target.host, target.port) == (h.HOST, 30015)
     assert (target.user, target.password) == (h.USER, h.PASSWORD)
@@ -101,7 +101,7 @@ def test_http_shape_gives_target():
 
 def test_tcp_shape_gives_target():
     target = settings_from_properties(
-        h.tcp_props(CloudConnectorLocationId="loc1"), "sib")
+        h.tcp_props(CloudConnectorLocationId="loc1"), "erp")
     assert (target.host, target.port) == (h.HOST, 30013)
     assert target.location_id == "loc1"
 
@@ -112,20 +112,20 @@ def test_default_encrypt_is_on():
 
 @pytest.mark.parametrize("value,expected", [("false", False), ("true", True)])
 def test_hana_encrypt_property(value, expected):
-    target = settings_from_properties(h.http_props(**{"hana.encrypt": value}), "sib")
+    target = settings_from_properties(h.http_props(**{"hana.encrypt": value}), "erp")
     assert target.encrypt is expected
 
 
 @pytest.mark.parametrize("value", ["False", "no", "0", "", " false", "TRUE"])
 def test_hana_encrypt_other_value_refused(value):
     with pytest.raises(HanaError) as info:
-        settings_from_properties(h.http_props(**{"hana.encrypt": value}), "sib")
+        settings_from_properties(h.http_props(**{"hana.encrypt": value}), "erp")
     assert info.value.code == "destination_error"
 
 
 def test_ssl_host_property_read():
     target = settings_from_properties(
-        h.http_props(**{"hana.sslHostNameInCertificate": "db.example.invalid"}), "sib")
+        h.http_props(**{"hana.sslHostNameInCertificate": "db.example.invalid"}), "erp")
     assert target.ssl_host == "db.example.invalid"
 
 
@@ -152,7 +152,7 @@ def test_ssl_host_property_read():
 def test_bad_destination_refused(props, caplog):
     caplog.set_level(logging.DEBUG)
     with pytest.raises(HanaError) as info:
-        settings_from_properties(props, "sib")
+        settings_from_properties(props, "erp")
     assert info.value.code == "destination_error"
     _no_secret(str(info.value.to_dict()))
     _logs_clean(caplog)
@@ -160,7 +160,7 @@ def test_bad_destination_refused(props, caplog):
 
 def test_target_repr_shows_no_credential_or_host():
     target = settings_from_properties(
-        h.http_props(CloudConnectorLocationId="loc1"), "sib")
+        h.http_props(CloudConnectorLocationId="loc1"), "erp")
     text = repr(target) + str(target)
     _no_secret(text)
     assert "loc1" not in text
@@ -172,7 +172,7 @@ PROXY = Socks5Proxy("connectivity-proxy.internal", 20004)
 
 
 def test_connect_kwargs_props_variant_unencrypted():
-    target = settings_from_properties(h.http_props(**{"hana.encrypt": "false"}), "sib")
+    target = settings_from_properties(h.http_props(**{"hana.encrypt": "false"}), "erp")
     assert connect_kwargs(target, h.TOKEN, PROXY) == {
         "address": h.HOST,
         "port": 30015,
@@ -188,13 +188,13 @@ def test_connect_kwargs_props_variant_unencrypted():
 
 
 def test_connect_kwargs_encrypted_validates_always():
-    target = settings_from_properties(h.http_props(), "sib")
+    target = settings_from_properties(h.http_props(), "erp")
     kwargs = connect_kwargs(target, h.TOKEN, PROXY)
     assert kwargs["encrypt"] == "true"
     assert kwargs["sslValidateCertificate"] == "true"
     assert "sslHostNameInCertificate" not in kwargs
     target = settings_from_properties(
-        h.http_props(**{"hana.sslHostNameInCertificate": "db.example.invalid"}), "sib")
+        h.http_props(**{"hana.sslHostNameInCertificate": "db.example.invalid"}), "erp")
     kwargs = connect_kwargs(target, h.TOKEN, PROXY)
     assert kwargs["sslHostNameInCertificate"] == "db.example.invalid"
 
@@ -202,7 +202,7 @@ def test_connect_kwargs_encrypted_validates_always():
 def test_connect_kwargs_no_ssl_keys_without_encrypt():
     target = settings_from_properties(
         h.http_props(**{"hana.encrypt": "false",
-                        "hana.sslHostNameInCertificate": "db.example.invalid"}), "sib")
+                        "hana.sslHostNameInCertificate": "db.example.invalid"}), "erp")
     kwargs = connect_kwargs(target, h.TOKEN, PROXY)
     assert "sslValidateCertificate" not in kwargs
     assert "sslHostNameInCertificate" not in kwargs
@@ -210,14 +210,14 @@ def test_connect_kwargs_no_ssl_keys_without_encrypt():
 
 def test_connect_kwargs_location_id_goes_into_proxy_password():
     target = settings_from_properties(
-        h.http_props(CloudConnectorLocationId="loc1", **{"hana.encrypt": "false"}), "sib")
+        h.http_props(CloudConnectorLocationId="loc1", **{"hana.encrypt": "false"}), "erp")
     kwargs = connect_kwargs(target, h.TOKEN, PROXY)
     assert kwargs["proxyPassword"] == "1." + base64.b64encode(b"loc1").decode()
     assert "proxyScpAccount" not in kwargs
 
 
 def test_connect_kwargs_without_location_has_no_proxy_password():
-    target = settings_from_properties(h.http_props(), "sib")
+    target = settings_from_properties(h.http_props(), "erp")
     assert "proxyPassword" not in connect_kwargs(target, h.TOKEN, PROXY)
 
 
@@ -317,7 +317,7 @@ async def test_connect_failure_closes_nothing_and_maps(monkeypatch, caplog):
     assert info.value.code == "login_failed"
     assert db.steps() == ["connect"]
     _logs_clean(caplog)
-    assert any("sib_tenant" in r.getMessage() and "connect" in r.getMessage()
+    assert any("erp_tenant" in r.getMessage() and "connect" in r.getMessage()
                for r in caplog.records)
 
 
@@ -460,7 +460,7 @@ async def test_no_connectivity_binding(monkeypatch, caplog):
     import agents.destination as destination
 
     monkeypatch.setattr(destination, "connectivity_from_environment", lambda: None)
-    system = HanaSystem("sib_tenant", "hana-test", resolver=h.FakeResolver())
+    system = HanaSystem("erp_tenant", "hana-test", resolver=h.FakeResolver())
     with pytest.raises(HanaError) as info:
         await run_query(system, "SELECT 1 FROM DUMMY", [], 1)
     assert info.value.code == "destination_error"
@@ -476,7 +476,7 @@ async def test_no_destination_binding(monkeypatch):
         raise DestinationError("no binding")
 
     monkeypatch.setattr(destination, "resolver_from_environment", refuse)
-    system = HanaSystem("sib_tenant", "hana-test", tokens=h.FakeTokens())
+    system = HanaSystem("erp_tenant", "hana-test", tokens=h.FakeTokens())
     with pytest.raises(HanaError) as info:
         await run_query(system, "SELECT 1 FROM DUMMY", [], 1)
     assert info.value.code == "destination_error"
@@ -496,7 +496,7 @@ async def test_token_failure_is_proxy_refused(monkeypatch, caplog):
 
 def test_system_repr_names_no_destination_internals():
     system = _system()
-    assert "sib_tenant" in repr(system)
+    assert "erp_tenant" in repr(system)
 
 
 def test_hdbcli_not_imported_at_module_load():
@@ -527,23 +527,23 @@ def test_schema_statement_is_fixed():
 
 
 def test_hana_database_property_accepted_and_ignored():
-    target = settings_from_properties(h.http_props(**{"hana.database": "SIB"}), "sib")
+    target = settings_from_properties(h.http_props(**{"hana.database": "ERP"}), "erp")
     kwargs = connect_kwargs(target, h.TOKEN, PROXY)
     assert "databaseName" not in kwargs
-    assert "SIB" not in repr(target)
+    assert "ERP" not in repr(target)
 
 
 def test_unknown_hana_property_named_by_rule_not_value(caplog):
     caplog.set_level(logging.DEBUG)
     with pytest.raises(HanaError) as info:
-        settings_from_properties(h.http_props(**{"hana.sslTrustStore": h.MARKER}), "sib")
+        settings_from_properties(h.http_props(**{"hana.sslTrustStore": h.MARKER}), "erp")
     assert info.value.code == "destination_error"
     _logs_clean(caplog)
     assert any("hana." in r.getMessage() for r in caplog.records)
 
 
 def test_connect_kwargs_encrypt_off_is_the_landscape_set():
-    target = settings_from_properties(h.http_props(**{"hana.encrypt": "false"}), "sib")
+    target = settings_from_properties(h.http_props(**{"hana.encrypt": "false"}), "erp")
     kwargs = connect_kwargs(target, h.TOKEN, PROXY)
     assert kwargs["encrypt"] == "false"
     assert not [k for k in kwargs if k.startswith("ssl")]
@@ -647,4 +647,4 @@ async def test_the_deadline_covers_the_wait_for_a_free_slot(monkeypatch, caplog)
     await run_query(_system(), "SELECT 1 FROM DUMMY", [], 1)
     assert slot._value == MAX_CONCURRENT
     _logs_clean(caplog)
-    assert any("sib_tenant" in r.getMessage() for r in caplog.records)
+    assert any("erp_tenant" in r.getMessage() for r in caplog.records)

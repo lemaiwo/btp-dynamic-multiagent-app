@@ -23,8 +23,8 @@ from agents.hana.config import (
 
 VALID = {
     "systems": [
-        {"name": "sib_systemdb", "destination": "HANA_SIB_SYSTEMDB"},
-        {"name": "sib_tenant", "destination": "HANA_SIB_TENANT"},
+        {"name": "erp_systemdb", "destination": "HANA_ERP_SYSTEMDB"},
+        {"name": "erp_tenant", "destination": "HANA_ERP_TENANT"},
     ],
     "allow_select": True,
 }
@@ -66,7 +66,7 @@ def test_clean_entry_returns_a_copy():
     cfg = _with()
     cleaned = clean_entry(cfg)
     cleaned["systems"][0]["name"] = "other"
-    assert cfg["systems"][0]["name"] == "sib_systemdb"
+    assert cfg["systems"][0]["name"] == "erp_systemdb"
 
 
 def test_allow_select_absent_or_false_is_stored_absent():
@@ -125,7 +125,7 @@ def test_item_without_name_or_destination(missing):
 
 
 @pytest.mark.parametrize("name", [
-    "Sib", "1sib", "_sib", "sib-tenant", "sib tenant", " sib", "sib ", "sib\n",
+    "Erp", "1erp", "_erp", "erp-tenant", "erp tenant", " erp", "erp ", "erp\n",
     "a" * 33, "", "sïb", 7, None, True])
 def test_bad_name(name):
     text = _refused(_with(systems=[{"name": name, "destination": "HANA_X"}]),
@@ -138,20 +138,20 @@ def test_bad_name(name):
 
 
 def test_good_names():
-    for name in ("a", "sib_systemdb", "a" * 32, "x9_"):
+    for name in ("a", "erp_systemdb", "a" * 32, "x9_"):
         clean_entry(_with(systems=[{"name": name, "destination": "HANA_X"}]))
 
 
 def test_duplicate_names():
-    systems = [{"name": "sib", "destination": "HANA_A"},
-               {"name": "sib", "destination": "HANA_B"}]
+    systems = [{"name": "erp", "destination": "HANA_A"},
+               {"name": "erp", "destination": "HANA_B"}]
     text = _refused(_with(systems=systems), "oauth.systems[1].name: duplicate", "HANA_A")
-    assert "sib" not in text.split(":", 1)[1]
+    assert "erp" not in text.split(":", 1)[1]
 
 
 def test_names_are_case_sensitive_only_lower_case_allowed():
     # Upper case is refused by the pattern, so a case-folded duplicate cannot exist.
-    _refused(_with(systems=[{"name": "SIB", "destination": "HANA_A"}]),
+    _refused(_with(systems=[{"name": "ERP", "destination": "HANA_A"}]),
              "oauth.systems[0].name:")
 
 
@@ -164,7 +164,7 @@ def test_bad_destination(destination):
 
 
 def test_good_destinations():
-    for destination in ("A", "HANA.SIB-1_x", "H" * 200):
+    for destination in ("A", "HANA.ERP-1_x", "H" * 200):
         clean_entry(_with(systems=[{"name": "x", "destination": destination}]))
 
 
@@ -210,8 +210,8 @@ def test_top_level_destination_is_refused():
 def test_pins_of():
     pins = pins_of(VALID)
     assert pins == Pins(
-        systems=(("sib_systemdb", "HANA_SIB_SYSTEMDB"),
-                 ("sib_tenant", "HANA_SIB_TENANT")),
+        systems=(("erp_systemdb", "HANA_ERP_SYSTEMDB"),
+                 ("erp_tenant", "HANA_ERP_TENANT")),
         allow_select=True)
     with pytest.raises(dataclasses.FrozenInstanceError):
         pins.allow_select = False  # type: ignore[misc]

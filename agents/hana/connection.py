@@ -51,7 +51,8 @@ from agents.hana.errors import HanaError
 
 logger = logging.getLogger(__name__)
 
-# probe 2026-11-10: SIB refuses TLS on its SQL ports; its destinations set hana.encrypt=false
+# landscape probe 2026-11-10: the first on-premise system refuses TLS on its SQL ports;
+# its destinations set hana.encrypt=false
 DEFAULT_ENCRYPT = True
 CONNECT_TIMEOUT_MS = 15000
 QUERY_TIMEOUT_SECONDS = 20
