@@ -151,6 +151,8 @@ class FakeDbapi:
     inside: int = 0
     peak: int = 0
     closed: bool = False
+    #: Passwords the fake database refuses with SQL code 10 (a wrong password).
+    refuse_passwords: set[str] = field(default_factory=set)
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def connect(self, **kwargs: Any) -> FakeConnection:
@@ -165,6 +167,8 @@ class FakeDbapi:
             failure = self.fail_at.get("connect")
             if failure is not None:
                 raise failure
+            if kwargs.get("password") in self.refuse_passwords:
+                raise driver_error(10, "authentication failed")
             self.closed = False
             return FakeConnection(self)
         finally:
@@ -175,8 +179,19 @@ class FakeDbapi:
         return [c[0] for c in self.calls]
 
 
+def fresh_login_state(monkeypatch: Any) -> None:
+    """Give the test a login state of its own (the connection layer keeps it
+    per process, keyed by destination): no breaker or confirmed login of an
+    earlier test reaches it, and the old state is back after the test."""
+    from agents.hana import connection
+
+    monkeypatch.setattr(connection, "_logins", {})
+
+
 def install(monkeypatch: Any, db: FakeDbapi | None = None) -> FakeDbapi:
-    """Inject a fake ``hdbcli`` package backed by ``db``."""
+    """Inject a fake ``hdbcli`` package backed by ``db``, with a fresh login
+    state (:func:`fresh_login_state`)."""
+    fresh_login_state(monkeypatch)
     db = db or FakeDbapi()
     dbapi = types.ModuleType("hdbcli.dbapi")
     dbapi.Error = Error

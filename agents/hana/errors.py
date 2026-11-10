@@ -23,7 +23,9 @@ MESSAGES: dict[str, str] = {
     "unreachable": "The database could not be reached through the Cloud Connector.",
     "login_failed": (
         "The database refused the login of the destination's user. Nothing was "
-        "read; tell the user instead of retrying."),
+        "read; tell the user instead of retrying. No login is tried again with "
+        "this password: once it is corrected in the destination it is used at "
+        "most about 15 minutes later, or at once after an admin presses Reload."),
     "not_authorized": "The database user may not read this view.",
     "timeout": "The database did not answer in time.",
     "unknown_system": "No system of that name is configured for this agent.",

@@ -339,6 +339,7 @@ async def test_at_most_four_at_a_time(monkeypatch):
     gate = threading.Event()
     db = h.install(monkeypatch, h.FakeDbapi(gate=gate))
     assert MAX_CONCURRENT == 4
+    await _confirm(db)
     tasks = [asyncio.create_task(run_query(_system(), "SELECT 1 FROM DUMMY", [], 1))
              for _ in range(5)]
     for _ in range(200):
@@ -347,16 +348,17 @@ async def test_at_most_four_at_a_time(monkeypatch):
         await asyncio.sleep(0.01)
     await asyncio.sleep(0.05)
     assert db.inside == 4
-    assert len(db.connect_kwargs) == 4
+    assert len(db.connect_kwargs) == 1 + 4
     gate.set()
     await asyncio.gather(*tasks)
     assert db.peak == 4
-    assert len(db.connect_kwargs) == 5
+    assert len(db.connect_kwargs) == 1 + 5
 
 
 async def test_cancelled_caller_keeps_slot_until_thread_ends(monkeypatch):
     gate = threading.Event()
     db = h.install(monkeypatch, h.FakeDbapi(gate=gate))
+    await _confirm(db)
     tasks = [asyncio.create_task(run_query(_system(), "SELECT 1 FROM DUMMY", [], 1))
              for _ in range(4)]
     for _ in range(200):
@@ -368,11 +370,19 @@ async def test_cancelled_caller_keeps_slot_until_thread_ends(monkeypatch):
     await asyncio.gather(*tasks, return_exceptions=True)
     fifth = asyncio.create_task(run_query(_system(), "SELECT 1 FROM DUMMY", [], 1))
     await asyncio.sleep(0.05)
-    assert len(db.connect_kwargs) == 4  # the fifth still waits for a slot
+    assert len(db.connect_kwargs) == 1 + 4  # the fifth still waits for a slot
     gate.set()
     await fifth
-    assert len(db.connect_kwargs) == 5
+    assert len(db.connect_kwargs) == 1 + 5
     assert db.peak <= 4
+
+
+async def _confirm(db: h.FakeDbapi) -> None:
+    """One successful login first: until one succeeded, logins through a
+    destination are made one at a time (tests/test_hanadb_login.py)."""
+    gate, db.gate = db.gate, None
+    await run_query(_system(), "SELECT 1 FROM DUMMY", [], 1)
+    db.gate = gate
 
 
 # ---- error mapping -----------------------------------------------------------------------
@@ -577,6 +587,7 @@ async def test_call_deadline_raises_timeout_and_keeps_slot(monkeypatch, caplog):
     caplog.set_level(logging.DEBUG)
     gate = threading.Event()
     db = h.install(monkeypatch, h.FakeDbapi(gate=gate))
+    await _confirm(db)
     assert connection.CALL_DEADLINE_SECONDS == 45
     monkeypatch.setattr(connection, "CALL_DEADLINE_SECONDS", 0.1)
     with pytest.raises(HanaError) as info:
@@ -587,10 +598,11 @@ async def test_call_deadline_raises_timeout_and_keeps_slot(monkeypatch, caplog):
     more = [asyncio.create_task(run_query(_system(), "SELECT 1 FROM DUMMY", [], 1))
             for _ in range(4)]
     await asyncio.sleep(0.1)
-    assert len(db.connect_kwargs) == 4  # 1 timed-out thread + 3: the slot is still taken
+    # 1 timed-out thread + 3: the slot is still taken
+    assert len(db.connect_kwargs) == 1 + 4
     gate.set()
     await asyncio.gather(*more)
-    assert len(db.connect_kwargs) == 5
+    assert len(db.connect_kwargs) == 1 + 5
     assert db.peak <= MAX_CONCURRENT
     _logs_clean(caplog)
 
@@ -636,6 +648,7 @@ async def test_the_deadline_covers_the_wait_for_a_free_slot(monkeypatch, caplog)
     caplog.set_level(logging.DEBUG)
     gate = threading.Event()
     db = h.install(monkeypatch, h.FakeDbapi(gate=gate))
+    await _confirm(db)
     held = [asyncio.create_task(run_query(_system(), "SELECT 1 FROM DUMMY", [], 1))
             for _ in range(MAX_CONCURRENT)]
     await _until(lambda: db.inside == MAX_CONCURRENT)
@@ -643,7 +656,7 @@ async def test_the_deadline_covers_the_wait_for_a_free_slot(monkeypatch, caplog)
     with pytest.raises(HanaError) as info:
         await run_query(_system(), "SELECT 1 FROM DUMMY", [], 1)
     assert info.value.code == "timeout"
-    assert len(db.connect_kwargs) == MAX_CONCURRENT  # the fifth never connected
+    assert len(db.connect_kwargs) == 1 + MAX_CONCURRENT  # the fifth never connected
     monkeypatch.setattr(connection, "CALL_DEADLINE_SECONDS", 5)
     gate.set()
     await asyncio.gather(*held)
@@ -717,6 +730,7 @@ async def test_breaker_window_ends_and_reads_the_destination_fresh(monkeypatch):
     assert db.steps() == ["connect"]
     assert resolver.forced == [False]  # the blocked call read nothing
     del db.fail_at["connect"]
+    resolver.props = h.http_props(Password="pw-corrected-1c9d")
     now[0] += 2
     await run_query(system, "SELECT 1 FROM SYS.DUMMY", [], 1)
     assert db.steps().count("connect") == 2
@@ -738,13 +752,18 @@ async def test_breaker_is_per_system(monkeypatch):
     assert db.steps() == ["connect", "connect"]
 
 
-async def test_a_new_system_object_resets_the_breaker(monkeypatch):
-    # A registry reload builds new HanaSystem objects: the way out after the
-    # password was corrected in the destination.
+async def test_a_reload_resets_the_breaker_a_new_system_object_does_not(monkeypatch):
+    # The breaker belongs to the destination, not to the system object: a
+    # registry reload calls reset_login_state(), the way out after the
+    # password was corrected in the database.
     db = _login_failing(monkeypatch)
     with pytest.raises(HanaError):
         await run_query(_system(), "SELECT 1 FROM SYS.DUMMY", [], 1)
     del db.fail_at["connect"]
+    with pytest.raises(HanaError):
+        await run_query(_system(), "SELECT 1 FROM SYS.DUMMY", [], 1)
+    assert db.steps().count("connect") == 1
+    connection.reset_login_state()
     await run_query(_system(), "SELECT 1 FROM SYS.DUMMY", [], 1)
     assert db.steps().count("connect") == 2
 
