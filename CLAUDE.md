@@ -1002,7 +1002,16 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     destination fresh once per window (an epoch, `recheck_at`); a digest in
     the list is answered `login_failed` without a connect and WITHOUT opening
     the shared window again (another destination of the account with the
-    correct password still connects), a new one is tried (one at a time).
+    correct password still connects), a new one is tried (one at a time);
+    a refusal's WARNING is logged once per window per account (`warned_until`).
+    (3) **The account cap**: HANA counts invalid connects per USER, whatever
+    the password, so the state also counts the account's failed logins since
+    its last successful one (`failures`; a success sets it to 0 and clears
+    `recheck_at`, a soft reset keeps it, a full reset clears it): from
+    `MAX_FAILED_LOGINS` (3) on, no login is tried with ANY credential, before
+    the lock and the slot, until a full reset; the `login_failed` hint then
+    tells the admin to correct the password in the destination, make sure the
+    database user is not locked, and press Reload.
     **Two resets**: `soft_reset_login_state()`, called by every
     `Registry.reload` (a model change, an agent or catalogue save, a bundle
     import, the IDE seed refresh...), keeps each failed digest and drops the
@@ -1013,13 +1022,16 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     BEFORE their registry reload (whose soft reset only removes, so it cannot
     bring a failure back): "I fixed it", also the way out after the user was
     unlocked in the database with the same password. Without either, a
-    corrected password is used at most about 15 minutes later. **Worst case
-    per account per app instance**: each distinct wrong credential costs 1
-    failed login (nothing confirmed); a confirmed credential going stale in
-    the database at most `MAX_CONCURRENT` (4): only threads already running
-    when the first failure is recorded can still fail; then 0 for every
-    credential in the failed list; +1 per explicit Reload, Restart or app
-    start; soft reloads add 0. Two app instances double it. `connectTimeout` 15 s,
+    corrected password is used at most about 15 minutes later (while the
+    account is under its cap). **Worst case per database account per app
+    instance**: at most max(`MAX_CONCURRENT`, `MAX_FAILED_LOGINS`) = 4 failed
+    logins reach the database without an explicit admin Reload / Restart or
+    an app start, however many wrong credentials are tried (4 only when a
+    confirmed credential goes stale with every slot in flight: those threads
+    already run when the first failure is recorded; else 3); soft reloads add
+    0. Each explicit Reload, Restart or app start allows a new round, so an
+    admin who presses Reload repeatedly with a wrong password can still lock
+    the user. More app instances multiply it. `connectTimeout` 15 s,
     `communicationTimeout` 30 s (not in the keyword set the probe proved:
     unverified on the landscape); ONE deadline of 45 s
     (`CALL_DEADLINE_SECONDS`, `asyncio.timeout` with `expired()`) covers the

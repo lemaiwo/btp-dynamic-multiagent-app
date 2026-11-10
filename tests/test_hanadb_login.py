@@ -657,3 +657,127 @@ async def test_a_success_keeps_the_other_failed_credentials(monkeypatch):
     state = _state("hana-a")
     assert state.confirmed is not None and len(state.failed) == 1
     assert state.blocked_until < now[0]
+
+
+# ---- at most MAX_FAILED_LOGINS failed logins per account until a full reset -------------
+# HANA counts invalid connects per USER, not per password (default lock limit 6).
+
+
+def _with_password(system: HanaSystem, password: str) -> None:
+    system._resolver.props = h.http_props(Password=password)
+
+
+async def test_a_stale_burst_then_new_wrong_passwords_cost_nothing_more(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(connection, "_clock", lambda: now[0])
+    gate = threading.Event()
+    db = h.install(monkeypatch)
+    system = _system(resolver=h.FakeResolver())
+    await run_query(system, SQL, [], 1)  # A confirmed
+    db.refuse_passwords.update({h.PASSWORD, OTHER_PASSWORD, "pw-third-2b8e41"})
+    db.gate = gate
+    tasks = [asyncio.create_task(run_query(system, SQL, [], 1)) for _ in range(MAX_CONCURRENT)]
+    await _until(lambda: db.inside == MAX_CONCURRENT)
+    gate.set()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    assert len(db.connect_kwargs) == 1 + MAX_CONCURRENT  # the burst: 4 failed
+    for password in (OTHER_PASSWORD, "pw-third-2b8e41"):
+        _with_password(system, password)
+        for _ in range(2):
+            now[0] += LOGIN_BREAKER_SECONDS + 1
+            connection.soft_reset_login_state()
+            with pytest.raises(HanaError) as info:
+                await run_query(system, SQL, [], 1)
+            assert info.value.code == "login_failed"
+    assert len(db.connect_kwargs) == 1 + MAX_CONCURRENT
+    reset_login_state()  # the admin's Reload
+    with pytest.raises(HanaError):
+        await run_query(system, SQL, [], 1)
+    assert len(db.connect_kwargs) == 2 + MAX_CONCURRENT
+    assert db.connect_kwargs[-1]["password"] == "pw-third-2b8e41"
+
+
+async def test_three_wrong_passwords_and_the_fourth_is_not_tried(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(connection, "_clock", lambda: now[0])
+    passwords = [f"pw-wrong-{n}-2b8e41" for n in range(4)]
+    db = h.install(monkeypatch, h.FakeDbapi(refuse_passwords=set(passwords)))
+    system = _system(resolver=h.FakeResolver())
+    assert connection.MAX_FAILED_LOGINS == 3
+    for password in passwords:
+        _with_password(system, password)
+        now[0] += LOGIN_BREAKER_SECONDS + 1
+        with pytest.raises(HanaError) as info:
+            await run_query(system, SQL, [], 1)
+        assert info.value.code == "login_failed"
+    assert len(db.connect_kwargs) == 3
+    connection.soft_reset_login_state()  # the count survives a soft reset
+    with pytest.raises(HanaError):
+        await run_query(system, SQL, [], 1)
+    assert len(db.connect_kwargs) == 3
+    message = HanaError("login_failed").message
+    assert "Reload" in message and "locked" in message and "destination" in message
+
+
+async def test_a_successful_login_resets_the_count(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(connection, "_clock", lambda: now[0])
+    wrong = [f"pw-wrong-{n}-2b8e41" for n in range(4)]
+    db = h.install(monkeypatch, h.FakeDbapi(refuse_passwords=set(wrong)))
+    system = _system(resolver=h.FakeResolver())
+    for password in (wrong[0], wrong[1], h.PASSWORD, wrong[2], wrong[3]):
+        _with_password(system, password)
+        now[0] += LOGIN_BREAKER_SECONDS + 1
+        try:
+            await run_query(system, SQL, [], 1)
+        except HanaError:
+            pass
+    assert len(db.connect_kwargs) == 5  # 2 failed, 1 success (count 0), 2 failed
+    assert _state().failures == 2
+
+
+async def test_a_confirmed_login_clears_the_recheck(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(connection, "_clock", lambda: now[0])
+    db = h.install(monkeypatch, h.FakeDbapi(refuse_passwords={h.PASSWORD}))
+    system = _system(resolver=h.FakeResolver())
+    with pytest.raises(HanaError):
+        await run_query(system, SQL, [], 1)
+    assert _state().recheck_at is not None
+    _with_password(system, OTHER_PASSWORD)
+    now[0] += LOGIN_BREAKER_SECONDS + 1
+    await run_query(system, SQL, [], 1)
+    assert _state().recheck_at is None and _state().failures == 0
+    assert len(db.connect_kwargs) == 2
+
+
+async def test_the_refusal_warnings_are_logged_once_per_window(monkeypatch, caplog):
+    caplog.set_level(logging.WARNING)
+    now = [1000.0]
+    monkeypatch.setattr(connection, "_clock", lambda: now[0])
+    passwords = [f"pw-wrong-{n}-2b8e41" for n in range(3)]
+    h.install(monkeypatch, h.FakeDbapi(refuse_passwords=set(passwords)))
+    system = _system(resolver=h.FakeResolver(h.http_props(Password=passwords[0])))
+    with pytest.raises(HanaError):
+        await run_query(system, SQL, [], 1)
+    now[0] += LOGIN_BREAKER_SECONDS + 1
+    for _ in range(4):
+        with pytest.raises(HanaError):
+            await run_query(system, SQL, [], 1)
+    stale = [r for r in caplog.records if "still holds" in r.getMessage()]
+    assert len(stale) == 1
+    for password in passwords[1:]:
+        _with_password(system, password)
+        now[0] += LOGIN_BREAKER_SECONDS + 1
+        with pytest.raises(HanaError):
+            await run_query(system, SQL, [], 1)
+    crossed = [r for r in caplog.records if "failed logins" in r.getMessage()]
+    assert len(crossed) == 1  # logged when the cap is reached
+    caplog.clear()
+    now[0] += LOGIN_BREAKER_SECONDS + 1
+    for _ in range(4):
+        with pytest.raises(HanaError):
+            await run_query(system, SQL, [], 1)
+    capped = [r for r in caplog.records if "failed logins" in r.getMessage()]
+    assert len(capped) == 1
+    _no_secret_in_logs(caplog)

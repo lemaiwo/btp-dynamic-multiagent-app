@@ -24,7 +24,12 @@ opens a breaker that answers ``login_failed`` without connecting for
 :data:`FAILED_CREDENTIALS_KEPT`, by :func:`credential_digest`) is tried
 again; such a caller is answered without opening the window again, so
 another destination of the account with the correct password still
-connects. A credential evicted from those 8 could be tried once more. Two
+connects. A credential evicted from those 8 could be tried once more. HANA
+counts invalid connects per USER, whatever the password, so an account also
+counts its failed logins since its last successful one: from
+:data:`MAX_FAILED_LOGINS` on, no login is tried with ANY credential until a
+full reset (the admin corrects the password, makes sure the user is not
+locked, and presses Reload). Two
 virtual hosts mapped to one backend cannot be told apart and are counted as
 two accounts: keep one destination per database user.
 
@@ -34,11 +39,14 @@ failed credential and drops only the window and the confirmations, so a
 corrected password is tried at once and the unchanged wrong one costs no
 login. :func:`reset_login_state` forgets everything; only the admin's Reload
 and Restart call it ("I fixed it", also the way out after an unlock in the
-database with the same password). Worst case per account and app instance:
-each distinct wrong credential costs 1 failed login (nothing confirmed), a
-confirmed credential going stale in the database at most
-:data:`MAX_CONCURRENT`; +1 per explicit Reload, Restart or app start; other
-reloads add none.
+database with the same password). Worst case per database account and app
+instance: at most ``max(MAX_CONCURRENT, MAX_FAILED_LOGINS)`` = 4 failed
+logins reach the database without an explicit Reload / Restart or an app
+start, however many wrong credentials are tried (4 when a confirmed one goes
+stale with every slot in flight, else 3); soft reloads add none. Each
+explicit Reload, Restart or app start allows a new round, so an admin who
+keeps pressing Reload with a wrong password can still lock the user. More app
+instances multiply it.
 
 **LOB values** (``NCLOB`` statement texts, ``BLOB``) are read in the worker
 thread before the connection closes, each up to a cap and all of a call
@@ -108,6 +116,10 @@ was cancelled keeps its slot until it ends."""
 LOGIN_BREAKER_SECONDS = 900
 """How long a system answers ``login_failed`` without connecting after a
 login failed (see the module docstring)."""
+MAX_FAILED_LOGINS = 3
+"""Failed logins an account may have since its last successful login (or
+the last full reset) before no login is tried with any credential: HANA
+locks a user after 6 invalid connects (default), counted per user."""
 FAILED_CREDENTIALS_KEPT = 8
 """How many failed credential digests an account remembers (oldest out
 first): two destinations of one account, or an old and a new password, must
@@ -421,7 +433,8 @@ class _Login:
     credential is held as :func:`credential_digest` only, and ``repr`` shows
     none of it."""
 
-    __slots__ = ("blocked_until", "confirmed", "epoch", "failed", "recheck_at")
+    __slots__ = ("blocked_until", "confirmed", "epoch", "failed", "failures",
+                 "recheck_at", "warned_until")
 
     def __init__(self) -> None:
         self.confirmed: str | None = None
@@ -431,11 +444,16 @@ class _Login:
         # When a caller next makes every system of the account read its
         # destination fresh (once per window, without closing the window).
         self.recheck_at: float | None = None
+        # Failed logins since the last successful one (or the full reset).
+        self.failures = 0
+        # Per refusal kind: until when its WARNING is not repeated.
+        self.warned_until: dict[str, float] = {}
         self.epoch = 0
 
     def __repr__(self) -> str:
         return (f"_Login(confirmed={self.confirmed is not None}, "
-                f"failed={len(self.failed)}, epoch={self.epoch})")
+                f"failed={len(self.failed)}, failures={self.failures}, "
+                f"epoch={self.epoch})")
 
     __str__ = __repr__
 
@@ -527,7 +545,30 @@ def _gate_closed(account: str, digest: str) -> bool:
     """No login may be tried: the breaker's window is open, or this very
     credential is the one that failed."""
     state = _login(account)
-    return _blocked(state) or digest in state.failed
+    return _blocked(state) or digest in state.failed or _capped(state)
+
+
+def _capped(state: _Login) -> bool:
+    """The account had MAX_FAILED_LOGINS failed logins since its last
+    successful one: no login with any credential until a full reset."""
+    return state.failures >= MAX_FAILED_LOGINS
+
+
+def _warn_once(state: _Login, kind: str, message: str, *args: Any) -> None:
+    """A refusal's WARNING at most once per window per account and kind."""
+    now = _clock()
+    until = state.warned_until.get(kind)
+    if until is None or now >= until:
+        state.warned_until[kind] = now + LOGIN_BREAKER_SECONDS
+        logger.warning(message, *args)
+
+
+def _refuse_capped(state: _Login, system: str) -> HanaError:
+    _warn_once(state, "capped", "hana: %d failed logins on the database account of "
+               "system %s; no login is tried with any password until an admin "
+               "corrects it, makes sure the user is not locked and presses Reload",
+               MAX_FAILED_LOGINS, system)
+    return HanaError("login_failed")
 
 
 def _confirmed(account: str, digest: str) -> bool:
@@ -562,6 +603,9 @@ def _note_login_failed(account: str, digest: str, system: str) -> None:
         state.failed.remove(digest)
     state.failed.append(digest)
     del state.failed[:-FAILED_CREDENTIALS_KEPT]
+    state.failures += 1
+    if _capped(state):
+        _refuse_capped(state, system)  # the WARNING, once per window
     # Whichever credential was confirmed: the gate closes for all of them, so
     # the next login is one at a time again.
     state.confirmed = None
@@ -575,6 +619,8 @@ def _note_login_ok(account: str, digest: str) -> None:
     # does. Nor does any success touch the OTHER failed credentials.
     if digest not in state.failed:
         state.confirmed = digest
+        state.failures = 0  # HANA resets its own count at a successful login
+        state.recheck_at = None
 
 
 def _settle(account: str, digest: str, system: str, fut: asyncio.Future) -> None:
@@ -853,6 +899,8 @@ async def run_query(system: HanaSystem, sql: str, binds: Sequence[Any],
     if known is not None:
         if _blocked(_login(known)):
             raise HanaError("login_failed")  # the window is open: nothing is read
+        if _capped(_login(known)):
+            raise _refuse_capped(_login(known), system.name)  # nothing is read
         _recheck_if_due(_login(known))
     props = await system.properties()
     target = settings_from_properties(props, system.name)
@@ -860,13 +908,16 @@ async def run_query(system: HanaSystem, sql: str, binds: Sequence[Any],
     account = account_key(target)
     _accounts[system.destination] = account
     state = _login(account)  # a reset may have replaced it meanwhile
+    if _capped(state):
+        raise _refuse_capped(state, system.name)
     if digest in state.failed:
         # The destination still holds a credential that failed on this
         # account: no login. The window is NOT opened again: it is shared by
         # the account, and another destination of it may hold the correct
         # password.
-        logger.warning("hana: the destination of system %s still holds the password "
-                       "that failed; no login tried (login breaker)", system.name)
+        _warn_once(state, "stale", "hana: the destination of system %s still holds "
+                   "the password that failed; no login tried (login breaker)",
+                   system.name)
         raise HanaError("login_failed")
     tokens = system.tokens()
     config = getattr(tokens, "config", None)
@@ -905,7 +956,7 @@ async def run_query(system: HanaSystem, sql: str, binds: Sequence[Any],
 __all__ = [
     "CALL_DEADLINE_SECONDS", "COMMUNICATION_TIMEOUT_MS", "CONNECT_TIMEOUT_MS",
     "DEFAULT_ENCRYPT", "LOB_BUDGET_CHARS", "LOB_MAX_BYTES", "LOB_MAX_CHARS",
-    "FAILED_CREDENTIALS_KEPT", "LOGIN_BREAKER_SECONDS",
+    "FAILED_CREDENTIALS_KEPT", "LOGIN_BREAKER_SECONDS", "MAX_FAILED_LOGINS",
     "MAX_CONCURRENT", "QUERY_TIMEOUT_SECONDS",
     "HanaSystem", "HanaTarget", "Socks5Proxy", "account_key", "connect_kwargs",
     "credential_digest", "map_driver_error", "reset_login_state", "run_query",
