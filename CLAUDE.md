@@ -945,12 +945,28 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   timeout.
   - `connection.py` — **one connection per call**, in a worker thread, at
     most `MAX_CONCURRENT` (4) at a time per app instance. In order:
-    autocommit off, `SET TRANSACTION READ ONLY`, `SET SCHEMA SYS` (the guard
-    allows unqualified `M_*` names and unqualified functions, which HANA
-    resolves in the current schema first; the user's own schema could hold
-    look-alikes), `setquerytimeout(20)`, execute, `fetchmany(top + 1)`, then
-    `rollback()` and `close()` on every path: nothing ever commits.
-    `connectTimeout` 15 s; ONE deadline of 45 s (`CALL_DEADLINE_SECONDS`,
+    autocommit off, `SET SCHEMA SYS` (the guard allows unqualified `M_*`
+    names and unqualified functions, which HANA resolves in the current
+    schema first; the user's own schema could hold look-alikes), `SET
+    TRANSACTION READ ONLY` (last, so no session statement can end or change
+    that transaction after it), `setquerytimeout(20)`, execute,
+    `fetchmany(top + 1)`, the LOB values of the kept rows read, then
+    `rollback()` and `close()` on every path: nothing ever commits. **LOB
+    values** (`STATEMENT_STRING` of `M_EXPENSIVE_STATEMENTS` /
+    `M_ACTIVE_STATEMENTS` is `NCLOB`): every value with a callable `read` is
+    read in the worker thread before the rollback (`_lob_value`): a text cut
+    at `LOB_MAX_CHARS` (65,536) with ` …[cut]`, bytes cut at 64 KiB (the
+    answer shows their size), a failing read the fixed `<unreadable LOB>`;
+    unverified on the real driver. **The login breaker** (`HanaSystem`): every
+    call is one login and HANA locks a user after a few invalid attempts (the
+    user may be a person's), so after a `login_failed` the system answers
+    `login_failed` without connecting for `LOGIN_BREAKER_SECONDS` (900) with
+    one WARNING (the slug only), and the next real attempt reads the
+    destination fresh (`resolve_properties(force=True)`); a registry reload
+    builds new systems and resets it: after correcting the password in the
+    destination, press Reload. Read and set on the event loop only.
+    `connectTimeout` 15 s, `communicationTimeout` 30 s (not in the keyword
+    set the probe proved: unverified on the landscape); ONE deadline of 45 s (`CALL_DEADLINE_SECONDS`,
     `asyncio.timeout` with `expired()`) covers the wait for a free slot and
     the run; a thread cannot be cancelled, so its slot is released only when
     the thread has ended (the caller already has `timeout`). **The

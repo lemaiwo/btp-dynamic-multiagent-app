@@ -206,6 +206,17 @@ async def test_run_check_binds_defaults_and_masks(db: h.FakeDbapi) -> None:
     assert answer["rows"][1][1] is None
 
 
+async def test_run_check_masks_a_statement_text_that_arrives_as_a_lob(db: h.FakeDbapi) -> None:
+    # STATEMENT_STRING is NCLOB: hdbcli hands it back as a LOB object.
+    db.description = (("A",), ("STATEMENT_STRING",))
+    db.rows = [(1, h.FakeLob(STATEMENT, db=db))]
+    answer = await call(build(), "run_check", system="erp_tenant", check="longRunning")
+    masked = answer["rows"][0][1]
+    assert isinstance(masked, str) and "KNA1" in masked
+    assert "customer4711" not in masked and "99" not in masked
+    assert not masked.startswith("<")
+
+
 async def test_run_check_binds_given_arguments(db: h.FakeDbapi) -> None:
     db.description = (("A",), ("STATEMENT_STRING",))
     await call(build(), "run_check", system="erp_tenant", check="longRunning",

@@ -52,6 +52,30 @@ def driver_error(code: Any, text: str = "", cls: type[Error] = DatabaseError) ->
     return cls(code, f"{text} {HOST} {USER} {MARKER}".strip())
 
 
+class FakeLob:
+    """Like an hdbcli LOB: ``read(size)`` answers at most ``size`` characters
+    (or bytes) of ``content``, and only while the connection is open; ``error``
+    makes ``read`` fail with a text that holds the marker. ``reads`` records
+    the sizes asked for."""
+
+    def __init__(self, content: str | bytes, *, error: BaseException | None = None,
+                 db: FakeDbapi | None = None) -> None:
+        self.content = content
+        self.error = error
+        self.db = db
+        self.reads: list[Any] = []
+
+    def read(self, size: int = -1, position: int = 0) -> str | bytes:
+        self.reads.append(size)
+        if self.db is not None:
+            self.db.calls.append(("lob_read",))
+            if self.db.closed:
+                raise driver_error(-10807, "LOB read after close")
+        if self.error is not None:
+            raise self.error
+        return self.content if size is None or size < 0 else self.content[:size]
+
+
 class FakeCursor:
     def __init__(self, db: FakeDbapi, conn: FakeConnection) -> None:
         self.db = db
@@ -112,6 +136,7 @@ class FakeConnection:
         self._step("commit")
 
     def close(self) -> None:
+        self.db.closed = True
         self._step("close")
 
 
@@ -125,6 +150,7 @@ class FakeDbapi:
     gate: threading.Event | None = None
     inside: int = 0
     peak: int = 0
+    closed: bool = False
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def connect(self, **kwargs: Any) -> FakeConnection:
@@ -139,6 +165,7 @@ class FakeDbapi:
             failure = self.fail_at.get("connect")
             if failure is not None:
                 raise failure
+            self.closed = False
             return FakeConnection(self)
         finally:
             with self._lock:
@@ -200,9 +227,11 @@ class FakeResolver:
         self.props = props if props is not None else http_props()
         self.error = error
         self.calls = 0
+        self.forced: list[bool] = []
 
     async def resolve_properties(self, *, force: bool = False) -> dict[str, str]:
         self.calls += 1
+        self.forced.append(force)
         if self.error is not None:
             raise self.error
         return self.props

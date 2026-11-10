@@ -18,8 +18,11 @@ import pytest
 from agents.destination import DestinationError
 from agents.hana import connection
 from agents.hana.connection import (
+    COMMUNICATION_TIMEOUT_MS,
     CONNECT_TIMEOUT_MS,
     DEFAULT_ENCRYPT,
+    LOB_MAX_CHARS,
+    LOGIN_BREAKER_SECONDS,
     MAX_CONCURRENT,
     QUERY_TIMEOUT_SECONDS,
     HanaSystem,
@@ -182,9 +185,11 @@ def test_connect_kwargs_props_variant_unencrypted():
         "proxyPort": "20004",
         "proxyUserName": h.TOKEN,
         "connectTimeout": str(CONNECT_TIMEOUT_MS),
+        "communicationTimeout": str(COMMUNICATION_TIMEOUT_MS),
         "encrypt": "false",
     }
     assert CONNECT_TIMEOUT_MS == 15000
+    assert COMMUNICATION_TIMEOUT_MS == 30000
 
 
 def test_connect_kwargs_encrypted_validates_always():
@@ -235,8 +240,8 @@ async def test_run_query_sequence_and_result(monkeypatch):
         ("connect",),
         ("setautocommit", False),
         ("cursor",),
-        ("read_only",),
         ("set_schema",),
+        ("read_only",),
         ("setquerytimeout", QUERY_TIMEOUT_SECONDS),
         ("execute", "SELECT A, B FROM M_X WHERE A = ?", ("1",)),
         ("fetchmany", 6),
@@ -280,7 +285,7 @@ async def test_run_query_runs_in_a_thread(monkeypatch):
 
 
 @pytest.mark.parametrize("step", [
-    "setautocommit", "cursor", "read_only", "set_schema", "setquerytimeout", "execute",
+    "setautocommit", "cursor", "set_schema", "read_only", "setquerytimeout", "execute",
     "fetchmany"])
 async def test_rollback_and_close_on_every_failure(monkeypatch, step, caplog):
     caplog.set_level(logging.DEBUG)
@@ -648,3 +653,167 @@ async def test_the_deadline_covers_the_wait_for_a_free_slot(monkeypatch, caplog)
     assert slot._value == MAX_CONCURRENT
     _logs_clean(caplog)
     assert any("erp_tenant" in r.getMessage() for r in caplog.records)
+
+
+# ---- final review: the order of the session statements ----------------------------------
+
+
+async def test_schema_is_pinned_before_the_transaction_is_made_read_only(monkeypatch):
+    db = h.install(monkeypatch)
+    await run_query(_system(), "SELECT 1 FROM SYS.DUMMY", [], 1)
+    steps = db.steps()
+    assert steps.index("setautocommit") < steps.index("set_schema") \
+        < steps.index("read_only") < steps.index("setquerytimeout") < steps.index("execute")
+    # nothing runs between the read-only statement and the query but the timeout
+    assert steps[steps.index("read_only") + 1:steps.index("execute")] == ["setquerytimeout"]
+
+
+# ---- final review: the login breaker ----------------------------------------------------
+
+
+def _login_failing(monkeypatch, code: int = 10) -> h.FakeDbapi:
+    return h.install(monkeypatch, h.FakeDbapi(
+        fail_at={"connect": h.driver_error(code, "authentication failed")}))
+
+
+async def test_breaker_after_a_login_failure_connects_once(monkeypatch, caplog):
+    caplog.set_level(logging.DEBUG)
+    db = _login_failing(monkeypatch)
+    system = _system()
+    for _ in range(3):
+        with pytest.raises(HanaError) as info:
+            await run_query(system, "SELECT 1 FROM SYS.DUMMY", [], 1)
+        assert info.value.code == "login_failed"
+    assert db.steps() == ["connect"]
+    warnings = [r.getMessage() for r in caplog.records
+                if r.levelno == logging.WARNING and "breaker" in r.getMessage()]
+    assert len(warnings) == 1 and "erp_tenant" in warnings[0]
+    _logs_clean(caplog)
+    assert "hana-test" not in " ".join(r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("code", [10, 414, 663])
+async def test_breaker_opens_for_every_login_code(monkeypatch, code):
+    db = _login_failing(monkeypatch, code)
+    system = _system()
+    for _ in range(2):
+        with pytest.raises(HanaError):
+            await run_query(system, "SELECT 1 FROM SYS.DUMMY", [], 1)
+    assert db.steps() == ["connect"]
+
+
+async def test_breaker_window_ends_and_reads_the_destination_fresh(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(connection, "_clock", lambda: now[0])
+    db = _login_failing(monkeypatch)
+    resolver = h.FakeResolver()
+    system = _system(resolver=resolver)
+    with pytest.raises(HanaError):
+        await run_query(system, "SELECT 1 FROM SYS.DUMMY", [], 1)
+    now[0] += LOGIN_BREAKER_SECONDS - 1
+    with pytest.raises(HanaError) as info:
+        await run_query(system, "SELECT 1 FROM SYS.DUMMY", [], 1)
+    assert info.value.code == "login_failed"
+    assert db.steps() == ["connect"]
+    assert resolver.forced == [False]  # the blocked call read nothing
+    del db.fail_at["connect"]
+    now[0] += 2
+    await run_query(system, "SELECT 1 FROM SYS.DUMMY", [], 1)
+    assert db.steps().count("connect") == 2
+    assert resolver.forced == [False, True]  # the cached properties were dropped
+    await run_query(system, "SELECT 1 FROM SYS.DUMMY", [], 1)
+    assert resolver.forced == [False, True, False]
+    assert LOGIN_BREAKER_SECONDS == 900
+
+
+async def test_breaker_is_per_system(monkeypatch):
+    db = _login_failing(monkeypatch)
+    first, second = _system(), HanaSystem(
+        "erp_systemdb", "hana-other", resolver=h.FakeResolver(), tokens=h.FakeTokens())
+    with pytest.raises(HanaError):
+        await run_query(first, "SELECT 1 FROM SYS.DUMMY", [], 1)
+    with pytest.raises(HanaError) as info:
+        await run_query(second, "SELECT 1 FROM SYS.DUMMY", [], 1)
+    assert info.value.code == "login_failed"
+    assert db.steps() == ["connect", "connect"]
+
+
+async def test_a_new_system_object_resets_the_breaker(monkeypatch):
+    # A registry reload builds new HanaSystem objects: the way out after the
+    # password was corrected in the destination.
+    db = _login_failing(monkeypatch)
+    with pytest.raises(HanaError):
+        await run_query(_system(), "SELECT 1 FROM SYS.DUMMY", [], 1)
+    del db.fail_at["connect"]
+    await run_query(_system(), "SELECT 1 FROM SYS.DUMMY", [], 1)
+    assert db.steps().count("connect") == 2
+
+
+@pytest.mark.parametrize("failure", [
+    h.driver_error(258, "insufficient privilege"),
+    h.driver_error(-10709, "connection refused"),
+    ConnectionRefusedError(111, "refused"),
+])
+async def test_other_failures_do_not_open_the_breaker(monkeypatch, failure):
+    db = h.install(monkeypatch, h.FakeDbapi(fail_at={"connect": failure}))
+    system = _system()
+    for _ in range(2):
+        with pytest.raises(HanaError) as info:
+            await run_query(system, "SELECT 1 FROM SYS.DUMMY", [], 1)
+        assert info.value.code != "login_failed"
+    assert db.steps() == ["connect", "connect"]
+
+
+# ---- final review: LOB values -------------------------------------------------------------
+
+
+async def test_text_lob_is_read_before_the_connection_closes(monkeypatch):
+    db = h.install(monkeypatch)
+    lob = h.FakeLob("SELECT * FROM T WHERE X = 1", db=db)
+    db.rows = [(1, lob)]
+    _, rows, _ = await run_query(_system(), "SELECT A, B FROM SYS.M_X", [], 1)
+    assert rows == [(1, "SELECT * FROM T WHERE X = 1")]
+    steps = db.steps()
+    assert steps.index("fetchmany") < steps.index("lob_read") < steps.index("rollback")
+
+
+async def test_long_text_lob_is_cut_with_a_marker(monkeypatch):
+    db = h.install(monkeypatch)
+    db.rows = [(h.FakeLob("x" * (LOB_MAX_CHARS + 10), db=db),)]
+    _, rows, _ = await run_query(_system(), "SELECT A FROM SYS.M_X", [], 1)
+    value = rows[0][0]
+    assert value == "x" * LOB_MAX_CHARS + " …[cut]"
+    assert LOB_MAX_CHARS == 65536
+
+
+async def test_text_lob_of_exactly_the_cap_is_not_marked(monkeypatch):
+    db = h.install(monkeypatch)
+    db.rows = [(h.FakeLob("y" * LOB_MAX_CHARS, db=db),)]
+    _, rows, _ = await run_query(_system(), "SELECT A FROM SYS.M_X", [], 1)
+    assert rows[0][0] == "y" * LOB_MAX_CHARS
+
+
+async def test_binary_lob_is_bytes_cut_at_64k(monkeypatch):
+    db = h.install(monkeypatch)
+    db.rows = [(h.FakeLob(b"\x01" * 70000, db=db),)]
+    _, rows, _ = await run_query(_system(), "SELECT A FROM SYS.M_X", [], 1)
+    assert rows[0][0] == b"\x01" * 65536
+
+
+async def test_unreadable_lob_is_a_fixed_text(monkeypatch, caplog):
+    caplog.set_level(logging.DEBUG)
+    db = h.install(monkeypatch)
+    db.rows = [(h.FakeLob("x", error=h.driver_error(-10807, "lob gone"), db=db), 2)]
+    _, rows, _ = await run_query(_system(), "SELECT A, B FROM SYS.M_X", [], 1)
+    assert rows == [("<unreadable LOB>", 2)]
+    assert db.steps()[-1] == "close" and "commit" not in db.steps()
+    _logs_clean(caplog)
+
+
+async def test_lobs_of_the_dropped_extra_row_are_not_read(monkeypatch):
+    db = h.install(monkeypatch)
+    kept, extra = h.FakeLob("a", db=db), h.FakeLob("b", db=db)
+    db.rows = [(kept,), (extra,)]
+    _, rows, truncated = await run_query(_system(), "SELECT A FROM SYS.M_X", [], 1)
+    assert rows == [("a",)] and truncated is True
+    assert extra.reads == []

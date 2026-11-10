@@ -5,9 +5,22 @@ Connector, inside a read-only transaction that is always rolled back.
 **Why the transaction matters.** The database user of a system is the
 destination's technical user, and on the first landscape that user has wide
 privileges by the customer's decision. So the barrier against a write is
-here, not in the database: autocommit off, ``SET TRANSACTION READ ONLY``
-before anything else, a query timeout, and ``rollback()`` plus ``close()``
-in ``finally`` on every path. Nothing here ever commits.
+here, not in the database: autocommit off, ``SET SCHEMA SYS``, then ``SET
+TRANSACTION READ ONLY`` as the last statement before the query (so no session
+statement can end or change that transaction after it), a query timeout, and
+``rollback()`` plus ``close()`` in ``finally`` on every path. Nothing here
+ever commits.
+
+**The login breaker.** Every call is one login, and HANA locks a user after a
+few invalid attempts; the user may be a person's. So after a ``login_failed``
+the system answers ``login_failed`` without connecting for
+:data:`LOGIN_BREAKER_SECONDS`, and the next real attempt reads the
+destination fresh. A registry reload builds new :class:`HanaSystem` objects
+and so resets it: after correcting the password in the destination, press
+Reload.
+
+**LOB values** (``NCLOB`` statement texts, ``BLOB``) are read in the worker
+thread before the connection closes (:func:`_lob_value`).
 
 **The destination** (resolved with the app's token, cached by
 :class:`agents.destination.DestinationResolver`) carries the virtual host,
@@ -40,6 +53,7 @@ import asyncio
 import base64
 import logging
 import re
+import time
 import urllib.parse
 import weakref
 from collections.abc import Mapping, Sequence
@@ -55,6 +69,10 @@ logger = logging.getLogger(__name__)
 # its destinations set hana.encrypt=false
 DEFAULT_ENCRYPT = True
 CONNECT_TIMEOUT_MS = 15000
+# hdbcli's communicationTimeout (ms): a socket that stalls after the login
+# fails the call instead of holding its slot until a restart. Unverified on the
+# landscape: the keyword set the probe proved (gate G0) did not have it.
+COMMUNICATION_TIMEOUT_MS = 30000
 QUERY_TIMEOUT_SECONDS = 20
 CALL_DEADLINE_SECONDS = 45
 """How long a caller waits, for a free slot and its connection thread
@@ -64,14 +82,23 @@ slot until it really ends."""
 MAX_CONCURRENT = 4
 """Connections at a time per process; a thread that runs on after its caller
 was cancelled keeps its slot until it ends."""
+LOGIN_BREAKER_SECONDS = 900
+"""How long a system answers ``login_failed`` without connecting after a
+login failed (see the module docstring)."""
+LOB_MAX_CHARS = 65536
+"""A text LOB longer than this is cut, with :data:`LOB_CUT_MARKER`."""
+LOB_MAX_BYTES = 65536
+"""A binary LOB is read up to this many bytes (the answer shows its size only)."""
+LOB_CUT_MARKER = " …[cut]"
+LOB_UNREADABLE = "<unreadable LOB>"
 
 READ_ONLY_STATEMENT = "SET TRANSACTION READ ONLY"
 # The SELECT guard allows unqualified M_* names and does not check unqualified
 # function calls; HANA resolves both in the session's current schema first,
 # and the destination's user may have a schema of its own with look-alikes.
-# Pinning SYS makes an unqualified name mean the monitoring view. Run after
-# SET TRANSACTION READ ONLY (SET SCHEMA is a session setting, not a write):
-# unverified on the landscape.
+# Pinning SYS makes an unqualified name mean the monitoring view. Run BEFORE
+# SET TRANSACTION READ ONLY: should a session statement end the transaction or
+# change its access mode, the read-only statement still comes last.
 SCHEMA_STATEMENT = "SET SCHEMA SYS"
 # hana.* destination properties this layer reads. hana.database is accepted
 # and ignored: the first system's destination carries it, and a tenant is
@@ -209,6 +236,8 @@ def connect_kwargs(target: HanaTarget, token: str, socks5: Socks5Proxy) -> dict[
         "proxyPort": str(socks5.port),
         "proxyUserName": token,
         "connectTimeout": str(CONNECT_TIMEOUT_MS),
+        # Not in the keyword set the landscape probe proved: unverified there.
+        "communicationTimeout": str(COMMUNICATION_TIMEOUT_MS),
         # Always sent, as in the probe's passing login: never left to the
         # driver's default.
         "encrypt": "true" if target.encrypt else "false",
@@ -289,9 +318,33 @@ class HanaSystem:
         self.destination = destination
         self._resolver = resolver
         self._tokens = tokens
+        # The login breaker. Read and set on the event loop only (run_query),
+        # never in the worker thread.
+        self._login_blocked_until: float | None = None
+        self._fresh_properties = False
 
     def __repr__(self) -> str:
         return f"HanaSystem({self.name})"
+
+    def login_blocked(self) -> bool:
+        """True while the breaker holds after a failed login."""
+        until = self._login_blocked_until
+        if until is None:
+            return False
+        if _clock() < until:
+            return True
+        self._login_blocked_until = None
+        return False
+
+    def note_login_failed(self) -> None:
+        """Open the breaker and drop what is cached of the destination: the
+        next real attempt must read a corrected password."""
+        if not self.login_blocked():
+            logger.warning("hana: login failed for system %s; no login is tried for "
+                           "%d s (login breaker; Reload resets it)",
+                           self.name, LOGIN_BREAKER_SECONDS)
+        self._login_blocked_until = _clock() + LOGIN_BREAKER_SECONDS
+        self._fresh_properties = True
 
     async def properties(self) -> Mapping[str, Any]:
         from agents import destination as dest
@@ -308,10 +361,15 @@ class HanaSystem:
                 logger.warning("hana: destination binding for system %s failed (%s)",
                                self.name, failure)
                 raise HanaError("destination_error")
+        fresh = self._fresh_properties
         try:
-            return await self._resolver.resolve_properties()
+            props = await self._resolver.resolve_properties(force=fresh)
         except Exception as exc:  # noqa: BLE001 - mapped, class logged
             failure = type(exc).__name__
+        else:
+            if fresh:
+                self._fresh_properties = False
+            return props
         logger.warning("hana: resolve destination of system %s failed (%s)",
                        self.name, failure)
         raise HanaError("destination_error")
@@ -325,6 +383,11 @@ class HanaSystem:
                 logger.warning("hana: no connectivity binding for system %s", self.name)
                 raise HanaError("destination_error")
         return self._tokens
+
+
+def _clock() -> float:
+    """The breaker's clock (a seam for the tests)."""
+    return time.monotonic()
 
 
 _slots: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = \
@@ -356,6 +419,35 @@ def _quiet(system: str, step: str, action: Any) -> None:
         logger.warning("hana: %s failed for system %s (%s)", step, system, _detail(exc))
 
 
+def _lob_value(value: Any) -> Any:
+    """A LOB's content in place of the driver's LOB object.
+
+    hdbcli hands ``NCLOB`` / ``CLOB`` / ``BLOB`` back as objects whose
+    ``read`` works only while the connection is open (``STATEMENT_STRING`` of
+    ``M_EXPENSIVE_STATEMENTS`` / ``M_ACTIVE_STATEMENTS`` is ``NCLOB``), so
+    this runs in the worker thread before ``rollback`` and ``close``. A text
+    is cut at :data:`LOB_MAX_CHARS` with :data:`LOB_CUT_MARKER`; bytes are cut
+    at :data:`LOB_MAX_BYTES` (the answer shows their size only); a failing
+    read is the fixed :data:`LOB_UNREADABLE`, never the driver's text.
+    Unverified on the real driver: ``read(size)`` as the first positional
+    argument and the type it returns.
+    """
+    read = getattr(value, "read", None)
+    if not callable(read):
+        return value
+    try:
+        content = read(max(LOB_MAX_CHARS, LOB_MAX_BYTES) + 1)
+    except Exception:  # noqa: BLE001 - the driver's text never leaves
+        return LOB_UNREADABLE
+    if isinstance(content, str):
+        if len(content) > LOB_MAX_CHARS:
+            return content[:LOB_MAX_CHARS] + LOB_CUT_MARKER
+        return content
+    if isinstance(content, (bytes, bytearray, memoryview)):
+        return bytes(content[:LOB_MAX_BYTES])
+    return LOB_UNREADABLE
+
+
 def _execute(system: str, kwargs: dict[str, Any], sql: str, binds: tuple,
              max_rows: int) -> tuple[list[str], list[tuple], bool]:
     """The blocking part, in a worker thread. Rollback and close always."""
@@ -372,10 +464,10 @@ def _execute(system: str, kwargs: dict[str, Any], sql: str, binds: tuple,
         conn.setautocommit(False)
         step = "cursor"
         cursor = conn.cursor()
-        step = "read_only"
-        cursor.execute(READ_ONLY_STATEMENT)
         step = "set_schema"
         cursor.execute(SCHEMA_STATEMENT)
+        step = "read_only"
+        cursor.execute(READ_ONLY_STATEMENT)
         step = "setquerytimeout"
         cursor.setquerytimeout(QUERY_TIMEOUT_SECONDS)
         step = "execute"
@@ -386,7 +478,10 @@ def _execute(system: str, kwargs: dict[str, Any], sql: str, binds: tuple,
         columns = [str(d[0]) for d in (cursor.description or ())]
         step = "fetch"
         fetched = cursor.fetchmany(max_rows + 1)
-        rows = [tuple(r) for r in fetched]
+        truncated = len(fetched) > max_rows
+        step = "lob_read"
+        # Before rollback and close: a LOB cannot be read after them.
+        rows = [tuple(_lob_value(v) for v in r) for r in fetched[:max_rows]]
     except Exception as exc:  # noqa: BLE001 - mapped by the caller
         failure: _Failed | None = _Failed(step, exc)
     else:
@@ -398,7 +493,7 @@ def _execute(system: str, kwargs: dict[str, Any], sql: str, binds: tuple,
         _quiet(system, "close", conn.close)
     if failure is not None:
         raise failure
-    return columns, rows[:max_rows], len(rows) > max_rows
+    return columns, rows, truncated
 
 
 async def _in_slot(system: str, kwargs: dict[str, Any], sql: str, binds: tuple,
@@ -458,6 +553,8 @@ async def run_query(system: HanaSystem, sql: str, binds: Sequence[Any],
         raise HanaError("invalid_argument")
     if not isinstance(sql, str) or not sql or not isinstance(binds, (list, tuple)):
         raise HanaError("invalid_argument")
+    if system.login_blocked():
+        raise HanaError("login_failed")
     props = await system.properties()
     target = settings_from_properties(props, system.name)
     tokens = system.tokens()
@@ -485,12 +582,15 @@ async def run_query(system: HanaSystem, sql: str, binds: Sequence[Any],
     error = map_driver_error(caught.cause)
     logger.warning("hana: %s failed for system %s (%s -> %s)", caught.step,
                    system.name, _detail(caught.cause), error.code)
+    if error.code == "login_failed":
+        system.note_login_failed()
     raise error
 
 
 __all__ = [
-    "CALL_DEADLINE_SECONDS", "CONNECT_TIMEOUT_MS", "DEFAULT_ENCRYPT", "MAX_CONCURRENT",
-    "QUERY_TIMEOUT_SECONDS",
+    "CALL_DEADLINE_SECONDS", "COMMUNICATION_TIMEOUT_MS", "CONNECT_TIMEOUT_MS",
+    "DEFAULT_ENCRYPT", "LOB_MAX_BYTES", "LOB_MAX_CHARS", "LOGIN_BREAKER_SECONDS",
+    "MAX_CONCURRENT", "QUERY_TIMEOUT_SECONDS",
     "HanaSystem", "HanaTarget", "Socks5Proxy", "connect_kwargs", "map_driver_error",
     "run_query", "settings_from_properties",
 ]
