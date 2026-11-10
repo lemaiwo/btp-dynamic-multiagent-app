@@ -144,6 +144,9 @@ from agents.deep import DeepConfig, dump_deep_config
 from agents.git_config import BUILTIN_GIT_URL
 from agents.git_config import check_entry as check_git_entry
 from agents.git_config import clean_entry as clean_git_entry
+from agents.hana import BUILTIN_HANA_URL
+from agents.hana.config import HANA_SINGLE_ENTRY_MESSAGE
+from agents.hana.config import check_entry as check_hana_entry
 from agents.ina import BUILTIN_INA_URL
 from agents.ina.models import QUERY_NAME_RE, check_query_names, validate_ina_query
 from agents.invoke_config import check_result_schema, clean_limits
@@ -383,6 +386,12 @@ class OAuthClientPayload(BaseModel):
     branch_prefix: StrictStr = Field(default="", max_length=41)
     allow_push: StrictBool = False
     allow_pull_request: StrictBool = False
+    # builtin:hana only. The systems (each a slug and the destination that
+    # reaches that database) and the switch for the agent's own SELECT.
+    # agents/hana/config.py is the gate; `systems` is handed on as received
+    # (a list of objects the gate reads key by key), never trimmed.
+    systems: list[Any] | None = None
+    allow_select: StrictBool = False
     # builtin:reconcile only (auth_mode=none). `arc1_server` names the
     # agent's own ARC-1 server entry by URL; the rest are the run's knobs.
     # Strings like `min_score`; agents/reconcile/config.py is the gate.
@@ -394,12 +403,15 @@ class OAuthClientPayload(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     @field_validator("services", "allow_write", "allow_approve", "allow_push",
-                     "allow_pull_request", mode="before")
+                     "allow_pull_request", "systems", "allow_select", mode="before")
     @classmethod
     def _null_is_absent(cls, v: Any, info: Any) -> Any:
         """A client that serialises an unset field as ``null`` means "not
-        set": no services, no writes. It can only ever close, never open."""
+        set": no services, no systems, no writes. It can only ever close,
+        never open."""
         if v is None:
+            if info.field_name == "systems":
+                return None
             return [] if info.field_name == "services" else False
         return v
 
@@ -577,6 +589,12 @@ class OAuthClientPayload(BaseModel):
             config["allow_push"] = True
         if self.allow_pull_request:
             config["allow_pull_request"] = True
+        if self.systems is not None:
+            # As received: agents/hana/config.py refuses a stray key or a
+            # value of the wrong form, so nothing may be repaired here.
+            config["systems"] = copy.deepcopy(self.systems)
+        if self.allow_select:
+            config["allow_select"] = True
         return config
 
 
@@ -776,6 +794,22 @@ class McpServerPayload(BaseModel):
             check_git_entry(oauth)
         return data
 
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_raw_hana_entry(cls, data: Any) -> Any:
+        """The ``builtin:hana`` block as the client sent it, for the reason
+        ``_validate_raw_bitbucket_entry`` gives: afterwards a stray key or the
+        string "true" can no longer be told from a correct entry."""
+        if isinstance(data, dict) and _server_key(data.get("url")) == BUILTIN_HANA_URL:
+            mode = str(data.get("auth_mode") or "").strip().lower()
+            if mode != AUTH_MODE_DESTINATION:
+                raise ValueError(_HANA_MODE_TEXT)
+            oauth = data.get("oauth")
+            if isinstance(oauth, OAuthClientPayload):
+                oauth = {k: getattr(oauth, k) for k in oauth.model_fields_set}
+            check_hana_entry(oauth)
+        return data
+
     @model_validator(mode="after")
     def _validate_oauth(self) -> "McpServerPayload":
         if _server_key(self.url) == BUILTIN_ODATA_URL:
@@ -804,6 +838,22 @@ class McpServerPayload(BaseModel):
             raise ValueError(
                 f"oauth.queries belongs to a {BUILTIN_INA_URL} entry only; no other "
                 "server reads it"
+            )
+        if _server_key(self.url) == BUILTIN_HANA_URL:
+            # Its own rules, as builtin:odata above: no top-level destination
+            # here (each system names its own), so none of the generic
+            # destination rules below apply. Again on the block the route
+            # hands to storage.
+            if self.auth_mode != AUTH_MODE_DESTINATION:
+                raise ValueError(_HANA_MODE_TEXT)
+            check_hana_entry(self.oauth.to_config() if self.oauth else None)
+            return self
+        if self.oauth is not None and (
+            self.oauth.systems is not None or self.oauth.allow_select
+        ):
+            raise ValueError(
+                f"oauth.systems and oauth.allow_select belong to a {BUILTIN_HANA_URL} "
+                "entry only; no other server reads them"
             )
         is_reconcile = _server_key(self.url) == BUILTIN_RECONCILE_URL
         if is_reconcile and self.auth_mode != AUTH_MODE_NONE:
@@ -1280,6 +1330,8 @@ class AgentPayload(BaseModel):
             raise ValueError(BITBUCKET_SINGLE_ENTRY_MESSAGE)
         if sum(1 for u in urls if _server_key(u) == BUILTIN_GIT_URL) > 1:
             raise ValueError(GIT_SINGLE_ENTRY_MESSAGE)
+        if sum(1 for u in urls if _server_key(u) == BUILTIN_HANA_URL) > 1:
+            raise ValueError(HANA_SINGLE_ENTRY_MESSAGE)
         # One reconcile entry, and its ARC-1 sibling in this very list on a
         # mode that acts as the tester (storage checks the same).
         check_reconcile_entries(self.to_servers_list())
@@ -3591,6 +3643,11 @@ _INA_MODE_TEXT = (
     f"{BUILTIN_INA_URL} requires auth_mode=destination: every registered query is "
     "reached through the BTP destination it names, and the entry holds no "
     "credential of its own"
+)
+_HANA_MODE_TEXT = (
+    f"{BUILTIN_HANA_URL} requires auth_mode=destination: it holds no credential of "
+    "its own and reaches each database only through the BTP destination its system "
+    "names"
 )
 
 

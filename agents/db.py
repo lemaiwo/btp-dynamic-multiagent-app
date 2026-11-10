@@ -59,6 +59,8 @@ from sqlalchemy.types import TypeDecorator
 
 from agents import hana_hdi, pg_schema
 from agents.db_errors import DatabaseConfigError
+from agents.hana import BUILTIN_HANA_URL
+from agents.hana.config import HANA_SINGLE_ENTRY_MESSAGE  # public here, as GIT_SINGLE_...
 from agents.ina import BUILTIN_INA_URL
 from agents.ina.models import MAX_ENTRY_QUERIES as _INA_MAX_ENTRY_QUERIES
 from agents.ina.models import InaQueryPayload, check_query_names, validate_ina_query
@@ -2838,6 +2840,30 @@ def _clean_git_entry(oauth: Any, mode: str) -> dict[str, Any]:
     return clean_entry(oauth)
 
 
+# builtin:hana: the systems (slug and destination each) and `allow_select`.
+# Nothing else is stored for it.
+_HANA_URL = BUILTIN_HANA_URL
+
+
+def _clean_hana_entry(oauth: Any, mode: str) -> dict[str, Any]:
+    """Normalize the block of a ``builtin:hana`` entry for storage.
+
+    The last gate before the row, whoever the caller is (the seed,
+    ``scripts/import_bundle.py``, a direct ``upsert_agent``): the block is
+    read by ``agents.hana.config`` (the reading the admin gate and the
+    toolset use), a value is stored only in the form that was checked, an
+    unknown key and ``user_context: true`` are a ValueError, and
+    ``allow_select`` is stored only for the JSON boolean ``true``. No
+    fallback to the row being replaced: the block holds no secret (each
+    system's destination holds the credential).
+    """
+    from agents.hana.config import clean_entry
+
+    if mode != AUTH_MODE_DESTINATION:
+        raise ValueError(f"{_HANA_URL} requires auth_mode=destination")
+    return clean_entry(oauth)
+
+
 def _clean_oauth(
     oauth: Any, mode: str, fallback: dict[str, Any] | None, url: str | None = None
 ) -> dict[str, Any] | None:
@@ -2860,6 +2886,10 @@ def _clean_oauth(
         # Its own cleaner, as builtin:bitbucket: a list and the switches are
         # stored only as checked.
         return _clean_git_entry(oauth, mode)
+    if builtin == _HANA_URL:
+        # Its own cleaner, as builtin:git: the systems list and the switch are
+        # stored only as checked, and there is no top-level destination.
+        return _clean_hana_entry(oauth, mode)
     cleaned = _clean_oauth_block(oauth, mode, fallback, url=url)
     if cleaned is not None and builtin in _MAIL_THEME_URLS and isinstance(oauth, dict):
         from agents.mail_render import MailTheme
@@ -3063,6 +3093,7 @@ def prepare_servers(
     ina_seen = False
     bitbucket_seen = False
     git_seen = False
+    hana_seen = False
     reconcile_seen = False
     for s in mcp_servers:
         url = (s.get("url") or "").strip()
@@ -3117,6 +3148,13 @@ def prepare_servers(
             if git_seen:
                 raise ValueError(GIT_SINGLE_ENTRY_MESSAGE)
             git_seen = True
+        elif url.rstrip("/").lower() == _HANA_URL:
+            # Stored under exactly this spelling and counted after it is
+            # settled, as builtin:git is.
+            url = _HANA_URL
+            if hana_seen:
+                raise ValueError(HANA_SINGLE_ENTRY_MESSAGE)
+            hana_seen = True
         elif url.rstrip("/").lower() == BUILTIN_RECONCILE_URL:
             # Stored under exactly this spelling, as builtin:git is. On 'none'
             # only: the factory refuses any other mode, so such a row would
