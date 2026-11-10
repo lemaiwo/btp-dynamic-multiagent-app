@@ -85,7 +85,7 @@ def _failed_login_state(monkeypatch):
 
     h.fresh_login_state(monkeypatch)
     state = connection._login("acct")
-    state.failed = connection.credential_digest(h.USER, h.PASSWORD)
+    state.failed.append(connection.credential_digest(h.USER, h.PASSWORD))
     state.blocked_until = connection._clock() + connection.LOGIN_BREAKER_SECONDS
     connection._accounts["hana-test"] = "acct"
     return connection
@@ -145,4 +145,4 @@ async def test_another_admin_save_that_reloads_keeps_the_failed_credential(monke
     _fake_reload(monkeypatch, connection, seen)
     await admin.registry.reload()  # what a model change or an agent save does
     state = connection._logins["acct"]
-    assert state.failed is not None and state.blocked_until is None
+    assert state.failed and state.blocked_until is None

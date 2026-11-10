@@ -310,12 +310,13 @@ async def test_after_the_window_the_same_credential_is_not_tried(monkeypatch, ca
             await run_query(system, SQL, [], 1)
         assert info.value.code == "login_failed"
     assert len(db.connect_kwargs) == 1
-    assert resolver.forced == [False, True]  # read fresh once, then the window again
+    # read fresh once per window, without opening the window again
+    assert resolver.forced == [False, True, False, False]
     now[0] += LOGIN_BREAKER_SECONDS + 1
     with pytest.raises(HanaError):
         await run_query(system, SQL, [], 1)
     assert len(db.connect_kwargs) == 1
-    assert resolver.forced == [False, True, True]
+    assert resolver.forced == [False, True, False, False, True]
     _no_secret_in_logs(caplog)
 
 
@@ -382,7 +383,7 @@ def test_the_state_holds_a_digest_never_the_credential(monkeypatch):
     digest = connection.credential_digest(h.USER, h.PASSWORD)
     assert digest == hashlib.sha256(f"{h.USER}\0{h.PASSWORD}".encode()).hexdigest()
     state = connection._login("hana-test")
-    state.failed = digest
+    state.failed.append(digest)
     text = repr(state) + str(state)
     assert h.PASSWORD not in text and h.USER not in text and digest not in text
 
@@ -393,7 +394,8 @@ async def test_the_registry_reload_is_a_soft_reset(monkeypatch):
     h.fresh_login_state(monkeypatch)
     state = connection._login("acct")
     digest = connection.credential_digest(h.USER, h.PASSWORD)
-    state.failed = state.confirmed = digest
+    state.failed.append(digest)
+    state.confirmed = digest
     state.blocked_until = connection._clock() + LOGIN_BREAKER_SECONDS
 
     class _Build:
@@ -414,7 +416,7 @@ async def test_the_registry_reload_is_a_soft_reset(monkeypatch):
     # the failure is kept, the window and the confirmation are gone, and the
     # next call reads the destination fresh
     assert connection._logins == {"acct": state}
-    assert state.failed == digest and state.confirmed is None
+    assert state.failed == [digest] and state.confirmed is None
     assert state.blocked_until is None and state.epoch == 1
 
 
@@ -526,7 +528,7 @@ async def test_a_destination_whose_user_changes_moves_to_that_accounts_state(mon
     assert len(db.connect_kwargs) == 2
     assert connection._accounts["hana-test"] != first_account
     assert _state().confirmed is not None
-    assert connection._logins[first_account].failed is not None  # the old account keeps it
+    assert connection._logins[first_account].failed  # the old account keeps it
 
 
 def test_the_account_key_is_a_digest_of_location_host_port_and_user():
@@ -566,3 +568,92 @@ async def test_a_failure_recorded_before_the_thread_starts_stops_it(monkeypatch)
     await asyncio.sleep(0)
     assert connection._semaphore()._value == MAX_CONCURRENT
     assert not connection._login_lock(connection._accounts["hana-test"]).locked()
+
+
+# ---- an account remembers every failed credential, not only the last -------------------
+
+
+def _two_destinations(password_a: str, password_b: str):
+    first = _system("erp_a", "hana-a", resolver=h.FakeResolver(h.http_props(
+        Password=password_a)))
+    second = _system("erp_b", "hana-b", resolver=h.FakeResolver(h.http_props(
+        Password=password_b)))
+    return first, second
+
+
+async def test_two_wrong_passwords_of_one_account_cost_one_login_each(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(connection, "_clock", lambda: now[0])
+    db = h.install(monkeypatch, h.FakeDbapi(refuse_passwords={h.PASSWORD, OTHER_PASSWORD}))
+    first, second = _two_destinations(h.PASSWORD, OTHER_PASSWORD)
+    with pytest.raises(HanaError):
+        await run_query(first, SQL, [], 1)
+    now[0] += LOGIN_BREAKER_SECONDS + 1
+    with pytest.raises(HanaError):
+        await run_query(second, SQL, [], 1)
+    assert len(db.connect_kwargs) == 2
+    for _ in range(3):
+        now[0] += LOGIN_BREAKER_SECONDS + 1
+        connection.soft_reset_login_state()
+        for system in (first, second, first, second):
+            with pytest.raises(HanaError) as info:
+                await run_query(system, SQL, [], 1)
+            assert info.value.code == "login_failed"
+    assert len(db.connect_kwargs) == 2
+
+
+async def test_a_late_failure_of_an_old_credential_keeps_the_newer_one_out(monkeypatch):
+    gate = threading.Event()
+    db = h.install(monkeypatch)
+    first, second = _two_destinations(h.PASSWORD, OTHER_PASSWORD)
+    await run_query(first, SQL, [], 1)  # A confirmed
+    db.refuse_passwords.update({h.PASSWORD, OTHER_PASSWORD})
+    db.gate = gate
+    old = asyncio.create_task(run_query(first, SQL, [], 1))  # confirmed: no lock
+    new = asyncio.create_task(run_query(second, SQL, [], 1))  # B: the lock
+    await _until(lambda: db.inside == 2)
+    gate.set()
+    results = await asyncio.gather(old, new, return_exceptions=True)
+    assert _codes(results) == ["login_failed"] * 2
+    assert len(db.connect_kwargs) == 3
+    for _ in range(3):
+        connection.soft_reset_login_state()
+        for system in (first, second):
+            with pytest.raises(HanaError):
+                await run_query(system, SQL, [], 1)
+    assert len(db.connect_kwargs) == 3
+
+
+def test_the_failed_credentials_are_the_last_eight(monkeypatch):
+    h.fresh_login_state(monkeypatch)
+    digests = [connection.credential_digest(h.USER, f"pw-{n}") for n in range(9)]
+    for digest in digests:
+        connection._note_login_failed("acct", digest, "erp_tenant")
+    state = connection._logins["acct"]
+    assert connection.FAILED_CREDENTIALS_KEPT == 8
+    assert state.failed == digests[1:]  # the oldest is evicted, in order
+    assert not connection._gate_closed("acct", digests[0]) or connection._blocked(state)
+    connection._note_login_failed("acct", digests[3], "erp_tenant")  # again: moved last
+    assert state.failed[-1] == digests[3] and len(state.failed) == 8
+
+
+async def test_a_success_keeps_the_other_failed_credentials(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(connection, "_clock", lambda: now[0])
+    db = h.install(monkeypatch, h.FakeDbapi(refuse_passwords={h.PASSWORD}))
+    stale, good = _two_destinations(h.PASSWORD, OTHER_PASSWORD)
+    with pytest.raises(HanaError):
+        await run_query(stale, SQL, [], 1)
+    now[0] += LOGIN_BREAKER_SECONDS + 1
+    for _ in range(3):
+        # the stale destination is answered without a login and does NOT
+        # open the shared window again ...
+        with pytest.raises(HanaError) as info:
+            await run_query(stale, SQL, [], 1)
+        assert info.value.code == "login_failed"
+        # ... so the destination with the correct password connects
+        await run_query(good, SQL, [], 1)
+    assert len(db.connect_kwargs) == 4
+    state = _state("hana-a")
+    assert state.confirmed is not None and len(state.failed) == 1
+    assert state.blocked_until < now[0]

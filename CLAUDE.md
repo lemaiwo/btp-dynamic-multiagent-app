@@ -991,12 +991,18 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     more right before `to_thread` (`login_failed` without a connect, slot and
     lock back through the done path). (2) **The
     breaker**: a login failure (10, 414, 663; the meaning of 414 and 663 on
-    SPS07 unverified, the safe direction) remembers the digest, drops the
-    confirmation and answers `login_failed` without reading the destination
-    for `LOGIN_BREAKER_SECONDS` (900), one WARNING naming the slug. After the
-    window the destination is read fresh (every system object of it once:
-    an epoch); the SAME digest is answered `login_failed` without a connect
-    and opens the window again, a changed one is tried (one at a time).
+    SPS07 unverified, the safe direction) adds the digest to the account's
+    failed list (the last `FAILED_CREDENTIALS_KEPT` = 8, oldest out first: two
+    destinations of one account or an old and a new password never overwrite
+    each other's failure; a digest evicted from the 8 could be tried once
+    more; a later success of any credential leaves the others in the list),
+    drops the confirmation and answers `login_failed` without reading the
+    destination for `LOGIN_BREAKER_SECONDS` (900), one WARNING naming the
+    slug. After the window every system object of the account reads its
+    destination fresh once per window (an epoch, `recheck_at`); a digest in
+    the list is answered `login_failed` without a connect and WITHOUT opening
+    the shared window again (another destination of the account with the
+    correct password still connects), a new one is tried (one at a time).
     **Two resets**: `soft_reset_login_state()`, called by every
     `Registry.reload` (a model change, an agent or catalogue save, a bundle
     import, the IDE seed refresh...), keeps each failed digest and drops the
@@ -1008,12 +1014,12 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     bring a failure back): "I fixed it", also the way out after the user was
     unlocked in the database with the same password. Without either, a
     corrected password is used at most about 15 minutes later. **Worst case
-    per stale credential per app instance**: 1 failed login when nothing was
-    confirmed; when a confirmed password goes stale in the database, at most
-    `MAX_CONCURRENT` (4): only threads already running when the first
-    failure is recorded can still fail; then 0 until the credential changes
-    (1 more per changed credential); +1 per explicit Reload, Restart or app
-    start; other reloads add 0. Two app instances double it. `connectTimeout` 15 s,
+    per account per app instance**: each distinct wrong credential costs 1
+    failed login (nothing confirmed); a confirmed credential going stale in
+    the database at most `MAX_CONCURRENT` (4): only threads already running
+    when the first failure is recorded can still fail; then 0 for every
+    credential in the failed list; +1 per explicit Reload, Restart or app
+    start; soft reloads add 0. Two app instances double it. `connectTimeout` 15 s,
     `communicationTimeout` 30 s (not in the keyword set the probe proved:
     unverified on the landscape); ONE deadline of 45 s
     (`CALL_DEADLINE_SECONDS`, `asyncio.timeout` with `expired()`) covers the

@@ -19,8 +19,12 @@ by every :class:`HanaSystem` and every destination that resolves to that
 account (:func:`_in_slot` describes the gate): until a login with the
 current credential succeeded only ONE login is in flight; a login failure
 opens a breaker that answers ``login_failed`` without connecting for
-:data:`LOGIN_BREAKER_SECONDS`, and after it the destination is read fresh and
-the same credential (by :func:`credential_digest`) is still not tried. Two
+:data:`LOGIN_BREAKER_SECONDS`, and after it the destination is read fresh
+(once per window) and no credential that failed on the account (the last
+:data:`FAILED_CREDENTIALS_KEPT`, by :func:`credential_digest`) is tried
+again; such a caller is answered without opening the window again, so
+another destination of the account with the correct password still
+connects. A credential evicted from those 8 could be tried once more. Two
 virtual hosts mapped to one backend cannot be told apart and are counted as
 two accounts: keep one destination per database user.
 
@@ -30,10 +34,11 @@ failed credential and drops only the window and the confirmations, so a
 corrected password is tried at once and the unchanged wrong one costs no
 login. :func:`reset_login_state` forgets everything; only the admin's Reload
 and Restart call it ("I fixed it", also the way out after an unlock in the
-database with the same password). Worst case per stale credential and app
-instance: 1 failed login, or :data:`MAX_CONCURRENT` when a confirmed password
-goes stale in the database while calls run; +1 per explicit Reload, Restart
-or app start; other reloads add none.
+database with the same password). Worst case per account and app instance:
+each distinct wrong credential costs 1 failed login (nothing confirmed), a
+confirmed credential going stale in the database at most
+:data:`MAX_CONCURRENT`; +1 per explicit Reload, Restart or app start; other
+reloads add none.
 
 **LOB values** (``NCLOB`` statement texts, ``BLOB``) are read in the worker
 thread before the connection closes, each up to a cap and all of a call
@@ -103,6 +108,10 @@ was cancelled keeps its slot until it ends."""
 LOGIN_BREAKER_SECONDS = 900
 """How long a system answers ``login_failed`` without connecting after a
 login failed (see the module docstring)."""
+FAILED_CREDENTIALS_KEPT = 8
+"""How many failed credential digests an account remembers (oldest out
+first): two destinations of one account, or an old and a new password, must
+not take turns overwriting one remembered failure."""
 LOB_MAX_CHARS = 65536
 """A text LOB longer than this is cut, with :data:`LOB_CUT_MARKER`."""
 LOB_MAX_BYTES = 65536
@@ -412,17 +421,21 @@ class _Login:
     credential is held as :func:`credential_digest` only, and ``repr`` shows
     none of it."""
 
-    __slots__ = ("blocked_until", "confirmed", "epoch", "failed")
+    __slots__ = ("blocked_until", "confirmed", "epoch", "failed", "recheck_at")
 
     def __init__(self) -> None:
         self.confirmed: str | None = None
-        self.failed: str | None = None
+        # The digests that failed, oldest first, at most FAILED_CREDENTIALS_KEPT.
+        self.failed: list[str] = []
         self.blocked_until: float | None = None
+        # When a caller next makes every system of the account read its
+        # destination fresh (once per window, without closing the window).
+        self.recheck_at: float | None = None
         self.epoch = 0
 
     def __repr__(self) -> str:
         return (f"_Login(confirmed={self.confirmed is not None}, "
-                f"failed={self.failed is not None}, epoch={self.epoch})")
+                f"failed={len(self.failed)}, epoch={self.epoch})")
 
     __str__ = __repr__
 
@@ -514,19 +527,29 @@ def _gate_closed(account: str, digest: str) -> bool:
     """No login may be tried: the breaker's window is open, or this very
     credential is the one that failed."""
     state = _login(account)
-    return _blocked(state) or state.failed == digest
+    return _blocked(state) or digest in state.failed
 
 
 def _confirmed(account: str, digest: str) -> bool:
     state = _login(account)
-    return state.confirmed == digest and state.failed != digest
+    return state.confirmed == digest and digest not in state.failed
 
 
 def _close_gate(state: _Login) -> None:
     """(Re)open the breaker's window; every system object of the
     account reads its destination fresh on its next attempt."""
-    state.blocked_until = _clock() + LOGIN_BREAKER_SECONDS
+    state.blocked_until = state.recheck_at = _clock() + LOGIN_BREAKER_SECONDS
     state.epoch += 1
+
+
+def _recheck_if_due(state: _Login) -> None:
+    """Once per window after a failure, have every system of the account
+    read its destination fresh (a corrected password is picked up even
+    when the resolver caches the old one), without blocking anybody."""
+    due = state.recheck_at
+    if due is not None and _clock() >= due:
+        state.recheck_at = _clock() + LOGIN_BREAKER_SECONDS
+        state.epoch += 1
 
 
 def _note_login_failed(account: str, digest: str, system: str) -> None:
@@ -535,7 +558,10 @@ def _note_login_failed(account: str, digest: str, system: str) -> None:
         logger.warning("hana: login failed for system %s; no login is tried for "
                        "%d s, nor with this password again (login breaker; an admin's "
                        "Reload resets it)", system, LOGIN_BREAKER_SECONDS)
-    state.failed = digest
+    if digest in state.failed:
+        state.failed.remove(digest)
+    state.failed.append(digest)
+    del state.failed[:-FAILED_CREDENTIALS_KEPT]
     # Whichever credential was confirmed: the gate closes for all of them, so
     # the next login is one at a time again.
     state.confirmed = None
@@ -545,8 +571,9 @@ def _note_login_failed(account: str, digest: str, system: str) -> None:
 def _note_login_ok(account: str, digest: str) -> None:
     state = _login(account)
     # A login of a thread that started before this credential failed does
-    # not lift the failure: only a changed credential or a full reset does.
-    if state.failed != digest:
+    # not lift the failure (the failure is the newer fact): only a full reset
+    # does. Nor does any success touch the OTHER failed credentials.
+    if digest not in state.failed:
         state.confirmed = digest
 
 
@@ -823,18 +850,21 @@ async def run_query(system: HanaSystem, sql: str, binds: Sequence[Any],
     if not isinstance(sql, str) or not sql or not isinstance(binds, (list, tuple)):
         raise HanaError("invalid_argument")
     known = _accounts.get(system.destination)
-    if known is not None and _blocked(_login(known)):
-        raise HanaError("login_failed")  # the window is open: nothing is read
+    if known is not None:
+        if _blocked(_login(known)):
+            raise HanaError("login_failed")  # the window is open: nothing is read
+        _recheck_if_due(_login(known))
     props = await system.properties()
     target = settings_from_properties(props, system.name)
     digest = credential_digest(target.user, target.password)
     account = account_key(target)
     _accounts[system.destination] = account
     state = _login(account)  # a reset may have replaced it meanwhile
-    if state.failed == digest and not _blocked(state):
-        # The window has passed and the destination (read fresh) still holds
-        # the credential that failed: no login, and the window again.
-        _close_gate(state)
+    if digest in state.failed:
+        # The destination still holds a credential that failed on this
+        # account: no login. The window is NOT opened again: it is shared by
+        # the account, and another destination of it may hold the correct
+        # password.
         logger.warning("hana: the destination of system %s still holds the password "
                        "that failed; no login tried (login breaker)", system.name)
         raise HanaError("login_failed")
@@ -875,7 +905,7 @@ async def run_query(system: HanaSystem, sql: str, binds: Sequence[Any],
 __all__ = [
     "CALL_DEADLINE_SECONDS", "COMMUNICATION_TIMEOUT_MS", "CONNECT_TIMEOUT_MS",
     "DEFAULT_ENCRYPT", "LOB_BUDGET_CHARS", "LOB_MAX_BYTES", "LOB_MAX_CHARS",
-    "LOGIN_BREAKER_SECONDS",
+    "FAILED_CREDENTIALS_KEPT", "LOGIN_BREAKER_SECONDS",
     "MAX_CONCURRENT", "QUERY_TIMEOUT_SECONDS",
     "HanaSystem", "HanaTarget", "Socks5Proxy", "account_key", "connect_kwargs",
     "credential_digest", "map_driver_error", "reset_login_state", "run_query",
