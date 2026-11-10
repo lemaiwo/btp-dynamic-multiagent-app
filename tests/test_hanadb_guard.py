@@ -393,9 +393,6 @@ def test_denied_views_are_refused_in_every_position(name: str, position: str) ->
 
 
 @pytest.mark.parametrize("sql", [
-    "SELECT * FROM SYS.M_INIFILES",
-    "SELECT * FROM M_INIFILE_CONTENT_HISTORY",
-    "SELECT * FROM SYS.M_CONFIGURATION_PARAMETER_VALUES_X",
     "SELECT * FROM _SYS_STATISTICS.HOST_WORKLOAD",
     "SELECT * FROM _SYS_STATISTICS.STATISTICS_CURRENT_ALERTS",
     "SELECT * FROM _SYS_STATISTICS.M_INIFILE_CONTENTS",
@@ -413,6 +410,45 @@ def test_fixed_checks_skip_only_the_deny_list(name: str) -> None:
     check_select(f"SELECT * FROM {name}", fixed=True)
     with pytest.raises(SelectRefused):
         check_select("SELECT * FROM SAPABAP1.VBAK", fixed=True)
+
+
+# ---- final review round 2: every ini and configuration-parameter view -----------------------
+# M_INIFILE_CONTENT_HISTORY holds KEY and VALUE, current and earlier: the
+# deny-list matches on part of the name, so a view of that family that the
+# list does not name yet is refused too.
+
+NAME_PART_DENIED = [
+    "M_INIFILE_CONTENT_HISTORY", "SYS.M_INIFILE_CONTENT_HISTORY",
+    '"SYS"."M_INIFILE_CONTENT_HISTORY"', "sys.m_inifile_content_history",
+    "M_INIFILES", "SYS.M_INIFILES", "SYS.INIFILE_ANYTHING",
+    "SYS.M_CONFIGURATION_PARAMETER_VALUES_X", "M_CONFIGURATION_PARAMETERS_HISTORY",
+    "SYS.CONFIGURATION_PARAMETER_PROPERTIES", '"SYS"."CONFIGURATION_PARAMETER_X"',
+]
+
+
+@pytest.mark.parametrize("position", POSITIONS)
+@pytest.mark.parametrize("name", NAME_PART_DENIED)
+def test_every_ini_and_configuration_parameter_view_is_refused(name: str,
+                                                               position: str) -> None:
+    with pytest.raises(SelectRefused) as info:
+        check_select(position.format(t=name))
+    assert info.value.rule == "table_not_allowed"
+
+
+@pytest.mark.parametrize("name", NAME_PART_DENIED)
+def test_fixed_checks_may_still_read_the_ini_family(name: str) -> None:
+    check_select(f"SELECT * FROM {name}", fixed=True)
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT * FROM _SYS_STATISTICS.M_INIFILE_CONTENT_HISTORY",  # SYS or unqualified only
+    'SELECT * FROM SYS."m_inifile_content_history"',  # quoted: another object
+    "SELECT * FROM SYS.M_INI_FILE",
+    "SELECT * FROM SYS.M_CONFIGURATION",
+    "WITH M_INIFILES AS (SELECT * FROM M_SERVICES) SELECT * FROM M_INIFILES",
+])
+def test_outside_the_name_parts_still_pass(sql: str) -> None:
+    check_select(sql)
 
 
 def test_fixed_is_keyword_only_and_off_by_default() -> None:

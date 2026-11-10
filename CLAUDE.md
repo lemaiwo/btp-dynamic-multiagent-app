@@ -1053,13 +1053,18 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     `TABLESAMPLE` or a parenthesised join is refused, and so is a
     schema-qualified call outside those two schemas or a quoted one. **The
     deny-list**, applied to a reference AFTER the allow rule and only to
-    model-written SQL: `M_INIFILE_CONTENTS` and
-    `M_CONFIGURATION_PARAMETER_VALUES` (unqualified or `SYS.`) and every
-    `SYS.P_*` or `_SYS_STATISTICS.P_*` object (internal persistence tables;
-    no registered check reads one) are
+    model-written SQL: every name, unqualified or `SYS.`, that holds
+    `INIFILE` or `CONFIGURATION_PARAMETER` (`DENIED_NAME_PARTS`: the whole
+    ini and configuration-parameter family, `M_INIFILE_CONTENTS`,
+    `M_INIFILE_CONTENT_HISTORY` with its current and earlier KEY / VALUE,
+    `M_INIFILES`, `M_CONFIGURATION_PARAMETER_VALUES`, and any such view the
+    list does not name; `_SYS_STATISTICS.` names are not matched by it) and
+    every `SYS.P_*` or `_SYS_STATISTICS.P_*` object (internal persistence
+    tables; no registered check reads one) are
     `table_not_allowed` in every position a reference can stand (a CTE of
     such a name is still a CTE); quoted names compared verbatim after the
-    allow rule's upper-casing of words (`DENIED_VIEWS`, `DENIED_SYS_PREFIX`).
+    allow rule's upper-casing of words (`DENIED_VIEWS`, `DENIED_NAME_PARTS`,
+    `DENIED_SYS_PREFIX`).
     `check_select(sql, *, fixed=False)`: `fixed=True` skips the deny-list and
     nothing else, for the registered checks only (`iniContents`, `iniFiles`
     and `backupStatus` read the ini contents for named keys;
@@ -1105,7 +1110,8 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     values (`M_SQL_PLAN_CACHE`, `M_EXPENSIVE_STATEMENTS`, ...), bind values
     (the `PARAMETERS` columns), session and user names, client hosts and
     trace contents; the deny-list keeps out only the ini / configuration
-    values and the `P_*` tables of `SYS` and `_SYS_STATISTICS`. Without the switch
+    views (every name holding `INIFILE` or `CONFIGURATION_PARAMETER`) and the
+    `P_*` tables of `SYS` and `_SYS_STATISTICS`. Without the switch
     `run_select` is not registered, and a `requires_select` check is neither
     listed nor runnable (`unknown_check`, as if it did not exist).
     **Nothing the model sent is echoed**: a refusal is `{"error": {code,
