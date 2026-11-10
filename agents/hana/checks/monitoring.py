@@ -10,8 +10,8 @@ view has (``M_LOCKS.LOCK_OWNER_CONNECTION_ID``, ``SYS.M_ALERTS``,
 on-premise views rather than copied; the ``# on-prem:`` comment of each check
 says how. ``# on-prem: verified 2026-11-10 on SPS07 rev 79`` marks a
 statement that ran on SYSTEMDB and a tenant of SPS07 (probe, 2026-11-10);
-"columns verified, statement not yet run" a statement rewritten on columns
-that were each probed there; ``# on-prem: unverified`` what has not run yet.
+"(run 2)" one rewritten on columns probed there after the first run, which
+the second run then passed; ``# on-prem: unverified`` what has not run yet.
 
 Columns are named, never ``*``: the database user of the first landscape may
 read more than the check needs, so the SQL is what limits the answer.
@@ -26,7 +26,7 @@ from agents.hana.checks.base import Check, Statement, register
 # ALERT_NAME and ALERT_USERACTION itself and has no HOST or PORT (SQL code
 # 260 for both, 2026-11-10): no join to STATISTICS_ALERT_INFORMATION, and no
 # host column (ALERT_DETAILS names the host or service where it matters).
-# on-prem: columns verified 2026-11-10 on SPS07 rev 79, statement not yet run
+# on-prem: verified 2026-11-10 on SPS07 rev 79 (run 2)
 # ALERT_DETAILS is free text and is kept on purpose (lead's decision): an
 # alert without its text is not usable for monitoring, and it is the
 # statistics server that writes it, not a user. ALERT_USERACTION is SAP's
@@ -173,7 +173,7 @@ CRASH_DUMPS = Check(
 # no column of M_SERVICE_REPLICATION on SPS07 (SQL code 260, 2026-11-10; it is
 # one of M_SYSTEM_REPLICATION) and is left out; SECONDARY_FULLY_RECOVERABLE,
 # BACKLOG_SIZE and BACKLOG_TIME were probed there and added.
-# on-prem: columns verified 2026-11-10 on SPS07 rev 79, statement not yet run
+# on-prem: verified 2026-11-10 on SPS07 rev 79 (run 2)
 REPLICATION_STATUS = Check(
     name="replicationStatus",
     category="monitoring",

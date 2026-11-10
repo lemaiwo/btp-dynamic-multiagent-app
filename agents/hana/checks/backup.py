@@ -4,9 +4,9 @@ Each check is data: ``register(Check(...))`` at import, with its SQL as a
 constant and every variable part a ``?`` bind (see :mod:`.base`).
 
 The target is on-premise SAP HANA 2.0 (SPS07). Every statement here ran on
-SYSTEMDB and a tenant of SPS07 rev 79 (probe, 2026-11-10) except ``progress``,
-rewritten on columns probed there. ``COMMENT`` of the backup catalogue is never selected: it is free
-text somebody typed, and the word is refused by the registry anyway.
+SYSTEMDB and a tenant of SPS07 rev 79 (probe, 2026-11-10; ``progress``, rewritten
+on columns probed there, in run 2). ``COMMENT`` of the backup catalogue is never
+selected: it is free text somebody typed, and the word is refused by the registry anyway.
 Destination paths and backint ids are left out: they name the backup
 server's file system.
 """
@@ -35,8 +35,8 @@ _LOG_BACKUP_SETTINGS = (
 # on-prem: verified 2026-11-10 on SPS07 rev 79 (last_successful, recent,
 # log_settings). `progress`: M_BACKUP_PROGRESS has no TOTAL_SIZE on SPS07
 # (SQL code 260); BACKUP_SIZE (the size of the whole backup) stands in, next to
-# TRANSFERRED_SIZE: columns verified 2026-11-10 on SPS07 rev 79, statement not
-# yet run.
+# TRANSFERRED_SIZE.
+# on-prem: verified 2026-11-10 on SPS07 rev 79 (run 2)
 BACKUP_STATUS = Check(
     name="backupStatus",
     category="backup",

@@ -17,9 +17,9 @@ changed per check:
 
 ``# on-prem: verified 2026-11-10 on SPS07 rev 79`` marks a check whose
 statements ran on SYSTEMDB and a tenant of SPS07 (probe, 2026-11-10, sample
-binds; a NULL bind of an optional filter was not part of that run); "columns
-verified, statement not yet run" one rewritten after that run on columns each
-probed there; ``# on-prem: unverified`` what the run could not show.
+binds; a NULL bind of an optional filter was not part of that run); "(run 2)"
+one rewritten after the first run on columns each probed there, which the
+second run then passed; ``# on-prem: unverified`` what the runs could not show.
 """
 
 from __future__ import annotations
@@ -249,7 +249,7 @@ register(
     # and HOST: SQL code 260, 2026-11-10); the files and the layers, tenants and
     # hosts they set parameters in come from M_INIFILE_CONTENTS, grouped. No
     # key or value is selected (iniContents is the check for those).
-    # on-prem: columns verified 2026-11-10 on SPS07 rev 79, statement not yet run
+    # on-prem: verified 2026-11-10 on SPS07 rev 79 (run 2)
     Check(
         name="iniFiles",
         category="system",
@@ -415,7 +415,7 @@ register(
         ),
         max_rows_cap=200,
     ),
-    Check(  # on-prem: verified 2026-11-10 on SPS07 rev 79 (all parts but read_tables)
+    Check(  # on-prem: verified 2026-11-10 on SPS07 rev 79
         name="recommendations",
         category="system",
         purpose=(
@@ -428,8 +428,7 @@ register(
             # M_TABLE_STATISTICS on HANA 2.0; the most read tables instead. SPS07
             # has no READ_COUNT / WRITE_COUNT there either (SQL code 260,
             # 2026-11-10): the SELECT count and the change counts per table.
-            # on-prem: columns verified 2026-11-10 on SPS07 rev 79, statement not
-            # yet run
+            # on-prem: verified 2026-11-10 on SPS07 rev 79 (run 2)
             Statement(
                 "read_tables",
                 "SELECT TOP ? SCHEMA_NAME, TABLE_NAME, SELECT_COUNT, INSERT_COUNT,"
