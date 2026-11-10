@@ -1221,10 +1221,12 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   not as the exact statement the app sends. "Read-only verified" means only
   that the statement was accepted: that a write is refused is what the
   probe's `--write-test` step (`write_refused`, `WRITE_REFUSED`) proves, and
-  it has not run yet (it needs the customer's agreement). **Not verified
-  there**: the app's own client end to end (nothing is deployed yet), the
-  order `SET SCHEMA SYS` then `SET TRANSACTION READ ONLY` (the probe now
-  sends it as `schema_pin`), a refused write, the login breaker,
+  it has not run yet (it needs the customer's agreement; its read-only
+  refusal code, `READ_ONLY_REFUSAL_CODES`, is a candidate to confirm then).
+  **Not verified there**: the app's own client end to end (nothing is
+  deployed yet), the order `SET SCHEMA SYS` then `SET TRANSACTION READ ONLY`
+  (the probe now sends it as `schema_pin`), a refused write, the login
+  breaker and the one-login gate, the LOB budget,
   `communicationTimeout`, the run_select deny-list against the real views,
   `traceContents` with a real host and file, a NULL bind of an optional
   filter, LOB values (`read(size)` of hdbcli's LOB object), a multi-line ini
@@ -3862,9 +3864,15 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `hdbcli` login per variant and TLS, S7 `M_DATABASE` (rows, version), S8
   `SET SCHEMA SYS` (`schema_pin`) then `SET TRANSACTION READ ONLY`, S8b
   (`--write-test` only, the customer agrees first) `CREATE LOCAL TEMPORARY
-  TABLE #AGENT_PROBE_RO`, which must be refused (an accepted write is dropped,
-  rolled back, and every later SQL step is `SKIP <step>: write was accepted`
-  with exit code 1), S9 the query timeout, S10 the effective
+  TABLE #AGENT_PROBE_RO`, which must be refused: `PASS write_refused:
+  sql_code=<n>` only for a code in `READ_ONLY_REFUSAL_CODES` (one unconfirmed
+  candidate, 7: confirm or correct it from the first run), any other refusal
+  `INCONCLUSIVE write_refused: sql_code=<n>` with exit code 1 (an accepted
+  write is dropped, rolled back, and every later SQL step is `SKIP <step>:
+  write was accepted` with exit code 1); a refused schema pin skips S8b and
+  S12 (`SKIP <step>: schema pin failed`, exit code 1), and `FAIL read_only:
+  sql_code=<n>` right after `PASS schema_pin` would say HANA refused READ
+  ONLY once the pin had opened the transaction; S9 the query timeout, S10 the effective
   privileges of the user (`ok`, `review`, `too_wide` or `unknown`; counts
   and schema names, never an object, grantor or user name), S11 `EXPLAIN
   PLAN` (`--explain-plan` only: it writes plan rows), S12 each statement of
@@ -3873,7 +3881,8 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   with one value per key: `DEST_SHAPE`, `PROXY_VARIANT`, `TLS`,
   `TOKEN_SECONDS`, `READ_ONLY`, `QUERY_TIMEOUT`, `EXPLAIN_PLAN`
   (`yes|no|untested`), `PRIVILEGES`, `WRITE_REFUSED` (`yes`; `no` only for
-  an accepted write; `untested`). Prints property names, SOCKS5 reply codes, SQL error codes
+  an accepted write; `inconclusive`; `untested`), `SCHEMA_PIN` (`yes|no`,
+  the last key). Prints property names, SOCKS5 reply codes, SQL error codes
   and counts, never a credential, a token, a host from a binding or a
   destination, a row or a driver's error text
   (`tests/test_probe_hana_connectivity.py`)

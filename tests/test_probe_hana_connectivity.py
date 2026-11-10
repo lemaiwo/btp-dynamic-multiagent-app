@@ -487,6 +487,7 @@ def test_report_block_and_exit_code():
         explain_plan="no",
         privileges="ok",
         version_ok=True,
+        schema_pin=True,
     )
     assert probe.report_block(facts).splitlines() == [
         "DEST_SHAPE http",
@@ -498,6 +499,7 @@ def test_report_block_and_exit_code():
         "EXPLAIN_PLAN no",
         "PRIVILEGES ok",
         "WRITE_REFUSED untested",
+        "SCHEMA_PIN yes",
     ]
     assert probe.exit_code(facts) == 0
     facts.privileges = "review"
@@ -536,11 +538,14 @@ def _mock_transport(destination: dict) -> httpx.MockTransport:
 
 class FakeConnection:
     def __init__(self, privileges, explain_fails=False, read_only_fails=False,
-                 write_refused=False):
+                 write_refused=False, schema_fails=False, write_error=None):
         self.privileges = privileges
         self.explain_fails = explain_fails
         self.read_only_fails = read_only_fails
         self.write_refused = write_refused
+        self.schema_fails = schema_fails
+        # what the refused write raises (default: SQL code 7)
+        self.write_error = write_error
         self.closed = False
         self.rolled_back = False
         self.statements: list[str] = []
@@ -566,8 +571,11 @@ class FakeConnection:
                     self.result = list(conn.privileges)
                 elif sql.startswith("SET TRANSACTION") and conn.read_only_fails:
                     raise dbapi.Error(7, "feature not supported: secret text")
+                elif sql.startswith("SET SCHEMA") and conn.schema_fails:
+                    raise dbapi.Error(362, "invalid schema name: secret text")
                 elif sql.startswith("CREATE LOCAL TEMPORARY") and conn.write_refused:
-                    raise dbapi.Error(7, "transaction is read-only: secret text")
+                    raise conn.write_error or dbapi.Error(
+                        7, "transaction is read-only: secret text")
                 elif sql.startswith("EXPLAIN PLAN") and conn.explain_fails:
                     raise dbapi.Error(258, "insufficient privilege: secret text")
                 elif "EXPLAIN_PLAN_TABLE" in sql:
@@ -610,10 +618,13 @@ def _run(
     connect=None,
     read_only_fails: bool = False,
     write_refused: bool = False,
+    schema_fails: bool = False,
+    write_error: BaseException | None = None,
 ):
     calls: list[dict] = []
     conn = FakeConnection(privileges, read_only_fails=read_only_fails,
-                          write_refused=write_refused)
+                          write_refused=write_refused, schema_fails=schema_fails,
+                          write_error=write_error)
 
     def fake_connect(**kwargs):
         calls.append(kwargs)
@@ -906,3 +917,79 @@ def test_no_login_skips_the_new_steps_too(capsys):
     out = capsys.readouterr().out
     assert "SKIP schema_pin: no login" in out
     assert "SKIP write_refused: no login" in out
+
+
+# ---- final review round 2: only a read-only refusal passes; the schema pin gates --------
+
+
+def test_the_read_only_refusal_codes_start_as_one_candidate():
+    assert probe.READ_ONLY_REFUSAL_CODES == frozenset({7})
+    assert all(isinstance(c, int) for c in probe.READ_ONLY_REFUSAL_CODES)
+
+
+@pytest.mark.parametrize("error,shown", [
+    (dbapi.Error(257, "sql syntax error: secret text"), "sql_code=257"),
+    (dbapi.Error(258, "insufficient privilege: secret text"), "sql_code=258"),
+    (RuntimeError("secret text"), "error=RuntimeError"),
+])
+def test_another_refusal_of_the_write_is_inconclusive(tmp_path, capsys, error, shown):
+    code, _, conn = _run(HTTP_DESTINATION, privileges=[("MONITORING", None)],
+                         write_refused=True, write_error=error, extra=["--write-test"])
+    out = capsys.readouterr().out
+    assert code == 1, out
+    assert f"INCONCLUSIVE write_refused: {shown}" in out
+    assert "PASS write_refused" not in out
+    assert "WRITE_REFUSED inconclusive" in out
+    assert "secret text" not in out
+    _assert_clean(out)
+
+
+def test_inconclusive_in_the_report_exits_non_zero():
+    facts = probe.Facts(version_ok=True, privileges="ok", schema_pin=True)
+    assert probe.exit_code(facts) == 0
+    facts.write_refused = "inconclusive"
+    assert "WRITE_REFUSED inconclusive" in probe.report_block(facts)
+    assert probe.exit_code(facts) == 1
+
+
+def test_a_failed_schema_pin_stops_the_write_test_and_the_checks(tmp_path, capsys):
+    checks = tmp_path / "checks.json"
+    checks.write_text(json.dumps([{"name": "alerts", "sql": "SELECT * FROM M_ALERTS"}]))
+    code, _, conn = _run(HTTP_DESTINATION, privileges=[("MONITORING", None)],
+                         schema_fails=True, write_refused=True,
+                         extra=["--write-test", "--checks-file", str(checks)])
+    out = capsys.readouterr().out
+    assert code == 1, out
+    assert "FAIL schema_pin: sql_code=362" in out
+    assert "SKIP write_refused: schema pin failed" in out
+    assert "SKIP checks: schema pin failed" in out
+    assert out.splitlines()[-1] == "SCHEMA_PIN no"
+    assert not any(x.startswith("CREATE") for x in conn.statements)
+    assert not any("M_ALERTS" in x for x in conn.statements)
+    assert "secret text" not in out
+
+
+def test_schema_pin_yes_is_the_last_key_of_a_good_run(capsys):
+    code, _, _ = _run(HTTP_DESTINATION, privileges=[("MONITORING", None)])
+    out = capsys.readouterr().out
+    assert code == 0, out
+    assert out.splitlines()[-1] == "SCHEMA_PIN yes"
+
+
+def test_a_read_only_refused_after_a_passing_schema_pin_is_legible(capsys):
+    code, _, conn = _run(HTTP_DESTINATION, privileges=[("MONITORING", None)],
+                         read_only_fails=True, extra=["--write-test"])
+    out = capsys.readouterr().out
+    assert out.index("PASS schema_pin: accepted") < out.index("FAIL read_only: sql_code=7")
+    s = conn.statements
+    assert s.index("SET SCHEMA SYS") + 1 == s.index("SET TRANSACTION READ ONLY")
+
+
+def test_no_login_reports_no_schema_pin(capsys):
+    def refuse(kwargs, conn):
+        raise dbapi.Error(10, "authentication failed: secret text")
+
+    code, _, _ = _run(HTTP_DESTINATION, privileges=[], connect=refuse)
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "SCHEMA_PIN no" in out

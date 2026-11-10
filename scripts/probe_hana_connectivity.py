@@ -48,10 +48,19 @@ Steps, one line each, ``PASS|FAIL|SKIP <step>: <fixed words>``:
 S8b (``write_refused``) proves what S8's ``accepted`` cannot: that the database
 refuses a write inside the read-only transaction. It sends ``CREATE LOCAL
 TEMPORARY TABLE #AGENT_PROBE_RO (I INTEGER)`` (a session-local table, gone with
-the session) right after ``SET TRANSACTION READ ONLY``. PASS is the refusal
-(``sql_code=<n>``); a write that is accepted is a FAIL: the table is dropped,
+the session) right after ``SET TRANSACTION READ ONLY``. PASS is a refusal whose
+SQL code is in ``READ_ONLY_REFUSAL_CODES`` (``sql_code=<n>``; the set starts as
+one unconfirmed candidate, 7, to be confirmed or corrected from the first
+run); any other refusal is ``INCONCLUSIVE write_refused: sql_code=<n>`` (a
+syntax error or a missing privilege proves nothing about the read-only
+transaction) and exits non-zero. A write that is accepted is a FAIL: the table is dropped,
 the transaction rolled back, ``READ_ONLY`` becomes ``no``, and every later SQL
-step (S9-S12) is ``SKIP <step>: write was accepted``. Off by default: it is a
+step (S9-S12) is ``SKIP <step>: write was accepted``. S8b and S12 also need a
+passing schema pin (the app never runs a statement without it): when
+``SET SCHEMA SYS`` is refused they are ``SKIP <step>: schema pin failed`` and the
+probe exits non-zero. A ``FAIL read_only: sql_code=<n>`` right after ``PASS
+schema_pin`` would say that the pin opened the transaction and HANA refused to
+make it read-only afterwards. Off by default: it is a
 write attempt on the customer's database, so it runs only with ``--write-test``
 once the customer agreed.
 
@@ -75,8 +84,11 @@ exception class).
 The final block holds one fixed value per key: ``DEST_SHAPE``,
 ``PROXY_VARIANT``, ``TLS``, ``TOKEN_SECONDS``, ``READ_ONLY``, ``QUERY_TIMEOUT``,
 ``EXPLAIN_PLAN`` (``yes``, ``no`` or ``untested``: S11 did not run),
-``PRIVILEGES``, ``WRITE_REFUSED`` (``yes``: S8b ran and the write was refused;
-``no``: the write was ACCEPTED, only ever that; ``untested``: S8b did not run).
+``PRIVILEGES``, ``WRITE_REFUSED`` (``yes``: S8b ran and the write was refused
+with a read-only code; ``no``: the write was ACCEPTED, only ever that;
+``inconclusive``: refused with another code; ``untested``: S8b did not run),
+``SCHEMA_PIN`` (``yes`` | ``no``, the last key). ``no``, ``inconclusive`` and
+``SCHEMA_PIN no`` each exit non-zero.
 ``QUERY_TIMEOUT yes`` says the driver accepted the timeout and ran a statement
 under it, not that it fired.
 
@@ -145,6 +157,13 @@ SCHEMA_STATEMENT = "SET SCHEMA SYS"
 READ_ONLY_STATEMENT = "SET TRANSACTION READ ONLY"
 WRITE_TEST_TABLE = "#AGENT_PROBE_RO"
 WRITE_TEST_STATEMENT = f"CREATE LOCAL TEMPORARY TABLE {WRITE_TEST_TABLE} (I INTEGER)"
+# The SQL codes that mean "refused because the transaction is read-only". Only
+# such a refusal is a PASS of S8b; any other (a syntax error, a missing
+# privilege, a driver failure) is INCONCLUSIVE: it does not show that the
+# read-only transaction refused the write. 7 ("feature not supported") is the
+# single best-known candidate and is NOT confirmed for HANA 2.0: confirm on
+# the first run (the line prints the code either way), then correct this set.
+READ_ONLY_REFUSAL_CODES = frozenset({7})
 
 
 class ProbeError(Exception):
@@ -190,7 +209,10 @@ class Facts:
     explain_plan: str = "untested"  # yes | no | untested
     privileges: str = "unknown"
     version_ok: bool = False
-    write_refused: str = "untested"  # yes | no (the write was accepted) | untested
+    # yes | no (the write was accepted) | inconclusive (refused, not for being
+    # read-only as far as READ_ONLY_REFUSAL_CODES knows) | untested
+    write_refused: str = "untested"
+    schema_pin: bool = False
 
 
 # ---- output -------------------------------------------------------------------
@@ -204,12 +226,17 @@ def _yes(value: object) -> str:
     return "yes" if value else "no"
 
 
-def sql_code_of(exc: BaseException) -> str:
-    """``sql_code=<n>`` for a driver error, else the class name. Never the text."""
+def _int_sql_code(exc: BaseException) -> int | None:
     code = getattr(exc, "errorcode", None)
     if not isinstance(code, int) and exc.args and isinstance(exc.args[0], int):
         code = exc.args[0]
-    if isinstance(code, int) and not isinstance(code, bool):
+    return code if isinstance(code, int) and not isinstance(code, bool) else None
+
+
+def sql_code_of(exc: BaseException) -> str:
+    """``sql_code=<n>`` for a driver error, else the class name. Never the text."""
+    code = _int_sql_code(exc)
+    if code is not None:
         return f"sql_code={code}"
     return f"error={type(exc).__name__}"
 
@@ -688,12 +715,13 @@ def report_block(facts: Facts) -> str:
             f"EXPLAIN_PLAN {facts.explain_plan}",
             f"PRIVILEGES {facts.privileges}",
             f"WRITE_REFUSED {facts.write_refused}",
+            f"SCHEMA_PIN {_yes(facts.schema_pin)}",
         ]
     )
 
 
 def exit_code(facts: Facts) -> int:
-    if facts.write_refused == "no":
+    if facts.write_refused in ("no", "inconclusive") or not facts.schema_pin:
         return 1
     return 0 if facts.version_ok and facts.privileges in ("ok", "review") else 1
 
@@ -905,6 +933,7 @@ def _sql_steps(conn, args, facts: Facts, checks: list[dict]) -> None:
         say("FAIL", "read_only", f"rollback {sql_code_of(exc)}")
     try:
         cursor.execute(SCHEMA_STATEMENT)
+        facts.schema_pin = True
         say("PASS", "schema_pin", "accepted")
     except Exception as exc:  # noqa: BLE001
         say("FAIL", "schema_pin", sql_code_of(exc))
@@ -918,6 +947,9 @@ def _sql_steps(conn, args, facts: Facts, checks: list[dict]) -> None:
     # S8b
     if not args.write_test:
         say("SKIP", "write_refused", "no --write-test")
+    elif not facts.schema_pin:
+        # The app never runs a statement without the pin: neither does the probe.
+        say("SKIP", "write_refused", "schema pin failed")
     elif not facts.read_only:
         say("SKIP", "write_refused", "not read-only")
     else:
@@ -983,7 +1015,9 @@ def _sql_steps(conn, args, facts: Facts, checks: list[dict]) -> None:
             say("FAIL", "explain_plan", sql_code_of(exc))
 
     # S12
-    if checks and not facts.read_only:
+    if not facts.schema_pin:
+        say("SKIP", "checks", "schema pin failed")
+    elif checks and not facts.read_only:
         say("SKIP", "checks", "not read-only")
     elif checks:
         passed, failed = run_checks(cursor, checks)
@@ -1005,8 +1039,12 @@ def _write_test(conn, cursor, facts: Facts) -> None:
     try:
         cursor.execute(WRITE_TEST_STATEMENT)
     except Exception as exc:  # noqa: BLE001 - code or class only
-        facts.write_refused = "yes"
-        say("PASS", "write_refused", sql_code_of(exc))
+        if _int_sql_code(exc) in READ_ONLY_REFUSAL_CODES:
+            facts.write_refused = "yes"
+            say("PASS", "write_refused", sql_code_of(exc))
+        else:
+            facts.write_refused = "inconclusive"
+            say("INCONCLUSIVE", "write_refused", sql_code_of(exc))
         return
     # Accepted: the transaction was not read-only. Undo, and run nothing more in it.
     for undo in (lambda: cursor.execute(f"DROP TABLE {WRITE_TEST_TABLE}"), conn.rollback):
