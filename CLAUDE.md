@@ -437,7 +437,11 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   in both of its modes (`app_only`, `destination`): `user_context` is refused.
   `builtin:bitbucket` has one mode, `destination`, as the destination's
   technical user (the table line `app` under `destination` only):
-  `user_context` is refused
+  `user_context` is refused. `builtin:hana` (`agents/hana/`) has one mode
+  too, `destination`, as the technical user of one destination per system
+  (the table line `app (tcp)` under `destination` only: SQL through the
+  Cloud Connector, not HTTP): `user_context` is refused, and its factory gets
+  the block as stored, `None` included, for its own reading to refuse
 - `agents/gmail_tools.py` — in-process Gmail tools over the REST API,
   attached when an agent lists the pseudo-URL `builtin:gmail` instead of an
   MCP endpoint. Google's hosted Gmail MCP server refuses every `tools/call`
@@ -911,6 +915,240 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   per provider in `docs/GIT_SETUP.md` (local, not in repo). Usable by any
   admin agent and, through a shared tool source (addendum g), by personal
   agents; the intended holders are the advanced UI5/Fiori and CAP agents
+- `agents/hana/` — on-premise SAP HANA 2.0 monitoring views over SQL as an
+  in-process toolset (`builtin:hana`, Phase 1): `hdbcli` through the
+  connectivity service's SOCKS5 proxy and the Cloud Connector, as the
+  database user of one BTP destination per system. Not `agents/hana_hdi.py`
+  (the registry's own schema): nothing here touches the registry database,
+  and its tests are `tests/test_hanadb_*.py` (the `test_hana_*` names are the
+  HDI registry's). No new dependency (`hdbcli` is pinned for the registry;
+  imported inside the call, so building the toolset needs neither the driver
+  nor a binding). **Destination mode only**, `user_context: true` refused.
+  The entry is exactly `{"url": "builtin:hana", "auth_mode": "destination",
+  "oauth": {"systems": [{"name": ..., "destination": ...}], "allow_select":
+  true}}`: 1 to 10 systems, `name` `[a-z][a-z0-9_]{0,31}` and distinct,
+  `destination` the OData gate's name pattern, no top-level `destination`,
+  `allow_select` stored only as `true`, an unknown key refused without being
+  named. `config.py` (standard library only) is the one reading: the gate
+  (`_validate_raw_hana_entry` in `agents/admin.py`), storage
+  (`_clean_hana_entry` in `agents/db.py`) and the build (`pins_of`); a second
+  entry per agent is refused at the gate and in storage
+  (`HANA_SINGLE_ENTRY_MESSAGE`), and a hand-written row with two gets no HANA
+  tools (one WARNING). The model names a system only by its slug, never a
+  destination or a host.
+  **The database user.** The design asks for a technical user per system
+  with the MONITORING role (CATALOG READ for the catalogue checks of a later
+  phase). A landscape may run it with a wider user, so the code does not rely
+  on the database user: the barriers are the fixed checks (registered only as
+  a single read that passes the SELECT guard), the guard itself for
+  `run_select`, the read-only transaction, the schema pin and the statement
+  timeout.
+  - `connection.py` — **one connection per call**, in a worker thread, at
+    most `MAX_CONCURRENT` (4) at a time per app instance. In order:
+    autocommit off, `SET TRANSACTION READ ONLY`, `SET SCHEMA SYS` (the guard
+    allows unqualified `M_*` names and unqualified functions, which HANA
+    resolves in the current schema first; the user's own schema could hold
+    look-alikes), `setquerytimeout(20)`, execute, `fetchmany(top + 1)`, then
+    `rollback()` and `close()` on every path: nothing ever commits.
+    `connectTimeout` 15 s; ONE deadline of 45 s (`CALL_DEADLINE_SECONDS`,
+    `asyncio.timeout` with `expired()`) covers the wait for a free slot and
+    the run; a thread cannot be cancelled, so its slot is released only when
+    the thread has ended (the caller already has `timeout`). **The
+    destination** (its raw properties, `resolve_properties()` with the app's
+    token) is an HTTP destination with `BasicAuthentication`, `ProxyType:
+    OnPremise`, `User` and `Password`, whose URL `http://<virtual
+    host>:<port>` is only a carrier for host and port (`https`, userinfo, a
+    path, query or fragment refused; nothing is sent over HTTP); the shape
+    `Type: TCP` with `Address <host>:<port>` is read too and has never run.
+    `hana.encrypt` is exactly `true` or `false` (absent: on; exactly `false`
+    switches TLS off), and an encrypted login always validates the
+    certificate (`sslValidateCertificate`): there is no insecure TLS switch;
+    `hana.sslHostNameInCertificate` names the host the certificate is
+    checked against; `hana.database` is accepted and ignored (a tenant is
+    reached on its own mapped SQL port); any other `hana.*` property is
+    refused (`destination_error`, the log naming the rule, never a value).
+    The SOCKS5 port is the connectivity binding's
+    `onpremise_socks5_proxy_port` (`ConnectivityConfig.socks5_port`; none:
+    `destination_error`). The proxy keywords are the probe's variant
+    `props`: `proxyHostname`, `proxyPort`, `proxyUserName` = the
+    application's connectivity token and, only with a
+    `CloudConnectorLocationId`, `proxyPassword` = `"1." + base64(location
+    id)`. A driver failure maps by its integer SQL code (10, 414, 663
+    `login_failed`; 258 `not_authorized`; 613, 1024 `timeout`; hdbcli's
+    -10709 `timeout`, `proxy_refused` or `unreachable` by words of the
+    driver's text that never leave the function, a mapping not observed on a
+    landscape; any other code `sql_error` with the code); a log line names
+    the step, the system's slug and the class or the code, never the
+    driver's text, the host, the user or a row
+  - `guard.py` + `sqltokens.py` — the SELECT guard (`check_select`) of
+    `run_select`, on the tokenizer the masking shares. **Closed by
+    default**: what it does not positively recognise is refused,
+    `SelectRefused(rule)` naming the rule, never any part of the SQL. The
+    strict tokenizer refuses a character outside ASCII SQL, an unterminated
+    literal, quoted identifier or block comment, a control or format
+    character and a number glued to a word (`unreadable`, as are unbalanced
+    parentheses). Refused besides: over 4,000 characters (`too_long`); a
+    comment (`no_comments`); a `;`, trailing ones included
+    (`one_statement`); a first word other than `SELECT` / `WITH`, `WITH`
+    anywhere else, a data, schema, session or transaction keyword anywhere
+    (`FORBIDDEN_WORDS`, `SET`, `CALL`, `EXPLAIN`, `NEXTVAL` included) and a
+    `FOR` that is no locking clause (`select_only`); `INTO` (`no_into`);
+    `FOR UPDATE` and every `FOR` + lock word (`no_for_update`). **Allowed
+    references** (`table_not_allowed` otherwise): `SYS.<name>`,
+    `_SYS_STATISTICS.<name>`, an unqualified `M_*` name, a CTE after its
+    body, and `(SELECT ...)`; after `FROM` / `JOIN` / `APPLY` / a `,` of a
+    FROM list a table function, `LATERAL`, `JSON_TABLE`, `AS OF`,
+    `TABLESAMPLE` or a parenthesised join is refused, and so is a
+    schema-qualified call outside those two schemas or a quoted one. One walk
+    with a frame per parenthesis level: **only reserved words end a FROM
+    list** (`WHERE` and `HAVING` followed by a condition, `GROUP BY`, `ORDER
+    BY`, `LIMIT <n>`, a set operator followed by `ALL`, `DISTINCT`, `SELECT`
+    or a query in parentheses), and only in a keyword position (not after
+    `.` or `AS`, not before `.`) with what their clause demands after them;
+    a non-reserved word (`OFFSET`) never does, since it could be an alias and
+    the next `,` would go unchecked. A subquery is a frame of its own, so a
+    reference in a select list, a `WHERE`, a CTE body or a second `UNION`
+    branch is checked like the first; `FROM` inside `EXTRACT`, `TRIM`,
+    `SUBSTRING` and the `*_REGEXPR` functions is an expression keyword
+    (expression frames), and no query may start at such a frame's own level.
+    The closing words were checked against the reserved words of the SAP
+    HANA Cloud SQL Reference; that list is unverified on SPS07, so the
+    follow-token rules are the safety net
+  - `masking.py` — `mask_statement`, for statement texts other sessions ran
+    (the masked `STATEMENT_STRING` of `expensiveStatements` and
+    `longRunning`): every literal (string, national string, number, binary)
+    becomes `?`, comments are dropped, the operand of `PASSWORD` is masked
+    whatever its form, a `"..."` inside a JSON document is masked,
+    identifiers stay; whitespace folded, control and format characters
+    dropped, cut at 300 characters. The tokenizer's lenient mode: never
+    raises, a text HANA cut mid-literal is masked to its end
+  - `tools.py` — `hana_toolset`: `list_systems()` (`{systems: [{name}]}`),
+    `list_checks(category=None)` (`{checks: [{name, category, purpose,
+    arguments: [{name, default, rule}]}]}`; a `required` argument carries
+    `required: true` instead of a default), `run_check(system, check,
+    schema=None, object=None, top=None, hours=None, host=None)` (defaults
+    applied by the registry: `top` 50, at most the check's cap; `hours` 24;
+    no filter; an argument the check does not take is refused, a `required`
+    one left out too; answers `{system, check, columns, rows, row_count,
+    truncated}`, for a check of several statements `{system, check, parts:
+    [{label, columns, rows, row_count, truncated}]}`) and, ONLY with
+    `allow_select`, `run_select(system, sql, top=100)` (`top` 1..500; the
+    guard first, nothing sent on a refusal; what it selected comes back
+    unmasked, which is what the switch is for). Without the switch
+    `run_select` is not registered, and a `requires_select` check is neither
+    listed nor runnable (`unknown_check`, as if it did not exist).
+    **Nothing the model sent is echoed**: a refusal is `{"error": {code,
+    message}}` from the closed `ERROR_CODES` (`errors.py`:
+    `destination_error`, `proxy_refused`, `unreachable`, `login_failed`,
+    `not_authorized`, `timeout`, `unknown_system`, `unknown_check`,
+    `invalid_argument` plus `argument` and `rule`, `select_refused` plus
+    `rule`, `result_too_large`, `sql_error` plus the integer `sql_code`,
+    `call_failed`), never a driver's, the destination service's or the
+    database's text; anything unexpected is `call_failed`, logged by class.
+    Every cell is made JSON safe (`json_value`: bytes as their size, temporal
+    values ISO, decimals as text, anything else its type name, never its
+    `repr`); a column name is cut to 128 characters, control and format
+    characters as `?` (`run_select`'s aliases are the model's). An answer
+    over `MAX_RESULT_CHARS` (60,000, measured by `agents/tool_results.py`
+    `result_chars`) is `result_too_large`, never cut. **What is stored**:
+    `activity_summary` gives the fixed lines `list_systems: n systems`,
+    `list_checks: n checks`, `run_check: <registered check>, n rows[,
+    truncated]`, `run_select: n rows[, truncated]`, `error: <code>`, plain
+    or prefixed (`hana_`, `hana_0_`), hooked into
+    `registry._short_tool_output`; `agents/run_activity.redact_args` keeps of
+    a `run_select` call only `system`, the SQL's length (`"<n chars>"`) and
+    `top`, for the run activity, the web chat's tool card and the classic
+    chat's tool card (`agents/chat_app.py`). Known limit: the web chat's
+    stored history (`chat_messages.model_json`, the next turn's
+    `message_history`) holds the real tool-call arguments, SQL included
+  - `checks/` — the closed check registry (`base.py`): a check is data, a
+    hana-cli command name, a category, a one-line purpose,
+    `source="bin/<name>.js"` and fixed statements whose only variable parts
+    are `?` binds of the closed arguments `schema` and `object`
+    (identifiers, bound as given: the catalogue's case, usually upper),
+    `top` (1..500, default 50, a `max_rows_cap` per check), `hours` (1..720,
+    default 24) and `host` (a host name), plus the derived `top_plus_one`
+    for a row limit in the SQL; `required`, `masked_columns` and
+    `requires_select` per check. `register` refuses a statement that is not
+    one read (first word `SELECT` / `WITH`; no comment, `;`, forbidden word,
+    `INTO` or format placeholder), and a test runs the SELECT guard over
+    every registered statement. **29 checks in Phase 1** (68 planned; Phases
+    2 and 3, the categories `security`, `database` and `schema`, are not
+    built): monitoring 7 (`alerts`, `blocking`, `deadlocks`, `traces`,
+    `traceContents`, `crashDumps`, `replicationStatus`), performance 7
+    (`memoryAnalysis`, `memoryLeaks`, `expensiveStatements`,
+    `tableHotspots`, `longRunning`, `columnStats` (requires `schema` and
+    `object`), `fragmentationCheck`), system 13 (`systemInfo`,
+    `hostInformation` (a fixed list of host keys: no user, address or path
+    key), `disks`, `ports`, `dataVolumes`, `features`, `featureUsage`,
+    `iniFiles`, `iniContents`, `healthCheck`, `diagnose`, `recommendations`,
+    `workloadManagement`), backup 2 (`backupStatus`, `backupList`).
+    `queryPlan` is dropped: `EXPLAIN PLAN` failed on the landscape (SQL code
+    129). The SQL is derived from SAP hana-cli 4.202609.0 (Apache-2.0; the
+    attribution is the docstring of `checks/__init__.py`, each check names
+    its `bin/<command>.js`), mostly rewritten for the on-premise views:
+    named columns, never `*`; HANA Cloud views replaced; a `# on-prem:`
+    comment per check says how and what ran where. **`iniContents` hides
+    values by default**: a value is shown only when neither its key nor its
+    section holds a word of `DENY_WORDS` (and the key does not end in `key`)
+    AND the value has a harmless shape (at most 64 characters of
+    `[A-Za-z0-9_ .,+%-]`, no line feed, carriage return or tab); otherwise
+    it reads `<hidden>` with `VALUE_HIDDEN` 1. `traceContents` needs `host`
+    and `object` (the file, as `traces` lists them: `M_TRACEFILE_CONTENTS`
+    refuses a read without both equality predicates), exists only with
+    `allow_select` (trace text is unmasked) and returns at most 200 rows.
+    `python -m agents.hana.checks --dump` prints every statement with sample
+    binds, the probe's `--checks-file`
+  **Reach rules** (decided 2026-11-10; enforced like the approving
+  `builtin:bitbucket` entry: the `AgentPayload` gate, storage
+  `check_hana_reach` in `agents/db.py` (called by `upsert_agent` and the
+  admin update route), the registry build, and the invoke API's 404): an
+  agent with a `builtin:hana` entry cannot `share_tools`
+  (`HANA_SHARE_MESSAGE`; a hand-written sharing row shares nothing). An
+  entry that asks to select (`asks_to_select`: `allow_select` anything but
+  `false` / absent, so a hand-written `"true"` counts) cannot be
+  `expose_invoke`, may be chat-exposed only at tier `advanced`, and may not
+  be named in any agent's `peers` (any other row, enabled or not); a
+  hand-written row exposed to the invoke API or to basic chat is built
+  without `run_select` (the fixed checks stay), and no delegation tool is
+  attached to such a peer, each with one WARNING. Such an agent runs from
+  advanced chat, the scheduler run endpoint or an admin's Run now. Accepted
+  gaps: a workflow step may name such an agent; an advanced user's personal
+  agent may consult one; the agent's own deep sub-agents share its tools;
+  `check_hana_reach` takes no row lock (the build closes what it misses).
+  **Registry and admin.** `agents/builtins.py` builds it from the stored
+  block; an agent save or bundle import that changes the entry (systems,
+  Allow SELECT, the entry itself) or enables or disables such an agent
+  reloads the registry (`_entry_signature`). `GET
+  /admin/api/credential-health` lists a `builtin:hana` entry once per system
+  (`system`, `destination`, `state`, `auth_type`): the destination's
+  properties are read only, no SQL login is made; a block the reading
+  refuses is one `error` entry with the reading's text. Denied in ABAP
+  Assistant sessions (not in `READONLY_POLICY`). **Verified on a landscape**
+  (2026-11-10, SAP HANA 2.0 SPS07 revision 79, a SYSTEMDB and a tenant of
+  one on-premise system, through `scripts/probe_hana_connectivity.py
+  --checks-file`): the connection path (unencrypted there: a TLS login was
+  refused, cause unknown), the read-only transaction, the statement timeout,
+  and 54 of the 55 statements of the 29 checks on both databases (the 55th,
+  `traceContents`, ran with the probe's host that does not exist, SQL code
+  8). **Not verified there**: the app's own client end to end (nothing is
+  deployed yet), `SET SCHEMA SYS` inside the read-only transaction,
+  `traceContents` with a real host and file, a NULL bind of an optional
+  filter, LOB values, a multi-line ini value, the word-based mapping of
+  -10709, TLS, a Cloud Connector location id, the `tcp` destination shape.
+  The seed agent `hana-monitor` and skill `hana-monitoring`: see
+  `agents.seed.json`. Tests: `tests/test_hanadb_config.py`,
+  `_connection.py`, `_connectivity_config.py`, `_guard.py`, `_masking.py`,
+  `_checks.py`, `_checks_monitoring.py`, `_checks_performance.py`,
+  `_checks_system.py`, `_checks_backup.py`, `_tools.py`, `_activity.py`,
+  `_registration.py`, `_reload.py`, `_reach.py`, `_readonly.py`,
+  `_seed.py`; setup in `docs/HANA_SETUP.md` (local, not in repo)
+- `agents/tool_results.py` — `result_chars(result)`: the size of a tool
+  result as the model receives it (pydantic-ai's `tool_return_ta` JSON, or
+  plain JSON without ASCII escapes when that is longer or the name cannot be
+  imported: imported inside the measure). The one measure of the 60,000
+  character caps of `builtin:sharepoint` and `builtin:hana`, in a neutral
+  module so neither toolset imports the other
 - `agents/slack_tools.py` — Slack over the Web API (`builtin:slack`), as a
   bot. Slack has no client-credentials grant, so the `xoxb-` token lives in a
   BTP destination (NoAuthentication + `URL.headers.Authorization`, which
@@ -946,7 +1184,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   (`CloudConnectorLocationId`) and `queries` (the `URL.queries.*`
   properties, e.g. `sap-client`). `ConnectivityConfig` and
   `connectivity_config_from_environment` read the connectivity binding from
-  `VCAP_SERVICES` (env fallback `CONNECTIVITY_*`); `ConnectivityTokens` gets
+  `VCAP_SERVICES` (env fallback `CONNECTIVITY_*`);
+  `ConnectivityConfig.socks5_port` is the binding's
+  `onpremise_socks5_proxy_port` (env `CONNECTIVITY_SOCKS5_PORT`; `None` when
+  absent or not a port), read only by `builtin:hana`; `ConnectivityTokens` gets
   the application's token (client credentials) or a user's (jwt-bearer
   exchange), cached per owner and token digest, and fails with class,
   status and OAuth code only, never the endpoint's text
@@ -2981,7 +3222,14 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   an ABSENT `expose_invoke` / `result_schema` / `invoke_limits` key as "keep
   what is stored" (`invoke_kwargs`, by `model_fields_set`), so an older
   client cannot wipe them, and an explicit `false` / `null` switches off or
-  clears: a client that edits them must always send all three
+  clears: a client that edits them must always send all three.
+  It offers `builtin:hana` (destination mode only, refused before the save
+  otherwise): a Systems text area with one `name destination` per line
+  (blank lines dropped, the names sent as typed for the server to judge, a
+  line without exactly two names refused by its line number, never its
+  text) and an "Allow SELECT" checkbox whose ticking asks first (Cancel
+  leaves it unticked; the question names no system); two such rows are
+  refused before the save
 - `ui5-admin/` — SAPUI5 (TypeScript) rebuild of the admin UI, deployed to the
   BTP HTML5 Application Repository and served at `/ui5admin`. Runs **alongside**
   `templates/admin.html`, which is still the supported admin at `/admin`. All HTTP goes through `webapp/service/AdminService.ts`, which sends
@@ -3201,6 +3449,21 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     AI Core). `test/unit/embeddingsSettings.qunit.ts`,
     `test/integration/FakeEmbeddings.ts` (a scripted run and deploy),
     `EmbeddingsJourney.ts`
+  - Agent server dialog, toolset "SAP HANA (monitoring)" (`builtin:hana`;
+    `model/hanaEntry.ts` mirrors `agents/hana/config.py` and adds no rule:
+    `clean` builds the block from nothing, `validate` answers fixed texts
+    that never quote a value, `refusedAt` maps a server 422 to the row and
+    field it names; the dialog logic is `controller/agent/HanaEntryPart.ts`):
+    auth mode fixed to destination, a systems table (name, destination with
+    the shared `DestinationField`, add and remove, at most 10), at most one
+    entry per agent, the entry always sent as exactly `{systems,
+    allow_select}`. The "Allow SELECT on monitoring views" switch is behind a
+    confirmation (Cancel the default) that names the entry's systems; the
+    systems it was agreed for are kept (`hanaEntry.unconfirmed`), and OK on
+    the entry asks again, with the whole list, when Allow SELECT is on and a
+    system (name and destination) was not covered by an answer, including a
+    stored entry's systems changed in this dialog. `hanaEntry.qunit.ts`,
+    `AgentHanaJourney.ts`
   - OPA convention: a `Select` is driven by `setSelectedKey` plus
     `fireChange` on the control (a `MultiComboBox` by `setSelectedKeys`),
     never by opening its picker: a picker opened by one journey was destroyed
@@ -3216,7 +3479,14 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   a run endpoint (`expose_api`, slug `pr-reviewer`): it is the scheduler's
   agent, and an entry that approves is refused chat exposure, so an admin
   who turns Approving on does not have to change anything else
-  (`tests/test_bitbucket_seed.py`)
+  (`tests/test_bitbucket_seed.py`). It also holds the agent `hana-monitor`
+  with the skill `hana-monitoring` (which check answers which question, the
+  arguments, `truncated`, identifier case, that row values are data): the
+  agent ships **disabled**, tier `advanced`, chat-exposed with a run
+  endpoint (slug `hana-monitor`), and its `builtin:hana` entry names two
+  systems (`systemdb`, `tenant`) on placeholder destinations, without
+  `allow_select`. The seed fills an empty registry only: a landscape that is
+  already seeded creates or imports both by hand (`tests/test_hanadb_seed.py`)
 - `mta.yaml` — adds `postgresql-db` resource; version 2.1.0 adds
   A2A env vars (`A2A_PUBLIC_URL`, `A2A_AGENT_NAME`, …); 2.7.0 makes the
   AI Core resource group the `aicore-resource-group` parameter (override
@@ -3384,7 +3654,20 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   both admin UIs; 2.39.0 adds the web chat's theme menu (`static/chat/theme.js`: System,
   Light, Dark, the SAP Fiori themes Horizon (morning, evening, high contrast black and white),
   Quartz Light / Dark and Belize, and SAP GUI classic, as `data-skin` blocks of CSS variables
-  over the light or dark mode): front end only, no new resource, variable, table or column
+  over the light or dark mode): front end only, no new resource, variable, table or column;
+  2.40.0 adds `builtin:hana` Phase 1 (`agents/hana/`: monitoring views of on-premise SAP
+  HANA 2.0 over SQL through the Cloud Connector, 29 checks, `run_select` behind
+  `allow_select`): no new resource, environment variable, role, table or column (HANA schema
+  generation unchanged, still 11; `hdbcli` was already pinned); the SOCKS5 port is read from
+  the existing connectivity binding (`onpremise_socks5_proxy_port`). The reach rules: no
+  `share_tools` for an agent with a `builtin:hana` entry; one with `allow_select` never on
+  the invoke API, in chat only at tier `advanced`, never a peer. A landscape creates, per
+  database, a Cloud Connector TCP mapping of its SQL port and a destination (and
+  `hana.encrypt=false` where the database has no TLS on its SQL port). Verified on a
+  landscape with the probe only (connection, read-only, timeout, 54 of 55 statements on a
+  SYSTEMDB and a tenant); unverified: the app's own client end to end, `SET SCHEMA SYS` in
+  the read-only transaction, `traceContents` on a real file, NULL binds, LOB values, TLS, a
+  location id, the `tcp` destination shape
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets
@@ -3472,6 +3755,27 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   on the command line, statuses, counts, sizes and host names, never a
   token, a `Location`, a response body, an exception text, a line of a
   diff, a title or a user name (`tests/test_probe_bitbucket.py`)
+- `scripts/probe_hana_connectivity.py` — standalone go/no-go probe for
+  `builtin:hana` (stdlib, `httpx` and `hdbcli`, nothing imported from the
+  app; read statements only), run inside an app container with the
+  destination and connectivity bindings: `--destination <name>` and
+  optionally `--variant props|props-account|both`, `--encrypt yes|no|both`,
+  `--checks-file` (the output of `python -m agents.hana.checks --dump`),
+  `--timeout`, `--no-version`. One `PASS` / `FAIL` / `SKIP` line per step:
+  S1 bindings, S2 destination (`http` or `tcp` shape), S3 connectivity token
+  (lifetime), S4 TCP connect to the SOCKS5 port, S5 raw SOCKS5 handshake, S6
+  `hdbcli` login per variant and TLS, S7 `M_DATABASE` (rows, version), S8
+  `SET TRANSACTION READ ONLY`, S9 the query timeout, S10 the effective
+  privileges of the user (`ok`, `review`, `too_wide` or `unknown`; counts
+  and schema names, never an object, grantor or user name), S11 `EXPLAIN
+  PLAN`, S12 each statement of the checks file (run as `SELECT TOP 1 * FROM
+  (...)` with the sample binds, in the read-only transaction). A final block
+  with one value per key: `DEST_SHAPE`, `PROXY_VARIANT`, `TLS`,
+  `TOKEN_SECONDS`, `READ_ONLY`, `QUERY_TIMEOUT`, `EXPLAIN_PLAN`,
+  `PRIVILEGES`. Prints property names, SOCKS5 reply codes, SQL error codes
+  and counts, never a credential, a token, a host from a binding or a
+  destination, a row or a driver's error text
+  (`tests/test_probe_hana_connectivity.py`)
 - `scripts/ensure_aicore_setup.py` — creates the `AICORE_RESOURCE_GROUP`
   resource group if missing, idempotent, no-op for `default`. Creates the
   group only; model deployments stay in `scripts/deploy_claude.py` because
