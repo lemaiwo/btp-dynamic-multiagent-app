@@ -31,6 +31,7 @@ sap.ui.define(function () {
             "unit/reconcileEntry": { title: "Unit: reconcileEntry, the migration reconciliation entry" },
             "unit/bitbucketEntry": { title: "Unit: bitbucketEntry" },
             "unit/gitEntry": { title: "Unit: gitEntry" },
+            "unit/hanaEntry": { title: "Unit: hanaEntry, the agent's SAP HANA (monitoring) entry" },
             "unit/invokeSettings": { title: "Unit: invokeSettings, the agent's invoke API panel" },
             "unit/importBundle": { title: "Unit: importBundle, what a configuration import opens" },
             "unit/ReportRenderer": { title: "Unit: ReportRenderer" },

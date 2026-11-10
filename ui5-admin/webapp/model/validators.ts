@@ -5,6 +5,7 @@ import odataEntry from "./odataEntry";
 import bitbucketEntry from "./bitbucketEntry";
 import gitEntry from "./gitEntry";
 import inaEntry, { INA_TEXTS } from "./inaEntry";
+import hanaEntry, { HANA_TEXTS } from "./hanaEntry";
 import reconcileEntry from "./reconcileEntry";
 
 // --- odata ---
@@ -360,6 +361,11 @@ export default {
             // below: this entry names no destination.
             return inaEntry.validate(oauth, authMode);
         }
+        if (hanaEntry.isHanaUrl(url)) {
+            // --- hana --- Its own rules and none of the destination ones
+            // below: the destinations are per system.
+            return hanaEntry.validate(oauth, authMode);
+        }
         if (this.isTeams(url)) {
             const teamsError = this.validateTeams(oauth, authMode);
             if (teamsError) {
@@ -562,6 +568,8 @@ export default {
                     errors[index] = "An agent has one Git entry; add the repositories to the existing one.";
                 } else if (key === inaEntry.INA_URL) {
                     errors[index] = INA_TEXTS.secondEntry;
+                } else if (key === hanaEntry.HANA_URL) {
+                    errors[index] = HANA_TEXTS.secondEntry;
                 } else {
                     errors[index] = "This is a duplicate URL; each server may appear once.";
                 }

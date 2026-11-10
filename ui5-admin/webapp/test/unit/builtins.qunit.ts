@@ -40,6 +40,7 @@ QUnit.test("restricted built-ins offer only what the server accepts", function (
     assert.deepEqual(authModesFor("builtin:bitbucket"), ["destination"]);
     assert.deepEqual(authModesFor("builtin:confluence"), ["destination"]);
     assert.deepEqual(authModesFor("builtin:git"), ["destination"]);
+    assert.deepEqual(authModesFor("builtin:hana"), ["destination"]);
     assert.deepEqual(authModesFor("builtin:reconcile"), ["none"]);
 });
 

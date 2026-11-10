@@ -246,6 +246,20 @@ export type OAuthClient =
            * to each registered query. See model/inaEntry.ts.
            */
           queries?: string[];
+          // --- hana ---
+          /**
+           * `builtin:hana` only. The databases (1-10) the agent may read: a
+           * slug the model names and the BTP destination that holds host,
+           * port, user and password of that one database. The entry has no
+           * top-level `destination` and no `user_context`. See
+           * agents/hana/config.py and model/hanaEntry.ts.
+           */
+          systems?: { name: string; destination: string }[];
+          /**
+           * `builtin:hana` only. Lets the agent run its own SELECT on the
+           * monitoring views; stored only as `true`.
+           */
+          allow_select?: boolean;
       };
 
 export interface McpServer {
