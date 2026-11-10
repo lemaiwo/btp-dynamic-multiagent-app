@@ -51,6 +51,12 @@ body or the second branch of a ``UNION`` is checked like the first one.
 ``*_REGEXPR`` functions is an expression keyword, not a table reference; a
 subquery inside them is again a frame of its own.
 
+The closing words were checked against the reserved-word list of the SAP
+HANA Cloud SQL Reference only. The first target is SAP HANA 2.0 SPS07
+on-premise, where that list is unverified, so the follow-token rules of
+:meth:`_Walker._closes_from` (a clause must follow, a set operator's "(" must
+open a query) are the safety net, not the list.
+
 Standard library only.
 """
 
@@ -334,9 +340,12 @@ class _Walker:
         if word == "LIMIT":
             return following is not None and following.kind in ("number", "param")
         if word in _SET_OPERATORS:
-            return following is not None and (
-                following.is_word("ALL", "DISTINCT", "SELECT") or following.is_symbol("(")
-            )
+            if following is not None and following.is_symbol("("):
+                # "(" is also the shape of a call ("MINUS(1)"): only a query in
+                # parentheses opens the next branch.
+                inner = self._at(index + 2)
+                return inner is not None and (inner.is_word("SELECT") or inner.is_symbol("("))
+            return following is not None and following.is_word("ALL", "DISTINCT", "SELECT")
         # WHERE, HAVING: a condition must follow
         return following is not None and not following.is_symbol(",", ")")
 
@@ -379,6 +388,11 @@ class _Walker:
                 word = token.value
                 if index != 0:
                     self._check_word(index, frame)
+                if frame.expression and (word == "SELECT" or word in _SET_OPERATORS):
+                    # EXTRACT(...) and friends ignore FROM at their own level, so
+                    # no query may start there: "TRIM((SELECT ..) UNION SELECT ..
+                    # FROM t)" would read t unchecked.
+                    raise SelectRefused("table_not_allowed")
                 if word == "FROM" and not frame.expression:
                     frame.in_from = True
                     index = self._reference(index + 1, stack)

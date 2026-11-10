@@ -313,3 +313,45 @@ def test_numeric_named_parameter_is_unreadable() -> None:
     with pytest.raises(SelectRefused) as caught:
         check_select("SELECT * FROM M_SERVICES WHERE PORT = :1")
     assert caught.value.rule == "unreadable"
+
+
+# -- fix round 2 -------------------------------------------------------------
+
+EXPRESSION_FRAME_BYPASSES = [
+    "SELECT 1 FROM M_SERVICES WHERE 'a' = "
+    "TRIM((SELECT 'a' FROM M_X) UNION ALL SELECT ZQX FROM SAPHANADB.BKPF)",
+    "SELECT EXTRACT((SELECT 1 FROM M_X) UNION SELECT ZQX FROM SAPHANADB.BKPF) FROM M_SERVICES",
+    "SELECT SUBSTRING((SELECT 'a' FROM M_X) EXCEPT SELECT ZQX FROM SAPHANADB.BKPF, 1, 2) "
+    "FROM M_SERVICES",
+    "SELECT SUBSTR_REGEXPR((SELECT 'a' FROM M_X) INTERSECT SELECT ZQX FROM SAPHANADB.BKPF) "
+    "FROM M_SERVICES",
+    "SELECT TRIM((SELECT 'a' FROM M_X) MINUS SELECT ZQX FROM SAPHANADB.BKPF) FROM M_SERVICES",
+    "SELECT TRIM(1 SELECT ZQX FROM SAPHANADB.BKPF) FROM M_SERVICES",
+]
+
+
+@pytest.mark.parametrize("sql", EXPRESSION_FRAME_BYPASSES)
+def test_select_or_set_operator_in_an_expression_frame_is_refused(sql: str) -> None:
+    with pytest.raises(SelectRefused) as caught:
+        check_select(sql)
+    assert caught.value.rule == "table_not_allowed"
+    assert "ZQX" not in str(caught.value)
+
+
+@pytest.mark.parametrize("word", ["UNION", "INTERSECT", "EXCEPT", "MINUS"])
+def test_set_operator_shaped_like_a_call_does_not_end_the_from_list(word: str) -> None:
+    sql = f"SELECT b.* FROM M_X t JOIN M_SERVICES m ON {word}(1) = 1, SAPHANADB.BKPF b"
+    with pytest.raises(SelectRefused):
+        check_select(sql)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT HOST FROM M_SERVICES UNION ((SELECT HOST FROM M_VOLUMES))",
+        "SELECT TRIM(BOTH ' ' FROM (SELECT MAX(HOST) FROM M_VOLUMES)) FROM M_SERVICES",
+        "SELECT EXTRACT(YEAR FROM START_TIME) FROM M_SERVICES",
+    ],
+)
+def test_round_2_legitimate_shapes_still_pass(sql: str) -> None:
+    check_select(sql)
