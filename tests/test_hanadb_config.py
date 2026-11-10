@@ -128,11 +128,13 @@ def test_item_without_name_or_destination(missing):
     "Sib", "1sib", "_sib", "sib-tenant", "sib tenant", " sib", "sib ", "sib\n",
     "a" * 33, "", "sïb", 7, None, True])
 def test_bad_name(name):
-    secret = name if isinstance(name, str) and name.strip() else "\x00never"
     text = _refused(_with(systems=[{"name": name, "destination": "HANA_X"}]),
                     "oauth.systems[0].name:")
-    if isinstance(name, str) and len(name) > 2:
-        assert secret not in text
+    # A name of fewer than three visible characters could stand in the fixed
+    # text by chance; every longer one must not be repeated.
+    if isinstance(name, str) and len(name.strip()) >= 3:
+        assert name not in text, text
+        assert name.strip() not in text, text
 
 
 def test_good_names():
@@ -224,7 +226,9 @@ def test_pins_of_refuses_what_check_refuses():
 
 
 def test_standard_library_only():
-    source = pathlib.Path("agents/hana/config.py").read_text(encoding="utf-8")
+    from agents.hana import config
+
+    source = pathlib.Path(config.__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)
     roots = set()
     for node in ast.walk(tree):
@@ -235,3 +239,13 @@ def test_standard_library_only():
             roots.add(node.module if node.module == "agents.hana"
                       else node.module.split(".")[0])
     assert roots <= {"__future__", "re", "dataclasses", "typing", "agents.hana"}, roots
+
+
+def test_the_package_init_imports_nothing():
+    """``agents/db.py`` reads the entry through ``agents.hana.config``: the
+    package itself must stay free of imports, or that read would pull them."""
+    import agents.hana
+
+    tree = ast.parse(pathlib.Path(agents.hana.__file__).read_text(encoding="utf-8"))
+    imports = [n for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom))]
+    assert imports == []

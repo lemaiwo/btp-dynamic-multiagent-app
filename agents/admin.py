@@ -590,9 +590,11 @@ class OAuthClientPayload(BaseModel):
             config["allow_push"] = True
         if self.allow_pull_request:
             config["allow_pull_request"] = True
-        if self.systems is not None:
+        if self.systems:
             # As received: agents/hana/config.py refuses a stray key or a
-            # value of the wrong form, so nothing may be repaired here.
+            # value of the wrong form, so nothing may be repaired here. An
+            # empty list is "not set", as for `services` (the hana gate then
+            # says the list is required).
             config["systems"] = copy.deepcopy(self.systems)
         if self.allow_select:
             config["allow_select"] = True
@@ -849,9 +851,7 @@ class McpServerPayload(BaseModel):
                 raise ValueError(_HANA_MODE_TEXT)
             check_hana_entry(self.oauth.to_config() if self.oauth else None)
             return self
-        if self.oauth is not None and (
-            self.oauth.systems is not None or self.oauth.allow_select
-        ):
+        if self.oauth is not None and (self.oauth.systems or self.oauth.allow_select):
             raise ValueError(
                 f"oauth.systems and oauth.allow_select belong to a {BUILTIN_HANA_URL} "
                 "entry only; no other server reads them"

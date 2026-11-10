@@ -267,6 +267,28 @@ def test_the_hana_keys_belong_to_a_hana_entry_only(url, block):
     assert "belong to a builtin:hana entry only" in _refusal(block, url=url)
 
 
+@pytest.mark.parametrize("empty", [None, []])
+def test_an_empty_systems_list_on_another_entry_passes_like_services(empty):
+    """``systems`` is read by truthiness on a non-hana entry, as ``services``
+    and ``queries`` are: ``null`` and ``[]`` both mean "not set"."""
+    block = {"destination": "S", "systems": empty}
+    assert "systems" not in _payload(block, url="builtin:slack").oauth.to_config()
+    assert _payload({"destination": "S", "services": empty},
+                    url="builtin:slack").oauth.services == []
+
+
+def test_a_system_with_a_null_extra_key_passes_and_is_stored_without_it():
+    """A client that serialises an unset field as ``null`` is not refused by
+    the gate (which hands ``systems`` on as received); storage keeps only the
+    two keys of a system."""
+    from agents.db import _clean_oauth
+
+    block = {"systems": [{"name": "prd", "destination": "HANA_PRD", "host": None}]}
+    handed_on = _payload(_copy(block)).oauth.to_config()
+    assert _clean_oauth(handed_on, "destination", None, url=URL) == BASE
+    assert _clean_oauth(_copy(block), "destination", None, url=URL) == BASE
+
+
 def test_a_git_entry_with_a_hana_key_is_refused_by_its_own_reading():
     assert "builtin:git entry holds only" in _refusal(
         {**GIT["oauth"], "allow_select": True}, url="builtin:git")
