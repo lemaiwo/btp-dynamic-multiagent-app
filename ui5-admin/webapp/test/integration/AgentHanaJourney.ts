@@ -31,9 +31,9 @@ const HANA = "builtin:hana";
 const PUT_101 = "PUT agents/101";
 const TENANT = { name: "erp_tenant", destination: "hana-erp-tenant" };
 const SYSTEMDB = { name: "erp_systemdb", destination: "hana-erp-systemdb" };
-const CONFIRM = "This lets the agent run its own SELECT statements on the monitoring views (SYS, _SYS_STATISTICS, M_*) "
-    + "and read trace file contents of \"erp_tenant\" (hana-erp-tenant), \"erp_systemdb\" (hana-erp-systemdb). "
-    + "Statement texts come back unmasked. Continue?";
+const CONFIRM = "This lets the agent run its own SELECT statements on the system and monitoring views "
+    + "(SYS, _SYS_STATISTICS, M_*) of \"erp_tenant\" (hana-erp-tenant), \"erp_systemdb\" (hana-erp-systemdb). "
+    + "Catalogue data, statement texts with their values and trace file contents come back unmasked. Continue?";
 
 /** What the entry shows, read from its controls. */
 interface Entry {
@@ -399,7 +399,7 @@ opaTest("Scenario A: a system added after Allow SELECT was confirmed is asked ab
     iType(When, 0, "destination", "hana-dev");
     iSwitchAllowSelect(When, true);
     iSeeAMessage(Then, "the question at the switch", function (dialog) {
-        Opa5.assert.ok(messageOf(dialog).indexOf("trace file contents of \"dev\" (hana-dev).") > -1, "it names dev only, with its destination");
+        Opa5.assert.ok(messageOf(dialog).indexOf("(SYS, _SYS_STATISTICS, M_*) of \"dev\" (hana-dev).") > -1, "it names dev only, with its destination");
     });
     iAnswer(When, "Allow SELECT");
     iSeeNoMessage(Then, "the switch is on");
@@ -408,7 +408,7 @@ opaTest("Scenario A: a system added after Allow SELECT was confirmed is asked ab
     iType(When, 1, "destination", PROD.destination);
     iPressInTheDialog(When, "serverConfirm");
     iSeeAMessage(Then, "the question again at OK", function (dialog) {
-        Opa5.assert.ok(messageOf(dialog).indexOf("trace file contents of \"dev\" (hana-dev), \"prod_tenant\" (hana-prod-tenant).") > -1,
+        Opa5.assert.ok(messageOf(dialog).indexOf("(SYS, _SYS_STATISTICS, M_*) of \"dev\" (hana-dev), \"prod_tenant\" (hana-prod-tenant).") > -1,
             "it names every system of the entry now");
         const focus = Element.getElementById((dialog as Dialog).getInitialFocus()) as Button | undefined;
         Opa5.assert.strictEqual(focus?.getText(), "Cancel", "Cancel has the initial focus");
@@ -444,7 +444,7 @@ opaTest("Scenario B: a stored entry that allows SELECT asks at OK when its syste
     iType(When, 1, "destination", SYSTEMDB.destination);
     iPressInTheDialog(When, "serverConfirm");
     iSeeAMessage(Then, "the question at OK", function (dialog) {
-        Opa5.assert.ok(messageOf(dialog).indexOf("trace file contents of \"prod_tenant\" (hana-prod-tenant), \"erp_systemdb\" (hana-erp-systemdb).") > -1,
+        Opa5.assert.ok(messageOf(dialog).indexOf("(SYS, _SYS_STATISTICS, M_*) of \"prod_tenant\" (hana-prod-tenant), \"erp_systemdb\" (hana-erp-systemdb).") > -1,
             "it names the systems now in the entry");
     });
     iAnswer(When, "Cancel");
@@ -467,7 +467,7 @@ opaTest("a confirmed system whose destination changed is asked about at OK, nami
     iType(When, 0, "destination", "hana-erp-other");
     iPressInTheDialog(When, "serverConfirm");
     iSeeAMessage(Then, "the question at OK", function (dialog) {
-        Opa5.assert.ok(messageOf(dialog).indexOf("trace file contents of \"erp_tenant\" (hana-erp-other).") > -1,
+        Opa5.assert.ok(messageOf(dialog).indexOf("(SYS, _SYS_STATISTICS, M_*) of \"erp_tenant\" (hana-erp-other).") > -1,
             "the question shows the new destination");
     });
     iAnswer(When, "Allow SELECT");
