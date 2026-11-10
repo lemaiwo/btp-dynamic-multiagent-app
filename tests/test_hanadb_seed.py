@@ -127,6 +127,18 @@ def test_the_skill_explains_truncated_select_and_identifier_case():
         assert cat in c
 
 
+def test_the_skill_names_the_required_arguments():
+    """The two checks that cannot run without a filter are named with what
+    they need, matching the registry's ``required`` sets."""
+    from agents.hana.checks import get_check
+
+    c = _skill()["content"]
+    assert "`traceContents` needs `object` (the trace file name)" in c
+    assert "`columnStats` needs `schema` and `object`" in c
+    assert get_check("traceContents").required == frozenset({"object"})
+    assert get_check("columnStats").required == frozenset({"schema", "object"})
+
+
 def test_the_seed_names_no_customer_or_landscape():
     low = RAW.lower()
     assert "infrabel" not in low and "hanasib" not in low
