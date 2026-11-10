@@ -1019,7 +1019,8 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     deny-list**, applied to a reference AFTER the allow rule and only to
     model-written SQL: `M_INIFILE_CONTENTS` and
     `M_CONFIGURATION_PARAMETER_VALUES` (unqualified or `SYS.`) and every
-    `SYS.P_*` object (HANA's internal persistence tables) are
+    `SYS.P_*` or `_SYS_STATISTICS.P_*` object (internal persistence tables;
+    no registered check reads one) are
     `table_not_allowed` in every position a reference can stand (a CTE of
     such a name is still a CTE); quoted names compared verbatim after the
     allow rule's upper-casing of words (`DENIED_VIEWS`, `DENIED_SYS_PREFIX`).
@@ -1068,7 +1069,7 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     values (`M_SQL_PLAN_CACHE`, `M_EXPENSIVE_STATEMENTS`, ...), bind values
     (the `PARAMETERS` columns), session and user names, client hosts and
     trace contents; the deny-list keeps out only the ini / configuration
-    values and the `SYS.P_*` tables. Without the switch
+    values and the `P_*` tables of `SYS` and `_SYS_STATISTICS`. Without the switch
     `run_select` is not registered, and a `requires_select` check is neither
     listed nor runnable (`unknown_check`, as if it did not exist).
     **Nothing the model sent is echoed**: a refusal is `{"error": {code,
@@ -3812,18 +3813,25 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   destination and connectivity bindings: `--destination <name>` and
   optionally `--variant props|props-account|both`, `--encrypt yes|no|both`,
   `--checks-file` (the output of `python -m agents.hana.checks --dump`),
-  `--timeout`, `--no-version`. One `PASS` / `FAIL` / `SKIP` line per step:
+  `--timeout`, `--no-version`, `--write-test`, `--explain-plan` (both off by
+  default). One `PASS` / `FAIL` / `SKIP` line per step:
   S1 bindings, S2 destination (`http` or `tcp` shape), S3 connectivity token
   (lifetime), S4 TCP connect to the SOCKS5 port, S5 raw SOCKS5 handshake, S6
   `hdbcli` login per variant and TLS, S7 `M_DATABASE` (rows, version), S8
-  `SET TRANSACTION READ ONLY`, S9 the query timeout, S10 the effective
+  `SET SCHEMA SYS` (`schema_pin`) then `SET TRANSACTION READ ONLY`, S8b
+  (`--write-test` only, the customer agrees first) `CREATE LOCAL TEMPORARY
+  TABLE #AGENT_PROBE_RO`, which must be refused (an accepted write is dropped,
+  rolled back, and every later SQL step is `SKIP <step>: write was accepted`
+  with exit code 1), S9 the query timeout, S10 the effective
   privileges of the user (`ok`, `review`, `too_wide` or `unknown`; counts
   and schema names, never an object, grantor or user name), S11 `EXPLAIN
-  PLAN`, S12 each statement of the checks file (run as `SELECT TOP 1 * FROM
+  PLAN` (`--explain-plan` only: it writes plan rows), S12 each statement of
+  the checks file (run as `SELECT TOP 1 * FROM
   (...)` with the sample binds, in the read-only transaction). A final block
   with one value per key: `DEST_SHAPE`, `PROXY_VARIANT`, `TLS`,
-  `TOKEN_SECONDS`, `READ_ONLY`, `QUERY_TIMEOUT`, `EXPLAIN_PLAN`,
-  `PRIVILEGES`. Prints property names, SOCKS5 reply codes, SQL error codes
+  `TOKEN_SECONDS`, `READ_ONLY`, `QUERY_TIMEOUT`, `EXPLAIN_PLAN`
+  (`yes|no|untested`), `PRIVILEGES`, `WRITE_REFUSED` (`yes`; `no` only for
+  an accepted write; `untested`). Prints property names, SOCKS5 reply codes, SQL error codes
   and counts, never a credential, a token, a host from a binding or a
   destination, a row or a driver's error text
   (`tests/test_probe_hana_connectivity.py`)

@@ -36,7 +36,7 @@ The rules, in the order they are checked:
     Then, for model-written SQL only, the deny-list (:data:`DENIED_VIEWS`,
     :data:`DENIED_SYS_PREFIX`): an allowed reference to ``M_INIFILE_CONTENTS``
     or ``M_CONFIGURATION_PARAMETER_VALUES`` (unqualified or ``SYS.``) or to a
-    ``SYS.P_*`` object is refused too. The registered checks pass
+    ``SYS.P_*`` or ``_SYS_STATISTICS.P_*`` object is refused too. The registered checks pass
     ``fixed=True``, which skips the deny-list and nothing else: ``iniContents``,
     ``iniFiles`` and ``backupStatus`` read the ini contents for named keys.
 
@@ -84,8 +84,9 @@ ALLOWED_SCHEMAS = frozenset({"SYS", "_SYS_STATISTICS"})
 #: ``iniContents`` check deliberately hides. Matched unqualified or with
 #: ``SYS.``, after the allow rule's upper-casing (a quoted name verbatim).
 DENIED_VIEWS = frozenset({"M_INIFILE_CONTENTS", "M_CONFIGURATION_PARAMETER_VALUES"})
-#: ``SYS.P_*``: HANA's internal persistence tables (users, password hashes,
-#: principals); never for model-written SQL.
+#: ``SYS.P_*`` and ``_SYS_STATISTICS.P_*``: internal persistence tables (users,
+#: password hashes, principals); never for model-written SQL. No registered
+#: check reads one (``tests/test_hanadb_checks.py``).
 DENIED_SYS_PREFIX = "P_"
 
 #: Keywords that have no place in a read: data and schema changes, sessions,
@@ -300,9 +301,11 @@ class _Walker:
 
     def _check_denied(self, schema: str | None, name: str) -> None:
         """The deny-list, after the allow rule (a CTE never reaches it)."""
-        if not self.deny or schema not in (None, "SYS"):
+        if not self.deny:
             return
-        if name in DENIED_VIEWS or (schema == "SYS" and name.startswith(DENIED_SYS_PREFIX)):
+        if schema in (None, "SYS") and name in DENIED_VIEWS:
+            raise SelectRefused("table_not_allowed")
+        if schema in ALLOWED_SCHEMAS and name.startswith(DENIED_SYS_PREFIX):
             raise SelectRefused("table_not_allowed")
 
     def _after_reference(self, index: int) -> int:

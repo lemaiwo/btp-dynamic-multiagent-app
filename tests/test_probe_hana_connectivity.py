@@ -484,7 +484,7 @@ def test_report_block_and_exit_code():
         token_seconds=3599,
         read_only=True,
         query_timeout=True,
-        explain_plan=False,
+        explain_plan="no",
         privileges="ok",
         version_ok=True,
     )
@@ -497,7 +497,7 @@ def test_report_block_and_exit_code():
         "QUERY_TIMEOUT yes",
         "EXPLAIN_PLAN no",
         "PRIVILEGES ok",
-        "WRITE_REFUSED no",
+        "WRITE_REFUSED untested",
     ]
     assert probe.exit_code(facts) == 0
     facts.privileges = "review"
@@ -646,7 +646,10 @@ def test_full_run_on_the_http_shape(capsys):
     assert "TOKEN_SECONDS 3599" in out
     assert "PRIVILEGES ok" in out
     assert "READ_ONLY yes" in out
-    assert "EXPLAIN_PLAN yes" in out
+    # EXPLAIN PLAN writes plan rows for the session: only with --explain-plan.
+    assert "EXPLAIN_PLAN untested" in out
+    assert "SKIP explain_plan: no --explain-plan" in out
+    assert not any(x.startswith("EXPLAIN") for x in conn.statements)
     assert "2.00.079.00.1234567890" in out
     assert "PASS socks5_handshake: reply=0" in out
     assert "User present: yes" in out
@@ -718,7 +721,8 @@ def test_namespace_type():
 
 
 def test_read_only_starts_a_fresh_transaction(capsys):
-    _, _, conn = _run(HTTP_DESTINATION, privileges=[("MONITORING", None)])
+    _, _, conn = _run(HTTP_DESTINATION, privileges=[("MONITORING", None)],
+                      extra=["--explain-plan"])
     capsys.readouterr()
     s = conn.statements
     database = next(i for i, x in enumerate(s) if "M_DATABASE" in x)
@@ -797,7 +801,8 @@ def test_schema_pin_comes_before_read_only_and_the_write_test_is_off_by_default(
     assert "PASS schema_pin: accepted" in out
     assert "PASS read_only: accepted" in out
     assert "SKIP write_refused: no --write-test" in out
-    assert "WRITE_REFUSED no" in out
+    assert "WRITE_REFUSED untested" in out
+    assert "WRITE_REFUSED no" not in out
     assert not any(x.startswith("CREATE") for x in conn.statements)
     s = conn.statements
     assert s.index("SET SCHEMA SYS") < s.index("SET TRANSACTION READ ONLY")
@@ -808,6 +813,9 @@ def test_parser_write_test_flag():
     assert probe.build_parser().parse_args(["--destination", "d"]).write_test is False
     assert probe.build_parser().parse_args(
         ["--destination", "d", "--write-test"]).write_test is True
+    assert probe.build_parser().parse_args(["--destination", "d"]).explain_plan is False
+    assert probe.build_parser().parse_args(
+        ["--destination", "d", "--explain-plan"]).explain_plan is True
 
 
 def test_a_refused_write_passes_inside_the_read_only_transaction(tmp_path, capsys):
@@ -842,14 +850,44 @@ def test_an_accepted_write_fails_is_dropped_and_rolled_back(tmp_path, capsys):
     assert code == 1
     assert "FAIL write_refused: the write was accepted" in out
     assert "WRITE_REFUSED no" in out
-    # The transaction was not read-only after all: nothing more runs in it.
+    # The transaction was not read-only after all: no later SQL step runs.
     assert "READ_ONLY no" in out
-    assert "SKIP checks: not read-only" in out
+    for step in ("query_timeout", "privileges", "explain_plan", "checks"):
+        assert f"SKIP {step}: write was accepted" in out
+    assert "EXPLAIN_PLAN untested" in out and "QUERY_TIMEOUT no" in out
     _assert_clean(out)
     s = conn.statements
     create = next(i for i, x in enumerate(s) if x.startswith("CREATE LOCAL TEMPORARY"))
-    assert s[create + 1:create + 3] == ["DROP TABLE #AGENT_PROBE_RO", "ROLLBACK"]
+    assert s[create + 1:] == ["DROP TABLE #AGENT_PROBE_RO", "ROLLBACK", "ROLLBACK"]
     assert not any("M_ALERTS" in x for x in s)
+
+
+def test_an_accepted_write_stops_the_explain_plan_too(capsys):
+    code, _, conn = _run(HTTP_DESTINATION, privileges=[("MONITORING", None)],
+                         extra=["--write-test", "--explain-plan"])
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "SKIP explain_plan: write was accepted" in out
+    assert not any(x.startswith("EXPLAIN") for x in conn.statements)
+
+
+def test_explain_plan_runs_only_with_its_flag(capsys):
+    code, _, conn = _run(HTTP_DESTINATION, privileges=[("MONITORING", None)],
+                         extra=["--explain-plan"])
+    out = capsys.readouterr().out
+    assert code == 0, out
+    assert "PASS explain_plan: rows=1" in out and "EXPLAIN_PLAN yes" in out
+    assert any(x.startswith("EXPLAIN PLAN") for x in conn.statements)
+
+
+def test_write_refused_values_in_the_report():
+    facts = probe.Facts()
+    assert "WRITE_REFUSED untested" in probe.report_block(facts)
+    assert "EXPLAIN_PLAN untested" in probe.report_block(facts)
+    facts.write_refused = "yes"
+    assert "WRITE_REFUSED yes" in probe.report_block(facts)
+    facts.write_refused, facts.version_ok, facts.privileges = "no", True, "ok"
+    assert probe.exit_code(facts) == 1
 
 
 def test_the_write_test_is_skipped_when_read_only_was_refused(capsys):

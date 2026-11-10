@@ -651,3 +651,13 @@ def test_the_ini_checks_need_the_fixed_switch() -> None:
         with pytest.raises(SelectRefused) as info:
             check_select(statement.sql)
         assert info.value.rule == "table_not_allowed"
+
+
+def test_no_registered_check_reads_a_p_table() -> None:
+    # The deny-list's P_* rule (SYS and _SYS_STATISTICS) would refuse none of
+    # them even without fixed=True.
+    import re
+
+    for check in EVERY_CHECK:
+        for statement in check.statements:
+            assert not re.search(r"(?i)\b(SYS|_SYS_STATISTICS)\s*\.\s*\"?P_", statement.sql)
