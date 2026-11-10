@@ -180,8 +180,10 @@ export default class HanaEntryPart {
      */
     private ask(cancelled: () => void, allowed?: () => void): void {
         const model = this.host.serverModel();
-        const names = this.rows().map((row) => row.name).filter((name) => name !== "");
-        const which = names.length > 0 ? names.map((name) => `"${hanaEntry.shownName(name)}"`).join(", ")
+        // Each system with its destination: a changed destination is what the
+        // admin is asked about again, so the question shows it.
+        const named = this.rows().filter((row) => row.name !== "");
+        const which = named.length > 0 ? named.map((row) => hanaEntry.shownSystem(row)).join(", ")
             : this.host.text("hanaAllowSelectTheseSystems");
         const allow = this.host.text("hanaAllowSelectYes");
         MessageBox.warning(this.host.text("hanaAllowSelectConfirm", [which]), {

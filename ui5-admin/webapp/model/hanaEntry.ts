@@ -227,6 +227,13 @@ function shownName(name: string): string {
     return name.length > SHOWN_NAME_MAX ? `${name.slice(0, SHOWN_NAME_MAX - 1)}…` : name;
 }
 
+/** A system as a question names it: `"name" (destination)`, each part cut
+ *  at 64 characters, plain text; without a destination the name alone. */
+function shownSystem(system: HanaSystem): string {
+    const name = `"${shownName(system.name)}"`;
+    return system.destination ? `${name} (${shownName(system.destination)})` : name;
+}
+
 const NESTED_LOC = /^mcp_servers\.(\d+)\.oauth\.systems\.(\d+)(?:\.(name|destination))?$/;
 const SERVER_LOC = /^mcp_servers\.(\d+)$/;
 /** The field prefix of a refusal of agents/hana/config.py (behind
@@ -261,6 +268,7 @@ export default {
     selectNewlyAllowed,
     unconfirmed,
     shownName,
+    shownSystem,
     entryIndex,
     explicit,
     refusedAt

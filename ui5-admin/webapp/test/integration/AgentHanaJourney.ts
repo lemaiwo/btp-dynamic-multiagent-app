@@ -32,7 +32,8 @@ const PUT_101 = "PUT agents/101";
 const TENANT = { name: "erp_tenant", destination: "hana-erp-tenant" };
 const SYSTEMDB = { name: "erp_systemdb", destination: "hana-erp-systemdb" };
 const CONFIRM = "This lets the agent run its own SELECT statements on the monitoring views (SYS, _SYS_STATISTICS, M_*) "
-    + "and read trace file contents of \"erp_tenant\", \"erp_systemdb\". Statement texts come back unmasked. Continue?";
+    + "and read trace file contents of \"erp_tenant\" (hana-erp-tenant), \"erp_systemdb\" (hana-erp-systemdb). "
+    + "Statement texts come back unmasked. Continue?";
 
 /** What the entry shows, read from its controls. */
 interface Entry {
@@ -398,7 +399,7 @@ opaTest("Scenario A: a system added after Allow SELECT was confirmed is asked ab
     iType(When, 0, "destination", "hana-dev");
     iSwitchAllowSelect(When, true);
     iSeeAMessage(Then, "the question at the switch", function (dialog) {
-        Opa5.assert.ok(messageOf(dialog).indexOf("trace file contents of \"dev\".") > -1, "it names dev only");
+        Opa5.assert.ok(messageOf(dialog).indexOf("trace file contents of \"dev\" (hana-dev).") > -1, "it names dev only, with its destination");
     });
     iAnswer(When, "Allow SELECT");
     iSeeNoMessage(Then, "the switch is on");
@@ -407,7 +408,7 @@ opaTest("Scenario A: a system added after Allow SELECT was confirmed is asked ab
     iType(When, 1, "destination", PROD.destination);
     iPressInTheDialog(When, "serverConfirm");
     iSeeAMessage(Then, "the question again at OK", function (dialog) {
-        Opa5.assert.ok(messageOf(dialog).indexOf("trace file contents of \"dev\", \"prod_tenant\".") > -1,
+        Opa5.assert.ok(messageOf(dialog).indexOf("trace file contents of \"dev\" (hana-dev), \"prod_tenant\" (hana-prod-tenant).") > -1,
             "it names every system of the entry now");
         const focus = Element.getElementById((dialog as Dialog).getInitialFocus()) as Button | undefined;
         Opa5.assert.strictEqual(focus?.getText(), "Cancel", "Cancel has the initial focus");
@@ -443,7 +444,7 @@ opaTest("Scenario B: a stored entry that allows SELECT asks at OK when its syste
     iType(When, 1, "destination", SYSTEMDB.destination);
     iPressInTheDialog(When, "serverConfirm");
     iSeeAMessage(Then, "the question at OK", function (dialog) {
-        Opa5.assert.ok(messageOf(dialog).indexOf("trace file contents of \"prod_tenant\", \"erp_systemdb\".") > -1,
+        Opa5.assert.ok(messageOf(dialog).indexOf("trace file contents of \"prod_tenant\" (hana-prod-tenant), \"erp_systemdb\" (hana-erp-systemdb).") > -1,
             "it names the systems now in the entry");
     });
     iAnswer(When, "Cancel");
@@ -453,5 +454,27 @@ opaTest("Scenario B: a stored entry that allows SELECT asks at OK when its syste
         Opa5.assert.deepEqual((data.mcp_servers[2].oauth as Record<string, unknown>).systems, [TENANT],
             "Cancel of the dialog kept the stored entry");
     });
+    Then.iStopTheApp();
+});
+
+opaTest("a confirmed system whose destination changed is asked about at OK, naming the new destination", function (Given: Common, When: Common, Then: Common) {
+    iOpenAgent(Given, When, 101, () => storeEntry(101, { systems: [TENANT], allow_select: true }));
+    iSeeTheServers(When, 3);
+    iEditServer(When, 2);
+    iSeeTheEntry(Then, "the stored entry", (entry) => entry.rows.length === 1 && entry.allowSelect, function () {
+        Opa5.assert.ok(true, "one confirmed system, SELECT on");
+    });
+    iType(When, 0, "destination", "hana-erp-other");
+    iPressInTheDialog(When, "serverConfirm");
+    iSeeAMessage(Then, "the question at OK", function (dialog) {
+        Opa5.assert.ok(messageOf(dialog).indexOf("trace file contents of \"erp_tenant\" (hana-erp-other).") > -1,
+            "the question shows the new destination");
+    });
+    iAnswer(When, "Allow SELECT");
+    iSeeTheForm(Then, "the entry on its new destination", function (data) {
+        Opa5.assert.deepEqual(data.mcp_servers[2].oauth, {
+            systems: [{ name: TENANT.name, destination: "hana-erp-other" }], allow_select: true
+        }, "the answer goes on with OK");
+    }, (data) => JSON.stringify(data.mcp_servers[2]?.oauth ?? {}).indexOf("hana-erp-other") > -1);
     Then.iStopTheApp();
 });

@@ -176,6 +176,13 @@ QUnit.test("unconfirmed: the systems Allow SELECT would cover that were not conf
     assert.deepEqual(hanaEntry.unconfirmed(undefined, [TENANT]), [TENANT]);
 });
 
+QUnit.test("shownSystem names a system with its destination, each part capped", function (assert) {
+    assert.strictEqual(hanaEntry.shownSystem(TENANT), "\"erp_tenant\" (hana-erp-tenant)");
+    assert.strictEqual(hanaEntry.shownSystem({ name: "dev", destination: "" }), "\"dev\"", "no destination yet");
+    assert.strictEqual(hanaEntry.shownSystem({ name: "a".repeat(70), destination: "d".repeat(70) }),
+        `"${"a".repeat(63)}…" (${"d".repeat(63)}…)`);
+});
+
 QUnit.test("shownName caps a name at 64 characters with an ellipsis", function (assert) {
     assert.strictEqual(hanaEntry.shownName("erp_tenant"), "erp_tenant");
     assert.strictEqual(hanaEntry.shownName("a".repeat(64)), "a".repeat(64));
