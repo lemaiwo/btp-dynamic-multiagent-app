@@ -66,9 +66,16 @@ MAX_RESULT_CHARS = 60_000
 SELECT_DEFAULT_TOP = 100
 SELECT_MAX_TOP = 500
 MAX_COLUMN_NAME_CHARS = 128
+#: What a registered check reads of each LOB value (a statement text): the
+#: masking keeps 300 characters of it, so more is never needed.
+CHECK_LOB_CHARS = 4096
+#: What the LOB values of one statement may read together: one more than the
+#: answer may hold, since anything larger is refused anyway.
+LOB_BUDGET = MAX_RESULT_CHARS + 1
 _UNSAFE_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
 
-__all__ = ["MAX_RESULT_CHARS", "TOOL_NAMES", "activity_summary", "hana_toolset", "json_value"]
+__all__ = ["CHECK_LOB_CHARS", "LOB_BUDGET", "MAX_RESULT_CHARS", "TOOL_NAMES",
+           "activity_summary", "hana_toolset", "json_value"]
 
 
 # ---- values -------------------------------------------------------------------------
@@ -264,7 +271,8 @@ def hana_toolset(
                                 host=host)
             max_rows = args.get("top", found.max_rows_cap)
             results = [await run_query(target, statement.sql,
-                                       bind_values(statement, args), max_rows)
+                                       bind_values(statement, args), max_rows,
+                                       lob_chars=CHECK_LOB_CHARS, lob_budget=LOB_BUDGET)
                        for statement in found.statements]
             answer = build_answer(found, results)
             for part in answer.get("parts", [answer]):
@@ -292,7 +300,8 @@ def hana_toolset(
                 error = HanaError("select_refused").to_dict()
                 error["rule"] = refused.rule
                 return {"error": error}
-            columns, rows, truncated = await run_query(target, sql, (), top)
+            columns, rows, truncated = await run_query(target, sql, (), top,
+                                                       lob_budget=LOB_BUDGET)
             part = {"columns": columns, "rows": rows}
             _safe_part(part)
             return {"system": target.name, "columns": part["columns"], "rows": part["rows"],

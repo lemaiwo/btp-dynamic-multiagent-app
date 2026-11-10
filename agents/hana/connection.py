@@ -25,7 +25,8 @@ credential and app instance: 1 failed login, or :data:`MAX_CONCURRENT` when a
 confirmed password goes stale in the database while calls run.
 
 **LOB values** (``NCLOB`` statement texts, ``BLOB``) are read in the worker
-thread before the connection closes (:func:`_lob_value`).
+thread before the connection closes, each up to a cap and all of a call
+within a total budget (:class:`_LobReader`).
 
 **The destination** (resolved with the app's token, cached by
 :class:`agents.destination.DestinationResolver`) carries the virtual host,
@@ -95,6 +96,10 @@ LOB_MAX_CHARS = 65536
 """A text LOB longer than this is cut, with :data:`LOB_CUT_MARKER`."""
 LOB_MAX_BYTES = 65536
 """A binary LOB is read up to this many bytes (the answer shows its size only)."""
+LOB_BUDGET_CHARS = 60_001
+"""What the LOB values of one call may read together when the caller names no
+budget: one more than the toolset's answer cap (``MAX_RESULT_CHARS`` of
+``agents/hana/tools.py``), since an answer that holds more is refused anyway."""
 LOB_CUT_MARKER = " …[cut]"
 LOB_UNREADABLE = "<unreadable LOB>"
 
@@ -527,37 +532,58 @@ def _quiet(system: str, step: str, action: Any) -> None:
         logger.warning("hana: %s failed for system %s (%s)", step, system, _detail(exc))
 
 
-def _lob_value(value: Any) -> Any:
-    """A LOB's content in place of the driver's LOB object.
+class _LobBudget(Exception):
+    """The LOB values of one call passed the call's budget (no text)."""
+
+
+class _LobReader:
+    """Reads the LOB values of one call within a total budget.
 
     hdbcli hands ``NCLOB`` / ``CLOB`` / ``BLOB`` back as objects whose
     ``read`` works only while the connection is open (``STATEMENT_STRING`` of
     ``M_EXPENSIVE_STATEMENTS`` / ``M_ACTIVE_STATEMENTS`` is ``NCLOB``), so
-    this runs in the worker thread before ``rollback`` and ``close``. A text
-    is cut at :data:`LOB_MAX_CHARS` with :data:`LOB_CUT_MARKER`; bytes are cut
-    at :data:`LOB_MAX_BYTES` (the answer shows their size only); a failing
-    read is the fixed :data:`LOB_UNREADABLE`, never the driver's text.
-    Unverified on the real driver: ``read(size)`` as the first positional
-    argument and the type it returns.
+    this runs in the worker thread before ``rollback`` and ``close``. Each
+    value is read up to ``per_value`` characters (bytes for a ``BLOB``; the
+    answer shows a binary value's size only) and a longer text is cut with
+    :data:`LOB_CUT_MARKER`. All values of the call together may take
+    ``budget`` characters: a value that would pass it, or any further value
+    once it is used up, raises :class:`_LobBudget` without another read (no
+    more round trips; the caller answers ``result_too_large``). Why a total:
+    ``top`` 500 rows of a SELECT that repeats a LOB column would otherwise
+    read gigabytes before the answer's cap refuses it. A failing read is the
+    fixed :data:`LOB_UNREADABLE`, never the driver's text. Unverified on the
+    real driver: ``read(size)`` as the first positional argument and the
+    type it returns.
     """
-    read = getattr(value, "read", None)
-    if not callable(read):
-        return value
-    try:
-        content = read(max(LOB_MAX_CHARS, LOB_MAX_BYTES) + 1)
-    except Exception:  # noqa: BLE001 - the driver's text never leaves
-        return LOB_UNREADABLE
-    if isinstance(content, str):
-        if len(content) > LOB_MAX_CHARS:
-            return content[:LOB_MAX_CHARS] + LOB_CUT_MARKER
-        return content
-    if isinstance(content, (bytes, bytearray, memoryview)):
-        return bytes(content[:LOB_MAX_BYTES])
-    return LOB_UNREADABLE
+
+    def __init__(self, per_value: int, budget: int) -> None:
+        self.per_value = per_value
+        self.left = budget
+
+    def value(self, value: Any) -> Any:
+        read = getattr(value, "read", None)
+        if not callable(read):
+            return value
+        if self.left <= 0:
+            raise _LobBudget()
+        try:
+            content = read(min(self.per_value, self.left) + 1)
+        except Exception:  # noqa: BLE001 - the driver's text never leaves
+            return LOB_UNREADABLE
+        if not isinstance(content, (str, bytes, bytearray, memoryview)):
+            return LOB_UNREADABLE
+        if len(content) > self.left:
+            raise _LobBudget()
+        kept = content[:self.per_value]
+        self.left -= len(kept)
+        if isinstance(content, str):
+            return kept + LOB_CUT_MARKER if len(content) > self.per_value else kept
+        return bytes(kept)
 
 
 def _execute(system: str, kwargs: dict[str, Any], sql: str, binds: tuple,
-             max_rows: int) -> tuple[list[str], list[tuple], bool]:
+             max_rows: int, lob: tuple[int, int] = (LOB_MAX_CHARS, LOB_BUDGET_CHARS)
+             ) -> tuple[list[str], list[tuple], bool]:
     """The blocking part, in a worker thread. Rollback and close always."""
     from hdbcli import dbapi
 
@@ -589,7 +615,8 @@ def _execute(system: str, kwargs: dict[str, Any], sql: str, binds: tuple,
         truncated = len(fetched) > max_rows
         step = "lob_read"
         # Before rollback and close: a LOB cannot be read after them.
-        rows = [tuple(_lob_value(v) for v in r) for r in fetched[:max_rows]]
+        lobs = _LobReader(*lob)
+        rows = [tuple(lobs.value(v) for v in r) for r in fetched[:max_rows]]
     except Exception as exc:  # noqa: BLE001 - mapped by the caller
         failure: _Failed | None = _Failed(step, exc)
     else:
@@ -605,7 +632,7 @@ def _execute(system: str, kwargs: dict[str, Any], sql: str, binds: tuple,
 
 
 async def _in_slot(system: str, destination: str, digest: str, kwargs: dict[str, Any],
-                   sql: str, binds: tuple, max_rows: int
+                   sql: str, binds: tuple, max_rows: int, lob: tuple[int, int]
                    ) -> tuple[list[str], list[tuple], bool]:
     """Wait for the login turn and a free slot, then run in a worker thread.
 
@@ -636,7 +663,7 @@ async def _in_slot(system: str, destination: str, digest: str, kwargs: dict[str,
                     lock.release()
 
         started = asyncio.ensure_future(
-            asyncio.to_thread(_execute, system, kwargs, sql, binds, max_rows))
+            asyncio.to_thread(_execute, system, kwargs, sql, binds, max_rows, lob))
         started.add_done_callback(_done)
         return started
 
@@ -699,12 +726,16 @@ async def _in_slot(system: str, destination: str, digest: str, kwargs: dict[str,
 
 
 async def run_query(system: HanaSystem, sql: str, binds: Sequence[Any],
-                    max_rows: int) -> tuple[list[str], list[tuple], bool]:
+                    max_rows: int, *, lob_chars: int = LOB_MAX_CHARS,
+                    lob_budget: int = LOB_BUDGET_CHARS
+                    ) -> tuple[list[str], list[tuple], bool]:
     """Run one read on ``system``: ``(columns, rows, truncated)``.
 
     ``rows`` holds at most ``max_rows``; ``truncated`` says one more was
     there. The SQL is checked by the caller (the guard); this layer only
-    makes sure it runs read-only and never commits.
+    makes sure it runs read-only and never commits. ``lob_chars`` caps each
+    LOB value and ``lob_budget`` all of them together (:class:`_LobReader`);
+    a call over the budget is ``result_too_large``.
     """
     if not (isinstance(max_rows, int) and not isinstance(max_rows, bool)
             and max_rows >= 1):
@@ -745,9 +776,13 @@ async def run_query(system: HanaSystem, sql: str, binds: Sequence[Any],
     kwargs = connect_kwargs(target, token, Socks5Proxy(config.proxy_host, socks5_port))
     try:
         return await _in_slot(system.name, system.destination, digest, kwargs, sql,
-                              tuple(binds), max_rows)
+                              tuple(binds), max_rows, (lob_chars, lob_budget))
     except _Failed as failed:
         caught: _Failed | None = failed
+    if isinstance(caught.cause, _LobBudget):
+        logger.warning("hana: LOB values of system %s passed the call's budget; "
+                       "reading stopped (result_too_large)", system.name)
+        raise HanaError("result_too_large")
     error = map_driver_error(caught.cause)
     logger.warning("hana: %s failed for system %s (%s -> %s)", caught.step,
                    system.name, _detail(caught.cause), error.code)
@@ -757,7 +792,8 @@ async def run_query(system: HanaSystem, sql: str, binds: Sequence[Any],
 
 __all__ = [
     "CALL_DEADLINE_SECONDS", "COMMUNICATION_TIMEOUT_MS", "CONNECT_TIMEOUT_MS",
-    "DEFAULT_ENCRYPT", "LOB_MAX_BYTES", "LOB_MAX_CHARS", "LOGIN_BREAKER_SECONDS",
+    "DEFAULT_ENCRYPT", "LOB_BUDGET_CHARS", "LOB_MAX_BYTES", "LOB_MAX_CHARS",
+    "LOGIN_BREAKER_SECONDS",
     "MAX_CONCURRENT", "QUERY_TIMEOUT_SECONDS",
     "HanaSystem", "HanaTarget", "Socks5Proxy", "connect_kwargs", "credential_digest",
     "map_driver_error", "reset_login_state", "run_query", "settings_from_properties",

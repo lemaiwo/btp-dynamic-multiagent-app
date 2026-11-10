@@ -510,3 +510,29 @@ def test_the_result_measure_is_the_neutral_module() -> None:
     imported |= {a.name for n in ast.walk(tree) if isinstance(n, ast.Import)
                  for a in n.names}
     assert "agents.sharepoint_tools" not in imported
+
+
+# ---- final review round 2: the LOB budget -------------------------------------------------
+
+
+async def test_run_select_stops_reading_lobs_at_the_budget(db: h.FakeDbapi) -> None:
+    db.description = (("STATEMENT_STRING",),)
+    lobs = [h.FakeLob("s" * 50_000, db=db) for _ in range(5)]
+    db.rows = [(lob,) for lob in lobs]
+    answer = await call(build(OAUTH_SELECT), "run_select", system="erp_tenant",
+                        sql="SELECT STATEMENT_STRING FROM M_EXPENSIVE_STATEMENTS", top=500)
+    assert answer["error"]["code"] == "result_too_large"
+    assert sum(len(lob.reads) for lob in lobs) == 2
+    assert lobs[0].reads == [tools.MAX_RESULT_CHARS + 2]
+
+
+async def test_run_check_reads_a_statement_lob_only_up_to_its_per_value_cap(
+        db: h.FakeDbapi) -> None:
+    db.description = (("A",), ("STATEMENT_STRING",))
+    lob = h.FakeLob(STATEMENT + " " * 20_000, db=db)
+    db.rows = [(1, lob)]
+    answer = await call(build(), "run_check", system="erp_tenant", check="longRunning")
+    assert lob.reads == [tools.CHECK_LOB_CHARS + 1]
+    assert tools.CHECK_LOB_CHARS == 4096
+    masked = answer["rows"][0][1]
+    assert "KNA1" in masked and "customer4711" not in masked

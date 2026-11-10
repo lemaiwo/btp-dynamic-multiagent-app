@@ -954,10 +954,18 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     `rollback()` and `close()` on every path: nothing ever commits. **LOB
     values** (`STATEMENT_STRING` of `M_EXPENSIVE_STATEMENTS` /
     `M_ACTIVE_STATEMENTS` is `NCLOB`): every value with a callable `read` is
-    read in the worker thread before the rollback (`_lob_value`): a text cut
-    at `LOB_MAX_CHARS` (65,536) with ` …[cut]`, bytes cut at 64 KiB (the
-    answer shows their size), a failing read the fixed `<unreadable LOB>`;
-    unverified on the real driver. **The login protection**: every call is
+    read in the worker thread before the rollback (`_LobReader`), each up to
+    a cap per value (`run_query(..., lob_chars=)`, default `LOB_MAX_CHARS`
+    65,536; `run_check` passes `CHECK_LOB_CHARS` 4,096, the masking keeps
+    300) and a longer text cut with ` …[cut]`, bytes likewise (the answer
+    shows their size), and all values of one statement within a total
+    budget (`lob_budget=`, default `LOB_BUDGET_CHARS` 60,001; both tools pass
+    `MAX_RESULT_CHARS + 1`, since a larger answer is refused anyway; bytes
+    count too): a value that would pass it, or any further value once it is
+    used up, stops the reading at once (no further `read` round trip) and
+    the call is `result_too_large`, rollback and close as always; a failing
+    read the fixed `<unreadable LOB>`; `read(size)` unverified on the real
+    driver. **The login protection**: every call is
     one login and HANA locks a user after a few invalid attempts (default 6,
     reset only by a successful login; the user may be a person's). The state
     is per process and keyed by DESTINATION NAME (`_logins`, shared by every

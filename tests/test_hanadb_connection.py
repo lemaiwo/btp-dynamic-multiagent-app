@@ -799,7 +799,7 @@ async def test_text_lob_is_read_before_the_connection_closes(monkeypatch):
 async def test_long_text_lob_is_cut_with_a_marker(monkeypatch):
     db = h.install(monkeypatch)
     db.rows = [(h.FakeLob("x" * (LOB_MAX_CHARS + 10), db=db),)]
-    _, rows, _ = await run_query(_system(), "SELECT A FROM SYS.M_X", [], 1)
+    _, rows, _ = await run_query(_system(), "SELECT A FROM SYS.M_X", [], 1, lob_budget=10**6)
     value = rows[0][0]
     assert value == "x" * LOB_MAX_CHARS + " …[cut]"
     assert LOB_MAX_CHARS == 65536
@@ -808,14 +808,14 @@ async def test_long_text_lob_is_cut_with_a_marker(monkeypatch):
 async def test_text_lob_of_exactly_the_cap_is_not_marked(monkeypatch):
     db = h.install(monkeypatch)
     db.rows = [(h.FakeLob("y" * LOB_MAX_CHARS, db=db),)]
-    _, rows, _ = await run_query(_system(), "SELECT A FROM SYS.M_X", [], 1)
+    _, rows, _ = await run_query(_system(), "SELECT A FROM SYS.M_X", [], 1, lob_budget=10**6)
     assert rows[0][0] == "y" * LOB_MAX_CHARS
 
 
 async def test_binary_lob_is_bytes_cut_at_64k(monkeypatch):
     db = h.install(monkeypatch)
     db.rows = [(h.FakeLob(b"\x01" * 70000, db=db),)]
-    _, rows, _ = await run_query(_system(), "SELECT A FROM SYS.M_X", [], 1)
+    _, rows, _ = await run_query(_system(), "SELECT A FROM SYS.M_X", [], 1, lob_budget=10**6)
     assert rows[0][0] == b"\x01" * 65536
 
 
@@ -836,3 +836,59 @@ async def test_lobs_of_the_dropped_extra_row_are_not_read(monkeypatch):
     _, rows, truncated = await run_query(_system(), "SELECT A FROM SYS.M_X", [], 1)
     assert rows == [("a",)] and truncated is True
     assert extra.reads == []
+
+
+# ---- final review round 2: a total LOB budget per call ------------------------------------
+
+
+async def test_lobs_over_the_budget_stop_the_reading_and_are_result_too_large(
+        monkeypatch, caplog):
+    caplog.set_level(logging.DEBUG)
+    db = h.install(monkeypatch)
+    lobs = [h.FakeLob("z" * 40_000, db=db) for _ in range(4)]
+    db.rows = [(lob,) for lob in lobs]
+    with pytest.raises(HanaError) as info:
+        await run_query(_system(), "SELECT A FROM SYS.M_X", [], 5, lob_budget=60_001)
+    assert info.value.code == "result_too_large"
+    assert [len(lob.reads) for lob in lobs] == [1, 1, 0, 0]  # no further round trips
+    steps = db.steps()
+    assert steps.index("lob_read") < steps.index("rollback")
+    assert steps[-1] == "close" and "commit" not in steps
+    _logs_clean(caplog)
+
+
+async def test_lobs_that_fit_the_budget_exactly_come_back(monkeypatch):
+    db = h.install(monkeypatch)
+    db.rows = [(h.FakeLob("a" * 30_000, db=db),), (h.FakeLob("b" * 30_000, db=db),)]
+    _, rows, _ = await run_query(_system(), "SELECT A FROM SYS.M_X", [], 5,
+                                 lob_budget=60_000)
+    assert [len(r[0]) for r in rows] == [30_000, 30_000]
+
+
+async def test_a_budget_used_up_reads_no_further_lob(monkeypatch):
+    db = h.install(monkeypatch)
+    first, second = h.FakeLob("a" * 5, db=db), h.FakeLob("", db=db)
+    db.rows = [(first,), (second,)]
+    with pytest.raises(HanaError) as info:
+        await run_query(_system(), "SELECT A FROM SYS.M_X", [], 5, lob_budget=5)
+    assert info.value.code == "result_too_large"
+    assert first.reads == [6] and second.reads == []
+
+
+async def test_lob_chars_cuts_each_value_and_reads_only_that_much(monkeypatch):
+    db = h.install(monkeypatch)
+    lob = h.FakeLob("q" * 10_000, db=db)
+    db.rows = [(lob,)]
+    _, rows, _ = await run_query(_system(), "SELECT A FROM SYS.M_X", [], 1,
+                                 lob_chars=4096, lob_budget=60_001)
+    assert rows[0][0] == "q" * 4096 + connection.LOB_CUT_MARKER
+    assert lob.reads == [4097]
+
+
+async def test_the_default_budget_bounds_a_call_without_the_keywords(monkeypatch):
+    db = h.install(monkeypatch)
+    db.rows = [(h.FakeLob("w" * LOB_MAX_CHARS, db=db),) for _ in range(3)]
+    with pytest.raises(HanaError) as info:
+        await run_query(_system(), "SELECT A FROM SYS.M_X", [], 5)
+    assert info.value.code == "result_too_large"
+    assert connection.LOB_BUDGET_CHARS == 60_001
