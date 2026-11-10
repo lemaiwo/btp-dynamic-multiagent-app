@@ -38,24 +38,37 @@ Steps, one line each, ``PASS|FAIL|SKIP <step>: <fixed words>``:
   S1 bindings (names only)          S7  SELECT ... FROM M_DATABASE (rows, version)
   S2 destination (facts only)       S8  SET SCHEMA SYS (schema_pin), then SET
   S3 connectivity token (lifetime)      TRANSACTION READ ONLY: the app's order
-  S4 TCP connect to the SOCKS5 port S8b with --write-test only: a write that the
-  S5 raw SOCKS5 handshake (0x80)        read-only transaction must refuse
+  S4 TCP connect to the SOCKS5 port S8b with --write-test only: a DDL and a
+  S5 raw SOCKS5 handshake (0x80)        DML write the read-only transaction
+                                        must refuse (S8a: the DML target)
   S6 hdbcli login per variant/TLS   S9  setquerytimeout(20) + SYS.DUMMY
                                     S10 EFFECTIVE_PRIVILEGES of CURRENT_USER
                                     S11 with --explain-plan only: EXPLAIN PLAN
                                     S12 the statements of --checks-file
 
-S8b (``write_refused``) proves what S8's ``accepted`` cannot: that the database
-refuses a write inside the read-only transaction. It sends ``CREATE LOCAL
-TEMPORARY TABLE #AGENT_PROBE_RO (I INTEGER)`` (a session-local table, gone with
-the session) right after ``SET TRANSACTION READ ONLY``. PASS is a refusal whose
-SQL code is in ``READ_ONLY_REFUSAL_CODES`` (``sql_code=<n>``; the set starts as
-one unconfirmed candidate, 7, to be confirmed or corrected from the first
-run); any other refusal is ``INCONCLUSIVE write_refused: sql_code=<n>`` (a
-syntax error or a missing privilege proves nothing about the read-only
-transaction) and exits non-zero. A write that is accepted is a FAIL: the table is dropped,
-the transaction rolled back, ``READ_ONLY`` becomes ``no``, and every later SQL
-step (S9-S12) is ``SKIP <step>: write was accepted``. S8b and S12 also need a
+S8b proves what S8's ``accepted`` cannot: that the database refuses a write
+inside the read-only transaction, with two attempts, each on its own line
+with its SQL code. First S8a, before the transaction is reset: ``SELECT
+CURRENT_SCHEMA`` and ``CREATE LOCAL TEMPORARY TABLE "<schema>".#AGENT_PROBE_RW
+(I INTEGER)`` (``PASS|FAIL write_setup``; the schema is never printed; if
+HANA does not commit that DDL by itself, the rollback that follows takes it
+back and the insert below is refused as an unknown table: inconclusive, the
+safe direction). Then, right after ``SET TRANSACTION READ ONLY``: (1) DDL,
+``CREATE LOCAL TEMPORARY TABLE #AGENT_PROBE_RO (I INTEGER)``
+(``write_refused_ddl``); (2) DML, ``INSERT INTO "<schema>".#AGENT_PROBE_RW
+VALUES (1)`` (``write_refused_dml``; ``SKIP ...: setup failed`` without the
+table). An attempt PASSes on a refusal whose SQL code is in
+``READ_ONLY_REFUSAL_CODES`` (``sql_code=<n>``; the set starts as one
+unconfirmed candidate, 7, to be confirmed or corrected from the first run);
+any other refusal is ``INCONCLUSIVE <step>: sql_code=<n>`` (a syntax error or
+a missing privilege proves nothing about the read-only transaction).
+``WRITE_REFUSED yes`` only when BOTH are refused with such a code. An
+accepted attempt is a FAIL: the RO table is dropped or the row rolled back,
+the DML attempt after an accepted DDL is ``SKIP ...: write was accepted``,
+``READ_ONLY`` becomes ``no``, and every later SQL step (S9-S12) is ``SKIP
+<step>: write was accepted``. When the steps are done the transaction is
+rolled back and the RW table dropped (``PASS|FAIL write_cleanup``; it would
+go with the session anyway). Everything the test makes is session-local. S8b and S12 also need a
 passing schema pin (the app never runs a statement without it): when
 ``SET SCHEMA SYS`` is refused they are ``SKIP <step>: schema pin failed`` and the
 probe exits non-zero. A ``FAIL read_only: sql_code=<n>`` right after ``PASS
@@ -84,9 +97,10 @@ exception class).
 The final block holds one fixed value per key: ``DEST_SHAPE``,
 ``PROXY_VARIANT``, ``TLS``, ``TOKEN_SECONDS``, ``READ_ONLY``, ``QUERY_TIMEOUT``,
 ``EXPLAIN_PLAN`` (``yes``, ``no`` or ``untested``: S11 did not run),
-``PRIVILEGES``, ``WRITE_REFUSED`` (``yes``: S8b ran and the write was refused
-with a read-only code; ``no``: the write was ACCEPTED, only ever that;
-``inconclusive``: refused with another code; ``untested``: S8b did not run),
+``PRIVILEGES``, ``WRITE_REFUSED`` (``yes``: S8b ran and both writes were
+refused with a read-only code; ``no``: a write was ACCEPTED, only ever that;
+``inconclusive``: otherwise, a refusal with another code or a failed setup;
+``untested``: S8b did not run),
 ``SCHEMA_PIN`` (``yes`` | ``no``, the last key). ``no``, ``inconclusive`` and
 ``SCHEMA_PIN no`` each exit non-zero.
 ``QUERY_TIMEOUT yes`` says the driver accepted the timeout and ran a statement
@@ -157,6 +171,9 @@ SCHEMA_STATEMENT = "SET SCHEMA SYS"
 READ_ONLY_STATEMENT = "SET TRANSACTION READ ONLY"
 WRITE_TEST_TABLE = "#AGENT_PROBE_RO"
 WRITE_TEST_STATEMENT = f"CREATE LOCAL TEMPORARY TABLE {WRITE_TEST_TABLE} (I INTEGER)"
+# The DML attempt's target, made before the read-only transaction in the
+# user's current schema (qualified: the schema pin moves the session to SYS).
+WRITE_DML_TABLE = "#AGENT_PROBE_RW"
 # The SQL codes that mean "refused because the transaction is read-only". Only
 # such a refusal is a PASS of S8b; any other (a syntax error, a missing
 # privilege, a driver failure) is INCONCLUSIVE: it does not show that the
@@ -922,6 +939,9 @@ def _sql_steps(conn, args, facts: Facts, checks: list[dict]) -> None:
     except Exception as exc:  # noqa: BLE001
         say("FAIL", "database", sql_code_of(exc))
 
+    # S8a, --write-test only: the DML target, before the transaction is reset.
+    rw_table = _write_setup(cursor) if args.write_test else None
+
     # S8: S7 opened a transaction (autocommit is off). End it, so the
     # transaction S9-S12 then run in starts here; mid-transaction SET
     # TRANSACTION READ ONLY could be refused, and A5 would be judged on a
@@ -953,11 +973,12 @@ def _sql_steps(conn, args, facts: Facts, checks: list[dict]) -> None:
     elif not facts.read_only:
         say("SKIP", "write_refused", "not read-only")
     else:
-        _write_test(conn, cursor, facts)
+        _write_test(conn, cursor, facts, rw_table)
     if facts.write_refused == "no":
         # The transaction was not read-only: nothing else runs on this login.
         for step in ("query_timeout", "privileges", "explain_plan", "checks"):
             say("SKIP", step, "write was accepted")
+        _write_cleanup(conn, cursor, rw_table)
         _close_cursor(cursor)
         return
 
@@ -1024,6 +1045,7 @@ def _sql_steps(conn, args, facts: Facts, checks: list[dict]) -> None:
         say("PASS" if not failed else "FAIL", "checks", f"passed={passed} failed={failed}")
     else:
         say("SKIP", "checks", "no --checks-file")
+    _write_cleanup(conn, cursor, rw_table)
     _close_cursor(cursor)
 
 
@@ -1034,27 +1056,86 @@ def _close_cursor(cursor) -> None:
         pass
 
 
-def _write_test(conn, cursor, facts: Facts) -> None:
-    """S8b: a write inside the read-only transaction must be refused."""
+def _write_setup(cursor) -> str | None:
+    """S8a: the session-local table the DML attempt inserts into, in the
+    user's current schema; its qualified name, or None (nothing printed but
+    the step and a code: never the schema)."""
     try:
-        cursor.execute(WRITE_TEST_STATEMENT)
+        cursor.execute("SELECT CURRENT_SCHEMA FROM SYS.DUMMY")
+        row = cursor.fetchone()
+        schema = row[0] if row else None
+        if not (isinstance(schema, str) and 0 < len(schema) <= 256 and "\0" not in schema):
+            say("FAIL", "write_setup", "no current schema")
+            return None
+        table = '"' + schema.replace('"', '""') + '".' + WRITE_DML_TABLE
+        cursor.execute(f"CREATE LOCAL TEMPORARY TABLE {table} (I INTEGER)")
+    except Exception as exc:  # noqa: BLE001 - code or class only
+        say("FAIL", "write_setup", sql_code_of(exc))
+        return None
+    say("PASS", "write_setup", "accepted")
+    return table
+
+
+def _write_attempt(cursor, step: str, statement: str) -> str:
+    """One write inside the read-only transaction: ``refused`` (a read-only
+    code), ``other`` (another refusal) or ``accepted``."""
+    try:
+        cursor.execute(statement)
     except Exception as exc:  # noqa: BLE001 - code or class only
         if _int_sql_code(exc) in READ_ONLY_REFUSAL_CODES:
-            facts.write_refused = "yes"
-            say("PASS", "write_refused", sql_code_of(exc))
-        else:
-            facts.write_refused = "inconclusive"
-            say("INCONCLUSIVE", "write_refused", sql_code_of(exc))
+            say("PASS", step, sql_code_of(exc))
+            return "refused"
+        say("INCONCLUSIVE", step, sql_code_of(exc))
+        return "other"
+    say("FAIL", step, "the write was accepted")
+    return "accepted"
+
+
+def _write_test(conn, cursor, facts: Facts, rw_table: str | None) -> None:
+    """S8b: a DDL and a DML write inside the read-only transaction must both
+    be refused with a read-only code."""
+    dml = "skipped"
+    ddl = _write_attempt(cursor, "write_refused_ddl", WRITE_TEST_STATEMENT)
+    if ddl == "accepted":
+        # The transaction was not read-only. Undo, and run nothing more in it.
+        _undo(cursor.execute, f"DROP TABLE {WRITE_TEST_TABLE}")
+        _undo(conn.rollback)
+        say("SKIP", "write_refused_dml", "write was accepted")
+    elif rw_table is None:
+        say("SKIP", "write_refused_dml", "setup failed")
+        dml = "other"
+    else:
+        dml = _write_attempt(cursor, "write_refused_dml",
+                             f"INSERT INTO {rw_table} VALUES (1)")
+        if dml == "accepted":
+            _undo(conn.rollback)  # the row goes at once
+    if "accepted" in (ddl, dml):
+        facts.read_only = False
+        facts.write_refused = "no"
+    else:
+        facts.write_refused = "yes" if ddl == dml == "refused" else "inconclusive"
+
+
+def _undo(action, *args) -> None:
+    try:
+        action(*args)
+    except Exception:  # noqa: BLE001,S110 - best effort; everything is session-local
+        pass
+
+
+def _write_cleanup(conn, cursor, rw_table: str | None) -> None:
+    """Drop the DML target once the steps are done (it would go with the
+    session anyway); a DDL statement, so after leaving the read-only
+    transaction."""
+    if rw_table is None:
         return
-    # Accepted: the transaction was not read-only. Undo, and run nothing more in it.
-    for undo in (lambda: cursor.execute(f"DROP TABLE {WRITE_TEST_TABLE}"), conn.rollback):
-        try:
-            undo()
-        except Exception:  # noqa: BLE001,S110 - best effort; the table is session-local
-            pass
-    facts.read_only = False
-    facts.write_refused = "no"
-    say("FAIL", "write_refused", "the write was accepted")
+    try:
+        conn.rollback()
+        cursor.execute(f"DROP TABLE {rw_table}")
+    except Exception as exc:  # noqa: BLE001 - code or class only
+        say("FAIL", "write_cleanup", sql_code_of(exc))
+        return
+    say("PASS", "write_cleanup", "dropped")
 
 
 def main(argv: list[str] | None = None) -> int:

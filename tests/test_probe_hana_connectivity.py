@@ -538,7 +538,8 @@ def _mock_transport(destination: dict) -> httpx.MockTransport:
 
 class FakeConnection:
     def __init__(self, privileges, explain_fails=False, read_only_fails=False,
-                 write_refused=False, schema_fails=False, write_error=None):
+                 write_refused=False, schema_fails=False, write_error=None,
+                 insert_refused=None, insert_error=None, setup_fails=False):
         self.privileges = privileges
         self.explain_fails = explain_fails
         self.read_only_fails = read_only_fails
@@ -546,6 +547,10 @@ class FakeConnection:
         self.schema_fails = schema_fails
         # what the refused write raises (default: SQL code 7)
         self.write_error = write_error
+        # the DML attempt: refused like the DDL one unless said otherwise
+        self.insert_refused = write_refused if insert_refused is None else insert_refused
+        self.insert_error = insert_error or write_error
+        self.setup_fails = setup_fails
         self.closed = False
         self.rolled_back = False
         self.statements: list[str] = []
@@ -573,8 +578,16 @@ class FakeConnection:
                     raise dbapi.Error(7, "feature not supported: secret text")
                 elif sql.startswith("SET SCHEMA") and conn.schema_fails:
                     raise dbapi.Error(362, "invalid schema name: secret text")
+                elif "CURRENT_SCHEMA" in sql:
+                    self.result = [("PROBEUSER",)]
+                elif sql.startswith("CREATE LOCAL TEMPORARY") and "AGENT_PROBE_RW" in sql:
+                    if conn.setup_fails:
+                        raise dbapi.Error(258, "insufficient privilege: secret text")
                 elif sql.startswith("CREATE LOCAL TEMPORARY") and conn.write_refused:
                     raise conn.write_error or dbapi.Error(
+                        7, "transaction is read-only: secret text")
+                elif sql.startswith("INSERT") and conn.insert_refused:
+                    raise conn.insert_error or dbapi.Error(
                         7, "transaction is read-only: secret text")
                 elif sql.startswith("EXPLAIN PLAN") and conn.explain_fails:
                     raise dbapi.Error(258, "insufficient privilege: secret text")
@@ -620,11 +633,12 @@ def _run(
     write_refused: bool = False,
     schema_fails: bool = False,
     write_error: BaseException | None = None,
+    **fake,
 ):
     calls: list[dict] = []
     conn = FakeConnection(privileges, read_only_fails=read_only_fails,
                           write_refused=write_refused, schema_fails=schema_fails,
-                          write_error=write_error)
+                          write_error=write_error, **fake)
 
     def fake_connect(**kwargs):
         calls.append(kwargs)
@@ -815,6 +829,7 @@ def test_schema_pin_comes_before_read_only_and_the_write_test_is_off_by_default(
     assert "WRITE_REFUSED untested" in out
     assert "WRITE_REFUSED no" not in out
     assert not any(x.startswith("CREATE") for x in conn.statements)
+    assert not any("CURRENT_SCHEMA" in x or x.startswith("INSERT") for x in conn.statements)
     s = conn.statements
     assert s.index("SET SCHEMA SYS") < s.index("SET TRANSACTION READ ONLY")
     assert out.index("schema_pin") < out.index("read_only:") < out.index("write_refused")
@@ -837,17 +852,26 @@ def test_a_refused_write_passes_inside_the_read_only_transaction(tmp_path, capsy
         extra=["--write-test", "--checks-file", str(checks)])
     out = capsys.readouterr().out
     assert code == 0, out
-    assert "PASS write_refused: sql_code=7" in out
+    assert "PASS write_setup: accepted" in out
+    assert "PASS write_refused_ddl: sql_code=7" in out
+    assert "PASS write_refused_dml: sql_code=7" in out
     assert "WRITE_REFUSED yes" in out
     assert "READ_ONLY yes" in out
-    assert "secret text" not in out
+    assert "secret text" not in out and "PROBEUSER" not in out
     _assert_clean(out)
     s = conn.statements
     read_only = s.index("SET TRANSACTION READ ONLY")
-    create = next(i for i, x in enumerate(s) if x.startswith("CREATE LOCAL TEMPORARY"))
-    assert s[create] == "CREATE LOCAL TEMPORARY TABLE #AGENT_PROBE_RO (I INTEGER)"
+    create = s.index("CREATE LOCAL TEMPORARY TABLE #AGENT_PROBE_RO (I INTEGER)")
     assert create == read_only + 1  # same transaction, nothing in between
-    assert not any(x.startswith("DROP") for x in s)
+    # the DML target is made before the read-only transaction, in the user's
+    # own schema, and dropped once the steps are done
+    setup = s.index('CREATE LOCAL TEMPORARY TABLE "PROBEUSER".#AGENT_PROBE_RW (I INTEGER)')
+    assert s.index("SELECT CURRENT_SCHEMA FROM SYS.DUMMY") < setup
+    assert setup < s.index("ROLLBACK") < s.index("SET SCHEMA SYS")
+    assert s[create + 1] == 'INSERT INTO "PROBEUSER".#AGENT_PROBE_RW VALUES (1)'
+    assert not any(x == "DROP TABLE #AGENT_PROBE_RO" for x in s)
+    assert s[-3:] == ["ROLLBACK", 'DROP TABLE "PROBEUSER".#AGENT_PROBE_RW', "ROLLBACK"]
+    assert out.index("PASS checks") < out.index("PASS write_cleanup: dropped")
     assert "PASS checks: passed=1 failed=0" in out
 
 
@@ -859,7 +883,8 @@ def test_an_accepted_write_fails_is_dropped_and_rolled_back(tmp_path, capsys):
         extra=["--write-test", "--checks-file", str(checks)])
     out = capsys.readouterr().out
     assert code == 1
-    assert "FAIL write_refused: the write was accepted" in out
+    assert "FAIL write_refused_ddl: the write was accepted" in out
+    assert "SKIP write_refused_dml: write was accepted" in out
     assert "WRITE_REFUSED no" in out
     # The transaction was not read-only after all: no later SQL step runs.
     assert "READ_ONLY no" in out
@@ -868,8 +893,9 @@ def test_an_accepted_write_fails_is_dropped_and_rolled_back(tmp_path, capsys):
     assert "EXPLAIN_PLAN untested" in out and "QUERY_TIMEOUT no" in out
     _assert_clean(out)
     s = conn.statements
-    create = next(i for i, x in enumerate(s) if x.startswith("CREATE LOCAL TEMPORARY"))
-    assert s[create + 1:] == ["DROP TABLE #AGENT_PROBE_RO", "ROLLBACK", "ROLLBACK"]
+    create = s.index("CREATE LOCAL TEMPORARY TABLE #AGENT_PROBE_RO (I INTEGER)")
+    assert s[create + 1:] == ["DROP TABLE #AGENT_PROBE_RO", "ROLLBACK", "ROLLBACK",
+                              'DROP TABLE "PROBEUSER".#AGENT_PROBE_RW', "ROLLBACK"]
     assert not any("M_ALERTS" in x for x in s)
 
 
@@ -906,7 +932,8 @@ def test_the_write_test_is_skipped_when_read_only_was_refused(capsys):
                       read_only_fails=True, extra=["--write-test"])
     out = capsys.readouterr().out
     assert "SKIP write_refused: not read-only" in out
-    assert not any(x.startswith("CREATE") for x in conn.statements)
+    assert not any(x.startswith("CREATE LOCAL TEMPORARY TABLE #AGENT_PROBE_RO")
+                   or x.startswith("INSERT") for x in conn.statements)
 
 
 def test_no_login_skips_the_new_steps_too(capsys):
@@ -937,7 +964,8 @@ def test_another_refusal_of_the_write_is_inconclusive(tmp_path, capsys, error, s
                          write_refused=True, write_error=error, extra=["--write-test"])
     out = capsys.readouterr().out
     assert code == 1, out
-    assert f"INCONCLUSIVE write_refused: {shown}" in out
+    assert f"INCONCLUSIVE write_refused_ddl: {shown}" in out
+    assert f"INCONCLUSIVE write_refused_dml: {shown}" in out
     assert "PASS write_refused" not in out
     assert "WRITE_REFUSED inconclusive" in out
     assert "secret text" not in out
@@ -964,7 +992,9 @@ def test_a_failed_schema_pin_stops_the_write_test_and_the_checks(tmp_path, capsy
     assert "SKIP write_refused: schema pin failed" in out
     assert "SKIP checks: schema pin failed" in out
     assert out.splitlines()[-1] == "SCHEMA_PIN no"
-    assert not any(x.startswith("CREATE") for x in conn.statements)
+    assert not any(x.startswith("CREATE LOCAL TEMPORARY TABLE #AGENT_PROBE_RO")
+                   or x.startswith("INSERT") for x in conn.statements)
+    assert 'DROP TABLE "PROBEUSER".#AGENT_PROBE_RW' in conn.statements  # the setup is undone
     assert not any("M_ALERTS" in x for x in conn.statements)
     assert "secret text" not in out
 
@@ -993,3 +1023,56 @@ def test_no_login_reports_no_schema_pin(capsys):
     out = capsys.readouterr().out
     assert code == 1
     assert "SCHEMA_PIN no" in out
+
+
+# ---- final review round 3: a DML attempt beside the DDL one ------------------------------
+
+
+def test_a_refused_ddl_with_an_accepted_insert_fails(tmp_path, capsys):
+    checks = tmp_path / "checks.json"
+    checks.write_text(json.dumps([{"name": "alerts", "sql": "SELECT * FROM M_ALERTS"}]))
+    code, _, conn = _run(HTTP_DESTINATION, privileges=[("MONITORING", None)],
+                         write_refused=True, insert_refused=False,
+                         extra=["--write-test", "--checks-file", str(checks)])
+    out = capsys.readouterr().out
+    assert code == 1, out
+    assert "PASS write_refused_ddl: sql_code=7" in out
+    assert "FAIL write_refused_dml: the write was accepted" in out
+    assert "WRITE_REFUSED no" in out and "READ_ONLY no" in out
+    for step in ("query_timeout", "privileges", "explain_plan", "checks"):
+        assert f"SKIP {step}: write was accepted" in out
+    s = conn.statements
+    insert = s.index('INSERT INTO "PROBEUSER".#AGENT_PROBE_RW VALUES (1)')
+    assert s[insert + 1] == "ROLLBACK"  # the row is undone at once
+    assert 'DROP TABLE "PROBEUSER".#AGENT_PROBE_RW' in s[insert:]
+    assert not any("M_ALERTS" in x for x in s)
+    _assert_clean(out)
+
+
+@pytest.mark.parametrize("ddl,dml", [(None, 258), (258, None)])
+def test_one_attempt_refused_for_another_reason_is_inconclusive(capsys, ddl, dml):
+    def error(code):
+        return None if code is None else dbapi.Error(code, "other: secret text")
+
+    code, _, _ = _run(HTTP_DESTINATION, privileges=[("MONITORING", None)],
+                      write_refused=True, write_error=error(ddl),
+                      insert_refused=True, insert_error=error(dml) or dbapi.Error(7, "ro"),
+                      extra=["--write-test"])
+    out = capsys.readouterr().out
+    assert code == 1, out
+    assert "WRITE_REFUSED inconclusive" in out
+    assert "INCONCLUSIVE write_refused_" in out and "PASS write_refused_" in out
+    assert "secret text" not in out
+
+
+def test_a_failed_setup_skips_the_insert_and_is_inconclusive(capsys):
+    code, _, conn = _run(HTTP_DESTINATION, privileges=[("MONITORING", None)],
+                         write_refused=True, setup_fails=True, extra=["--write-test"])
+    out = capsys.readouterr().out
+    assert code == 1, out
+    assert "FAIL write_setup: sql_code=258" in out
+    assert "PASS write_refused_ddl: sql_code=7" in out
+    assert "SKIP write_refused_dml: setup failed" in out
+    assert "WRITE_REFUSED inconclusive" in out
+    assert not any(x.startswith("INSERT") or x.startswith("DROP") for x in conn.statements)
+    assert "secret text" not in out

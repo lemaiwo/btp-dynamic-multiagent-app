@@ -35,7 +35,7 @@ The rules, in the order they are checked:
     schema-qualified function call outside those two schemas, or a quoted one.
     Then, for model-written SQL only, the deny-list (:data:`DENIED_VIEWS`,
     :data:`DENIED_NAME_PARTS`, :data:`DENIED_SYS_PREFIX`): an allowed reference
-    (unqualified or ``SYS.``) to a name that holds ``INIFILE`` or
+    (unqualified, ``SYS.`` or ``_SYS_STATISTICS.``) to a name that holds ``INIFILE`` or
     ``CONFIGURATION_PARAMETER`` (``M_INIFILE_CONTENTS``,
     ``M_INIFILE_CONTENT_HISTORY``, ``M_INIFILES``,
     ``M_CONFIGURATION_PARAMETER_VALUES``, ...) or to a
@@ -84,10 +84,12 @@ ALLOWED_SCHEMAS = frozenset({"SYS", "_SYS_STATISTICS"})
 
 #: Monitoring views ``run_select`` may not read although the allow rule would
 #: let them through: they hold the ini and configuration values the fixed
-#: ``iniContents`` check deliberately hides. Matched unqualified or with
-#: ``SYS.``, after the allow rule's upper-casing (a quoted name verbatim).
+#: ``iniContents`` check deliberately hides. Matched unqualified and in every
+#: allowed schema (``SYS.``, ``_SYS_STATISTICS.``), after the allow rule's
+#: upper-casing (a quoted name verbatim).
 DENIED_VIEWS = frozenset({"M_INIFILE_CONTENTS", "M_CONFIGURATION_PARAMETER_VALUES"})
-#: Parts of a name that deny it, for the same schemas as :data:`DENIED_VIEWS`:
+#: Parts of a name that deny it, in the same schemas as :data:`DENIED_VIEWS`
+#: (the statistics server keeps copies and histories of these values too):
 #: the whole ini and configuration-parameter family, so a view the list does
 #: not name (``M_INIFILE_CONTENT_HISTORY``: KEY and VALUE, current and earlier)
 #: is refused too. ``M_INIFILES`` goes with it (it names files, not values).
@@ -311,7 +313,9 @@ class _Walker:
         """The deny-list, after the allow rule (a CTE never reaches it)."""
         if not self.deny:
             return
-        if schema in (None, "SYS") and (
+        # Every allowed schema, unqualified included: a copy in
+        # _SYS_STATISTICS holds the same values as the SYS view.
+        if (schema is None or schema in ALLOWED_SCHEMAS) and (
                 name in DENIED_VIEWS or any(part in name for part in DENIED_NAME_PARTS)):
             raise SelectRefused("table_not_allowed")
         if schema in ALLOWED_SCHEMAS and name.startswith(DENIED_SYS_PREFIX):

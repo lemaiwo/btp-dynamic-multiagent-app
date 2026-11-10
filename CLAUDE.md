@@ -1068,12 +1068,13 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     `TABLESAMPLE` or a parenthesised join is refused, and so is a
     schema-qualified call outside those two schemas or a quoted one. **The
     deny-list**, applied to a reference AFTER the allow rule and only to
-    model-written SQL: every name, unqualified or `SYS.`, that holds
+    model-written SQL: every name, unqualified or in either allowed schema
+    (`SYS.`, `_SYS_STATISTICS.`), that holds
     `INIFILE` or `CONFIGURATION_PARAMETER` (`DENIED_NAME_PARTS`: the whole
     ini and configuration-parameter family, `M_INIFILE_CONTENTS`,
     `M_INIFILE_CONTENT_HISTORY` with its current and earlier KEY / VALUE,
     `M_INIFILES`, `M_CONFIGURATION_PARAMETER_VALUES`, and any such view the
-    list does not name; `_SYS_STATISTICS.` names are not matched by it) and
+    list does not name, and the statistics server's copies) and
     every `SYS.P_*` or `_SYS_STATISTICS.P_*` object (internal persistence
     tables; no registered check reads one) are
     `table_not_allowed` in every position a reference can stand (a CTE of
@@ -3878,13 +3879,20 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   (lifetime), S4 TCP connect to the SOCKS5 port, S5 raw SOCKS5 handshake, S6
   `hdbcli` login per variant and TLS, S7 `M_DATABASE` (rows, version), S8
   `SET SCHEMA SYS` (`schema_pin`) then `SET TRANSACTION READ ONLY`, S8b
-  (`--write-test` only, the customer agrees first) `CREATE LOCAL TEMPORARY
-  TABLE #AGENT_PROBE_RO`, which must be refused: `PASS write_refused:
-  sql_code=<n>` only for a code in `READ_ONLY_REFUSAL_CODES` (one unconfirmed
-  candidate, 7: confirm or correct it from the first run), any other refusal
-  `INCONCLUSIVE write_refused: sql_code=<n>` with exit code 1 (an accepted
-  write is dropped, rolled back, and every later SQL step is `SKIP <step>:
-  write was accepted` with exit code 1); a refused schema pin skips S8b and
+  (`--write-test` only, the customer agrees first) two writes in the
+  read-only transaction, each on its own line with its SQL code, which must
+  both be refused: DDL `CREATE LOCAL TEMPORARY TABLE #AGENT_PROBE_RO`
+  (`write_refused_ddl`) and DML `INSERT INTO "<current schema>".#AGENT_PROBE_RW
+  VALUES (1)` (`write_refused_dml`) into a session-local table made before
+  the transaction is reset (S8a `write_setup`: `SELECT CURRENT_SCHEMA`, then
+  the `CREATE`; the schema is never printed) and dropped after the last step
+  (`write_cleanup`). An attempt PASSes only for a code in
+  `READ_ONLY_REFUSAL_CODES` (one unconfirmed candidate, 7: confirm or correct
+  it from the first run), any other refusal is `INCONCLUSIVE <step>:
+  sql_code=<n>`; `WRITE_REFUSED yes` only when both pass, `no` when either is
+  accepted (the RO table dropped or the row rolled back, every later SQL
+  step `SKIP <step>: write was accepted`), `inconclusive` otherwise (a failed
+  setup included); `no` and `inconclusive` exit 1; a refused schema pin skips S8b and
   S12 (`SKIP <step>: schema pin failed`, exit code 1), and `FAIL read_only:
   sql_code=<n>` right after `PASS schema_pin` would say HANA refused READ
   ONLY once the pin had opened the transaction; S9 the query timeout, S10 the effective
@@ -3895,8 +3903,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   (...)` with the sample binds, in the read-only transaction). A final block
   with one value per key: `DEST_SHAPE`, `PROXY_VARIANT`, `TLS`,
   `TOKEN_SECONDS`, `READ_ONLY`, `QUERY_TIMEOUT`, `EXPLAIN_PLAN`
-  (`yes|no|untested`), `PRIVILEGES`, `WRITE_REFUSED` (`yes`; `no` only for
-  an accepted write; `inconclusive`; `untested`), `SCHEMA_PIN` (`yes|no`,
+  (`yes|no|untested`), `PRIVILEGES`, `WRITE_REFUSED` (`yes`: both writes
+  refused with a read-only code; `no` only for an accepted write;
+  `inconclusive`; `untested`), `SCHEMA_PIN` (`yes|no`,
   the last key). Prints property names, SOCKS5 reply codes, SQL error codes
   and counts, never a credential, a token, a host from a binding or a
   destination, a row or a driver's error text

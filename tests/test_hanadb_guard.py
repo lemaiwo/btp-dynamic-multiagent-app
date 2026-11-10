@@ -395,7 +395,6 @@ def test_denied_views_are_refused_in_every_position(name: str, position: str) ->
 @pytest.mark.parametrize("sql", [
     "SELECT * FROM _SYS_STATISTICS.HOST_WORKLOAD",
     "SELECT * FROM _SYS_STATISTICS.STATISTICS_CURRENT_ALERTS",
-    "SELECT * FROM _SYS_STATISTICS.M_INIFILE_CONTENTS",
     'SELECT * FROM SYS."p_lower_quoted"',
     "SELECT * FROM SYS.PRINCIPALS",
     "WITH M_INIFILE_CONTENTS AS (SELECT * FROM M_SERVICES) SELECT * FROM M_INIFILE_CONTENTS",
@@ -423,6 +422,11 @@ NAME_PART_DENIED = [
     "M_INIFILES", "SYS.M_INIFILES", "SYS.INIFILE_ANYTHING",
     "SYS.M_CONFIGURATION_PARAMETER_VALUES_X", "M_CONFIGURATION_PARAMETERS_HISTORY",
     "SYS.CONFIGURATION_PARAMETER_PROPERTIES", '"SYS"."CONFIGURATION_PARAMETER_X"',
+    # every allowed schema, not only SYS (final review round 3)
+    "_SYS_STATISTICS.M_INIFILE_CONTENTS", "_SYS_STATISTICS.M_INIFILE_CONTENT_HISTORY",
+    '"_SYS_STATISTICS"."M_INIFILES"', "_sys_statistics.host_inifile_contents",
+    "_SYS_STATISTICS.M_CONFIGURATION_PARAMETER_VALUES",
+    "_SYS_STATISTICS.HOST_CONFIGURATION_PARAMETER_X",
 ]
 
 
@@ -441,7 +445,7 @@ def test_fixed_checks_may_still_read_the_ini_family(name: str) -> None:
 
 
 @pytest.mark.parametrize("sql", [
-    "SELECT * FROM _SYS_STATISTICS.M_INIFILE_CONTENT_HISTORY",  # SYS or unqualified only
+    'SELECT * FROM _SYS_STATISTICS."m_inifiles"',  # quoted: another object
     'SELECT * FROM SYS."m_inifile_content_history"',  # quoted: another object
     "SELECT * FROM SYS.M_INI_FILE",
     "SELECT * FROM SYS.M_CONFIGURATION",
