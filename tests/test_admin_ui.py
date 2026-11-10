@@ -1736,7 +1736,19 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
               and '<option value="gitlab">GitLab</option>' in html)
         check("git switches use the approved wording",
               "Allow pushing to agent branches" in html and "Allow opening pull requests" in html)
-        check("the hint list names builtin:git", "builtin:bitbucket, builtin:git, builtin:sapnotes," in html)
+        check("the hint list names builtin:git", "builtin:bitbucket, builtin:git, builtin:hana," in html)
+        # builtin:hana: destination mode only, systems and one switch,
+        # collected by their own function.
+        check("hana is a known destination built-in",
+              "'builtin:hana':" in html and "['systems', 'allow_select']" in html
+              and "const HANA_BUILTIN = 'builtin:hana';" in html
+              and "function collectHanaConfig(row)" in html)
+        check("hana is offered under its toolset name",
+              "const HANA_TOOLSET_LABEL = 'SAP HANA (monitoring)';" in html)
+        check("hana has its fields",
+              'class="dest-systems"' in html and 'class="dest-allow_select"' in html
+              and "Allow SELECT on monitoring views" in html)
+        check("the hint list names builtin:hana", "builtin:git, builtin:hana, builtin:sapnotes," in html)
         check("the views placeholder shows a calendar view with its kinds",
               '"kinds": ["Presence", "Guard"]' in html)
         # A stored server on an auth mode this page does not offer (app_only,
@@ -2298,6 +2310,132 @@ assert.throws(() => collectMcpServers(), /Two builtin:git rows/);
 assert.deepStrictEqual(out.oauth, { destination: 'BITBUCKET', workspace: 'acme-ws' });
 assert.strictEqual(row.querySelector('.dest-allow_push').checked, false);
 assert.strictEqual(row.querySelector('.dest-base_branch').value, '');
+// 7e2. builtin:hana: destination mode only; a Systems list (one "name
+//      destination" line per system) and "Allow SELECT", which asks first.
+const HANA_CONFIRM = 'This lets the agent run its own SELECT statements on the monitoring views '
+    + '(SYS, _SYS_STATISTICS, M_*) and read trace file contents of the listed systems. '
+    + 'Statement texts come back unmasked. Continue?';
+const HANA_OAUTH = { systems: [{ name: 'sib_tenant', destination: 'hana-sib-tenant' },
+                               { name: 'sib_systemdb', destination: 'HANA_SIB.SYS' }],
+                     allow_select: true };
+const hanaUrl = (r, v) => {
+    r.querySelector('.mcp-url').value = v;
+    r.querySelector('.mcp-url').dispatchEvent(new window.Event('input', { bubbles: true }));
+};
+const hanaFire = (el) => el.dispatchEvent(new window.Event('change', { bubbles: true }));
+const hanaAsked = [];
+let hanaAnswer = false;
+global.confirm = (msg) => { hanaAsked.push(msg); return hanaAnswer; };
+({ row, out } = addAndCollect({ url: 'builtin:hana', auth_mode: 'destination',
+    oauth: { ...HANA_OAUTH, user_context: false, has_client_secret: false, project: 'ABC',
+             allow_write: true, repositories: ['a/b'], provider: 'gitlab', allow_push: true } }));
+for (const k of ['systems', 'allow_select']) {
+    assert.strictEqual(row.querySelector('.dest-field-' + k).style.display, '', k + ' is shown');
+}
+for (const k of ['destination', 'user_context', 'project', 'allow_write', 'repositories', 'provider',
+                 'allow_push', 'allow_comment', 'workspace']) {
+    assert.strictEqual(row.querySelector('.dest-field-' + k).style.display, 'none', k + ' is hidden');
+}
+// The stored systems load back, one line each; the stored switch is loaded
+// without asking (nothing was ticked by the admin).
+assert.strictEqual(row.querySelector('.dest-systems').value,
+    'sib_tenant hana-sib-tenant\nsib_systemdb HANA_SIB.SYS');
+assert.strictEqual(row.querySelector('.dest-allow_select').checked, true);
+assert.deepStrictEqual(hanaAsked, []);
+assert.deepStrictEqual(out, { url: 'builtin:hana', auth_mode: 'destination', oauth: HANA_OAUTH });
+assert.strictEqual(row.querySelector('.dest-hint').textContent,
+    'Reads monitoring and catalogue views of the listed on-premise HANA databases as the database '
+    + 'user of each destination; read only.');
+console.log('HANA:' + JSON.stringify(out));
+// Built from the fields as left: blank lines dropped, the blank around and
+// between the two names is the separator's, the names themselves as typed
+// (the server refuses an upper-case name: no repair here); unticked = absent.
+row.querySelector('.dest-systems').value = '  sib_tenant   hana-sib-tenant \n\n\tSib_X dest.2\n';
+row.querySelector('.dest-allow_select').checked = false;
+assert.deepStrictEqual(collectMcpServers()[0].oauth,
+    { systems: [{ name: 'sib_tenant', destination: 'hana-sib-tenant' },
+                { name: 'Sib_X', destination: 'dest.2' }] });
+// A line that is not exactly two names is refused, naming the line, never its text.
+row.querySelector('.dest-systems').value = 'sib_tenant hana-sib-tenant\nSECRETVALUE';
+assert.throws(() => collectMcpServers(), e => {
+    assert.strictEqual(e.message, 'SAP HANA: line 2 of Systems needs a system name and a destination '
+        + 'name, separated by a space.');
+    return true;
+});
+row.querySelector('.dest-systems').value = 'a b SECRETVALUE';
+assert.throws(() => collectMcpServers(), e => {
+    assert.ok(/line 1 of Systems/.test(e.message));
+    assert.ok(!e.message.includes('SECRETVALUE'));
+    return true;
+});
+row.querySelector('.dest-systems').value = ' \n ';
+assert.throws(() => collectMcpServers(), e => {
+    assert.strictEqual(e.message, 'SAP HANA: list at least one system.');
+    return true;
+});
+// Ticking "Allow SELECT" asks first, naming no system; Cancel leaves it unticked.
+row.querySelector('.dest-systems').value = 'sib_tenant hana-sib-tenant';
+const selectBox = row.querySelector('.dest-allow_select');
+selectBox.checked = true;
+hanaFire(selectBox);
+assert.deepStrictEqual(hanaAsked, [HANA_CONFIRM]);
+assert.strictEqual(selectBox.checked, false, 'Cancel leaves it unticked');
+assert.deepStrictEqual(collectMcpServers()[0].oauth,
+    { systems: [{ name: 'sib_tenant', destination: 'hana-sib-tenant' }] });
+hanaAnswer = true;
+selectBox.checked = true;
+hanaFire(selectBox);
+assert.strictEqual(hanaAsked.length, 2);
+assert.strictEqual(selectBox.checked, true, 'OK keeps it ticked');
+assert.strictEqual(collectMcpServers()[0].oauth.allow_select, true);
+// Unticking asks nothing.
+selectBox.checked = false;
+hanaFire(selectBox);
+assert.strictEqual(hanaAsked.length, 2);
+// A URL edit to another built-in and back does not carry the tick over.
+selectBox.checked = true;
+hanaUrl(row, 'builtin:git');
+hanaUrl(row, 'builtin:hana');
+assert.strictEqual(selectBox.checked, false, 'the tick does not survive a type change');
+// What the URL passes through while typed changes nothing.
+selectBox.checked = true;
+hanaUrl(row, 'builtin:han');
+hanaUrl(row, '');
+hanaUrl(row, 'builtin:hana');
+assert.strictEqual(selectBox.checked, true, 'a half-typed URL back to hana keeps the tick');
+// Only the destination mode.
+({ row } = addAndCollect({ url: 'builtin:hana', auth_mode: 'destination',
+    oauth: { systems: [{ name: 'sib_tenant', destination: 'hana-sib-tenant' }] } }));
+row.querySelector('.mcp-auth-mode').value = 'jwt';
+assert.throws(() => collectMcpServers(), /builtin:hana needs the auth mode "BTP destination"/);
+// An agent takes one hana entry: two rows (in any spelling) are refused here, not posted.
+row.querySelector('.mcp-auth-mode').value = 'destination';
+addMcpServerRow({ url: 'Builtin:HANA/', auth_mode: 'destination',
+    oauth: { systems: [{ name: 'other', destination: 'hana-other' }] } });
+assert.throws(() => collectMcpServers(), e => {
+    assert.strictEqual(e.message,
+        'Two builtin:hana rows: an agent takes one. List every system in one row.');
+    return true;
+});
+// Another type's block loads no systems and no switch; a stored non-boolean switch is not loaded.
+({ row, out } = addAndCollect({ url: 'builtin:git', auth_mode: 'destination',
+    oauth: { destination: 'GH', provider: 'github', repositories: ['a/b'], allow_select: true,
+             systems: [{ name: 'x', destination: 'y' }] } }));
+assert.strictEqual(row.querySelector('.dest-systems').value, '');
+assert.strictEqual(row.querySelector('.dest-allow_select').checked, false);
+({ row, out } = addAndCollect({ url: 'builtin:hana', auth_mode: 'destination',
+    oauth: { systems: [{ name: 'sib_tenant', destination: 'd' }], allow_select: 'true' } }));
+assert.deepStrictEqual(out.oauth, { systems: [{ name: 'sib_tenant', destination: 'd' }] });
+// A new row typed as builtin:hana starts empty and unticked.
+document.getElementById('agent-mcp-servers').innerHTML = '';
+addMcpServerRow();
+row = document.querySelector('.mcp-server-row');
+row.querySelector('.mcp-auth-mode').value = 'destination';
+toggleOauthFields(row.querySelector('.mcp-auth-mode'));
+hanaUrl(row, 'builtin:hana');
+assert.strictEqual(row.querySelector('.dest-systems').value, '');
+assert.strictEqual(row.querySelector('.dest-allow_select').checked, false);
+assert.strictEqual(row.querySelector('.dest-field-systems').style.display, '');
 // 7f. builtin:ina (analytical queries) is edited in the UI5 admin. A stored
 //     row is shown with the destination option, its queries as a read-only
 //     line and a fixed note, and goes back as it was loaded; a NEW row cannot
