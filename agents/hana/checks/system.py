@@ -25,22 +25,49 @@ from __future__ import annotations
 from agents.hana.checks.base import Check, Statement, register
 
 HIDDEN = "<hidden>"
-"""What ``iniContents`` answers instead of a value that may be a secret."""
+"""What ``iniContents`` answers instead of a value it does not show."""
 
-# The one place a configuration value is chosen: a value is hidden when its
-# key or section names a secret, or when the value itself does. Fixed SQL, so
-# the words are literals of this repository, never arguments. LOCATE / RIGHT
-# instead of LIKE '%...%': the registry refuses "%s" in a statement (a format
-# placeholder), which '%secret%' would hold. The raw VALUE column is reachable
-# only through this CASE.
-_SECRET_WORDS = ("password", "secret", "credential", "passphrase", "token", "private")
-_SECRET_TEST = " OR ".join(
-    [f"LOCATE(LOWER(KEY), '{w}') > 0" for w in _SECRET_WORDS]
-    + ["RIGHT(LOWER(KEY), 3) = 'key'"]
-    + [f"LOCATE(LOWER(SECTION), '{w}') > 0" for w in _SECRET_WORDS]
-    + [f"LOCATE(LOWER(VALUE), '{w}') > 0" for w in ("password", "secret", "pwd=")]
+# iniContents is DEFAULT-DENY BY SHAPE. A value is shown only when (a) neither
+# its key nor its section names anything secret-like and the key does not end
+# in "key", and (b) the value itself has a harmless shape: at most SHAPE_MAX
+# characters of letters, digits, space and _ . , + - % (numbers, booleans,
+# sizes, simple names). Anything with / \ : @ = ; ' " (paths, hosts, URLs,
+# connection strings, credentials) or longer is hidden whatever its key says.
+# Fixed SQL: the words and the pattern are literals of this repository, never
+# arguments. LOCATE / RIGHT instead of LIKE '%...%', and LENGTH instead of a
+# {0,64} quantifier: the registry refuses "%s" and braces in a statement.
+# on-prem: unverified (LIKE_REGEXPR on SPS07 and the CASE as a whole)
+DENY_WORDS: tuple[str, ...] = (
+    "password", "passwd", "pwd", "pass", "secret", "credential", "passphrase", "token",
+    "auth", "cert", "salt", "saml", "jwt", "proxy", "keystore", "private", "ssl", "ldap")
+SHAPE_MAX = 64
+SHAPE_PATTERN = "^[A-Za-z0-9_ .,+%-]*$"
+
+_DENIED = " OR ".join(
+    [f"LOCATE(LOWER(\"KEY\"), '{w}') > 0" for w in DENY_WORDS]
+    + ["RIGHT(LOWER(\"KEY\"), 3) = 'key'"]
+    + [f"LOCATE(LOWER(SECTION), '{w}') > 0" for w in DENY_WORDS]
 )
-INI_VALUE_SQL = f"CASE WHEN {_SECRET_TEST} THEN '{HIDDEN}' ELSE VALUE END AS VALUE"
+_EMPTY = "\"VALUE\" IS NULL OR \"VALUE\" = ''"
+_SHOWN = (
+    f"NOT ({_DENIED}) AND LENGTH(\"VALUE\") <= {SHAPE_MAX}"
+    f" AND \"VALUE\" LIKE_REGEXPR '{SHAPE_PATTERN}'"
+)
+# A NULL anywhere in the conditions makes them unknown, which falls to ELSE:
+# hidden. The raw VALUE column is reachable only through the first CASE.
+INI_VALUE_SQL = (
+    f"CASE WHEN {_EMPTY} THEN \"VALUE\" WHEN {_SHOWN} THEN \"VALUE\""
+    f" ELSE '{HIDDEN}' END AS \"VALUE\","
+    f" CASE WHEN {_EMPTY} THEN 0 WHEN {_SHOWN} THEN 0 ELSE 1 END AS VALUE_HIDDEN"
+)
+
+HOST_INFORMATION_KEYS: tuple[str, ...] = (
+    "sid", "sapsystem", "build_version", "build_branch", "os_name", "os_kernel_version",
+    "os_cpe_name", "hw_manufacturer", "hw_model", "cpu_model", "cpu_summary", "cpu_cores",
+    "cpu_threads", "cpu_sockets", "mem_phys", "mem_swap", "timezone_name", "timezone_offset",
+    "start_time")
+"""The host facts ``hostInformation`` returns: no user, address or path key
+(os_user, net_*, ...). on-prem: unverified (which of these keys exist)."""
 
 # The optional filter on a name: ``(? IS NULL OR X = ?)`` with a NULL bind is
 # not verified on HANA, so the first ``?`` is typed explicitly.
@@ -61,7 +88,7 @@ register(
         statements=(
             Statement(
                 "overview",
-                "SELECT SECTION, NAME, STATUS, VALUE FROM SYS.M_SYSTEM_OVERVIEW"
+                "SELECT SECTION, NAME, STATUS, \"VALUE\" FROM SYS.M_SYSTEM_OVERVIEW"
                 " ORDER BY SECTION, NAME",
                 (),
             ),
@@ -85,7 +112,10 @@ register(
         statements=(
             Statement(
                 "information",
-                "SELECT TOP ? HOST, KEY, VALUE FROM SYS.M_HOST_INFORMATION ORDER BY HOST, KEY",
+                "SELECT TOP ? HOST, \"KEY\", \"VALUE\" FROM SYS.M_HOST_INFORMATION"
+                " WHERE \"KEY\" IN ("
+                + ", ".join(f"'{k}'" for k in HOST_INFORMATION_KEYS)
+                + ") ORDER BY HOST, \"KEY\"",
                 ("top_plus_one",),
             ),
             # on-prem: the memory figures hana-cli looks for in M_HOST_INFORMATION
@@ -194,7 +224,7 @@ register(
             Statement(
                 "",
                 "SELECT TOP ? COMPONENT_NAME, FEATURE_NAME, IS_DEPRECATED, OBJECT_COUNT,"
-                " CALL_COUNT, LAST_TIMESTAMP, LAST_USER_NAME, LAST_APPLICATION_NAME"
+                " CALL_COUNT, LAST_TIMESTAMP"
                 " FROM SYS.M_FEATURE_USAGE ORDER BY COMPONENT_NAME, FEATURE_NAME",
                 ("top_plus_one",),
             ),
@@ -218,18 +248,18 @@ register(
         name="iniContents",
         category="system",
         purpose=(
-            "Configuration parameters (file, layer, section, key, value); object ="
-            " one file name; secrets hidden."
+            "Configuration parameters of one file (object) or all; values that could hold"
+            " secrets, paths, hosts or URLs hidden."
         ),
         source="bin/iniContents.js",
         statements=(
             Statement(
                 "",
-                "SELECT TOP ? FILE_NAME, LAYER_NAME, TENANT_NAME, HOST, SECTION, KEY, "
+                "SELECT TOP ? FILE_NAME, LAYER_NAME, TENANT_NAME, HOST, SECTION, \"KEY\", "
                 + INI_VALUE_SQL
                 + " FROM SYS.M_INIFILE_CONTENTS WHERE "
                 + _OPTIONAL_FILE
-                + " ORDER BY FILE_NAME, SECTION, KEY, LAYER_NAME",
+                + " ORDER BY FILE_NAME, SECTION, \"KEY\", LAYER_NAME",
                 ("top_plus_one", "object", "object"),
             ),
         ),
@@ -276,7 +306,7 @@ register(
         statements=(
             Statement(
                 "overview",
-                "SELECT SECTION, NAME, STATUS, VALUE FROM SYS.M_SYSTEM_OVERVIEW"
+                "SELECT SECTION, NAME, STATUS, \"VALUE\" FROM SYS.M_SYSTEM_OVERVIEW"
                 " ORDER BY SECTION, NAME",
                 (),
             ),
@@ -313,12 +343,14 @@ register(
                 (),
             ),
             # on-prem: M_BACKUP_CATALOG_ENTRIES is M_BACKUP_CATALOG; the latest
-            # start and end per backup type and state, not one row.
+            # start and end per backup type and state in the last 30 days, not one row.
             Statement(
                 "backups",
                 "SELECT ENTRY_TYPE_NAME, STATE_NAME, COUNT(*) AS BACKUP_COUNT,"
                 " MAX(SYS_START_TIME) AS LAST_START_TIME, MAX(SYS_END_TIME) AS LAST_END_TIME"
-                " FROM SYS.M_BACKUP_CATALOG GROUP BY ENTRY_TYPE_NAME, STATE_NAME"
+                " FROM SYS.M_BACKUP_CATALOG"
+                " WHERE SYS_START_TIME >= ADD_DAYS(CURRENT_TIMESTAMP, -30)"
+                " GROUP BY ENTRY_TYPE_NAME, STATE_NAME"
                 " ORDER BY ENTRY_TYPE_NAME, STATE_NAME",
                 (),
             ),
@@ -397,6 +429,7 @@ register(
             ),
             # on-prem: MEMORY_SIZE_IN_TOTAL is a column of M_CS_TABLES (there is no
             # COMPRESSION_RATIO); a large delta or a stale compression shows here.
+            # cost: unverified on a large system (M_CS_TABLES over every column table)
             Statement(
                 "large_tables",
                 "SELECT TOP ? SCHEMA_NAME, TABLE_NAME, RECORD_COUNT, MEMORY_SIZE_IN_TOTAL,"

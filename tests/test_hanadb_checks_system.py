@@ -9,6 +9,7 @@ read, the SELECT guard, the row limit) are in ``tests/test_hanadb_checks.py``.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import pytest
@@ -126,36 +127,108 @@ async def test_ini_contents_binds_the_optional_file(db: h.FakeDbapi) -> None:
     assert "CAST(? AS NVARCHAR(256)) IS NULL OR FILE_NAME = ?" in executed[0][1]
 
 
-def _case_span(tokens) -> tuple[int, int]:
-    start = next(i for i, t in enumerate(tokens) if t.is_word("CASE"))
-    depth = 0
-    for i in range(start, len(tokens)):
-        if tokens[i].is_word("CASE"):
+def _case_spans(tokens) -> list[tuple[int, int]]:
+    """Every outermost CASE ... END of a statement, as token index pairs."""
+    spans, depth, start = [], 0, 0
+    for i, token in enumerate(tokens):
+        if token.is_word("CASE"):
+            if depth == 0:
+                start = i
             depth += 1
-        elif tokens[i].is_word("END"):
+        elif token.is_word("END") and depth:
             depth -= 1
             if depth == 0:
-                return start, i
-    raise AssertionError("CASE has no END")
+                spans.append((start, i))
+    assert depth == 0, "CASE has no END"
+    return spans
+
+
+def _is_name(token, name: str) -> bool:
+    return token.kind in ("word", "quoted") and token.value == name
 
 
 def test_ini_contents_value_only_through_the_hiding_case() -> None:
     """The fake does not evaluate SQL, so the rule is held on the tokens: the
-    raw VALUE column appears only inside the CASE and as its alias."""
+    raw VALUE column appears only inside a CASE and as an alias after one."""
     sql = get_check("iniContents").statements[0].sql
     tokens = tokenize(sql)
-    start, end = _case_span(tokens)
-    assert tokens[end + 1].is_word("AS") and tokens[end + 2].is_word("VALUE")
+    spans = _case_spans(tokens)
+    assert len(spans) == 2  # VALUE and VALUE_HIDDEN
+    aliases = {end + 2 for _, end in spans if tokens[end + 1].is_word("AS")}
     for i, token in enumerate(tokens):
-        if token.is_word("VALUE"):
-            assert start < i < end or i == end + 2
-    case_sql = system.INI_VALUE_SQL
-    assert case_sql.startswith("CASE WHEN ")
-    assert f"THEN '{system.HIDDEN}' ELSE VALUE END" in case_sql
-    for word in ("'password'", "'secret'", "'credential'", "'passphrase'", "'token'"):
-        assert f"LOCATE(LOWER(KEY), {word}) > 0" in case_sql
-        assert f"LOCATE(LOWER(SECTION), {word}) > 0" in case_sql
-    assert "RIGHT(LOWER(KEY), 3) = 'key'" in case_sql
-    assert "LOCATE(LOWER(VALUE), 'password') > 0" in case_sql
-    # exactly one CASE, and the select list has no second way to VALUE
-    assert sum(1 for t in tokens if t.is_word("CASE")) == 1
+        if _is_name(token, "VALUE"):
+            assert any(s < i < e for s, e in spans) or i in aliases, "VALUE outside CASE"
+    (s1, e1), (s2, e2) = spans
+    assert _is_name(tokens[e1 + 2], "VALUE") and _is_name(tokens[e2 + 2], "VALUE_HIDDEN")
+    # default-deny: the CASE ends in the hidden literal, and 1 for VALUE_HIDDEN
+    assert tokens[e1 - 2].is_word("ELSE") and tokens[e1 - 1].text == f"'{system.HIDDEN}'"
+    assert tokens[e2 - 2].is_word("ELSE") and tokens[e2 - 1].text == "1"
+
+
+def test_ini_contents_deny_words_and_shape() -> None:
+    sql = system.INI_VALUE_SQL
+    for word in ("password", "passwd", "pwd", "pass", "secret", "credential", "passphrase",
+                 "token", "auth", "cert", "salt", "saml", "jwt", "proxy", "keystore",
+                 "private", "ssl", "ldap"):
+        assert word in system.DENY_WORDS
+        assert f"LOCATE(LOWER(\"KEY\"), '{word}') > 0" in sql
+        assert f"LOCATE(LOWER(SECTION), '{word}') > 0" in sql
+    assert "RIGHT(LOWER(\"KEY\"), 3) = 'key'" in sql
+    assert f"LENGTH(\"VALUE\") <= {system.SHAPE_MAX}" in sql
+    assert f"\"VALUE\" LIKE_REGEXPR '{system.SHAPE_PATTERN}'" in sql
+    assert system.SHAPE_MAX == 64
+
+
+@pytest.mark.parametrize("value", ["1024", "true", "on", "80%", "1.5", "row_store", "a-b,c +d"])
+def test_ini_shape_lets_plain_values_through(value: str) -> None:
+    assert len(value) <= system.SHAPE_MAX
+    assert re.fullmatch(system.SHAPE_PATTERN.strip("^$"), value)
+
+
+@pytest.mark.parametrize("value", [
+    "ldap://host:389", "jdbc:sap://u:p@host:30015", "user@host", "a=b", "/hana/data/SID",
+    "C:\\x", "x;y", "it's", 'say "x"', "a" * 65, "tab\tbed", "line\nbreak", "naïve"])
+def test_ini_shape_hides_everything_else(value: str) -> None:
+    shown = len(value) <= system.SHAPE_MAX and re.fullmatch(
+        system.SHAPE_PATTERN.strip("^$"), value)
+    assert not shown
+
+
+def test_ini_contents_purpose_says_what_is_hidden() -> None:
+    purpose = get_check("iniContents").purpose
+    for word in ("secrets", "paths", "hosts", "URLs"):
+        assert word in purpose
+
+
+def test_host_information_returns_fixed_keys_only() -> None:
+    statement = get_check("hostInformation").statements[0]
+    tokens = tokenize(statement.sql)
+    keys = {t.text.strip("'") for t in tokens if t.kind == "string"}
+    assert keys == set(system.HOST_INFORMATION_KEYS)
+    assert "os_user" not in keys and "net_ip_addresses" not in keys
+    assert "\"KEY\" IN (" in statement.sql
+
+
+def test_feature_usage_names_no_user() -> None:
+    sql = get_check("featureUsage").statements[0].sql
+    assert "LAST_USER_NAME" not in sql and "LAST_APPLICATION_NAME" not in sql
+
+
+def test_health_check_backups_last_30_days() -> None:
+    sql = dict((s.label, s.sql) for s in get_check("healthCheck").statements)["backups"]
+    assert "WHERE SYS_START_TIME >= ADD_DAYS(CURRENT_TIMESTAMP, -30)" in sql
+
+
+def test_large_tables_has_a_row_limit() -> None:
+    parts = {s.label: s for s in get_check("recommendations").statements}
+    assert parts["large_tables"].binds == ("top_plus_one",)
+    assert parts["large_tables"].sql.startswith("SELECT TOP ? ")
+
+
+def test_key_and_value_are_quoted() -> None:
+    for check in all_checks():
+        if check.category != "system":
+            continue
+        for statement in check.statements:
+            for token in tokenize(statement.sql):
+                assert not token.is_word("KEY", "VALUE"), f"{check.name}: unquoted"
