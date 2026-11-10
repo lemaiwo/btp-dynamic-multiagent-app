@@ -5,8 +5,8 @@ import { authModesFor, findBuiltin } from "com/agent/admin/model/builtins";
 import type { McpServer } from "com/agent/admin/service/types";
 
 const URL = "builtin:hana";
-const TENANT = { name: "sib_tenant", destination: "hana-sib-tenant" };
-const SYSTEMDB = { name: "sib_systemdb", destination: "hana-sib-systemdb" };
+const TENANT = { name: "erp_tenant", destination: "hana-erp-tenant" };
+const SYSTEMDB = { name: "erp_systemdb", destination: "hana-erp-systemdb" };
 
 /** A dialog model holding fields of every other toolset as well. */
 function form(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -56,8 +56,8 @@ QUnit.test("clean builds { systems, allow_select } from nothing", function (asse
 });
 
 QUnit.test("values are sent as typed, never trimmed, and refused before the save", function (assert) {
-    const out = hanaEntry.clean({ systems: [{ name: " sib", destination: "hana-sib " }] });
-    assert.deepEqual(out.systems, [{ name: " sib", destination: "hana-sib " }]);
+    const out = hanaEntry.clean({ systems: [{ name: " erp", destination: "hana-erp " }] });
+    assert.deepEqual(out.systems, [{ name: " erp", destination: "hana-erp " }]);
     assert.ok(hanaEntry.validate(out, "destination"));
 });
 
@@ -177,7 +177,7 @@ QUnit.test("unconfirmed: the systems Allow SELECT would cover that were not conf
 });
 
 QUnit.test("shownName caps a name at 64 characters with an ellipsis", function (assert) {
-    assert.strictEqual(hanaEntry.shownName("sib_tenant"), "sib_tenant");
+    assert.strictEqual(hanaEntry.shownName("erp_tenant"), "erp_tenant");
     assert.strictEqual(hanaEntry.shownName("a".repeat(64)), "a".repeat(64));
     assert.strictEqual(hanaEntry.shownName("a".repeat(70)), `${"a".repeat(63)}…`);
     assert.strictEqual(hanaEntry.shownName("a".repeat(70)).length, 64);

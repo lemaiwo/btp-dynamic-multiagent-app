@@ -29,10 +29,10 @@ QUnit.module("Agent journey: SAP HANA (monitoring) entry");
 const VIEW = "AgentDetail";
 const HANA = "builtin:hana";
 const PUT_101 = "PUT agents/101";
-const TENANT = { name: "sib_tenant", destination: "hana-sib-tenant" };
-const SYSTEMDB = { name: "sib_systemdb", destination: "hana-sib-systemdb" };
+const TENANT = { name: "erp_tenant", destination: "hana-erp-tenant" };
+const SYSTEMDB = { name: "erp_systemdb", destination: "hana-erp-systemdb" };
 const CONFIRM = "This lets the agent run its own SELECT statements on the monitoring views (SYS, _SYS_STATISTICS, M_*) "
-    + "and read trace file contents of \"sib_tenant\", \"sib_systemdb\". Statement texts come back unmasked. Continue?";
+    + "and read trace file contents of \"erp_tenant\", \"erp_systemdb\". Statement texts come back unmasked. Continue?";
 
 /** What the entry shows, read from its controls. */
 interface Entry {
@@ -370,7 +370,7 @@ opaTest("a server 422 at oauth.systems[1].name marks that row", function (Given:
             Opa5.assert.ok(entry.rows[1].name.getValueStateText().indexOf("oauth.systems[1].name:") === 0,
                 "the second row's name carries the server's text");
         });
-    iType(When, 1, "name", "sib_systemdb2");
+    iType(When, 1, "name", "erp_systemdb2");
     iSeeTheEntry(Then, "the mark gone", (entry) => entry.rows[1].name.getValueState() === "None", function () {
         Opa5.assert.ok(true, "typing in the row takes the mark away");
     });
@@ -443,7 +443,7 @@ opaTest("Scenario B: a stored entry that allows SELECT asks at OK when its syste
     iType(When, 1, "destination", SYSTEMDB.destination);
     iPressInTheDialog(When, "serverConfirm");
     iSeeAMessage(Then, "the question at OK", function (dialog) {
-        Opa5.assert.ok(messageOf(dialog).indexOf("trace file contents of \"prod_tenant\", \"sib_systemdb\".") > -1,
+        Opa5.assert.ok(messageOf(dialog).indexOf("trace file contents of \"prod_tenant\", \"erp_systemdb\".") > -1,
             "it names the systems now in the entry");
     });
     iAnswer(When, "Cancel");

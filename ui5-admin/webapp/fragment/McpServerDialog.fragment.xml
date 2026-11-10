@@ -702,7 +702,7 @@
                             <Input
                                 value="{server>name}"
                                 required="true"
-                                placeholder="sib_tenant"
+                                placeholder="erp_tenant"
                                 valueState="{server>nameState}"
                                 valueStateText="{server>nameText}"
                                 liveChange=".onHanaSystemEdited"
