@@ -3346,17 +3346,35 @@ async def upsert_agent(
     )
     # Here for the same reason as the OData check above: the last gate for an
     # approving agent, on the entries and the peer list the row will hold.
+    peers_after = (
+        (list(existing.peers) if existing is not None else [])
+        if isinstance(peers, _Keep) else cleaned_peers
+    )
     await check_bitbucket_approver_reach(
         session,
         name=name,
-        servers=prepared_server_list(primary, extras, primary_oauth_json),
+        servers=prepared,
         expose_chat=bool(expose_chat),
         expose_invoke=invoke_on,
         share_tools=share_on,
-        peers=(
-            (list(existing.peers) if existing is not None else [])
-            if isinstance(peers, _Keep) else cleaned_peers
+        peers=peers_after,
+        ignore_names=ignore_peer_lists_of,
+    )
+    # And for a builtin:hana entry (no sharing; SELECT not from the invoke
+    # API, basic chat or a peer), on the tier the row will hold: a kept tier
+    # is the stored one, a new row's is basic.
+    await check_hana_reach(
+        session,
+        name=name,
+        servers=prepared,
+        expose_chat=bool(expose_chat),
+        tier=(
+            ((existing.tier or "basic") if existing is not None else "basic")
+            if isinstance(tier, _Keep) else tier
         ),
+        expose_invoke=invoke_on,
+        share_tools=share_on,
+        peers=peers_after,
         ignore_names=ignore_peer_lists_of,
     )
 
@@ -5646,6 +5664,114 @@ async def check_bitbucket_approver_reach(
         raise ValueError(
             f"peers: {_agent_names(approvers)}: {_BITBUCKET_APPROVER_PEER_RULE}"
         )
+
+
+def _hana_entries(servers: Any) -> list[dict[str, Any]]:
+    """The ``builtin:hana`` entries of a server list, in any spelling of the
+    URL (trimmed, no trailing slash, any case)."""
+    return [
+        s for s in (servers if isinstance(servers, list) else [])
+        if isinstance(s, dict)
+        and str(s.get("url") or "").strip().rstrip("/").lower() == BUILTIN_HANA_URL
+    ]
+
+
+def has_hana_entry(servers: Any) -> bool:
+    """Whether a server list holds a ``builtin:hana`` entry (rule R1)."""
+    return bool(_hana_entries(servers))
+
+
+def hana_selects(servers: Any) -> bool:
+    """Whether a server list holds a ``builtin:hana`` entry that asks for
+    ``run_select`` (`agents.hana.config.asks_to_select`; a hand-written
+    ``"true"`` counts)."""
+    from agents.hana.config import asks_to_select
+
+    return any(asks_to_select(s.get("oauth")) for s in _hana_entries(servers))
+
+
+# A builtin:hana entry connects as each destination's technical user, whose
+# privileges on the first landscape are wide (decided 2026-11-10). With
+# allow_select the model writes the SQL itself: such an agent runs from chat
+# only for advanced users, from the scheduler run endpoint or an admin's Run
+# now, never from the invoke API and never as another agent's peer (a basic
+# chat user could steer it through that agent). Fixed texts naming the field
+# and the rule; public for the admin gate and the tests.
+HANA_SHARE_MESSAGE = (
+    "share_tools: an agent with a builtin:hana entry cannot share its tools; "
+    "its database connections are a technical user's, and a personal agent "
+    "would use them with a chat user's prompt"
+)
+HANA_SELECT_INVOKE_MESSAGE = (
+    "expose_invoke: must be false for an agent whose builtin:hana entry has "
+    "allow_select; an agent that may run SELECT runs only from advanced chat, "
+    "the scheduler run endpoint or an admin's Run now, never from the invoke API"
+)
+HANA_SELECT_CHAT_MESSAGE = (
+    "tier: must be advanced for a chat-exposed agent whose builtin:hana entry "
+    "has allow_select; set tier to advanced, or expose_chat to false"
+)
+_HANA_SELECT_PEER_RULE = (
+    "an agent that may run SELECT may not be a peer: no agent may delegate to "
+    "an agent whose builtin:hana entry has allow_select"
+)
+
+
+async def check_hana_reach(
+    session: AsyncSession,
+    *,
+    name: str,
+    servers: list[dict[str, Any]],
+    expose_chat: Any,
+    tier: Any,
+    peers: list[str],
+    stored_name: str | None = None,
+    ignore_names: set[str] | None = None,
+    expose_invoke: Any = False,
+    share_tools: Any = False,
+) -> None:
+    """Refuse an agent write that would make a ``builtin:hana`` agent
+    reachable beyond what the customer allowed (rules R1, R2a-c).
+
+    ``ValueError`` with a fixed text when, as the row is about to be stored:
+    it has a hana entry and shares its tools (R1); its entry asks to select
+    (`hana_selects`) and it is exposed to the invoke API (R2a), or to chat at
+    a tier other than ``advanced`` (R2b), or another agent lists it as a peer
+    (R2c, any other row, enabled or not); or one of its own ``peers`` asks
+    to select (R2c). Called next to `check_bitbucket_approver_reach` by every
+    write of an agent, with the same arguments plus the ``tier`` the row
+    will hold; ``stored_name`` and ``ignore_names`` mean what they mean
+    there. The registry build closes the same doors again for rows no gate
+    has seen (`agents.registry.build_orchestrator`).
+    """
+    ignore = ignore_names or set()
+    own = {name, stored_name or name}
+    if share_tools and has_hana_entry(servers):
+        raise ValueError(HANA_SHARE_MESSAGE)
+    if hana_selects(servers):
+        if expose_invoke:
+            raise ValueError(HANA_SELECT_INVOKE_MESSAGE)
+        if expose_chat and tier != "advanced":
+            raise ValueError(HANA_SELECT_CHAT_MESSAGE)
+        listers = [
+            r.name for r in await list_agents(session)
+            if r.name not in own and r.name not in ignore and own & set(r.peers)
+        ]
+        if listers:
+            raise ValueError(
+                f"oauth.allow_select: this agent is a peer of agent(s) "
+                f"{_agent_names(listers)}; {_HANA_SELECT_PEER_RULE}. Remove it "
+                "from their peers first."
+            )
+    selecting = []
+    for peer in peers:
+        if peer in own:
+            continue
+        row = await get_agent_by_name(session, peer)
+        if row is not None and hana_selects(row.mcp_servers):
+            selecting.append(row.name)
+    if selecting:
+        raise ValueError(f"peers: {_agent_names(selecting)}: {_HANA_SELECT_PEER_RULE}")
 
 
 ODATA_SINGLE_ENTRY_MESSAGE = (

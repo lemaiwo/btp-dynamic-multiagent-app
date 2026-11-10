@@ -125,6 +125,21 @@ def check_entry(cfg: Any) -> None:
             "or a number does not set it")
 
 
+def asks_to_select(cfg: Any) -> bool:
+    """Whether a block asks for ``run_select``, checked or not:
+    ``allow_select`` holds anything but ``false`` / nothing.
+
+    For the rules about who may reach an agent that may run SELECT (no invoke
+    API, chat only at tier advanced, never a peer), which also judge rows no
+    gate has seen. Wider than :func:`pins_of` on purpose, as
+    ``agents.bitbucket_config.asks_to_approve``: a hand-written ``"true"``
+    gives no toolset at all, and still must not read as "does not select"
+    to those rules."""
+    return isinstance(cfg, dict) and (
+        cfg.get("allow_select") is not None and cfg.get("allow_select") is not False
+    )
+
+
 def clean_entry(cfg: Any) -> dict[str, Any]:
     """The block as it is stored: checked, its own keys only, fixed order, a
     new object. ``allow_select`` only as ``true``."""

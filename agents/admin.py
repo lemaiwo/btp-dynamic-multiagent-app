@@ -72,6 +72,9 @@ from agents.db import (
     BITBUCKET_SINGLE_ENTRY_MESSAGE,
     BUILTIN_PUBLIC_KEYS,
     GIT_SINGLE_ENTRY_MESSAGE,
+    HANA_SELECT_CHAT_MESSAGE,
+    HANA_SELECT_INVOKE_MESSAGE,
+    HANA_SHARE_MESSAGE,
     INA_ENTRY_KEYS,
     INA_SINGLE_ENTRY_MESSAGE,
     KEEP,
@@ -89,6 +92,7 @@ from agents.db import (
     bitbucket_approves,
     check_bitbucket_approver_reach,
     check_delegation_name_collision,
+    check_hana_reach,
     check_ina_queries,
     check_odata_services,
     create_ina_query,
@@ -109,6 +113,8 @@ from agents.db import (
     get_workflow_by_name,
     get_workflow_parts,
     get_workflow_run,
+    hana_selects,
+    has_hana_entry,
     ina_entries,
     ina_query_referrers,
     list_agents,
@@ -1217,6 +1223,10 @@ class AgentPayload(BaseModel):
         servers = _servers_list(info.data.get("mcp_servers") or [])
         if v is True and bitbucket_approves(servers):
             raise ValueError(BITBUCKET_APPROVER_SHARE_MESSAGE)
+        # Rule R1: a builtin:hana entry connects as a destination's technical
+        # user; no personal agent borrows it (`agents.db.check_hana_reach`).
+        if v is True and has_hana_entry(servers):
+            raise ValueError(HANA_SHARE_MESSAGE)
         return v
 
     @field_validator("result_schema")
@@ -1355,6 +1365,24 @@ class AgentPayload(BaseModel):
         # The invoke API's caller chooses the prompt as a chat user does.
         if self.expose_invoke is True and bitbucket_approves(self.to_servers_list()):
             raise ValueError(BITBUCKET_APPROVER_INVOKE_MESSAGE)
+        return self
+
+    @model_validator(mode="after")
+    def _hana_select_reach(self) -> "AgentPayload":
+        """An agent whose ``builtin:hana`` entry has ``allow_select`` runs SQL
+        the model writes, as a technical user with wide privileges: never from
+        the invoke API (R2a), from chat only at tier ``advanced`` (R2b). An
+        absent ``expose_chat`` is true and an absent ``tier`` is not
+        ``advanced`` (fail closed: both UIs always send the tier). The
+        scheduler run endpoint and Run now stay allowed. Storage checks again
+        and adds the peer rule (R2c), which needs the database
+        (`agents.db.check_hana_reach`)."""
+        if not hana_selects(self.to_servers_list()):
+            return self
+        if self.expose_invoke is True:
+            raise ValueError(HANA_SELECT_INVOKE_MESSAGE)
+        if self.expose_chat is not False and self.tier != "advanced":
+            raise ValueError(HANA_SELECT_CHAT_MESSAGE)
         return self
 
     def invoke_kwargs(self) -> dict[str, Any]:
@@ -1854,6 +1882,19 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
                 stored_name=old_name,
                 servers=prepared_server_list(primary, extras, primary_oauth_json),
                 expose_chat=payload.expose_chat,
+                peers=list(row.peers) if payload.peers is None else payload.peers,
+                expose_invoke=invoke_on,
+                share_tools=share_on,
+            )
+            # The builtin:hana rules on the tier the row will hold (an absent
+            # tier keeps the stored one).
+            await check_hana_reach(
+                session,
+                name=payload.name,
+                stored_name=old_name,
+                servers=prepared_server_list(primary, extras, primary_oauth_json),
+                expose_chat=payload.expose_chat,
+                tier=payload.tier if payload.tier is not None else (row.tier or "basic"),
                 peers=list(row.peers) if payload.peers is None else payload.peers,
                 expose_invoke=invoke_on,
                 share_tools=share_on,
