@@ -209,3 +209,107 @@ def test_non_string_is_refused(value: object) -> None:
     with pytest.raises(SelectRefused) as caught:
         check_select(value)  # type: ignore[arg-type]
     assert caught.value.rule == "unreadable"
+
+
+# -- fix round 1: words the walker changes state on ------------------------
+#
+# A word that ends a FROM list must be a HANA reserved word in a keyword
+# position, followed by what its clause demands; otherwise a non-reserved
+# word used as a column, alias or CTE name switched the FROM list off and the
+# next ", schema.table" went unchecked.
+
+REVIEW_BYPASSES = [
+    "SELECT b.* FROM (SELECT 1 AS OFFSET FROM SYS.DUMMY) s "
+    "JOIN M_SERVICES m ON s.OFFSET = 1, SAPHANADB.BKPF b",
+    "SELECT b.* FROM M_TRACEFILE_CONTENTS t JOIN M_SERVICES m ON t.OFFSET > 0, SAPHANADB.BKPF b",
+]
+
+#: Not reserved in HANA (SAP HANA SQL Reference, "Reserved Words"), clause-like.
+NON_RESERVED = [
+    "OFFSET", "OUTER", "APPLY", "PARTITION", "SYSTEM_TIME", "APPLICATION_TIME", "SHARE",
+    "NOWAIT", "WAIT", "IGNORE", "MANY", "ONE", "EXACT", "HINT", "ROWS", "FETCH", "FIRST",
+    "NEXT", "ONLY", "QUALIFY", "KEEP", "PARAMETERS", "PLACEHOLDER",
+]
+#: Reserved structural words: only reachable here after "." or "AS".
+RESERVED = [
+    "WHERE", "GROUP", "ORDER", "HAVING", "LIMIT", "UNION", "INTERSECT", "EXCEPT", "MINUS",
+    "SELECT", "ON", "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "BY", "ALL",
+    "DISTINCT", "USING", "NATURAL", "LATERAL", "TABLESAMPLE", "OF", "AT", "WITH", "FROM",
+    "FOR", "INTO", "TOP",
+]
+TAIL = ", SAPHANADB.BKPF b"
+
+
+def _class_statements() -> list[str]:
+    statements = list(REVIEW_BYPASSES)
+    for word in NON_RESERVED + RESERVED:
+        statements += [
+            f"SELECT b.* FROM M_X t JOIN M_SERVICES m ON t.{word} > 0{TAIL}",
+            f"SELECT b.* FROM (SELECT 1 AS {word} FROM SYS.DUMMY) s "
+            f"JOIN M_SERVICES m ON s.{word} = 1{TAIL}",
+            f"SELECT b.* FROM M_X AS {word}{TAIL}",
+            f"SELECT b.* FROM M_X AS {word} JOIN M_SERVICES m ON 1 = 1{TAIL}",
+            f"WITH {word} AS (SELECT 1 AS A FROM SYS.DUMMY) "
+            f"SELECT b.* FROM {word} JOIN M_SERVICES m ON 1 = 1{TAIL}",
+            f"SELECT b.* FROM M_X t JOIN M_SERVICES m ON t.A = {word}.A{TAIL}",
+        ]
+    for word in NON_RESERVED:
+        statements += [
+            f"SELECT b.* FROM M_X {word}{TAIL}",
+            f"SELECT b.* FROM M_X {word} JOIN M_SERVICES m ON 1 = 1{TAIL}",
+            f"SELECT b.* FROM M_X t JOIN M_SERVICES m ON {word} = 1{TAIL}",
+            f"SELECT b.* FROM M_X t JOIN M_SERVICES m ON 1 = {word}{TAIL}",
+        ]
+    return statements
+
+
+@pytest.mark.parametrize("sql", _class_statements())
+def test_clause_words_in_identifier_positions_never_hide_a_table(sql: str) -> None:
+    with pytest.raises(SelectRefused) as caught:
+        check_select(sql)
+    assert "BKPF" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # a reserved word without what its clause demands leaves the list open
+        "SELECT b.* FROM M_X t JOIN M_SERVICES m ON 1 = 1 ORDER" + TAIL,
+        "SELECT b.* FROM M_X t JOIN M_SERVICES m ON 1 = 1 GROUP" + TAIL,
+        "SELECT b.* FROM M_X t JOIN M_SERVICES m ON 1 = LIMIT" + TAIL,
+        "SELECT b.* FROM M_X t JOIN M_SERVICES m ON 1 = UNION" + TAIL,
+        "SELECT b.* FROM M_X t JOIN M_SERVICES m ON 1 = WHERE" + TAIL,
+        "SELECT b.* FROM M_X t JOIN M_SERVICES m ON 1 = SELECT" + TAIL,
+    ],
+)
+def test_reserved_word_without_its_clause_does_not_end_the_from_list(sql: str) -> None:
+    with pytest.raises(SelectRefused):
+        check_select(sql)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT OFFSET, HOST FROM M_TRACEFILE_CONTENTS t WHERE t.OFFSET > 0 "
+        "ORDER BY OFFSET LIMIT 10 OFFSET 5",
+        "SELECT t.OFFSET AS OUTER FROM M_TRACEFILE_CONTENTS t, M_SERVICES s WHERE 1 = 1",
+        "SELECT * FROM M_SERVICES OFFSET, M_VOLUMES v",
+        "SELECT HOST FROM M_SERVICES UNION (SELECT HOST FROM M_VOLUMES)",
+        "SELECT HOST FROM M_SERVICES LIMIT ?",
+    ],
+)
+def test_non_reserved_words_as_identifiers_are_accepted(sql: str) -> None:
+    check_select(sql)
+
+
+def test_join_using_is_refused() -> None:
+    """Pinned: HANA's JOIN ... USING is not supported by the guard (say so in the tool)."""
+    with pytest.raises(SelectRefused) as caught:
+        check_select("SELECT * FROM M_SERVICES a JOIN M_VOLUMES b USING (HOST)")
+    assert caught.value.rule == "table_not_allowed"
+
+
+def test_numeric_named_parameter_is_unreadable() -> None:
+    with pytest.raises(SelectRefused) as caught:
+        check_select("SELECT * FROM M_SERVICES WHERE PORT = :1")
+    assert caught.value.rule == "unreadable"

@@ -35,10 +35,16 @@ The rules, in the order they are checked:
     schema-qualified function call outside those two schemas, or a quoted one.
 
 How table references are found: the walker reads the tokens once, keeping a
-frame per parenthesis level. In a query frame ``FROM`` opens the FROM list,
-``WHERE`` / ``GROUP`` / ``ORDER`` / ``HAVING`` / ``LIMIT`` / ``OFFSET`` / a
-set operator closes it; inside it every ``,`` at that level, and ``JOIN`` /
-``APPLY`` anywhere, introduce a reference that must pass. Subqueries are
+frame per parenthesis level. In a query frame ``FROM`` opens the FROM list;
+only ``WHERE`` / ``HAVING`` (followed by a condition), ``GROUP BY`` /
+``ORDER BY``, ``LIMIT <n>`` and a set operator (followed by ``ALL``,
+``DISTINCT``, ``SELECT`` or ``(``) close it: all HANA reserved words, and
+only in a keyword position (never right after ``.`` or ``AS``, never right
+before ``.``). A non-reserved word (``OFFSET``, ``OUTER``, ...) never closes
+it, since it could be a column or alias and the next ``,`` would go
+unchecked. Inside the list every ``,`` at that level, and ``JOIN`` (and
+``APPLY`` in a keyword position) anywhere, introduce a reference that must
+pass. Subqueries are
 frames of their own, so a reference in a select list, a ``WHERE``, a CTE
 body or the second branch of a ``UNION`` is checked like the first one.
 ``FROM`` inside ``EXTRACT(...)``, ``TRIM(...)``, ``SUBSTRING(...)`` and the
@@ -75,14 +81,25 @@ FORBIDDEN_WORDS = frozenset(
 )
 _LOCK_WORDS = frozenset({"UPDATE", "SHARE", "LOCK", "NOWAIT", "WAIT", "IGNORE"})
 
-#: Words that end a FROM list at the same parenthesis level.
+#: Words that end a FROM list at the same parenthesis level. Every one of
+#: them is a HANA reserved word (SAP HANA SQL Reference, "Reserved Words"), so
+#: it can never be a column, alias or CTE name written unquoted; and a word
+#: only counts as one where it stands as a keyword (:meth:`_Walker._keyword_at`)
+#: and is followed by what its clause demands (:meth:`_Walker._closes_from`).
+#: A non-reserved word (``OFFSET``, ``OUTER``, ``APPLY``, ...) never switches
+#: the FROM list off: a word that is not reserved could be an identifier, and
+#: switching off would let the next ``, schema.table`` go unchecked.
 _FROM_END = frozenset(
-    {"WHERE", "GROUP", "ORDER", "HAVING", "LIMIT", "OFFSET", "UNION", "INTERSECT",
-     "EXCEPT", "MINUS", "FOR", "SELECT"}
+    {"WHERE", "GROUP", "ORDER", "HAVING", "LIMIT", "UNION", "INTERSECT",
+     "EXCEPT", "MINUS"}
 )
+_SET_OPERATORS = frozenset({"UNION", "INTERSECT", "EXCEPT", "MINUS"})
 #: What may follow a table reference (after its alias).
-_AFTER_REF = _FROM_END | {"ON", "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "OUTER"}
-_JOIN_WORDS = frozenset({"JOIN", "APPLY"})
+#: ``FOR`` is not in :data:`_FROM_END`: outside EXTRACT and friends it is refused
+#: (``no_for_update`` / ``select_only``) wherever it stands.
+_AFTER_REF = _FROM_END | {
+    "FOR", "SELECT", "ON", "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "OUTER"
+}
 #: Words never read as an alias of a table reference.
 _NOT_ALIAS = (
     _AFTER_REF
@@ -287,9 +304,41 @@ class _Walker:
             before is not None
             and before.kind == "word"
             and before.value in _EXPRESSION_FROM_FUNCTIONS
+            and self._keyword_at(index - 1)
             and not (inner is not None and inner.is_word("SELECT"))
         )
         return _Frame(expression=expression)
+
+    def _keyword_at(self, index: int) -> bool:
+        """False where a word can only be an identifier: after ``.`` or ``AS``, before ``.``."""
+        before = self._at(index - 1)
+        after = self._at(index + 1)
+        if before is not None and (before.is_symbol(".") or before.is_word("AS")):
+            return False
+        return not (after is not None and after.is_symbol("."))
+
+    def _closes_from(self, index: int) -> bool:
+        """Does the word at ``index`` really open the clause that ends a FROM list?
+
+        Only reserved words are in :data:`_FROM_END`; on top of that the word
+        must stand in a keyword position and be followed by what its clause
+        demands. Anything else leaves the FROM list open, so the next ``,`` at
+        this level is still read as a table separator (the safe direction).
+        """
+        word = self.tokens[index].value
+        if word not in _FROM_END or not self._keyword_at(index):
+            return False
+        following = self._at(index + 1)
+        if word in ("GROUP", "ORDER"):
+            return following is not None and following.is_word("BY")
+        if word == "LIMIT":
+            return following is not None and following.kind in ("number", "param")
+        if word in _SET_OPERATORS:
+            return following is not None and (
+                following.is_word("ALL", "DISTINCT", "SELECT") or following.is_symbol("(")
+            )
+        # WHERE, HAVING: a condition must follow
+        return following is not None and not following.is_symbol(",", ")")
 
     def _check_qualified_call(self, last: int) -> None:
         parts = [self.tokens[last]]
@@ -334,11 +383,14 @@ class _Walker:
                     frame.in_from = True
                     index = self._reference(index + 1, stack)
                     continue
-                if word in _JOIN_WORDS:
+                # FROM and JOIN are reserved and always start a reference (a
+                # false refusal at worst); APPLY is not reserved, so it starts
+                # one only in a keyword position.
+                if word == "JOIN" or (word == "APPLY" and self._keyword_at(index)):
                     frame.in_from = True
                     index = self._reference(index + 1, stack)
                     continue
-                if word in _FROM_END:
+                if self._closes_from(index):
                     frame.in_from = False
             index += 1
         if len(stack) != 1:

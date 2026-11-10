@@ -81,7 +81,9 @@ _WORD_STRICT = re.compile(r"[A-Za-z_][A-Za-z0-9_#$]*")
 _WORD_LENIENT = re.compile(r"[^\W\d][\w#$]*")
 _NUMBER = re.compile(r"[0-9]+(?:\.[0-9]*)?(?:[eE][+-]?[0-9]+)?")
 _HEX = re.compile(r"[0-9A-Fa-f]*")
-_PARAM_NAME = re.compile(r"[A-Za-z0-9_]+")
+#: A named parameter starts like a word: ``:1`` is a ``:`` and a number, so the
+#: number is masked (and refused by the strict mode, which has no lone ``:``).
+_PARAM_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 def _check_characters(sql: str) -> None:
@@ -191,7 +193,7 @@ def tokenize(sql: str, *, lenient: bool = False) -> list[Token]:
 
         if char.isdigit() and (not lenient or char.isascii()):
             match = _NUMBER.match(sql, pos)
-            if match is None:  # pragma: no cover - a digit always matches
+            if match is None:  # a non-ASCII digit (isdigit) is no [0-9]: refused
                 raise refuse()
             end = match.end()
             if not lenient and end < size and (sql[end].isalnum() or sql[end] in "_#$\"'"):

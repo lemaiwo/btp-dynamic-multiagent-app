@@ -73,3 +73,31 @@ def test_empty_and_none() -> None:
 
 def test_odd_characters_never_raise() -> None:
     assert mask_statement("SELECT `a` FROM #T WHERE М = 'x'") == "SELECT `a` FROM #T WHERE М = ?"
+
+
+def test_json_document_values_are_masked() -> None:
+    text = 'INSERT INTO coll VALUES({"name":"Smith","iban":"BE71 0961","tags":["vip","x"]})'
+    masked = mask_statement(text)
+    assert "Smith" not in masked and "BE71" not in masked and "vip" not in masked
+    assert masked == "INSERT INTO coll VALUES({?:?,?:?,?:[?,?]})"
+    # outside a document, quoted identifiers stay
+    assert mask_statement('SELECT "name" FROM coll WHERE "x" = 1') == (
+        'SELECT "name" FROM coll WHERE "x" = ?'
+    )
+
+
+def test_password_operand_is_masked_to_the_next_whitespace() -> None:
+    assert mask_statement("ALTER USER u PASSWORD 1Welcome NO FORCE_FIRST_PASSWORD_CHANGE") == (
+        "ALTER USER u PASSWORD ? NO FORCE_FIRST_PASSWORD_CHANGE"
+    )
+    assert mask_statement("ALTER USER u PASSWORD Abc.123#x'y z' DISABLE") == (
+        "ALTER USER u PASSWORD ? DISABLE"
+    )
+    assert mask_statement("CONNECT u PASSWORD = 9Secret") == "CONNECT u PASSWORD = ?"
+    assert mask_statement("ALTER USER u PASSWORD") == "ALTER USER u PASSWORD"
+
+
+def test_numeric_positional_parameter_text_is_masked() -> None:
+    assert mask_statement("SELECT * FROM T WHERE A = :1 AND B = :name") == (
+        "SELECT * FROM T WHERE A = :? AND B = :name"
+    )
