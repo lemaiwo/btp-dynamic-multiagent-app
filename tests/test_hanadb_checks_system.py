@@ -179,6 +179,19 @@ def test_ini_contents_deny_words_and_shape() -> None:
     assert system.SHAPE_MAX == 64
 
 
+def test_ini_contents_never_shows_a_multi_line_value() -> None:
+    """Whether ^ and $ anchor the whole string in HANA's LIKE_REGEXPR is not
+    verified: a line feed, carriage return or tab hides the value anyway, in
+    both CASEs (VALUE and VALUE_HIDDEN)."""
+    sql = get_check("iniContents").statements[0].sql
+    for code in (10, 13, 9):
+        term = f"LOCATE(\"VALUE\", CHAR({code})) = 0"
+        assert term in system.INI_VALUE_SQL
+        assert sql.count(term) == 2
+    from agents.hana.guard import MAX_SQL_CHARS
+    assert len(sql) < MAX_SQL_CHARS
+
+
 @pytest.mark.parametrize("value", ["1024", "true", "on", "80%", "1.5", "row_store", "a-b,c +d"])
 def test_ini_shape_lets_plain_values_through(value: str) -> None:
     assert len(value) <= system.SHAPE_MAX

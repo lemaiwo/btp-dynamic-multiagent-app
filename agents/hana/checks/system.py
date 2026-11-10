@@ -36,7 +36,11 @@ HIDDEN = "<hidden>"
 # Fixed SQL: the words and the pattern are literals of this repository, never
 # arguments. LOCATE / RIGHT instead of LIKE '%...%', and LENGTH instead of a
 # {0,64} quantifier: the registry refuses "%s" and braces in a statement.
-# on-prem: unverified (LIKE_REGEXPR on SPS07 and the CASE as a whole)
+# A line feed, carriage return or tab hides the value outright: if ^ and $ were
+# line anchors in HANA's LIKE_REGEXPR, one harmless line would otherwise show
+# a multi-line value with a secret on another line.
+# on-prem: unverified (LIKE_REGEXPR on SPS07, its anchors on a multi-line ini
+# value, and the CASE as a whole)
 DENY_WORDS: tuple[str, ...] = (
     "password", "passwd", "pwd", "pass", "secret", "credential", "passphrase", "token",
     "auth", "cert", "salt", "saml", "jwt", "proxy", "keystore", "private", "ssl", "ldap")
@@ -52,6 +56,8 @@ _EMPTY = "\"VALUE\" IS NULL OR \"VALUE\" = ''"
 _SHOWN = (
     f"NOT ({_DENIED}) AND LENGTH(\"VALUE\") <= {SHAPE_MAX}"
     f" AND \"VALUE\" LIKE_REGEXPR '{SHAPE_PATTERN}'"
+    " AND LOCATE(\"VALUE\", CHAR(10)) = 0 AND LOCATE(\"VALUE\", CHAR(13)) = 0"
+    " AND LOCATE(\"VALUE\", CHAR(9)) = 0"
 )
 # A NULL anywhere in the conditions makes them unknown, which falls to ELSE:
 # hidden. The raw VALUE column is reachable only through the first CASE.
