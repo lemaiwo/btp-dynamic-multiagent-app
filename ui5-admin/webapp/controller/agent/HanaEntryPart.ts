@@ -2,7 +2,7 @@ import MessageBox from "sap/m/MessageBox";
 import JSONModel from "sap/ui/model/json/JSONModel";
 import { ValueState } from "sap/ui/core/library";
 import hanaEntry from "../../model/hanaEntry";
-import type { HanaEntry, HanaRefusal } from "../../model/hanaEntry";
+import type { HanaEntry, HanaRefusal, HanaSystem } from "../../model/hanaEntry";
 import DestinationField from "../DestinationField";
 import type Event from "sap/ui/base/Event";
 import type Control from "sap/ui/core/Control";
@@ -45,6 +45,11 @@ export interface HanaEntryState {
     /** What the entry said when the dialog opened: the confirmation asks
      *  only when SELECT is switched on where it was not. */
     storedAllowSelect: boolean;
+    /** The systems (name and destination) Allow SELECT was agreed for: the
+     *  stored ones of an entry that already allowed it, or those named when
+     *  the admin answered the question in this dialog. OK asks again for
+     *  any other. */
+    confirmed: HanaSystem[];
     duplicate: string;
 }
 
@@ -73,7 +78,9 @@ const DEST_MODEL = "hanaDest";
 export default class HanaEntryPart {
 
     private readonly destinations: DestinationField;
-    private readonly attached = new WeakSet<Input>();
+    /** The destination inputs attached to `destinations`; a row's input is
+     *  detached when its row goes away. */
+    private readonly attached = new Set<Input>();
 
     public constructor(private readonly host: HanaEntryHost) {
         const model = new JSONModel({ items: [], hint: "", notice: "", noticeText: "" });
@@ -102,7 +109,8 @@ export default class HanaEntryPart {
             void this.destinations.load();
         }
         const allow = stored.allow_select === true;
-        return { rows, allowSelect: allow, storedAllowSelect: allow, duplicate: "" };
+        return { rows, allowSelect: allow, storedAllowSelect: allow,
+            confirmed: allow ? stored.systems.slice() : [], duplicate: "" };
     }
 
     /** "SAP HANA (monitoring)" was picked in a dialog opened for something else. */
@@ -160,8 +168,20 @@ export default class HanaEntryPart {
             { allow_select: model.getProperty("/hana/storedAllowSelect") === true }, { allow_select: true })) {
             return;
         }
+        this.ask(() => {
+            model.setProperty("/hana/allowSelect", false);
+        });
+    }
+
+    /**
+     * The question about Allow SELECT, naming every system of the entry now.
+     * "Allow SELECT" records them as confirmed and calls `allowed`; Cancel
+     * (the default) calls `cancelled`.
+     */
+    private ask(cancelled: () => void, allowed?: () => void): void {
+        const model = this.host.serverModel();
         const names = this.rows().map((row) => row.name).filter((name) => name !== "");
-        const which = names.length > 0 ? names.map((name) => `"${name}"`).join(", ")
+        const which = names.length > 0 ? names.map((name) => `"${hanaEntry.shownName(name)}"`).join(", ")
             : this.host.text("hanaAllowSelectTheseSystems");
         const allow = this.host.text("hanaAllowSelectYes");
         MessageBox.warning(this.host.text("hanaAllowSelectConfirm", [which]), {
@@ -171,8 +191,11 @@ export default class HanaEntryPart {
             initialFocus: MessageBox.Action.CANCEL,
             onClose: (action: string | null) => {
                 if (action !== allow) {
-                    model.setProperty("/hana/allowSelect", false);
+                    cancelled();
+                    return;
                 }
+                model.setProperty("/hana/confirmed", this.block().systems);
+                allowed?.();
             }
         });
     }
@@ -181,8 +204,15 @@ export default class HanaEntryPart {
      *  a shared destination field. */
     public onRowsUpdated(event: Event): void {
         const table = event.getSource() as Table;
-        table.getItems().forEach((item) => {
-            const field = (item as ColumnListItem).getCells()[1] as Input | undefined;
+        const shown = table.getItems().map((item) => (item as ColumnListItem).getCells()[1] as Input | undefined);
+        // Rows that went away: their inputs are no destination fields any more.
+        Array.from(this.attached).forEach((field) => {
+            if (field.isDestroyed() || shown.indexOf(field) === -1) {
+                this.destinations.detach(field);
+                this.attached.delete(field);
+            }
+        });
+        shown.forEach((field) => {
             if (!field || this.attached.has(field)) {
                 return;
             }
@@ -208,10 +238,12 @@ export default class HanaEntryPart {
 
     /**
      * OK on the entry. False when the dialog must stay open: a second entry,
-     * or a block the server would refuse (the row and field it names are
-     * marked).
+     * a block the server would refuse (the row and field it names are
+     * marked), or Allow SELECT on while a system was not confirmed for it
+     * (asked with the whole list; the answer "Allow SELECT" calls `again`,
+     * which is OK once more; Cancel, the default, changes nothing).
      */
-    public confirm(table: Table | undefined): boolean {
+    public confirm(table: Table | undefined, again: () => void): boolean {
         const model = this.host.serverModel();
         table?.getItems().forEach((item) => {
             const field = (item as ColumnListItem).getCells()[1] as Input | undefined;
@@ -235,6 +267,12 @@ export default class HanaEntryPart {
                 }
             }
             MessageBox.error(problem.text);
+            return false;
+        }
+        const block = this.block();
+        if (block.allow_select === true && hanaEntry.unconfirmed(
+            model.getProperty("/hana/confirmed") as HanaSystem[] | undefined, block.systems).length > 0) {
+            this.ask(() => undefined, again);
             return false;
         }
         return true;

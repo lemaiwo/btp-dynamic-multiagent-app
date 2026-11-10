@@ -163,3 +163,22 @@ QUnit.test("refusedAt reads where a server 422 points in a hana entry", function
     assert.strictEqual(hanaEntry.refusedAt("mcp_servers.1", "Value error, oauth.systems: required"), null);
     assert.strictEqual(hanaEntry.refusedAt("name", message), null);
 });
+
+QUnit.test("unconfirmed: the systems Allow SELECT would cover that were not confirmed, by name AND destination", function (assert) {
+    const confirmed = [TENANT];
+    assert.deepEqual(hanaEntry.unconfirmed(confirmed, [TENANT]), []);
+    assert.deepEqual(hanaEntry.unconfirmed(confirmed, [TENANT, SYSTEMDB]), [SYSTEMDB], "a system added after the question");
+    assert.deepEqual(hanaEntry.unconfirmed(confirmed, [{ name: TENANT.name, destination: "hana-prod" }]),
+        [{ name: TENANT.name, destination: "hana-prod" }], "the same name on another destination");
+    assert.deepEqual(hanaEntry.unconfirmed(confirmed, [{ name: "other", destination: TENANT.destination }]),
+        [{ name: "other", destination: TENANT.destination }], "the same destination under another name");
+    assert.deepEqual(hanaEntry.unconfirmed([], []), []);
+    assert.deepEqual(hanaEntry.unconfirmed(undefined, [TENANT]), [TENANT]);
+});
+
+QUnit.test("shownName caps a name at 64 characters with an ellipsis", function (assert) {
+    assert.strictEqual(hanaEntry.shownName("sib_tenant"), "sib_tenant");
+    assert.strictEqual(hanaEntry.shownName("a".repeat(64)), "a".repeat(64));
+    assert.strictEqual(hanaEntry.shownName("a".repeat(70)), `${"a".repeat(63)}…`);
+    assert.strictEqual(hanaEntry.shownName("a".repeat(70)).length, 64);
+});

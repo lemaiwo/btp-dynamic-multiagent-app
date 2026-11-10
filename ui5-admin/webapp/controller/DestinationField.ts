@@ -102,6 +102,18 @@ export default class DestinationField {
         });
     }
 
+    /** `field` is no destination field any more (its row went away): it is
+     *  neither judged nor listened to by this object again. */
+    public detach(field: Input): void {
+        this.targets.delete(field);
+        if (this.pickerField === field) {
+            this.pickerField = undefined;
+        }
+        if (this.heldAtValueHelp?.field === field) {
+            this.heldAtValueHelp = undefined;
+        }
+    }
+
     /** Reads the list. Quiet whatever happens: without it the field is a
      *  text field with a hint. Only `dest` is written, never a form. */
     public async load(): Promise<void> {

@@ -367,8 +367,10 @@ export default class AgentDetail extends BaseController {
         }
         // --- hana --- Its own state, its canonical spelling.
         const isHana = hanaEntry.isHanaUrl(server.url);
-        const hana = this.hana.begin(server, this.hanaRefusal && this.hanaRefusal.server === this.editingServerIndex
-            ? this.hanaRefusal : null);
+        // A refusal belongs to the hana entry at the row it named; another
+        // server at that index never gets it.
+        const hana = this.hana.begin(server, isHana && this.hanaRefusal
+            && this.hanaRefusal.server === this.editingServerIndex ? this.hanaRefusal : null);
         (this.getModel("server") as JSONModel).setData({
             // The fragment shows the services box and "Allow writes" for
             // exactly `builtin:odata`: an entry stored in another spelling
@@ -939,7 +941,7 @@ export default class AgentDetail extends BaseController {
         if (hanaEntry.isHanaUrl(url)) {
             // --- hana --- Only the entry's own values reach cleanOAuth: the
             // systems as typed and the switch as a real boolean.
-            if (!this.hana.confirm(this.byId("hanaSystemsTable") as Table | undefined)) {
+            if (!this.hana.confirm(this.byId("hanaSystemsTable") as Table | undefined, () => this.onConfirmServer())) {
                 return;
             }
             const block = this.hana.block();
@@ -1038,6 +1040,8 @@ export default class AgentDetail extends BaseController {
         const model = this.getModel("agent") as JSONModel;
         const servers = (model.getProperty("/data/mcp_servers") as McpServer[]).slice();
         servers.splice(index, 1);
+        // --- hana --- Row indexes moved: a kept refusal points nowhere now.
+        this.hanaRefusal = null;
         model.setProperty("/data/mcp_servers", servers);
     }
 
@@ -1179,6 +1183,7 @@ export default class AgentDetail extends BaseController {
                 MessageToast.show(this.text("agentSaved"));
             }
             this.agentId = saved.id;
+            this.hanaRefusal = null;
             this.getRouter().navTo("agents");
         } catch (error) {
             if (error instanceof AdminError && Object.keys(error.fieldErrors).length > 0) {

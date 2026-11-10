@@ -376,3 +376,82 @@ opaTest("a server 422 at oauth.systems[1].name marks that row", function (Given:
     });
     Then.iStopTheApp();
 });
+
+const PROD = { name: "prod_tenant", destination: "hana-prod-tenant" };
+
+/** Waits until no message box is open, so that the next step sees the dialog. */
+function iSeeNoMessage(Then: Common, what: string): void {
+    Then.waitFor({
+        id: "hanaSystemsTable",
+        viewName: VIEW,
+        searchOpenDialogs: true,
+        check: () => document.querySelectorAll(".sapMMessageBox").length === 0,
+        success: function () { Opa5.assert.ok(true, what); }
+    });
+}
+
+opaTest("Scenario A: a system added after Allow SELECT was confirmed is asked about at OK; Cancel keeps the dialog open", function (Given: Common, When: Common, Then: Common) {
+    iOpenAgent(Given, When, 101);
+    iAddAServer(When);
+    iPickTheKind(When, HANA);
+    iType(When, 0, "name", "dev");
+    iType(When, 0, "destination", "hana-dev");
+    iSwitchAllowSelect(When, true);
+    iSeeAMessage(Then, "the question at the switch", function (dialog) {
+        Opa5.assert.ok(messageOf(dialog).indexOf("trace file contents of \"dev\".") > -1, "it names dev only");
+    });
+    iAnswer(When, "Allow SELECT");
+    iSeeNoMessage(Then, "the switch is on");
+    iPressInTheDialog(When, "hanaAddSystem");
+    iType(When, 1, "name", PROD.name);
+    iType(When, 1, "destination", PROD.destination);
+    iPressInTheDialog(When, "serverConfirm");
+    iSeeAMessage(Then, "the question again at OK", function (dialog) {
+        Opa5.assert.ok(messageOf(dialog).indexOf("trace file contents of \"dev\", \"prod_tenant\".") > -1,
+            "it names every system of the entry now");
+        const focus = Element.getElementById((dialog as Dialog).getInitialFocus()) as Button | undefined;
+        Opa5.assert.strictEqual(focus?.getText(), "Cancel", "Cancel has the initial focus");
+    });
+    iAnswer(When, "Cancel");
+    iSeeTheEntry(Then, "the dialog still open, unchanged", (entry) => entry.rows.length === 2, function (entry) {
+        Opa5.assert.strictEqual(entry.allowSelect, true, "the switch stays as it is");
+        Opa5.assert.strictEqual(entry.rows[1].name.getValue(), PROD.name, "the system stays");
+        Opa5.assert.strictEqual(backend.countRequests(PUT_101), 0, "nothing was saved");
+    });
+    iPressInTheDialog(When, "serverConfirm");
+    iAnswer(When, "Allow SELECT");
+    iSeeTheForm(Then, "the entry with both systems", function (data) {
+        Opa5.assert.deepEqual(data.mcp_servers[2], {
+            url: HANA, auth_mode: "destination",
+            oauth: { systems: [{ name: "dev", destination: "hana-dev" }, PROD], allow_select: true }
+        }, "the answer goes on with OK");
+    }, (data) => data.mcp_servers.length === 3);
+    Then.iStopTheApp();
+});
+
+opaTest("Scenario B: a stored entry that allows SELECT asks at OK when its systems were replaced", function (Given: Common, When: Common, Then: Common) {
+    iOpenAgent(Given, When, 101, () => storeEntry(101, { systems: [TENANT], allow_select: true }));
+    iSeeTheServers(When, 3);
+    iEditServer(When, 2);
+    iSeeTheEntry(Then, "the stored entry", (entry) => entry.rows.length === 1 && entry.allowSelect, function () {
+        Opa5.assert.ok(true, "one system, SELECT on");
+    });
+    iType(When, 0, "name", PROD.name);
+    iType(When, 0, "destination", PROD.destination);
+    iPressInTheDialog(When, "hanaAddSystem");
+    iType(When, 1, "name", SYSTEMDB.name);
+    iType(When, 1, "destination", SYSTEMDB.destination);
+    iPressInTheDialog(When, "serverConfirm");
+    iSeeAMessage(Then, "the question at OK", function (dialog) {
+        Opa5.assert.ok(messageOf(dialog).indexOf("trace file contents of \"prod_tenant\", \"sib_systemdb\".") > -1,
+            "it names the systems now in the entry");
+    });
+    iAnswer(When, "Cancel");
+    iSeeNoMessage(Then, "the dialog stays open");
+    iPressInTheDialog(When, "serverCancel");
+    iSeeTheForm(Then, "the stored entry untouched", function (data) {
+        Opa5.assert.deepEqual((data.mcp_servers[2].oauth as Record<string, unknown>).systems, [TENANT],
+            "Cancel of the dialog kept the stored entry");
+    });
+    Then.iStopTheApp();
+});

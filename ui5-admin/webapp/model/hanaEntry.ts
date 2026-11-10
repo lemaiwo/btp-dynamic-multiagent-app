@@ -206,6 +206,27 @@ function explicit(servers: readonly McpServer[] | undefined | null): McpServer[]
     ));
 }
 
+/**
+ * The systems of `current` that `confirmed` does not hold as the same name
+ * AND destination: what Allow SELECT would cover that the admin was not
+ * asked about. Compared exactly, as the server stores them.
+ */
+function unconfirmed(confirmed: readonly HanaSystem[] | undefined | null,
+    current: readonly HanaSystem[]): HanaSystem[] {
+    const known = (confirmed ?? []).map((system) => JSON.stringify([system.name, system.destination]));
+    return current.filter((system) => known.indexOf(JSON.stringify([system.name, system.destination])) === -1)
+        .map((system) => ({ name: system.name, destination: system.destination }));
+}
+
+/** At most this many characters of a name are shown in a question. */
+const SHOWN_NAME_MAX = 64;
+
+/** A system name as a question shows it: plain text, cut at 64 characters
+ *  with an ellipsis. */
+function shownName(name: string): string {
+    return name.length > SHOWN_NAME_MAX ? `${name.slice(0, SHOWN_NAME_MAX - 1)}…` : name;
+}
+
 const NESTED_LOC = /^mcp_servers\.(\d+)\.oauth\.systems\.(\d+)(?:\.(name|destination))?$/;
 const SERVER_LOC = /^mcp_servers\.(\d+)$/;
 /** The field prefix of a refusal of agents/hana/config.py (behind
@@ -238,6 +259,8 @@ export default {
     problem,
     validate,
     selectNewlyAllowed,
+    unconfirmed,
+    shownName,
     entryIndex,
     explicit,
     refusedAt
