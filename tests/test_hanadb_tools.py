@@ -1,0 +1,398 @@
+"""The ``builtin:hana`` toolset on a fake hdbcli.
+
+Dummy checks are registered into an empty registry per test (no real check
+exists yet). The connection layer runs for real against the fake driver of
+``tests/hanadb_helpers.py``; every error text of the fake holds the host,
+the user and a marker, none of which may reach an answer or a log record.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import json
+import logging
+from decimal import Decimal
+from typing import Any
+
+import pytest
+
+from agents.hana import tools
+from agents.hana.checks import base
+from agents.hana.checks.base import Check, Statement, register
+from agents.hana.connection import HanaSystem
+from agents.hana.errors import MESSAGES
+from tests import hanadb_helpers as h
+
+SECRETS = (h.MARKER, h.HOST, h.USER, h.PASSWORD, h.TOKEN, "hana-dest-one", "hana-dest-two")
+STATEMENT = "SELECT * FROM SAPABAP1.KNA1 WHERE KUNNR = 'customer4711' AND X = 99"
+
+OAUTH = {"systems": [{"name": "sib_tenant", "destination": "hana-dest-one"},
+                     {"name": "sib_systemdb", "destination": "hana-dest-two"}]}
+OAUTH_SELECT = {**OAUTH, "allow_select": True}
+
+
+@pytest.fixture(autouse=True)
+def registry(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(base, "_REGISTRY", {})
+    register(
+        Check(name="alerts", category="monitoring", purpose="Current alerts.",
+              source="bin/alerts.js",
+              statements=(Statement("", "SELECT A, B FROM SYS.M_ALERTS", ()),)),
+        Check(name="longRunning", category="performance", purpose="Long statements.",
+              source="bin/longRunning.js",
+              statements=(Statement(
+                  "", "SELECT A, STATEMENT_STRING FROM SYS.M_X "
+                      "WHERE (? IS NULL OR SCHEMA_NAME = ?) AND H < ?",
+                  ("schema", "schema", "hours")),),
+              args=frozenset({"top", "schema", "hours"}),
+              masked_columns=frozenset({"STATEMENT_STRING"})),
+        Check(name="traceContents", category="system", purpose="Trace file contents.",
+              source="bin/traceContents.js",
+              statements=(Statement("", "SELECT A FROM SYS.M_TRACEFILE_CONTENTS", ()),),
+              requires_select=True),
+        Check(name="backups", category="backup", purpose="Backup catalog.",
+              source="bin/backups.js",
+              statements=(Statement("catalog", "SELECT A FROM SYS.M_BACKUP_CATALOG", ()),
+                          Statement("size", "SELECT B FROM SYS.M_BACKUP_SIZE", ()))),
+        Check(name="version", category="system", purpose="Database version.",
+              source="bin/version.js",
+              statements=(Statement("", "SELECT A FROM SYS.M_DATABASE", ()),),
+              args=frozenset(), max_rows_cap=5),
+    )
+
+
+@pytest.fixture
+def db(monkeypatch: pytest.MonkeyPatch) -> h.FakeDbapi:
+    return h.install(monkeypatch)
+
+
+def _factory(name: str, destination: str) -> HanaSystem:
+    return HanaSystem(name, destination, resolver=h.FakeResolver(), tokens=h.FakeTokens())
+
+
+def build(oauth: dict | None = None, **kw: Any):
+    return tools.hana_toolset(oauth or OAUTH, auth_mode="destination",
+                              system_factory=kw.pop("system_factory", _factory), **kw)
+
+
+async def call(toolset, name: str, /, **kw: Any) -> dict[str, Any]:
+    return await toolset.tools[name].function(**kw)
+
+
+def _clean(answer: Any, *extra: str) -> None:
+    text = json.dumps(answer)
+    for secret in SECRETS + extra:
+        assert secret not in text
+
+
+def _logs_clean(caplog: pytest.LogCaptureFixture, *extra: str) -> None:
+    for record in caplog.records:
+        for secret in SECRETS + extra:
+            assert secret not in record.getMessage()
+        assert record.exc_info is None
+
+
+# ---- build ------------------------------------------------------------------------------
+
+
+def test_build_refuses_another_auth_mode() -> None:
+    with pytest.raises(ValueError, match="requires auth_mode=destination"):
+        tools.hana_toolset(OAUTH, auth_mode="oauth2")
+
+
+def test_build_refuses_a_bad_entry() -> None:
+    with pytest.raises(ValueError):
+        tools.hana_toolset({"systems": []}, auth_mode="destination")
+    with pytest.raises(ValueError):
+        tools.hana_toolset({**OAUTH, "user_context": True}, auth_mode="destination")
+
+
+def test_run_select_is_registered_only_with_allow_select() -> None:
+    assert set(build().tools) == {"list_systems", "list_checks", "run_check"}
+    assert set(build(OAUTH_SELECT).tools) == {
+        "list_systems", "list_checks", "run_check", "run_select"}
+
+
+def test_descriptions_state_defaults_categories_and_select_rules() -> None:
+    run_check = build().tools["run_check"].description
+    assert "50" in run_check and "24" in run_check
+    for category in ("monitoring", "performance", "system", "backup"):
+        assert category in run_check
+    for name in ("alerts", "longRunning", "backups"):
+        assert name not in run_check  # categories, not the checks
+    select = build(OAUTH_SELECT).tools["run_select"].description
+    for words in ("SYS.<view>", "_SYS_STATISTICS.<view>", "M_*", "SYS.DUMMY",
+                  "comment", ";"):
+        assert words in select
+
+
+# ---- list_systems / list_checks ---------------------------------------------------------
+
+
+async def test_list_systems_names_only() -> None:
+    answer = await call(build(), "list_systems")
+    assert answer == {"systems": [{"name": "sib_tenant"}, {"name": "sib_systemdb"}]}
+    _clean(answer)
+
+
+async def test_list_checks_without_allow_select_hides_select_checks() -> None:
+    answer = await call(build(), "list_checks")
+    names = [c["name"] for c in answer["checks"]]
+    assert names == ["alerts", "longRunning", "backups", "version"]
+    long_running = answer["checks"][1]
+    assert long_running["category"] == "performance"
+    assert long_running["purpose"] == "Long statements."
+    assert [a["name"] for a in long_running["arguments"]] == ["schema", "top", "hours"]
+    top = next(a for a in long_running["arguments"] if a["name"] == "top")
+    assert top["default"] == 50 and "500" in top["rule"]
+    assert answer["checks"][3]["arguments"] == []
+
+
+async def test_list_checks_with_allow_select_shows_them() -> None:
+    answer = await call(build(OAUTH_SELECT), "list_checks")
+    assert "traceContents" in [c["name"] for c in answer["checks"]]
+
+
+async def test_list_checks_by_category() -> None:
+    answer = await call(build(), "list_checks", category="system")
+    assert [c["name"] for c in answer["checks"]] == ["version"]
+
+
+async def test_list_checks_refuses_unknown_category_without_echo() -> None:
+    answer = await call(build(), "list_checks", category="evil_category_x")
+    assert answer["error"]["code"] == "invalid_argument"
+    assert answer["error"]["argument"] == "category"
+    _clean(answer, "evil_category_x")
+
+
+# ---- run_check ----------------------------------------------------------------------------
+
+
+async def test_run_check_ok(db: h.FakeDbapi) -> None:
+    db.rows = [(1, "x"), (2, "y")]
+    answer = await call(build(), "run_check", system="sib_tenant", check="alerts")
+    assert answer == {"system": "sib_tenant", "check": "alerts", "columns": ["A", "B"],
+                      "rows": [[1, "x"], [2, "y"]], "row_count": 2, "truncated": False}
+    assert ("fetchmany", 51) in db.calls  # default top 50, one more fetched
+    assert "commit" not in db.steps()
+
+
+async def test_run_check_top_plus_one_and_truncated_exact(db: h.FakeDbapi) -> None:
+    db.rows = [(i, "r") for i in range(5)]
+    answer = await call(build(), "run_check", system="sib_tenant", check="alerts", top=3)
+    assert ("fetchmany", 4) in db.calls
+    assert answer["row_count"] == 3 and answer["truncated"] is True
+    db.rows = [(i, "r") for i in range(3)]
+    answer = await call(build(), "run_check", system="sib_tenant", check="alerts", top=3)
+    assert answer["row_count"] == 3 and answer["truncated"] is False
+
+
+async def test_run_check_without_top_uses_the_check_cap(db: h.FakeDbapi) -> None:
+    db.description = (("A",),)
+    db.rows = [(1,)]
+    answer = await call(build(), "run_check", system="sib_tenant", check="version")
+    assert answer["rows"] == [[1]]
+    assert ("fetchmany", 6) in db.calls
+
+
+async def test_run_check_binds_defaults_and_masks(db: h.FakeDbapi) -> None:
+    db.description = (("A",), ("STATEMENT_STRING",))
+    db.rows = [(1, STATEMENT), (2, None)]
+    answer = await call(build(), "run_check", system="sib_tenant", check="longRunning")
+    executed = [c for c in db.calls if c[0] == "execute"][0]
+    assert executed[2] == (None, None, 24)
+    masked = answer["rows"][0][1]
+    assert "customer4711" not in masked and "99" not in masked and "KNA1" in masked
+    assert answer["rows"][1][1] is None
+
+
+async def test_run_check_binds_given_arguments(db: h.FakeDbapi) -> None:
+    db.description = (("A",), ("STATEMENT_STRING",))
+    await call(build(), "run_check", system="sib_tenant", check="longRunning",
+               schema="SAPABAP1", hours=2, top=10)
+    executed = [c for c in db.calls if c[0] == "execute"][0]
+    assert executed[2] == ("SAPABAP1", "SAPABAP1", 2)
+    assert ("fetchmany", 11) in db.calls
+
+
+async def test_run_check_composite(db: h.FakeDbapi) -> None:
+    db.rows = [(1, "a")]
+    answer = await call(build(), "run_check", system="sib_tenant", check="backups")
+    assert answer["system"] == "sib_tenant" and answer["check"] == "backups"
+    assert [p["label"] for p in answer["parts"]] == ["catalog", "size"]
+    assert all(p["row_count"] == 1 for p in answer["parts"])
+
+
+async def test_unknown_system_not_echoed(db: h.FakeDbapi) -> None:
+    for name in ("evil_system_x", 42, None):
+        answer = await call(build(), "run_check", system=name, check="alerts")
+        assert answer == {"error": {"code": "unknown_system",
+                                    "message": MESSAGES["unknown_system"]}}
+        _clean(answer, "evil_system_x")
+    assert db.calls == []
+
+
+async def test_unknown_check_not_echoed(db: h.FakeDbapi) -> None:
+    for name in ("evil_check_x", "traceContents", 7):
+        answer = await call(build(), "run_check", system="sib_tenant", check=name)
+        assert answer == {"error": {"code": "unknown_check",
+                                    "message": MESSAGES["unknown_check"]}}
+        _clean(answer, "evil_check_x")
+    assert db.calls == []
+
+
+async def test_select_check_runs_with_allow_select(db: h.FakeDbapi) -> None:
+    db.description = (("A",),)
+    db.rows = [(1,)]
+    answer = await call(build(OAUTH_SELECT), "run_check", system="sib_tenant",
+                        check="traceContents")
+    assert answer["rows"] == [[1]]
+
+
+@pytest.mark.parametrize("kw, argument", [
+    ({"top": 0}, "top"), ({"top": 501}, "top"), ({"top": True}, "top"),
+    ({"top": "5"}, "top"), ({"hours": 0}, "hours"), ({"hours": 721}, "hours"),
+    ({"schema": "evil schema'x"}, "schema"), ({"schema": 5}, "schema"),
+    ({"object": "SYS"}, "object"),
+])
+async def test_run_check_bad_arguments(db: h.FakeDbapi, kw: dict, argument: str) -> None:
+    answer = await call(build(), "run_check", system="sib_tenant", check="longRunning", **kw)
+    assert answer["error"]["code"] == "invalid_argument"
+    assert answer["error"]["argument"] == argument
+    _clean(answer, "evil schema'x")
+    assert db.calls == []
+
+
+async def test_run_check_undeclared_argument(db: h.FakeDbapi) -> None:
+    answer = await call(build(), "run_check", system="sib_tenant", check="alerts", hours=3)
+    assert answer["error"]["code"] == "invalid_argument"
+    assert answer["error"]["argument"] == "hours"
+
+
+async def test_values_made_json_safe(db: h.FakeDbapi) -> None:
+    class Odd:
+        def __repr__(self) -> str:
+            return h.MARKER
+
+    db.description = tuple((c,) for c in "ABCDEFGHIJK")
+    db.rows = [(b"\x00\x01\x02", bytearray(b"ab"), memoryview(b"abcd"),
+                dt.datetime(2026, 11, 10, 8, 30, 1), dt.date(2026, 11, 10),
+                dt.time(8, 30), Decimal("12.50"), Odd(), 1.5, True, "text")]
+    answer = await call(build(), "run_check", system="sib_tenant", check="alerts")
+    assert answer["rows"][0] == ["<3 bytes>", "<2 bytes>", "<4 bytes>",
+                                 "2026-11-10T08:30:01", "2026-11-10", "08:30:00",
+                                 "12.50", "<Odd>", 1.5, True, "text"]
+    json.dumps(answer, allow_nan=False)
+    _clean(answer)
+
+
+async def test_result_too_large_refused(db: h.FakeDbapi) -> None:
+    db.rows = [(i, "y" * 1000) for i in range(70)]
+    answer = await call(build(), "run_check", system="sib_tenant", check="alerts", top=100)
+    assert answer == {"error": {"code": "result_too_large",
+                                "message": MESSAGES["result_too_large"]}}
+
+
+async def test_driver_failure_is_an_error_object(db: h.FakeDbapi,
+                                                 caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.DEBUG)
+    db.fail_at["execute"] = h.driver_error(258, "insufficient privilege")
+    answer = await call(build(), "run_check", system="sib_tenant", check="alerts")
+    assert answer["error"]["code"] == "not_authorized"
+    assert set(answer["error"]) <= {"code", "message", "sql_code"}
+    _clean(answer)
+    _logs_clean(caplog)
+
+
+async def test_destination_failure(caplog: pytest.LogCaptureFixture,
+                                   db: h.FakeDbapi) -> None:
+    caplog.set_level(logging.DEBUG)
+
+    def factory(name: str, destination: str) -> HanaSystem:
+        return HanaSystem(name, destination,
+                          resolver=h.FakeResolver(error=RuntimeError(h.MARKER)),
+                          tokens=h.FakeTokens())
+
+    answer = await call(build(system_factory=factory), "run_check",
+                        system="sib_tenant", check="alerts")
+    assert answer["error"]["code"] == "destination_error"
+    _clean(answer)
+    _logs_clean(caplog)
+
+
+async def test_unexpected_failure_is_answered(monkeypatch: pytest.MonkeyPatch,
+                                              caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.DEBUG)
+
+    async def boom(*a: Any, **k: Any):
+        raise RuntimeError(f"{h.MARKER} {h.HOST}")
+
+    monkeypatch.setattr(tools, "run_query", boom)
+    answer = await call(build(OAUTH_SELECT), "run_check", system="sib_tenant", check="alerts")
+    assert answer["error"]["code"] == "call_failed"
+    answer = await call(build(OAUTH_SELECT), "run_select", system="sib_tenant",
+                        sql="SELECT * FROM SYS.DUMMY")
+    assert answer["error"]["code"] == "call_failed"
+    _clean(answer)
+    _logs_clean(caplog)
+
+
+# ---- run_select ---------------------------------------------------------------------------
+
+
+async def test_run_select_ok_unmasked(db: h.FakeDbapi) -> None:
+    db.description = (("STATEMENT_STRING",),)
+    db.rows = [(STATEMENT,)]
+    answer = await call(build(OAUTH_SELECT), "run_select", system="sib_tenant",
+                        sql="SELECT STATEMENT_STRING FROM M_EXPENSIVE_STATEMENTS")
+    assert answer == {"system": "sib_tenant", "columns": ["STATEMENT_STRING"],
+                      "rows": [[STATEMENT]], "row_count": 1, "truncated": False}
+    assert ("fetchmany", 101) in db.calls
+    executed = [c for c in db.calls if c[0] == "execute"]
+    assert executed == [("execute", "SELECT STATEMENT_STRING FROM M_EXPENSIVE_STATEMENTS")]
+
+
+async def test_run_select_top(db: h.FakeDbapi) -> None:
+    db.rows = [(i, i) for i in range(4)]
+    answer = await call(build(OAUTH_SELECT), "run_select", system="sib_tenant",
+                        sql="SELECT * FROM SYS.DUMMY", top=2)
+    assert answer["row_count"] == 2 and answer["truncated"] is True
+    assert ("fetchmany", 3) in db.calls
+
+
+@pytest.mark.parametrize("top", [0, 501, True, "5", 2.0])
+async def test_run_select_bad_top(db: h.FakeDbapi, top: Any) -> None:
+    answer = await call(build(OAUTH_SELECT), "run_select", system="sib_tenant",
+                        sql="SELECT * FROM SYS.DUMMY", top=top)
+    assert answer["error"]["code"] == "invalid_argument"
+    assert answer["error"]["argument"] == "top"
+    assert db.calls == []
+
+
+@pytest.mark.parametrize("sql, rule", [
+    ("DELETE FROM SAPABAP1.KNA1 WHERE KUNNR = 'customer4711'", "select_only"),
+    ("SELECT * FROM SAPABAP1.KNA1 WHERE KUNNR = 'customer4711'", "table_not_allowed"),
+    ("SELECT * FROM DUMMY WHERE 'customer4711' = ''", "table_not_allowed"),
+    ("SELECT 1 FROM SYS.DUMMY; SELECT 'customer4711' FROM SYS.DUMMY", "one_statement"),
+    (12, "unreadable"),
+])
+async def test_run_select_guard_refusal(db: h.FakeDbapi, sql: Any, rule: str) -> None:
+    answer = await call(build(OAUTH_SELECT), "run_select", system="sib_tenant", sql=sql)
+    assert answer["error"]["code"] == "select_refused"
+    assert answer["error"]["rule"] == rule
+    _clean(answer, "customer4711", "KNA1")
+    assert db.calls == []
+
+
+async def test_run_select_unknown_system(db: h.FakeDbapi) -> None:
+    answer = await call(build(OAUTH_SELECT), "run_select", system="evil_system_x",
+                        sql="SELECT * FROM SYS.DUMMY")
+    assert answer["error"]["code"] == "unknown_system"
+    _clean(answer, "evil_system_x")
+
+
+async def test_run_select_result_too_large(db: h.FakeDbapi) -> None:
+    db.rows = [("y" * 1000, i) for i in range(70)]
+    answer = await call(build(OAUTH_SELECT), "run_select", system="sib_tenant",
+                        sql="SELECT * FROM SYS.DUMMY", top=500)
+    assert answer["error"]["code"] == "result_too_large"
