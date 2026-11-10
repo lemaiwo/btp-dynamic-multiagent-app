@@ -181,11 +181,13 @@ class FakeDbapi:
 
 def fresh_login_state(monkeypatch: Any) -> None:
     """Give the test a login state of its own (the connection layer keeps it
-    per process, keyed by destination): no breaker or confirmed login of an
+    per process, keyed by database account): no breaker or confirmed login of an
     earlier test reaches it, and the old state is back after the test."""
     from agents.hana import connection
 
     monkeypatch.setattr(connection, "_logins", {})
+    monkeypatch.setattr(connection, "_accounts", {})
+    monkeypatch.setattr(connection, "_generation", 0)
 
 
 def install(monkeypatch: Any, db: FakeDbapi | None = None) -> FakeDbapi:

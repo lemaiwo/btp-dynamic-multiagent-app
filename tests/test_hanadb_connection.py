@@ -740,22 +740,28 @@ async def test_breaker_window_ends_and_reads_the_destination_fresh(monkeypatch):
     assert LOGIN_BREAKER_SECONDS == 900
 
 
-async def test_breaker_is_per_system(monkeypatch):
+async def test_breaker_is_per_database_account(monkeypatch):
     db = _login_failing(monkeypatch)
     first, second = _system(), HanaSystem(
         "erp_systemdb", "hana-other", resolver=h.FakeResolver(), tokens=h.FakeTokens())
+    third = HanaSystem("erp_other_user", "hana-third", resolver=h.FakeResolver(
+        h.http_props(User="DBUSER_THIRD_7F3A9C")), tokens=h.FakeTokens())
     with pytest.raises(HanaError):
         await run_query(first, "SELECT 1 FROM SYS.DUMMY", [], 1)
     with pytest.raises(HanaError) as info:
+        # another destination of the same host, port and user: the same account
         await run_query(second, "SELECT 1 FROM SYS.DUMMY", [], 1)
     assert info.value.code == "login_failed"
+    assert db.steps() == ["connect"]
+    with pytest.raises(HanaError):
+        await run_query(third, "SELECT 1 FROM SYS.DUMMY", [], 1)  # another user
     assert db.steps() == ["connect", "connect"]
 
 
 async def test_a_reload_resets_the_breaker_a_new_system_object_does_not(monkeypatch):
-    # The breaker belongs to the destination, not to the system object: a
-    # registry reload calls reset_login_state(), the way out after the
-    # password was corrected in the database.
+    # The breaker belongs to the database account, not to the system object:
+    # an admin's Reload calls reset_login_state(), the way out after the
+    # user was unlocked or its password corrected in the database.
     db = _login_failing(monkeypatch)
     with pytest.raises(HanaError):
         await run_query(_system(), "SELECT 1 FROM SYS.DUMMY", [], 1)

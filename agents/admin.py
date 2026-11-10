@@ -2633,9 +2633,20 @@ async def api_update_model(payload: ModelPayload) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Reload & restart
 # ---------------------------------------------------------------------------
+def _forget_hana_logins() -> None:
+    """builtin:hana: the admin's Reload and Restart are "I fixed it", so the
+    login state is forgotten in full (failed credentials included). Before the
+    registry reload, whose own soft reset only removes and so cannot bring a
+    forgotten failure back."""
+    from agents.hana.connection import reset_login_state
+
+    reset_login_state()
+
+
 @router.post("/api/reload", dependencies=[Depends(require_admin)])
 async def api_reload() -> dict[str, Any]:
     """Rebuild the orchestrator from the database without restarting."""
+    _forget_hana_logins()
     build = await registry.reload()
     dynamic_chat_app.refresh()
     return {
@@ -2656,6 +2667,7 @@ async def api_restart() -> JSONResponse:
     configured, the in-memory reload alone is sufficient for newly added
     agents to take effect.
     """
+    _forget_hana_logins()
     build = await registry.reload()
     dynamic_chat_app.refresh()
 

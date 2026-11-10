@@ -42,7 +42,7 @@ from agents.git_tools import activity_summary as git_activity_summary
 from agents.builtins import build_builtin_toolset, is_builtin_url
 from agents.hana import BUILTIN_HANA_URL
 from agents.hana.config import asks_to_select
-from agents.hana.connection import reset_login_state as reset_hana_logins
+from agents.hana.connection import soft_reset_login_state as soft_reset_hana_logins
 from agents.hana.tools import activity_summary as hana_activity_summary
 from agents.ina import BUILTIN_INA_URL
 from agents.ina.tools import NoUsableQueryError, attached_queries
@@ -1662,7 +1662,7 @@ class Registry:
             old = self._build
             new = await build_orchestrator()
             self._build = new
-            reset_hana_logins()  # builtin:hana: "Reload after correcting the password"
+            soft_reset_hana_logins()  # builtin:hana: keeps failed credentials
             logger.info(
                 "Registry reloaded: %d enabled / %d total specialists",
                 len(new.specialists),

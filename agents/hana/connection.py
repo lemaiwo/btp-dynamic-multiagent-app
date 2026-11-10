@@ -13,16 +13,27 @@ ever commits.
 
 **The login protection.** Every call is one login, and HANA locks a user
 after a few invalid attempts (reset only by a successful login); the user may
-be a person's. The state is per process and keyed by destination name, shared
-by every :class:`HanaSystem` (:func:`_in_slot` describes the gate): until a
-login with the current credential succeeded only ONE login is in flight; a
-login failure opens a breaker that answers ``login_failed`` without
-connecting for :data:`LOGIN_BREAKER_SECONDS`, and after it the destination is
-read fresh and the same credential (by :func:`credential_digest`) is still
-not tried. :func:`reset_login_state`, called at each registry reload, clears
-it: after correcting the password, press Reload. Worst case per stale
-credential and app instance: 1 failed login, or :data:`MAX_CONCURRENT` when a
-confirmed password goes stale in the database while calls run.
+be a person's. The state is per process and keyed by the DATABASE ACCOUNT
+(:func:`account_key`: a digest of location id, host, port and user), shared
+by every :class:`HanaSystem` and every destination that resolves to that
+account (:func:`_in_slot` describes the gate): until a login with the
+current credential succeeded only ONE login is in flight; a login failure
+opens a breaker that answers ``login_failed`` without connecting for
+:data:`LOGIN_BREAKER_SECONDS`, and after it the destination is read fresh and
+the same credential (by :func:`credential_digest`) is still not tried. Two
+virtual hosts mapped to one backend cannot be told apart and are counted as
+two accounts: keep one destination per database user.
+
+Two resets. :func:`soft_reset_login_state`, called by every registry reload
+(a model change, an agent or catalogue save, a bundle import...), keeps the
+failed credential and drops only the window and the confirmations, so a
+corrected password is tried at once and the unchanged wrong one costs no
+login. :func:`reset_login_state` forgets everything; only the admin's Reload
+and Restart call it ("I fixed it", also the way out after an unlock in the
+database with the same password). Worst case per stale credential and app
+instance: 1 failed login, or :data:`MAX_CONCURRENT` when a confirmed password
+goes stale in the database while calls run; +1 per explicit Reload, Restart
+or app start; other reloads add none.
 
 **LOB values** (``NCLOB`` statement texts, ``BLOB``) are read in the worker
 thread before the connection closes, each up to a cap and all of a call
@@ -321,6 +332,16 @@ def _detail(exc: BaseException) -> str:
     return f"sql_code={code}" if code is not None else type(exc).__name__
 
 
+def account_key(target: HanaTarget) -> str:
+    """The database account a target logs in as: SHA-256 of location id,
+    host, port and user. Kept in memory only, never logged or returned; the
+    login state and the login lock are keyed by it, so two destinations of one
+    account share one breaker. The password is not part of it (that is
+    :func:`credential_digest`)."""
+    text = "\0".join((target.location_id or "", target.host, str(target.port), target.user))
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
 class HanaSystem:
     """One configured system: its slug, its destination and the clients that
     resolve it. The resolver and the connectivity tokens are built from the
@@ -333,10 +354,10 @@ class HanaSystem:
         self._resolver = resolver
         self._tokens = tokens
         # The login state's epoch this object last read its destination at:
-        # each failed login moves the epoch on, and every system object of
-        # that destination then reads it fresh once (its own resolver may
-        # cache the old password).
-        self._read_epoch = 0
+        # each failed login and each reset moves it on, and every system
+        # object of that account then reads its destination fresh once (its
+        # own resolver may cache the old password).
+        self._read_epoch: tuple[int, int] = (0, 0)
 
     def __repr__(self) -> str:
         return f"HanaSystem({self.name})"
@@ -356,7 +377,7 @@ class HanaSystem:
                 logger.warning("hana: destination binding for system %s failed (%s)",
                                self.name, failure)
                 raise HanaError("destination_error")
-        epoch = _login(self.destination).epoch
+        epoch = _read_epoch(self.destination)
         try:
             props = await self._resolver.resolve_properties(force=epoch != self._read_epoch)
         except Exception as exc:  # noqa: BLE001 - mapped, class logged
@@ -407,6 +428,14 @@ class _Login:
 
 
 _logins: dict[str, _Login] = {}
+"""Login state by :func:`account_key`."""
+_accounts: dict[str, str] = {}
+"""Destination name -> the account key it resolved to last: lets a call
+answer ``login_failed`` while the window is open without reading the
+destination. Before a destination's first resolve there is no entry (and
+nothing to protect yet)."""
+_generation = 0
+"""Moved on by each reset: every system object reads its destination fresh."""
 _login_locks: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[str, asyncio.Lock]] = \
     weakref.WeakKeyDictionary()
 
@@ -417,33 +446,63 @@ def credential_digest(user: str, password: str) -> str:
     return hashlib.sha256(f"{user}\0{password}".encode()).hexdigest()
 
 
-def _login(destination: str) -> _Login:
-    state = _logins.get(destination)
+def _login(account: str) -> _Login:
+    state = _logins.get(account)
     if state is None:
-        state = _logins[destination] = _Login()
+        state = _logins[account] = _Login()
     return state
 
 
-def _login_lock(destination: str) -> asyncio.Lock:
-    """The lock that keeps one login in flight per destination, per event
-    loop (like the slots)."""
+def _read_epoch(destination: str) -> tuple[int, int]:
+    account = _accounts.get(destination)
+    state = _logins.get(account) if account is not None else None
+    return _generation, state.epoch if state is not None else 0
+
+
+def _login_lock(account: str) -> asyncio.Lock:
+    """The lock that keeps one login in flight per database account, per
+    event loop (like the slots)."""
     loop = asyncio.get_running_loop()
     locks = _login_locks.get(loop)
     if locks is None:
         locks = _login_locks[loop] = {}
-    lock = locks.get(destination)
+    lock = locks.get(account)
     if lock is None:
-        lock = locks[destination] = asyncio.Lock()
+        lock = locks[account] = asyncio.Lock()
     return lock
 
 
-def reset_login_state() -> None:
-    """Forget every breaker and every confirmed login (the registry calls
-    this at each reload: "press Reload after correcting the password").
+def soft_reset_login_state() -> None:
+    """What every registry reload does: drop each breaker window and each
+    confirmed login, KEEP each failed credential, and have every system read
+    its destination fresh. A corrected password is then tried at once (its
+    digest differs), the unchanged wrong one is answered ``login_failed``
+    without a login. Reloads happen for many reasons that have nothing to do
+    with the database (a model change, an agent save), so forgetting the
+    failure here would spend a login of the person's account at each.
 
-    The locks stay: a login still in flight keeps its destination's lock
-    until its thread ends, so no second login starts beside it."""
+    The states are changed in place and the locks stay: a login in flight
+    keeps its lock, and its outcome lands in the same state."""
+    global _generation
+    _generation += 1
+    for state in _logins.values():
+        state.blocked_until = None
+        state.confirmed = None
+        state.epoch += 1
+
+
+def reset_login_state() -> None:
+    """Forget every breaker, failed credential and confirmed login. Only the
+    admin's explicit Reload and Restart call this ("I fixed it": also the
+    way out after the user was unlocked in the database with the same
+    password); each costs at most one more login per stale credential.
+
+    The locks stay: a login still in flight keeps its account's lock until
+    its thread ends, so no second login starts beside it."""
+    global _generation
+    _generation += 1
     _logins.clear()
+    _accounts.clear()
 
 
 def _blocked(state: _Login) -> bool:
@@ -451,31 +510,31 @@ def _blocked(state: _Login) -> bool:
     return until is not None and _clock() < until
 
 
-def _gate_closed(destination: str, digest: str) -> bool:
+def _gate_closed(account: str, digest: str) -> bool:
     """No login may be tried: the breaker's window is open, or this very
     credential is the one that failed."""
-    state = _login(destination)
+    state = _login(account)
     return _blocked(state) or state.failed == digest
 
 
-def _confirmed(destination: str, digest: str) -> bool:
-    state = _login(destination)
+def _confirmed(account: str, digest: str) -> bool:
+    state = _login(account)
     return state.confirmed == digest and state.failed != digest
 
 
 def _close_gate(state: _Login) -> None:
     """(Re)open the breaker's window; every system object of the
-    destination reads it fresh on its next attempt."""
+    account reads its destination fresh on its next attempt."""
     state.blocked_until = _clock() + LOGIN_BREAKER_SECONDS
     state.epoch += 1
 
 
-def _note_login_failed(destination: str, digest: str, system: str) -> None:
-    state = _login(destination)
+def _note_login_failed(account: str, digest: str, system: str) -> None:
+    state = _login(account)
     if not _blocked(state):
         logger.warning("hana: login failed for system %s; no login is tried for "
-                       "%d s, nor with this password again (login breaker; Reload "
-                       "resets it)", system, LOGIN_BREAKER_SECONDS)
+                       "%d s, nor with this password again (login breaker; an admin's "
+                       "Reload resets it)", system, LOGIN_BREAKER_SECONDS)
     state.failed = digest
     # Whichever credential was confirmed: the gate closes for all of them, so
     # the next login is one at a time again.
@@ -483,24 +542,24 @@ def _note_login_failed(destination: str, digest: str, system: str) -> None:
     _close_gate(state)
 
 
-def _note_login_ok(destination: str, digest: str) -> None:
-    state = _login(destination)
+def _note_login_ok(account: str, digest: str) -> None:
+    state = _login(account)
     # A login of a thread that started before this credential failed does
-    # not lift the failure: only a changed credential or a reload does.
+    # not lift the failure: only a changed credential or a full reset does.
     if state.failed != digest:
         state.confirmed = digest
 
 
-def _settle(destination: str, digest: str, system: str, fut: asyncio.Future) -> None:
+def _settle(account: str, digest: str, system: str, fut: asyncio.Future) -> None:
     """What a finished thread says about the login, on the event loop. Runs
     also for a thread whose caller left (deadline, cancellation)."""
     if fut.cancelled():
         return
     exc = fut.exception()
     if exc is None or (isinstance(exc, _Failed) and exc.step != "connect"):
-        _note_login_ok(destination, digest)  # connect returned: the login held
+        _note_login_ok(account, digest)  # connect returned: the login held
     elif isinstance(exc, _Failed) and map_driver_error(exc.cause).code == "login_failed":
-        _note_login_failed(destination, digest, system)
+        _note_login_failed(account, digest, system)
 
 
 _slots: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = \
@@ -631,39 +690,60 @@ def _execute(system: str, kwargs: dict[str, Any], sql: str, binds: tuple,
     return columns, rows, truncated
 
 
-async def _in_slot(system: str, destination: str, digest: str, kwargs: dict[str, Any],
+def _spawn(coro: Any) -> asyncio.Future:
+    """Schedule the task that starts the worker thread (a seam for the
+    tests: what may happen between the slot check and the task's first
+    step)."""
+    return asyncio.ensure_future(coro)
+
+
+async def _in_slot(system: str, account: str, digest: str, kwargs: dict[str, Any],
                    sql: str, binds: tuple, max_rows: int, lob: tuple[int, int]
                    ) -> tuple[list[str], list[tuple], bool]:
     """Wait for the login turn and a free slot, then run in a worker thread.
 
     **The login gate.** While no login with this credential has succeeded
-    (:func:`_confirmed`), a caller first takes the destination's lock, so
-    only ONE such login is in flight; a caller that got the lock looks at
-    the breaker again (the holder before it may have failed). A thread that
+    (:func:`_confirmed`), a caller first takes the account's lock, so only
+    ONE such login is in flight; a caller that got the lock looks at the
+    breaker again (the holder before it may have failed). A thread that
     starts while holding the lock keeps it until the thread has ended (its
     login may still be in flight after its caller left), and :func:`_settle`
     records the outcome before the lock and the slot are given back. A
-    confirmed caller skips the lock; after it got a slot it checks again,
-    with no ``await`` between that check and the thread's start, so once a
-    failure is recorded no thread with that credential starts any more.
-    The lock is always taken before a slot: a caller holding a slot never
-    waits for the lock.
+    confirmed caller skips the lock and checks again after it got a slot.
+    The task that starts the thread runs a loop step later, so it looks at
+    the breaker once more right before ``to_thread`` (no ``await`` between
+    that check and the thread's submission) and answers ``login_failed``
+    without connecting when a failure was recorded meanwhile; slot and lock
+    then go back through the same done path. What bounds the failures of a
+    stale confirmed credential is the slots: only threads already running
+    when the first failure is recorded can still fail, at most
+    :data:`MAX_CONCURRENT`. The lock is always taken before a slot: a caller
+    holding a slot never waits for the lock.
     """
     slot = _semaphore()
-    lock = _login_lock(destination)
+    lock = _login_lock(account)
     future: asyncio.Future | None = None
+
+    async def _thread() -> tuple[list[str], list[tuple], bool]:
+        if _gate_closed(account, digest):
+            raise HanaError("login_failed")  # recorded since the slot check
+        return await asyncio.to_thread(_execute, system, kwargs, sql, binds, max_rows, lob)
 
     def _start(holds_lock: bool) -> asyncio.Future:
         def _done(fut: asyncio.Future) -> None:
             try:
-                _settle(destination, digest, system, fut)
+                _settle(account, digest, system, fut)
             finally:
                 slot.release()
                 if holds_lock:
                     lock.release()
 
-        started = asyncio.ensure_future(
-            asyncio.to_thread(_execute, system, kwargs, sql, binds, max_rows, lob))
+        coro = _thread()
+        try:
+            started = _spawn(coro)
+        except BaseException:
+            coro.close()
+            raise
         started.add_done_callback(_done)
         return started
 
@@ -673,26 +753,26 @@ async def _in_slot(system: str, destination: str, digest: str, kwargs: dict[str,
             while future is None:
                 holds_lock = False
                 try:
-                    if not _confirmed(destination, digest):
+                    if not _confirmed(account, digest):
                         # Cancelled or timed out while waiting, asyncio.Lock
                         # is left as it was: nothing is taken or leaked.
                         await lock.acquire()
                         holds_lock = True
-                        if _confirmed(destination, digest):
+                        if _confirmed(account, digest):
                             # A login succeeded meanwhile: run beside the others.
                             lock.release()
                             holds_lock = False
-                    if _gate_closed(destination, digest):
+                    if _gate_closed(account, digest):
                         raise HanaError("login_failed")
                     # Cancelled while queued, asyncio.Semaphore hands a slot it
                     # was about to give on to the next waiter.
                     await slot.acquire()
-                    if _gate_closed(destination, digest) or not (
-                            holds_lock or _confirmed(destination, digest)):
+                    if _gate_closed(account, digest) or not (
+                            holds_lock or _confirmed(account, digest)):
                         # The credential failed, or its confirmation was lost,
                         # while this caller waited for the slot.
                         slot.release()
-                        if _gate_closed(destination, digest):
+                        if _gate_closed(account, digest):
                             raise HanaError("login_failed")
                         continue
                     try:
@@ -742,13 +822,15 @@ async def run_query(system: HanaSystem, sql: str, binds: Sequence[Any],
         raise HanaError("invalid_argument")
     if not isinstance(sql, str) or not sql or not isinstance(binds, (list, tuple)):
         raise HanaError("invalid_argument")
-    state = _login(system.destination)
-    if _blocked(state):
+    known = _accounts.get(system.destination)
+    if known is not None and _blocked(_login(known)):
         raise HanaError("login_failed")  # the window is open: nothing is read
     props = await system.properties()
     target = settings_from_properties(props, system.name)
     digest = credential_digest(target.user, target.password)
-    state = _login(system.destination)  # a reload may have reset it meanwhile
+    account = account_key(target)
+    _accounts[system.destination] = account
+    state = _login(account)  # a reset may have replaced it meanwhile
     if state.failed == digest and not _blocked(state):
         # The window has passed and the destination (read fresh) still holds
         # the credential that failed: no login, and the window again.
@@ -775,7 +857,7 @@ async def run_query(system: HanaSystem, sql: str, binds: Sequence[Any],
         raise HanaError("proxy_refused")
     kwargs = connect_kwargs(target, token, Socks5Proxy(config.proxy_host, socks5_port))
     try:
-        return await _in_slot(system.name, system.destination, digest, kwargs, sql,
+        return await _in_slot(system.name, account, digest, kwargs, sql,
                               tuple(binds), max_rows, (lob_chars, lob_budget))
     except _Failed as failed:
         caught: _Failed | None = failed
@@ -795,6 +877,7 @@ __all__ = [
     "DEFAULT_ENCRYPT", "LOB_BUDGET_CHARS", "LOB_MAX_BYTES", "LOB_MAX_CHARS",
     "LOGIN_BREAKER_SECONDS",
     "MAX_CONCURRENT", "QUERY_TIMEOUT_SECONDS",
-    "HanaSystem", "HanaTarget", "Socks5Proxy", "connect_kwargs", "credential_digest",
-    "map_driver_error", "reset_login_state", "run_query", "settings_from_properties",
+    "HanaSystem", "HanaTarget", "Socks5Proxy", "account_key", "connect_kwargs",
+    "credential_digest", "map_driver_error", "reset_login_state", "run_query",
+    "settings_from_properties", "soft_reset_login_state",
 ]

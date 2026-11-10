@@ -74,3 +74,75 @@ def test_the_import_reload_names_every_entry_kind():
     assert "HANA" in inspect.getdoc(admin._entry_signatures)
     source = inspect.getsource(admin)
     assert "changed OData or Bitbucket entry of an agent" not in source
+
+
+# ---- the admin's Reload and Restart forget the login state; other reloads do not ----
+
+
+def _failed_login_state(monkeypatch):
+    from agents.hana import connection
+    from tests import hanadb_helpers as h
+
+    h.fresh_login_state(monkeypatch)
+    state = connection._login("acct")
+    state.failed = connection.credential_digest(h.USER, h.PASSWORD)
+    state.blocked_until = connection._clock() + connection.LOGIN_BREAKER_SECONDS
+    connection._accounts["hana-test"] = "acct"
+    return connection
+
+
+def _fake_reload(monkeypatch, connection, seen):
+    """The registry's reload, which itself does a soft reset: it must see the
+    state already forgotten, so that it cannot keep what the admin reset."""
+    from agents import admin
+
+    class _Build:
+        configs: list = []
+        specialists: dict = {}
+
+    async def reload():
+        seen.append(dict(connection._logins))
+        connection.soft_reset_login_state()
+        return _Build()
+
+    monkeypatch.setattr(admin.registry, "reload", reload)
+    monkeypatch.setattr(admin.dynamic_chat_app, "refresh", lambda: None)
+
+
+async def test_admin_reload_forgets_the_login_state_before_it_reloads(monkeypatch):
+    from agents import admin
+
+    connection = _failed_login_state(monkeypatch)
+    seen: list = []
+    _fake_reload(monkeypatch, connection, seen)
+    answer = await admin.api_reload()
+    assert answer["status"] == "reloaded"
+    assert seen == [{}]
+    assert connection._logins == {} and connection._accounts == {}
+
+
+async def test_admin_restart_forgets_the_login_state_before_it_reloads(monkeypatch):
+    from agents import admin, cf_api
+
+    connection = _failed_login_state(monkeypatch)
+    seen: list = []
+    _fake_reload(monkeypatch, connection, seen)
+
+    async def restart_self():
+        return {"restarted": False}
+
+    monkeypatch.setattr(cf_api, "restart_self", restart_self)
+    await admin.api_restart()
+    assert seen == [{}]
+    assert connection._logins == {} and connection._accounts == {}
+
+
+async def test_another_admin_save_that_reloads_keeps_the_failed_credential(monkeypatch):
+    from agents import admin
+
+    connection = _failed_login_state(monkeypatch)
+    seen: list = []
+    _fake_reload(monkeypatch, connection, seen)
+    await admin.registry.reload()  # what a model change or an agent save does
+    state = connection._logins["acct"]
+    assert state.failed is not None and state.blocked_until is None

@@ -968,12 +968,17 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     driver. **The login protection**: every call is
     one login and HANA locks a user after a few invalid attempts (default 6,
     reset only by a successful login; the user may be a person's). The state
-    is per process and keyed by DESTINATION NAME (`_logins`, shared by every
-    `HanaSystem` of every agent and system name on that destination), with
-    the credential held only as `credential_digest` (SHA-256 of user NUL
-    password, never logged). (1) **One login in flight until one succeeded**:
-    while no login with the current credential is confirmed, a call takes
-    the destination's `asyncio.Lock` (per event loop) before a slot and looks
+    is per process and keyed by the DATABASE ACCOUNT (`_logins` by
+    `account_key`: SHA-256 of location id, host, port and user, formed once
+    the destination is read, in memory only, never logged; `_accounts` maps a
+    destination name to the key it resolved to last, for the window check
+    before a read), shared by every `HanaSystem` of every agent, system name
+    and destination of that account; two virtual hosts mapped to one backend
+    cannot be told apart and count separately: one destination per database
+    user. The credential is held only as `credential_digest` (SHA-256 of
+    user NUL password, never logged). (1) **One login in flight until one
+    succeeded**: while no login with the current credential is confirmed, a
+    call takes the account's `asyncio.Lock` (per event loop) before a slot and looks
     at the breaker again once it has it; a thread started under the lock
     keeps it until the thread has ended (`_done` records the outcome first,
     also for a caller that left at its deadline or was cancelled), so a
@@ -982,7 +987,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     failure (unreachable, proxy refused, timeout) confirms nothing and hands
     the lock to the next caller, who makes its own attempt. Confirmed calls
     skip the lock and run up to the 4 slots; after taking a slot each checks
-    the breaker again with no `await` before its thread starts. (2) **The
+    the breaker again, and the task that starts the thread checks it once
+    more right before `to_thread` (`login_failed` without a connect, slot and
+    lock back through the done path). (2) **The
     breaker**: a login failure (10, 414, 663; the meaning of 414 and 663 on
     SPS07 unverified, the safe direction) remembers the digest, drops the
     confirmation and answers `login_failed` without reading the destination
@@ -990,15 +997,23 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     window the destination is read fresh (every system object of it once:
     an epoch); the SAME digest is answered `login_failed` without a connect
     and opens the window again, a changed one is tried (one at a time).
-    `reset_login_state()` clears it all and is called by `Registry.reload`
-    (after the new build is swapped in): Reload after correcting the
-    password; without Reload a corrected password is used at most about 15
-    minutes later. **Worst case per stale credential per app instance**: 1
-    failed login when nothing was confirmed; when a confirmed password goes
-    stale in the database, at most `MAX_CONCURRENT` (4): only threads that
-    already hold a slot when the first failure is recorded can still fail;
-    then 0 until the credential changes (1 more per changed credential or
-    Reload). Two app instances double it. `connectTimeout` 15 s,
+    **Two resets**: `soft_reset_login_state()`, called by every
+    `Registry.reload` (a model change, an agent or catalogue save, a bundle
+    import, the IDE seed refresh...), keeps each failed digest and drops the
+    window and the confirmations, and every system reads its destination
+    fresh: a corrected password is tried at once, the unchanged wrong one
+    costs no login. `reset_login_state()` forgets everything and is called
+    only by the admin's `POST /admin/api/reload` and `/admin/api/restart`,
+    BEFORE their registry reload (whose soft reset only removes, so it cannot
+    bring a failure back): "I fixed it", also the way out after the user was
+    unlocked in the database with the same password. Without either, a
+    corrected password is used at most about 15 minutes later. **Worst case
+    per stale credential per app instance**: 1 failed login when nothing was
+    confirmed; when a confirmed password goes stale in the database, at most
+    `MAX_CONCURRENT` (4): only threads already running when the first
+    failure is recorded can still fail; then 0 until the credential changes
+    (1 more per changed credential); +1 per explicit Reload, Restart or app
+    start; other reloads add 0. Two app instances double it. `connectTimeout` 15 s,
     `communicationTimeout` 30 s (not in the keyword set the probe proved:
     unverified on the landscape); ONE deadline of 45 s
     (`CALL_DEADLINE_SECONDS`, `asyncio.timeout` with `expired()`) covers the
