@@ -43,7 +43,7 @@ DUMMY_ONE = Check(
                 "SELECT TOP ? SCHEMA_NAME, STATEMENT_STRING FROM SYS.M_ACTIVE_STATEMENTS"
                 " WHERE (? IS NULL OR SCHEMA_NAME = ?)"
             ),
-            binds=("top", "schema", "schema"),
+            binds=("top_plus_one", "schema", "schema"),
         ),
     ),
     args=frozenset({"top", "schema"}),
@@ -67,7 +67,7 @@ DUMMY_TWO = Check(
                 "SELECT TOP ? HOST FROM SYS.M_SERVICE_THREADS"
                 " WHERE START_TIME > ADD_SECONDS(CURRENT_TIMESTAMP, -3600 * ?)"
             ),
-            binds=("top", "hours"),
+            binds=("top_plus_one", "hours"),
         ),
     ),
     args=frozenset({"top", "hours", "schema", "object"}),
@@ -118,7 +118,50 @@ def test_statements_are_bound_never_built(check: Check) -> None:
         params = [t for t in tokens if t.kind == "param"]
         assert all(t.text == "?" for t in params)
         assert len(params) == len(statement.binds)
-        assert set(statement.binds) <= check.args
+        assert set(statement.binds) <= check.args | {"top_plus_one"}
+        if "top_plus_one" in statement.binds:
+            assert "top" in check.args
+
+
+def _row_limit_problems(statement: Statement) -> list[str]:
+    """Why a statement could hide ``truncated``: the connection fetches
+    ``top + 1`` rows to tell, so an SQL row limit must be ``top_plus_one``."""
+    problems = []
+    if "top" in statement.binds:
+        problems.append("binds plain top: a row limit binds top_plus_one")
+    tokens = tokenize(statement.sql)
+    params = [i for i, t in enumerate(tokens) if t.kind == "param"]
+    for position, index in enumerate(params):
+        if index and tokens[index - 1].is_word("TOP", "LIMIT"):
+            if statement.binds[position] != "top_plus_one":
+                problems.append("TOP ? / LIMIT ? is not bound to top_plus_one")
+    return problems
+
+
+@pytest.mark.parametrize("check", EVERY_CHECK, ids=lambda c: c.name)
+def test_a_row_limit_leaves_room_for_truncated(check: Check) -> None:
+    for statement in check.statements:
+        assert _row_limit_problems(statement) == []
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        Statement("", "SELECT TOP ? A FROM SYS.M_TABLES", ("top",)),
+        Statement("", "SELECT A FROM SYS.M_TABLES LIMIT ?", ("top",)),
+        Statement("", "SELECT A FROM SYS.M_TABLES WHERE B < ?", ("top",)),
+        Statement("", "SELECT TOP ? A FROM SYS.M_TABLES", ("hours",)),
+    ],
+)
+def test_the_row_limit_rule_catches_a_plain_top(statement: Statement) -> None:
+    assert _row_limit_problems(statement)
+
+
+def test_top_plus_one_needs_top_declared() -> None:
+    with pytest.raises(ValueError):
+        base.validate_check(_variant(
+            args=frozenset({"hours"}),
+            statements=(Statement("", "SELECT TOP ? 1 FROM DUMMY", ("top_plus_one",)),)))
 
 
 @pytest.mark.parametrize("check", EVERY_CHECK, ids=lambda c: c.name)
@@ -345,7 +388,26 @@ def test_top_is_capped_by_the_check() -> None:
     assert info.value.argument == "top"
 
 
-SECRET = "S3cret Value'--"
+DUMMY_CAPPED = Check(
+    name="dummyCapped", category="system", purpose="Dummy check capped at 10 rows.",
+    source="bin/dummyCapped.js",
+    statements=(Statement("", "SELECT TOP ? A FROM SYS.M_DATABASE", ("top_plus_one",)),),
+    max_rows_cap=10,
+)
+
+
+def test_default_top_under_a_cap() -> None:
+    base.validate_check(DUMMY_CAPPED)
+    args = base.resolve_args(DUMMY_CAPPED)
+    assert args == {"top": 10}
+    assert base.bind_values(DUMMY_CAPPED.statements[0], args) == (11,)
+    assert base.resolve_args(DUMMY_CAPPED, top=3) == {"top": 3}
+    with pytest.raises(InvalidArgument) as info:
+        base.resolve_args(DUMMY_CAPPED, top=11)
+    assert info.value.argument == "top"
+
+
+SECRET ="S3cret Value'--"
 
 
 @pytest.mark.parametrize(
@@ -390,7 +452,7 @@ def test_unknown_keyword_is_refused() -> None:
 def test_bind_values_follow_the_statement() -> None:
     args = base.resolve_args(DUMMY_TWO, schema="SYS", object="DUMMY", top=5, hours=2)
     assert base.bind_values(DUMMY_TWO.statements[0], args) == ("SYS", "DUMMY")
-    assert base.bind_values(DUMMY_TWO.statements[1], args) == (5, 2)
+    assert base.bind_values(DUMMY_TWO.statements[1], args) == (6, 2)
 
 
 def test_hana_ident_re() -> None:
@@ -446,11 +508,11 @@ def test_dump_entries_are_what_the_probe_loads(tmp_path, dummies) -> None:
     entries = base.dump_entries()
     assert entries == [
         {"name": "dummyOne",
-         "sql": DUMMY_ONE.statements[0].sql, "binds": [1, "SYS", "SYS"]},
+         "sql": DUMMY_ONE.statements[0].sql, "binds": [2, "SYS", "SYS"]},
         {"name": "dummyTwo.summary",
          "sql": DUMMY_TWO.statements[0].sql, "binds": ["SYS", "DUMMY"]},
         {"name": "dummyTwo.recent",
-         "sql": DUMMY_TWO.statements[1].sql, "binds": [1, 24]},
+         "sql": DUMMY_TWO.statements[1].sql, "binds": [2, 24]},
     ]
     path = tmp_path / "checks.json"
     path.write_text(json.dumps(entries), encoding="utf-8")

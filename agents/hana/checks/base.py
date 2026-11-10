@@ -75,6 +75,11 @@ ARGS: dict[str, Arg] = {
 }
 """The closed set of arguments. A statement binds only these names."""
 
+TOP_PLUS_ONE = "top_plus_one"
+"""A derived bind, not an argument: the effective ``top`` plus one."""
+_DUMP_SAMPLES: dict[str, Any] = {
+    **{name: arg.sample for name, arg in ARGS.items()}, TOP_PLUS_ONE: 2}
+
 UNDECLARED_RULE = "not an argument of this check"
 
 
@@ -99,7 +104,14 @@ class Statement:
     """The part's name in a composite check; ``""`` for a single statement."""
     sql: str
     binds: tuple[str, ...]
-    """:data:`ARGS` names in ``?`` order."""
+    """:data:`ARGS` names in ``?`` order, plus :data:`TOP_PLUS_ONE`.
+
+    A row limit in the SQL (``TOP ?``, ``LIMIT ?``) binds ``top_plus_one``,
+    never ``top``: the connection fetches ``top + 1`` rows to tell whether the
+    answer was cut (``truncated``), so a limit of ``top`` would hide that. A
+    statement that binds ``top_plus_one`` needs ``top`` among the check's
+    ``args``; one without an SQL limit binds neither (the fetch cuts it).
+    """
 
 
 @dataclass(frozen=True)
@@ -184,8 +196,10 @@ def _validate_statement(check: Check, index: int, statement: Statement, refuse) 
         raise refuse(f"{where} has a named parameter: only ? is bound")
     if not isinstance(statement.binds, tuple) or len(params) != len(statement.binds):
         raise refuse(f"{where} binds do not match its ? count")
-    if not set(statement.binds) <= check.args:
+    if not set(statement.binds) <= check.args | {TOP_PLUS_ONE}:
         raise refuse(f"{where} binds an argument the check does not declare")
+    if TOP_PLUS_ONE in statement.binds and "top" not in check.args:
+        raise refuse(f"{where} binds top_plus_one without declaring top")
 
 
 def _require_read(tokens: list[Token], where: str, refuse) -> None:
@@ -291,7 +305,9 @@ def resolve_args(
             continue
         arg = ARGS[name]
         if value is None:
-            resolved[name] = arg.default
+            # Under a cap below the default, leaving top out means the cap.
+            resolved[name] = (
+                min(arg.default, check.max_rows_cap) if name == "top" else arg.default)
             continue
         resolved[name] = _check_value(arg, value)
     if "top" in resolved and resolved["top"] > check.max_rows_cap:
@@ -301,8 +317,12 @@ def resolve_args(
 
 
 def bind_values(statement: Statement, args: dict[str, Any]) -> tuple[Any, ...]:
-    """The bind parameters of one statement, in ``?`` order."""
-    return tuple(args[name] for name in statement.binds)
+    """The bind parameters of one statement, in ``?`` order.
+
+    ``top_plus_one`` is derived from the resolved ``top`` (see :class:`Statement`).
+    """
+    return tuple(
+        args["top"] + 1 if name == TOP_PLUS_ONE else args[name] for name in statement.binds)
 
 
 # ---- the answer ---------------------------------------------------------------------
@@ -357,7 +377,8 @@ def dump_entries() -> list[dict[str, Any]]:
     """``[{name, sql, binds}]`` for ``scripts/probe_hana_connectivity.py --checks-file``.
 
     One entry per statement (a composite check's as ``<name>.<label>``), with
-    the sample values of :data:`ARGS` (``SYS``, ``DUMMY``, 1, 24) as binds.
+    the sample values of :data:`ARGS` (``SYS``, ``DUMMY``, 1, 24; ``top_plus_one`` 2)
+    as binds.
     """
     entries = []
     for check in _REGISTRY.values():
@@ -366,6 +387,6 @@ def dump_entries() -> list[dict[str, Any]]:
             entries.append({
                 "name": name,
                 "sql": statement.sql,
-                "binds": [ARGS[b].sample for b in statement.binds],
+                "binds": [_DUMP_SAMPLES[b] for b in statement.binds],
             })
     return entries
