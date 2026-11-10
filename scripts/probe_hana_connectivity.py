@@ -17,7 +17,7 @@ Usage (inside the app container, with the app's Python):
 
     python probe_hana_connectivity.py --destination <name> \
         [--variant props|props-account|both] [--encrypt yes|no|both] \
-        [--checks-file f.json] [--timeout 15] [--no-version]
+        [--checks-file f.json] [--timeout 15] [--no-version] [--write-test]
 
 The database password is read from the resolved destination (``User`` /
 ``Password``), never from a prompt or an argument. Two destination shapes are
@@ -35,11 +35,23 @@ Optional destination properties: ``hana.database`` (tenant ``databaseName``),
 Steps, one line each, ``PASS|FAIL|SKIP <step>: <fixed words>``:
 
   S1 bindings (names only)          S7  SELECT ... FROM M_DATABASE (rows, version)
-  S2 destination (facts only)       S8  SET TRANSACTION READ ONLY
-  S3 connectivity token (lifetime)  S9  setquerytimeout(20) + SYS.DUMMY
-  S4 TCP connect to the SOCKS5 port S10 EFFECTIVE_PRIVILEGES of CURRENT_USER
-  S5 raw SOCKS5 handshake (0x80)    S11 EXPLAIN PLAN in the read-only transaction
-  S6 hdbcli login per variant/TLS   S12 the statements of --checks-file
+  S2 destination (facts only)       S8  SET SCHEMA SYS (schema_pin), then SET
+  S3 connectivity token (lifetime)      TRANSACTION READ ONLY: the app's order
+  S4 TCP connect to the SOCKS5 port S8b with --write-test only: a write that the
+  S5 raw SOCKS5 handshake (0x80)        read-only transaction must refuse
+  S6 hdbcli login per variant/TLS   S9  setquerytimeout(20) + SYS.DUMMY
+                                    S10 EFFECTIVE_PRIVILEGES of CURRENT_USER
+                                    S11 EXPLAIN PLAN in the read-only transaction
+                                    S12 the statements of --checks-file
+
+S8b (``write_refused``) proves what S8's ``accepted`` cannot: that the database
+refuses a write inside the read-only transaction. It sends ``CREATE LOCAL
+TEMPORARY TABLE #AGENT_PROBE_RO (I INTEGER)`` (a session-local table, gone with
+the session) right after ``SET TRANSACTION READ ONLY``. PASS is the refusal
+(``sql_code=<n>``); a write that is accepted is a FAIL: the table is dropped,
+the transaction rolled back, ``READ_ONLY`` becomes ``no`` and nothing else runs
+in it. Off by default: it is a write attempt on the customer's database, so it
+runs only with ``--write-test`` once the customer agreed.
 
 Variants (``hdbcli`` connection properties, SAP HANA Client SQLDBC properties):
 ``props`` = ``proxyHostname``, ``proxyPort``, ``proxyUserName`` (the
@@ -56,7 +68,8 @@ exception class).
 
 The final block holds one fixed value per key: ``DEST_SHAPE``,
 ``PROXY_VARIANT``, ``TLS``, ``TOKEN_SECONDS``, ``READ_ONLY``, ``QUERY_TIMEOUT``,
-``EXPLAIN_PLAN``, ``PRIVILEGES``. ``QUERY_TIMEOUT yes`` says the driver
+``EXPLAIN_PLAN``, ``PRIVILEGES``, ``WRITE_REFUSED`` (``yes`` only when S8b ran
+and the write was refused; ``no`` also when it did not run). ``QUERY_TIMEOUT yes`` says the driver
 accepted the timeout and ran a statement under it, not that it fired.
 
 S10 judges the effective privileges of the user (own grants plus what PUBLIC
@@ -76,8 +89,9 @@ per listed schema (at most 10), ``schema=<NAME> privileges=<KIND>:<n>,...``;
 a name or kind of an unexpected form is printed as ``<unprintable>``. Object
 names, grantors and user names are never printed.
 
-Exit code: 0 when S7 passed and ``PRIVILEGES`` is ``ok`` or ``review``, 1
-otherwise (``too_wide``, ``unknown``, or no database answer), 2 when the probe
+Exit code: 0 when S7 passed and ``PRIVILEGES`` is ``ok`` or ``review`` (and,
+with ``--write-test``, the write was refused), 1 otherwise (``too_wide``,
+``unknown``, no database answer, or an accepted write), 2 when the probe
 could not get as far as an attempt.
 """
 
@@ -119,6 +133,10 @@ MAX_SCHEMA_LINES = 10
 # System privileges (no schema) that reach business data of every schema.
 # DATA ADMIN authorises reading all data in the system views and any DDL.
 BROAD_SYSTEM_PRIVILEGES = frozenset({"DATA ADMIN"})
+SCHEMA_STATEMENT = "SET SCHEMA SYS"
+READ_ONLY_STATEMENT = "SET TRANSACTION READ ONLY"
+WRITE_TEST_TABLE = "#AGENT_PROBE_RO"
+WRITE_TEST_STATEMENT = f"CREATE LOCAL TEMPORARY TABLE {WRITE_TEST_TABLE} (I INTEGER)"
 
 
 class ProbeError(Exception):
@@ -164,6 +182,8 @@ class Facts:
     explain_plan: bool = False
     privileges: str = "unknown"
     version_ok: bool = False
+    write_test_ran: bool = False
+    write_refused: bool = False
 
 
 # ---- output -------------------------------------------------------------------
@@ -660,11 +680,14 @@ def report_block(facts: Facts) -> str:
             f"QUERY_TIMEOUT {_yes(facts.query_timeout)}",
             f"EXPLAIN_PLAN {_yes(facts.explain_plan)}",
             f"PRIVILEGES {facts.privileges}",
+            f"WRITE_REFUSED {_yes(facts.write_refused)}",
         ]
     )
 
 
 def exit_code(facts: Facts) -> int:
+    if facts.write_test_ran and not facts.write_refused:
+        return 1
     return 0 if facts.version_ok and facts.privileges in ("ok", "review") else 1
 
 
@@ -688,6 +711,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checks-file", help="JSON list of {name, sql, binds} to run")
     parser.add_argument("--timeout", type=float, default=15.0, help="seconds to connect")
     parser.add_argument("--no-version", action="store_true", help="do not print HANA's version")
+    parser.add_argument(
+        "--write-test",
+        action="store_true",
+        help="attempt one session-local write inside the read-only transaction "
+        "(it must be refused); only with the customer's agreement",
+    )
     return parser
 
 
@@ -816,7 +845,8 @@ def _run(args, environ, facts, transport, open_socket, handshake, connect) -> No
                 _close(attempt)
     facts.tls = tls_fact(logins)
     if conn is None:
-        for step in ("database", "read_only", "query_timeout", "privileges", "explain_plan"):
+        for step in ("database", "schema_pin", "read_only", "write_refused", "query_timeout",
+                     "privileges", "explain_plan"):
             say("SKIP", step, "no login")
         return
     try:
@@ -852,17 +882,34 @@ def _sql_steps(conn, args, facts: Facts, checks: list[dict]) -> None:
     except Exception as exc:  # noqa: BLE001
         say("FAIL", "database", sql_code_of(exc))
 
-    # S8: S7 opened a transaction (autocommit is off). End it, so SET
-    # TRANSACTION READ ONLY is the first statement of the transaction S9-S12
-    # then run in; mid-transaction it could be refused, and A5 would be judged
-    # on a transaction that never was read-only.
+    # S8: S7 opened a transaction (autocommit is off). End it, so the
+    # transaction S9-S12 then run in starts here; mid-transaction SET
+    # TRANSACTION READ ONLY could be refused, and A5 would be judged on a
+    # transaction that never was read-only. The app's order: the schema pin
+    # first, the read-only statement last before the reads.
     try:
         conn.rollback()
-        cursor.execute("SET TRANSACTION READ ONLY")
+    except Exception as exc:  # noqa: BLE001
+        say("FAIL", "read_only", f"rollback {sql_code_of(exc)}")
+    try:
+        cursor.execute(SCHEMA_STATEMENT)
+        say("PASS", "schema_pin", "accepted")
+    except Exception as exc:  # noqa: BLE001
+        say("FAIL", "schema_pin", sql_code_of(exc))
+    try:
+        cursor.execute(READ_ONLY_STATEMENT)
         facts.read_only = True
         say("PASS", "read_only", "accepted")
     except Exception as exc:  # noqa: BLE001
         say("FAIL", "read_only", sql_code_of(exc))
+
+    # S8b
+    if not args.write_test:
+        say("SKIP", "write_refused", "no --write-test")
+    elif not facts.read_only:
+        say("SKIP", "write_refused", "not read-only")
+    else:
+        _write_test(conn, cursor, facts)
 
     # S9
     try:
@@ -922,6 +969,25 @@ def _sql_steps(conn, args, facts: Facts, checks: list[dict]) -> None:
         cursor.close()
     except Exception:  # noqa: BLE001,S110
         pass
+
+
+def _write_test(conn, cursor, facts: Facts) -> None:
+    """S8b: a write inside the read-only transaction must be refused."""
+    facts.write_test_ran = True
+    try:
+        cursor.execute(WRITE_TEST_STATEMENT)
+    except Exception as exc:  # noqa: BLE001 - code or class only
+        facts.write_refused = True
+        say("PASS", "write_refused", sql_code_of(exc))
+        return
+    # Accepted: the transaction was not read-only. Undo, and run nothing more in it.
+    for undo in (lambda: cursor.execute(f"DROP TABLE {WRITE_TEST_TABLE}"), conn.rollback):
+        try:
+            undo()
+        except Exception:  # noqa: BLE001,S110 - best effort; the table is session-local
+            pass
+    facts.read_only = False
+    say("FAIL", "write_refused", "the write was accepted")
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -497,6 +497,7 @@ def test_report_block_and_exit_code():
         "QUERY_TIMEOUT yes",
         "EXPLAIN_PLAN no",
         "PRIVILEGES ok",
+        "WRITE_REFUSED no",
     ]
     assert probe.exit_code(facts) == 0
     facts.privileges = "review"
@@ -534,10 +535,12 @@ def _mock_transport(destination: dict) -> httpx.MockTransport:
 
 
 class FakeConnection:
-    def __init__(self, privileges, explain_fails=False, read_only_fails=False):
+    def __init__(self, privileges, explain_fails=False, read_only_fails=False,
+                 write_refused=False):
         self.privileges = privileges
         self.explain_fails = explain_fails
         self.read_only_fails = read_only_fails
+        self.write_refused = write_refused
         self.closed = False
         self.rolled_back = False
         self.statements: list[str] = []
@@ -563,6 +566,8 @@ class FakeConnection:
                     self.result = list(conn.privileges)
                 elif sql.startswith("SET TRANSACTION") and conn.read_only_fails:
                     raise dbapi.Error(7, "feature not supported: secret text")
+                elif sql.startswith("CREATE LOCAL TEMPORARY") and conn.write_refused:
+                    raise dbapi.Error(7, "transaction is read-only: secret text")
                 elif sql.startswith("EXPLAIN PLAN") and conn.explain_fails:
                     raise dbapi.Error(258, "insufficient privilege: secret text")
                 elif "EXPLAIN_PLAN_TABLE" in sql:
@@ -604,9 +609,11 @@ def _run(
     extra: list[str] | None = None,
     connect=None,
     read_only_fails: bool = False,
+    write_refused: bool = False,
 ):
     calls: list[dict] = []
-    conn = FakeConnection(privileges, read_only_fails=read_only_fails)
+    conn = FakeConnection(privileges, read_only_fails=read_only_fails,
+                          write_refused=write_refused)
 
     def fake_connect(**kwargs):
         calls.append(kwargs)
@@ -717,9 +724,10 @@ def test_read_only_starts_a_fresh_transaction(capsys):
     database = next(i for i, x in enumerate(s) if "M_DATABASE" in x)
     read_only = s.index("SET TRANSACTION READ ONLY")
     # S7 opened a transaction (autocommit off): it is rolled back right before S8,
-    # so S8 is the first statement of the transaction S9-S11 then run in.
+    # so S8 (schema pin, then read-only, the app's order) opens the transaction
+    # S9-S11 then run in.
     assert database < read_only
-    assert s[read_only - 1] == "ROLLBACK"
+    assert s[read_only - 2:read_only] == ["ROLLBACK", "SET SCHEMA SYS"]
     between = s[read_only + 1 :]
     assert any("EXPLAIN PLAN" in x for x in between)
     explain = next(i for i, x in enumerate(s) if x.startswith("EXPLAIN PLAN"))
@@ -777,3 +785,86 @@ def test_a_missing_hdbcli_stops_before_any_attempt(monkeypatch, capsys):
 def test_unencodable_hosts_are_a_probe_error(host):
     with pytest.raises(probe.ProbeError):
         probe.socks5_connect_request(host, 30013)
+
+
+# ---- final review: the write test --------------------------------------------------------
+
+
+def test_schema_pin_comes_before_read_only_and_the_write_test_is_off_by_default(capsys):
+    code, _, conn = _run(HTTP_DESTINATION, privileges=[("MONITORING", None)])
+    out = capsys.readouterr().out
+    assert code == 0, out
+    assert "PASS schema_pin: accepted" in out
+    assert "PASS read_only: accepted" in out
+    assert "SKIP write_refused: no --write-test" in out
+    assert "WRITE_REFUSED no" in out
+    assert not any(x.startswith("CREATE") for x in conn.statements)
+    s = conn.statements
+    assert s.index("SET SCHEMA SYS") < s.index("SET TRANSACTION READ ONLY")
+    assert out.index("schema_pin") < out.index("read_only:") < out.index("write_refused")
+
+
+def test_parser_write_test_flag():
+    assert probe.build_parser().parse_args(["--destination", "d"]).write_test is False
+    assert probe.build_parser().parse_args(
+        ["--destination", "d", "--write-test"]).write_test is True
+
+
+def test_a_refused_write_passes_inside_the_read_only_transaction(tmp_path, capsys):
+    checks = tmp_path / "checks.json"
+    checks.write_text(json.dumps([{"name": "alerts", "sql": "SELECT * FROM M_ALERTS"}]))
+    code, _, conn = _run(
+        HTTP_DESTINATION, privileges=[("MONITORING", None)], write_refused=True,
+        extra=["--write-test", "--checks-file", str(checks)])
+    out = capsys.readouterr().out
+    assert code == 0, out
+    assert "PASS write_refused: sql_code=7" in out
+    assert "WRITE_REFUSED yes" in out
+    assert "READ_ONLY yes" in out
+    assert "secret text" not in out
+    _assert_clean(out)
+    s = conn.statements
+    read_only = s.index("SET TRANSACTION READ ONLY")
+    create = next(i for i, x in enumerate(s) if x.startswith("CREATE LOCAL TEMPORARY"))
+    assert s[create] == "CREATE LOCAL TEMPORARY TABLE #AGENT_PROBE_RO (I INTEGER)"
+    assert create == read_only + 1  # same transaction, nothing in between
+    assert not any(x.startswith("DROP") for x in s)
+    assert "PASS checks: passed=1 failed=0" in out
+
+
+def test_an_accepted_write_fails_is_dropped_and_rolled_back(tmp_path, capsys):
+    checks = tmp_path / "checks.json"
+    checks.write_text(json.dumps([{"name": "alerts", "sql": "SELECT * FROM M_ALERTS"}]))
+    code, _, conn = _run(
+        HTTP_DESTINATION, privileges=[("MONITORING", None)],
+        extra=["--write-test", "--checks-file", str(checks)])
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "FAIL write_refused: the write was accepted" in out
+    assert "WRITE_REFUSED no" in out
+    # The transaction was not read-only after all: nothing more runs in it.
+    assert "READ_ONLY no" in out
+    assert "SKIP checks: not read-only" in out
+    _assert_clean(out)
+    s = conn.statements
+    create = next(i for i, x in enumerate(s) if x.startswith("CREATE LOCAL TEMPORARY"))
+    assert s[create + 1:create + 3] == ["DROP TABLE #AGENT_PROBE_RO", "ROLLBACK"]
+    assert not any("M_ALERTS" in x for x in s)
+
+
+def test_the_write_test_is_skipped_when_read_only_was_refused(capsys):
+    _, _, conn = _run(HTTP_DESTINATION, privileges=[("MONITORING", None)],
+                      read_only_fails=True, extra=["--write-test"])
+    out = capsys.readouterr().out
+    assert "SKIP write_refused: not read-only" in out
+    assert not any(x.startswith("CREATE") for x in conn.statements)
+
+
+def test_no_login_skips_the_new_steps_too(capsys):
+    def refuse(kwargs, conn):
+        raise dbapi.Error(10, "authentication failed: secret text")
+
+    _run(HTTP_DESTINATION, privileges=[], connect=refuse, extra=["--write-test"])
+    out = capsys.readouterr().out
+    assert "SKIP schema_pin: no login" in out
+    assert "SKIP write_refused: no login" in out
