@@ -263,6 +263,42 @@ async def test_run_check_bad_arguments(db: h.FakeDbapi, kw: dict, argument: str)
     assert db.calls == []
 
 
+async def test_run_check_passes_host_as_a_bind(db: h.FakeDbapi) -> None:
+    register(Check(name="traceTail", category="monitoring", purpose="Trace tail.",
+                   source="bin/traceTail.js",
+                   statements=(Statement("", "SELECT A FROM SYS.M_TRACEFILE_CONTENTS "
+                                             "WHERE HOST = ? AND FILE_NAME = ?",
+                                         ("host", "object")),),
+                   args=frozenset({"top", "host", "object"}),
+                   required=frozenset({"host", "object"})))
+    db.description = (("A",),)
+    db.rows = [(1,)]
+    await call(build(), "run_check", system="sib_tenant", check="traceTail",
+               host="h1", object="f.trc")
+    executed = [c for c in db.calls if c[0] == "execute"][0]
+    assert executed[2] == ("h1", "f.trc")
+    answer = await call(build(), "run_check", system="sib_tenant", check="traceTail",
+                        host="evil host'x", object="f.trc")
+    assert answer["error"]["argument"] == "host"
+    _clean(answer, "evil host'x")
+    answer = await call(build(), "list_checks", category="monitoring")
+    tail = next(c for c in answer["checks"] if c["name"] == "traceTail")
+    by_name = {a["name"]: a for a in tail["arguments"]}
+    assert by_name["host"] == {"name": "host", "required": True,
+                               "rule": "a host name (letters, digits, . _ -)"}
+
+
+async def test_run_check_refuses_host_on_a_check_without_it(db: h.FakeDbapi) -> None:
+    answer = await call(build(), "run_check", system="sib_tenant", check="alerts", host="h1")
+    assert answer["error"]["argument"] == "host"
+    assert db.calls == []
+
+
+def test_run_check_doc_describes_host() -> None:
+    doc = tools._run_check_doc(True)
+    assert "host: " in doc and "`traces`" in doc
+
+
 async def test_run_check_undeclared_argument(db: h.FakeDbapi) -> None:
     answer = await call(build(), "run_check", system="sib_tenant", check="alerts", hours=3)
     assert answer["error"]["code"] == "invalid_argument"

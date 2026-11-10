@@ -133,9 +133,10 @@ def test_the_skill_names_the_required_arguments():
     from agents.hana.checks import get_check
 
     c = _skill()["content"]
-    assert "`traceContents` needs `object` (the trace file name)" in c
+    assert ("`traceContents` needs `host` and `object` (host and file name as listed"
+            " by `traces`)") in c
     assert "`columnStats` needs `schema` and `object`" in c
-    assert get_check("traceContents").required == frozenset({"object"})
+    assert get_check("traceContents").required == frozenset({"host", "object"})
     assert get_check("columnStats").required == frozenset({"schema", "object"})
 
 

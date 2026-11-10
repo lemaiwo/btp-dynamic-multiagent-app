@@ -15,9 +15,11 @@ changed per check:
   comment next to the check;
 - a large view has a row limit bound to ``top_plus_one``.
 
-``# on-prem: unverified`` marks a view or column not yet seen on a HANA 2.0
-SPS07 system; the landscape run checks those first and a check that fails
-there is rewritten or dropped.
+``# on-prem: verified 2026-11-10 on SPS07 rev 79`` marks a check whose
+statements ran on SYSTEMDB and a tenant of SPS07 (probe, 2026-11-10, sample
+binds; a NULL bind of an optional filter was not part of that run); "columns
+verified, statement not yet run" one rewritten after that run on columns each
+probed there; ``# on-prem: unverified`` what the run could not show.
 """
 
 from __future__ import annotations
@@ -39,8 +41,9 @@ HIDDEN = "<hidden>"
 # A line feed, carriage return or tab hides the value outright: if ^ and $ were
 # line anchors in HANA's LIKE_REGEXPR, one harmless line would otherwise show
 # a multi-line value with a secret on another line.
-# on-prem: unverified (LIKE_REGEXPR on SPS07, its anchors on a multi-line ini
-# value, and the CASE as a whole)
+# on-prem: verified 2026-11-10 on SPS07 rev 79 (LIKE_REGEXPR and the CASE are
+# accepted); unverified: the anchors on a multi-line ini value (the line
+# feed rule above hides such a value whatever they do)
 DENY_WORDS: tuple[str, ...] = (
     "password", "passwd", "pwd", "pass", "secret", "credential", "passphrase", "token",
     "auth", "cert", "salt", "saml", "jwt", "proxy", "keystore", "private", "ssl", "ldap")
@@ -73,17 +76,20 @@ HOST_INFORMATION_KEYS: tuple[str, ...] = (
     "cpu_threads", "cpu_sockets", "mem_phys", "mem_swap", "timezone_name", "timezone_offset",
     "start_time")
 """The host facts ``hostInformation`` returns: no user, address or path key
-(os_user, net_*, ...). on-prem: unverified (which of these keys exist)."""
+(os_user, net_*, ...). on-prem: the statement is verified 2026-11-10 on SPS07
+rev 79; unverified: which of these keys exist (an absent key is no row)."""
 
-# The optional filter on a name: ``(? IS NULL OR X = ?)`` with a NULL bind is
-# not verified on HANA, so the first ``?`` is typed explicitly.
+# The optional filter on a name: ``(? IS NULL OR X = ?)`` with a NULL bind
+# can fail with "cannot determine parameter type", so the first ``?`` is typed
+# explicitly. Accepted on SPS07 rev 79 with a non-NULL bind (2026-11-10); the
+# NULL bind is unverified.
 _OPTIONAL_FILE = "(CAST(? AS NVARCHAR(256)) IS NULL OR FILE_NAME = ?)"
 
 
 # ---- single views (task 13a) ----------------------------------------------------------
 
 register(
-    Check(
+    Check(  # on-prem: verified 2026-11-10 on SPS07 rev 79
         name="systemInfo",
         category="system",
         purpose=(
@@ -107,7 +113,7 @@ register(
         ),
         max_rows_cap=200,
     ),
-    Check(
+    Check(  # on-prem: verified 2026-11-10 on SPS07 rev 79
         name="hostInformation",
         category="system",
         purpose=(
@@ -137,7 +143,7 @@ register(
             ),
         ),
     ),
-    Check(  # on-prem: unverified (M_DISK_USAGE and its columns)
+    Check(  # on-prem: verified 2026-11-10 on SPS07 rev 79
         name="disks",
         category="system",
         purpose="Disks of the system (size and use per usage type) and disk use per usage type.",
@@ -158,7 +164,7 @@ register(
         ),
         max_rows_cap=200,
     ),
-    Check(
+    Check(  # on-prem: verified 2026-11-10 on SPS07 rev 79
         name="ports",
         category="system",
         purpose="The internal and SQL port of each service.",
@@ -173,7 +179,7 @@ register(
         ),
         max_rows_cap=200,
     ),
-    Check(  # on-prem: unverified (M_DATA_VOLUMES and M_DATA_VOLUME_PAGE_STATISTICS columns)
+    Check(  # on-prem: verified 2026-11-10 on SPS07 rev 79
         name="dataVolumes",
         category="system",
         purpose=(
@@ -207,7 +213,7 @@ register(
         ),
         max_rows_cap=200,
     ),
-    Check(  # on-prem: unverified (M_FEATURES and FEATURE_VERSION)
+    Check(  # on-prem: verified 2026-11-10 on SPS07 rev 79
         name="features",
         category="system",
         purpose="The features the database offers, per component.",
@@ -221,7 +227,10 @@ register(
             ),
         ),
     ),
-    Check(  # on-prem: unverified (M_FEATURE_USAGE columns)
+    # on-prem: OBJECT_COUNT ran past the probe's 20 s timeout on the S/4 tenant
+    # (SQL code 613, alone as well as in the statement; fine on SYSTEMDB) and
+    # is left out. This statement ran on both (column-probes fu2_no_objcount).
+    Check(  # on-prem: verified 2026-11-10 on SPS07 rev 79
         name="featureUsage",
         category="system",
         purpose="How often each feature was used, and when last, per component.",
@@ -229,28 +238,36 @@ register(
         statements=(
             Statement(
                 "",
-                "SELECT TOP ? COMPONENT_NAME, FEATURE_NAME, IS_DEPRECATED, OBJECT_COUNT,"
+                "SELECT TOP ? COMPONENT_NAME, FEATURE_NAME, IS_DEPRECATED,"
                 " CALL_COUNT, LAST_TIMESTAMP"
                 " FROM SYS.M_FEATURE_USAGE ORDER BY COMPONENT_NAME, FEATURE_NAME",
                 ("top_plus_one",),
             ),
         ),
     ),
-    Check(  # on-prem: unverified (M_INIFILES columns LAYER_NAME, TENANT_NAME, HOST)
+    # on-prem: M_INIFILES has FILE_NAME only on SPS07 (LAYER_NAME, TENANT_NAME
+    # and HOST: SQL code 260, 2026-11-10); the files and the layers, tenants and
+    # hosts they set parameters in come from M_INIFILE_CONTENTS, grouped. No
+    # key or value is selected (iniContents is the check for those).
+    # on-prem: columns verified 2026-11-10 on SPS07 rev 79, statement not yet run
+    Check(
         name="iniFiles",
         category="system",
-        purpose="The configuration (.ini) files and the layers they are set in.",
+        purpose=("The configuration (.ini) files, the layers, tenants and hosts they set"
+                 " parameters in, and how many."),
         source="bin/iniFiles.js",
         statements=(
             Statement(
                 "",
-                "SELECT TOP ? FILE_NAME, LAYER_NAME, TENANT_NAME, HOST FROM SYS.M_INIFILES"
-                " ORDER BY FILE_NAME, LAYER_NAME",
+                "SELECT TOP ? FILE_NAME, LAYER_NAME, TENANT_NAME, HOST,"
+                " COUNT(*) AS PARAMETER_COUNT FROM SYS.M_INIFILE_CONTENTS"
+                " GROUP BY FILE_NAME, LAYER_NAME, TENANT_NAME, HOST"
+                " ORDER BY FILE_NAME, LAYER_NAME, TENANT_NAME, HOST",
                 ("top_plus_one",),
             ),
         ),
     ),
-    Check(
+    Check(  # on-prem: verified 2026-11-10 on SPS07 rev 79
         name="iniContents",
         category="system",
         purpose=(
@@ -301,7 +318,7 @@ _BLOCKED = (
 HANA Cloud view; HANA 2.0 reports waiting transactions in M_BLOCKED_TRANSACTIONS."""
 
 register(
-    Check(  # on-prem: unverified (M_DATABASES columns, M_TRANSACTIONS status values)
+    Check(  # on-prem: verified 2026-11-10 on SPS07 rev 79
         name="healthCheck",
         category="system",
         purpose=(
@@ -363,7 +380,7 @@ register(
         ),
         max_rows_cap=200,
     ),
-    Check(  # on-prem: unverified (_SYS_STATISTICS.STATISTICS_CURRENT_ALERTS, BLOCKED_TIME)
+    Check(  # on-prem: verified 2026-11-10 on SPS07 rev 79
         name="diagnose",
         category="system",
         purpose=(
@@ -398,7 +415,7 @@ register(
         ),
         max_rows_cap=200,
     ),
-    Check(  # on-prem: unverified (M_TABLE_STATISTICS and M_CACHES columns)
+    Check(  # on-prem: verified 2026-11-10 on SPS07 rev 79 (all parts but read_tables)
         name="recommendations",
         category="system",
         purpose=(
@@ -408,11 +425,16 @@ register(
         source="bin/recommendations.js",
         statements=(
             # on-prem: hana-cli's SCAN_COUNT > RECORD_COUNT is no column pair of
-            # M_TABLE_STATISTICS on HANA 2.0; the most read tables instead.
+            # M_TABLE_STATISTICS on HANA 2.0; the most read tables instead. SPS07
+            # has no READ_COUNT / WRITE_COUNT there either (SQL code 260,
+            # 2026-11-10): the SELECT count and the change counts per table.
+            # on-prem: columns verified 2026-11-10 on SPS07 rev 79, statement not
+            # yet run
             Statement(
                 "read_tables",
-                "SELECT TOP ? SCHEMA_NAME, TABLE_NAME, READ_COUNT, WRITE_COUNT, SELECT_COUNT"
-                " FROM SYS.M_TABLE_STATISTICS ORDER BY READ_COUNT DESC",
+                "SELECT TOP ? SCHEMA_NAME, TABLE_NAME, SELECT_COUNT, INSERT_COUNT,"
+                " UPDATE_COUNT, DELETE_COUNT, LAST_MODIFY_TIME"
+                " FROM SYS.M_TABLE_STATISTICS ORDER BY SELECT_COUNT DESC",
                 ("top_plus_one",),
             ),
             # on-prem: TOTAL_EXECUTION_TIME and EXECUTION_COUNT per statement hash
@@ -435,7 +457,7 @@ register(
             ),
             # on-prem: MEMORY_SIZE_IN_TOTAL is a column of M_CS_TABLES (there is no
             # COMPRESSION_RATIO); a large delta or a stale compression shows here.
-            # cost: unverified on a large system (M_CS_TABLES over every column table)
+            # cost: within the probe's 20 s on an S/4 tenant (2026-11-10)
             Statement(
                 "large_tables",
                 "SELECT TOP ? SCHEMA_NAME, TABLE_NAME, RECORD_COUNT, MEMORY_SIZE_IN_TOTAL,"
@@ -448,7 +470,7 @@ register(
         ),
         max_rows_cap=100,
     ),
-    Check(  # on-prem: unverified (M_WORKLOAD columns, SYS.WORKLOAD_CLASSES columns)
+    Check(  # on-prem: verified 2026-11-10 on SPS07 rev 79
         name="workloadManagement",
         category="system",
         purpose=(

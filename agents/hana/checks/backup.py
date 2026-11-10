@@ -3,9 +3,9 @@
 Each check is data: ``register(Check(...))`` at import, with its SQL as a
 constant and every variable part a ``?`` bind (see :mod:`.base`).
 
-The target is on-premise SAP HANA 2.0 (SPS07). ``# on-prem: unverified``
-marks a view or column not yet seen on an SPS07 system: the landscape run
-decides. ``COMMENT`` of the backup catalogue is never selected: it is free
+The target is on-premise SAP HANA 2.0 (SPS07). Every statement here ran on
+SYSTEMDB and a tenant of SPS07 rev 79 (probe, 2026-11-10) except ``progress``,
+rewritten on columns probed there. ``COMMENT`` of the backup catalogue is never selected: it is free
 text somebody typed, and the word is refused by the registry anyway.
 Destination paths and backint ids are left out: they name the backup
 server's file system.
@@ -30,9 +30,13 @@ _LOG_BACKUP_SETTINGS = (
 # looks back 90 days in fixed SQL, so it never aggregates the whole
 # catalogue (a type not backed up for 90 days has no row); successful log
 # backups are left out of the recent list (one every few minutes per service
-# would fill it), failed ones stay. M_BACKUP_PROGRESS and its columns
-# TRANSFERRED_SIZE / TOTAL_SIZE: unverified. The log backup settings are read
-# from M_INIFILE_CONTENTS for named keys only (hana-cli: the whole section).
+# would fill it), failed ones stay. The log backup settings are read from
+# M_INIFILE_CONTENTS for named keys only (hana-cli: the whole section).
+# on-prem: verified 2026-11-10 on SPS07 rev 79 (last_successful, recent,
+# log_settings). `progress`: M_BACKUP_PROGRESS has no TOTAL_SIZE on SPS07
+# (SQL code 260); BACKUP_SIZE (the size of the whole backup) stands in, next to
+# TRANSFERRED_SIZE: columns verified 2026-11-10 on SPS07 rev 79, statement not
+# yet run.
 BACKUP_STATUS = Check(
     name="backupStatus",
     category="backup",
@@ -64,7 +68,7 @@ BACKUP_STATUS = Check(
         Statement(
             "progress",
             "SELECT TOP ? HOST, PORT, SERVICE_NAME, BACKUP_ID, ENTRY_TYPE_NAME, STATE_NAME,"
-            " SYS_START_TIME, TRANSFERRED_SIZE, TOTAL_SIZE"
+            " SYS_START_TIME, TRANSFERRED_SIZE, BACKUP_SIZE"
             " FROM SYS.M_BACKUP_PROGRESS"
             " ORDER BY SYS_START_TIME DESC, HOST, PORT",
             ("top_plus_one",),
@@ -90,6 +94,7 @@ BACKUP_STATUS = Check(
 # EXTERNAL_BACKUP_ID are left out: they name the backup server's paths. The
 # `hours` window and the type filter apply to the catalogue in a subquery,
 # before the join, so the file rows of older backups are never joined.
+# on-prem: verified 2026-11-10 on SPS07 rev 79
 BACKUP_LIST = Check(
     name="backupList",
     category="backup",

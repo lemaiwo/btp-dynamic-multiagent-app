@@ -514,6 +514,52 @@ def test_bind_values_follow_the_statement() -> None:
     assert base.bind_values(DUMMY_TWO.statements[1], args) == (6, 2)
 
 
+DUMMY_HOSTED = Check(
+    name="dummyHosted", category="monitoring", purpose="Dummy check with a host.",
+    source="bin/dummyHosted.js",
+    statements=(Statement(
+        "", "SELECT TOP ? HOST FROM SYS.M_TRACEFILE_CONTENTS WHERE HOST = ? AND FILE_NAME = ?",
+        ("top_plus_one", "host", "object")),),
+    args=frozenset({"top", "host", "object"}),
+    required=frozenset({"host", "object"}),
+)
+
+
+def test_host_argument() -> None:
+    assert ARGS["host"].kind == "host" and ARGS["host"].default is None
+    assert base.HOST_NAME_RE.pattern == r"^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$"
+    base.validate_check(DUMMY_HOSTED)
+    for host in ("h1", "hdb01", "hdb01.corp.example", "1host", "a_b-c", "x" * 255):
+        resolved = base.resolve_args(DUMMY_HOSTED, host=host, object="f.trc")
+        assert base.bind_values(DUMMY_HOSTED.statements[0], resolved) == (51, host, "f.trc")
+
+
+@pytest.mark.parametrize("value", [
+    "", "-h1", ".h1", "h 1", "h'1", 'h"1', "h1:30015", "h1/x", "h1;", "x" * 256, "é",
+    "h1\n", 5, True, ["h1"], SECRET])
+def test_bad_host_names_the_argument_not_the_value(value) -> None:
+    with pytest.raises(InvalidArgument) as info:
+        base.resolve_args(DUMMY_HOSTED, host=value, object="f.trc")
+    assert info.value.argument == "host"
+    assert "host name" in info.value.rule
+    assert SECRET not in json.dumps(info.value.to_dict()) + str(info.value)
+
+
+def test_host_is_refused_where_not_declared() -> None:
+    with pytest.raises(InvalidArgument) as info:
+        base.resolve_args(DUMMY_ONE, host="h1")
+    assert info.value.argument == "host" and info.value.rule == "not an argument of this check"
+    with pytest.raises(InvalidArgument) as info:
+        base.resolve_args(DUMMY_HOSTED, object="f.trc")
+    assert info.value.argument == "host" and info.value.rule == "is required by this check"
+
+
+def test_dump_sample_of_host_fails_harmlessly(monkeypatch) -> None:
+    monkeypatch.setattr(base, "_REGISTRY", {})
+    registry.register(DUMMY_HOSTED)
+    assert base.dump_entries()[0]["binds"] == [2, "probe-no-such-host", "DUMMY"]
+
+
 def test_hana_ident_re() -> None:
     assert HANA_IDENT_RE.pattern == r"^[A-Za-z_][A-Za-z0-9_$#./]{0,126}$"
 

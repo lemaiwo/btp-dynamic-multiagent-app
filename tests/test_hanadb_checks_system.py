@@ -227,6 +227,36 @@ def test_feature_usage_names_no_user() -> None:
     assert "LAST_USER_NAME" not in sql and "LAST_APPLICATION_NAME" not in sql
 
 
+def _words(sql: str) -> set[str]:
+    return {t.value for t in tokenize(sql) if t.kind == "word"}
+
+
+def test_feature_usage_leaves_out_object_count() -> None:
+    # SPS07 tenant (2026-11-10): OBJECT_COUNT alone runs past the 20 s timeout.
+    words = _words(get_check("featureUsage").statements[0].sql)
+    assert "OBJECT_COUNT" not in words
+    assert {"CALL_COUNT", "LAST_TIMESTAMP", "IS_DEPRECATED"} <= words
+
+
+def test_ini_files_read_the_contents_view() -> None:
+    # SPS07: M_INIFILES has FILE_NAME only; layer, tenant and host per file
+    # come from M_INIFILE_CONTENTS, grouped. No value or key is selected.
+    sql = get_check("iniFiles").statements[0].sql
+    words = _words(sql)
+    assert "M_INIFILE_CONTENTS" in words and "M_INIFILES" not in words
+    assert "GROUP" in words
+    assert '"VALUE"' not in sql and '"KEY"' not in sql
+
+
+def test_read_tables_counts_selects() -> None:
+    # SPS07: M_TABLE_STATISTICS has no READ_COUNT / WRITE_COUNT.
+    parts = {s.label: s for s in get_check("recommendations").statements}
+    words = _words(parts["read_tables"].sql)
+    assert not words & {"READ_COUNT", "WRITE_COUNT"}
+    assert "SELECT_COUNT" in words
+    assert parts["read_tables"].binds == ("top_plus_one",)
+
+
 def test_health_check_backups_last_30_days() -> None:
     sql = dict((s.label, s.sql) for s in get_check("healthCheck").statements)["backups"]
     assert "WHERE SYS_START_TIME >= ADD_DAYS(CURRENT_TIMESTAMP, -30)" in sql

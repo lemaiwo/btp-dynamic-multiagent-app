@@ -3,8 +3,8 @@
 A check is DATA: a name (hana-cli's command name), a category, a one-line
 purpose, the upstream file it was derived from, and one or more fixed SQL
 statements whose only variable parts are ``?`` bind parameters. The model
-picks a check by name and passes at most four arguments (``schema``,
-``object``, ``top``, ``hours``); it never supplies SQL. Every argument is
+picks a check by name and passes at most five arguments (``schema``,
+``object``, ``top``, ``hours``, ``host``); it never supplies SQL. Every argument is
 checked here, before anything is sent, and a refusal names the argument and
 the rule, never the value: the value is model output and may hold anything.
 
@@ -44,6 +44,12 @@ catalogue column as given (no upper-casing), so these two characters cannot
 change the statement. Any other character of a delimited identifier (a space,
 a quote, ``::``) is refused for now."""
 
+HOST_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$")
+"""A host name as an argument (``traceContents``): a letter or digit, then
+letters, digits, ``.``, ``_`` and ``-``, at most 255 characters, as
+``M_TRACEFILES.HOST`` writes it. Only ever a bind parameter; no port, no
+``:`` and no ``/``, so it cannot be read as an address or a path."""
+
 MAX_PURPOSE = 120
 MAX_ROWS = 500
 _FORBIDDEN_MARKERS = ("{", "}", "%s", "%(")
@@ -51,7 +57,7 @@ _FORBIDDEN_MARKERS = ("{", "}", "%s", "%(")
 
 @dataclass(frozen=True)
 class Arg:
-    """One argument a check may declare. ``kind`` is ``int`` or ``ident``."""
+    """One argument a check may declare. ``kind`` is ``int``, ``ident`` or ``host``."""
 
     name: str
     kind: str
@@ -64,6 +70,9 @@ class Arg:
     def rule(self) -> str:
         if self.kind == "int":
             return f"must be a whole number from {self.low} to {self.high}"
+        if self.kind == "host":
+            return ("must be a host name: a letter or digit then letters, digits, . _ -,"
+                    " at most 255")
         return "must be an identifier: a letter or _ then letters, digits, _ $ # . /, at most 127"
 
 
@@ -72,6 +81,9 @@ ARGS: dict[str, Arg] = {
     "object": Arg("object", "ident", None, sample="DUMMY"),
     "top": Arg("top", "int", 50, 1, MAX_ROWS, sample=1),
     "hours": Arg("hours", "int", 24, 1, 720, sample=24),
+    # The sample is a host that does not exist: the probe's run of a check
+    # that binds it fails harmlessly (SPS07 answers SQL code 8).
+    "host": Arg("host", "host", None, sample="probe-no-such-host"),
 }
 """The closed set of arguments. A statement binds only these names."""
 
@@ -282,7 +294,8 @@ def _check_value(arg: Arg, value: Any) -> Any:
                 arg.low <= value <= arg.high):
             raise InvalidArgument(arg.name, arg.rule)
         return value
-    if not isinstance(value, str) or not HANA_IDENT_RE.fullmatch(value):
+    pattern = HOST_NAME_RE if arg.kind == "host" else HANA_IDENT_RE
+    if not isinstance(value, str) or not pattern.fullmatch(value):
         raise InvalidArgument(arg.name, arg.rule)
     return value
 
@@ -294,6 +307,7 @@ def resolve_args(
     object: Any = None,  # noqa: A002 - the tool's argument name
     top: Any = None,
     hours: Any = None,
+    host: Any = None,
 ) -> dict[str, Any]:
     """The values of the arguments ``check`` declares, defaults filled in.
 
@@ -303,7 +317,8 @@ def resolve_args(
     rule, and ``top`` also against the check's ``max_rows_cap``. Every refusal
     is :class:`InvalidArgument` naming the argument and the rule only.
     """
-    given = {"schema": schema, "object": object, "top": top, "hours": hours}
+    given = {"schema": schema, "object": object, "top": top, "hours": hours,
+             "host": host}
     resolved: dict[str, Any] = {}
     for name in ARGS:  # a fixed order: the first refused argument is deterministic
         value = given[name]
@@ -387,7 +402,8 @@ def dump_entries() -> list[dict[str, Any]]:
     """``[{name, sql, binds}]`` for ``scripts/probe_hana_connectivity.py --checks-file``.
 
     One entry per statement (a composite check's as ``<name>.<label>``), with
-    the sample values of :data:`ARGS` (``SYS``, ``DUMMY``, 1, 24; ``top_plus_one`` 2)
+    the sample values of :data:`ARGS` (``SYS``, ``DUMMY``, 1, 24,
+    ``probe-no-such-host``; ``top_plus_one`` 2)
     as binds.
     """
     entries = []

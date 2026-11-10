@@ -107,11 +107,16 @@ def test_the_seven_monitoring_checks() -> None:
 
 async def test_alerts(monkeypatch) -> None:
     check = assert_registered("alerts", "monitoring", {"top"})
-    assert "_SYS_STATISTICS.STATISTICS_CURRENT_ALERTS" in check.statements[0].sql
+    sql = check.statements[0].sql
+    assert "_SYS_STATISTICS.STATISTICS_CURRENT_ALERTS" in sql
+    # SPS07 (2026-11-10): the current alerts carry their name and no HOST / PORT,
+    # so there is no join to STATISTICS_ALERT_INFORMATION and no host column.
+    words = {t.value for t in tokenize(sql) if t.kind == "word"}
+    assert not words & {"HOST", "PORT", "JOIN", "STATISTICS_ALERT_INFORMATION"}
     columns = ["ALERT_TIMESTAMP", "ALERT_ID", "ALERT_NAME", "ALERT_RATING",
-               "ALERT_DETAILS", "HOST", "PORT"]
-    rows = [("2026-11-10 10:00:00", 2, "Disk usage", 4, "d", "h1", 30003),
-            ("2026-11-10 09:00:00", 3, "Inactive services", 3, "d", "h1", 30003)]
+               "ALERT_DETAILS", "ALERT_USERACTION"]
+    rows = [("2026-11-10 10:00:00", 2, "Disk usage", 4, "d", "u"),
+            ("2026-11-10 09:00:00", 3, "Inactive services", 3, "d", "u")]
     answer, executes = await run_on_fake(monkeypatch, "alerts", columns, rows)
     assert_single(answer, columns)
     assert executes[0][2] == (51,)
@@ -143,7 +148,10 @@ async def test_deadlocks(monkeypatch) -> None:
 
 
 async def test_traces(monkeypatch) -> None:
-    assert_registered("traces", "monitoring", {"top"})
+    check = assert_registered("traces", "monitoring", {"top"})
+    # traceContents takes the host and the file name as traces lists them.
+    words = {t.value for t in tokenize(check.statements[0].sql) if t.kind == "word"}
+    assert {"HOST", "FILE_NAME"} <= words
     columns = ["HOST", "FILE_NAME", "FILE_SIZE", "FILE_MTIME"]
     rows = [("h1", "indexserver_h1.30003.000.trc", 10, "t"),
             ("h1", "nameserver_h1.30001.000.trc", 20, "t")]
@@ -153,27 +161,33 @@ async def test_traces(monkeypatch) -> None:
 
 
 async def test_trace_contents(monkeypatch) -> None:
-    check = assert_registered("traceContents", "monitoring", {"top", "object"})
+    check = assert_registered("traceContents", "monitoring", {"top", "object", "host"})
     assert check.requires_select is True and check.max_rows_cap == 200
+    # SQL code 500 on SPS07 without both: M_TRACEFILE_CONTENTS needs equality
+    # predicates on HOST and FILE_NAME.
+    assert "WHERE HOST = ? AND FILE_NAME = ?" in check.statements[0].sql
     columns = ["HOST", "FILE_NAME", "OFFSET", "CONTENT"]
     rows = [("h1", "f.trc", 2000, "line b"), ("h1", "f.trc", 1000, "line a")]
     answer, executes = await run_on_fake(
-        monkeypatch, "traceContents", columns, rows, allow_select=True, object="f.trc")
+        monkeypatch, "traceContents", columns, rows, allow_select=True, object="f.trc",
+        host="h1")
     assert_single(answer, columns)
-    assert executes[0][2] == (51, "f.trc")
+    assert executes[0][2] == (51, "h1", "f.trc")
     assert "unmasked" in check.purpose
     answer, _ = await run_on_fake(
         monkeypatch, "traceContents", columns, rows, allow_select=True, object="f.trc",
-        top=201)
+        host="h1", top=201)
     assert answer["error"]["argument"] == "top"
 
 
-async def test_trace_contents_requires_the_file_name(monkeypatch) -> None:
-    assert registry.get_check("traceContents").required == frozenset({"object"})
+@pytest.mark.parametrize("given, missing", [
+    ({}, "object"), ({"host": "h1"}, "object"), ({"object": "f.trc"}, "host")])
+async def test_trace_contents_requires_host_and_file_name(monkeypatch, given, missing) -> None:
+    assert registry.get_check("traceContents").required == frozenset({"object", "host"})
     answer, executes = await run_on_fake(
-        monkeypatch, "traceContents", ["A"], [(1,)], allow_select=True)
+        monkeypatch, "traceContents", ["A"], [(1,)], allow_select=True, **given)
     assert answer["error"]["code"] == "invalid_argument"
-    assert answer["error"]["argument"] == "object"
+    assert answer["error"]["argument"] == missing
     assert executes == []
 
 
@@ -182,7 +196,7 @@ async def test_trace_contents_is_hidden_without_allow_select(monkeypatch) -> Non
         c.name for c in registry.visible_checks(allow_select=False)}
     assert "traceContents" in {c.name for c in registry.visible_checks(allow_select=True)}
     answer, executes = await run_on_fake(
-        monkeypatch, "traceContents", ["A"], [(1,)], object="f.trc")
+        monkeypatch, "traceContents", ["A"], [(1,)], object="f.trc", host="h1")
     assert answer["error"]["code"] == "unknown_check"
     assert executes == []
 
@@ -199,13 +213,18 @@ async def test_crash_dumps(monkeypatch) -> None:
 
 
 async def test_replication_status(monkeypatch) -> None:
-    assert_registered("replicationStatus", "monitoring", {"top"})
+    check = assert_registered("replicationStatus", "monitoring", {"top"})
+    # SPS07: M_SERVICE_REPLICATION has no OPERATION_MODE (it is a column of
+    # M_SYSTEM_REPLICATION only).
+    words = {t.value for t in tokenize(check.statements[0].sql) if t.kind == "word"}
+    assert "OPERATION_MODE" not in words
     columns = ["HOST", "PORT", "SITE_NAME", "SECONDARY_HOST", "SECONDARY_PORT",
-               "SECONDARY_SITE_NAME", "REPLICATION_MODE", "OPERATION_MODE",
+               "SECONDARY_SITE_NAME", "REPLICATION_MODE",
                "REPLICATION_STATUS", "REPLICATION_STATUS_DETAILS",
-               "SECONDARY_ACTIVE_STATUS", "SHIPPED_LOG_POSITION_TIME",
-               "LAST_LOG_POSITION_TIME", "LOG_SHIPPING_DELAY_SECONDS"]
-    rows = [tuple(range(14)), tuple(range(14, 28))]
+               "SECONDARY_ACTIVE_STATUS", "SECONDARY_FULLY_RECOVERABLE",
+               "SHIPPED_LOG_POSITION_TIME", "LAST_LOG_POSITION_TIME",
+               "LOG_SHIPPING_DELAY_SECONDS", "BACKLOG_SIZE", "BACKLOG_TIME"]
+    rows = [tuple(range(16)), tuple(range(16, 32))]
     answer, executes = await run_on_fake(monkeypatch, "replicationStatus", columns, rows)
     assert_single(answer, columns)
     assert executes[0][2] == (51,)

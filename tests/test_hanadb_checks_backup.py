@@ -43,6 +43,16 @@ def test_recent_backups_carry_no_message() -> None:
     assert "MESSAGE" not in _words(recent.sql)
 
 
+def test_progress_reads_the_columns_sps07_has() -> None:
+    # SPS07 (2026-11-10): M_BACKUP_PROGRESS has BACKUP_SIZE (the size of the
+    # whole backup) and TRANSFERRED_SIZE, no TOTAL_SIZE.
+    progress = registry.get_check("backupStatus").statements[2]
+    assert progress.label == "progress"
+    words = _words(progress.sql)
+    assert {"BACKUP_SIZE", "TRANSFERRED_SIZE"} <= words
+    assert "TOTAL_SIZE" not in words
+
+
 def test_last_successful_is_bounded_to_90_days() -> None:
     check = registry.get_check("backupStatus")
     assert "ADD_DAYS(CURRENT_TIMESTAMP, -90)" in check.statements[0].sql

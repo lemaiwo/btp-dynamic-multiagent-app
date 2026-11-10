@@ -7,15 +7,18 @@ The target is on-premise SAP HANA 2.0 (SPS07). hana-cli reads several of
 these views with ``SELECT *`` and falls back on another ``ORDER BY`` when a
 column is missing; here every column is named (the database user may read
 more than a check needs, so the SQL limits the answer) and the statement is
-written for the HANA 2.0 view. ``# on-prem: unverified`` marks a view or
-column not yet seen on an SPS07 system: the landscape run decides.
+written for the HANA 2.0 view. Every statement here ran on SYSTEMDB and a
+tenant of SPS07 rev 79 (probe, 2026-11-10, sample binds): ``# on-prem:
+verified 2026-11-10 on SPS07 rev 79``; ``# on-prem: unverified`` marks what
+that run could not show.
 
 ``queryPlan`` is not a check: ``EXPLAIN PLAN`` failed on the landscape.
 
 An optional ``schema`` filter is written
 ``(CAST(? AS NVARCHAR(256)) IS NULL OR SCHEMA_NAME = ?)``: the CAST gives the
 NULL bind a type (a bare ``? IS NULL`` can fail with "cannot determine
-parameter type"); the form itself is unverified on HANA (``tableHotspots``,
+parameter type"); the form is accepted on SPS07 rev 79 with a non-NULL bind
+(2026-11-10), the NULL bind is unverified (``tableHotspots``,
 ``fragmentationCheck``).
 """
 
@@ -27,7 +30,8 @@ _SCHEMA_FILTER = "(CAST(? AS NVARCHAR(256)) IS NULL OR SCHEMA_NAME = ?)"
 
 # on-prem: M_MEMORY_OBJECTS of hana-cli is replaced by the service view
 # M_SERVICE_MEMORY and the per-component view M_SERVICE_COMPONENT_MEMORY
-# (component view and EFFECTIVE_ALLOCATION_LIMIT: unverified).
+# (component view and EFFECTIVE_ALLOCATION_LIMIT).
+# on-prem: verified 2026-11-10 on SPS07 rev 79
 MEMORY_ANALYSIS = Check(
     name="memoryAnalysis",
     category="performance",
@@ -57,8 +61,9 @@ MEMORY_ANALYSIS = Check(
 # on-prem: hana-cli groups M_HEAP_MEMORY by a COMPONENT column; here the
 # largest allocators now, plus their growth over the last hours from the
 # statistics server's history _SYS_STATISTICS.HOST_HEAP_ALLOCATORS
-# (history table and its SERVER_TIMESTAMP column: unverified). A leak is an
+# (history table and its SERVER_TIMESTAMP column). A leak is an
 # allocator that keeps growing, which one snapshot cannot show.
+# on-prem: verified 2026-11-10 on SPS07 rev 79
 # on-prem: unverified (time zone of SERVER_TIMESTAMP; cost with hours=720)
 MEMORY_LEAKS = Check(
     name="memoryLeaks",
@@ -93,7 +98,8 @@ MEMORY_LEAKS = Check(
 
 # on-prem: M_EXPENSIVE_STATEMENTS as in hana-cli, named columns instead of *.
 # PARAMETERS (bind values: business data) and ERROR_TEXT are left out;
-# STATEMENT_STRING is masked. APP_USER and APPLICATION_NAME: unverified.
+# STATEMENT_STRING is masked.
+# on-prem: verified 2026-11-10 on SPS07 rev 79
 EXPENSIVE_STATEMENTS = Check(
     name="expensiveStatements",
     category="performance",
@@ -117,9 +123,10 @@ EXPENSIVE_STATEMENTS = Check(
 # on-prem: hana-cli reads M_TABLE_STATISTICS (and M_TABLE_PARTITIONS) with *
 # and an ORDER BY that falls back when TOTAL_ACCESS_COUNT is missing. The
 # read and write counters of a column table are in M_CS_TABLES (one row per
-# partition, summed here); row store tables are not covered. READ_COUNT and
-# WRITE_COUNT: unverified.
-# cost: unverified on a large system (whole M_CS_TABLES grouped when no schema)
+# partition, summed here); row store tables are not covered.
+# on-prem: verified 2026-11-10 on SPS07 rev 79
+# cost: within the probe's 20 s on an S/4 tenant with a schema bind (2026-11-10);
+# unverified without a schema (whole M_CS_TABLES grouped)
 TABLE_HOTSPOTS = Check(
     name="tableHotspots",
     category="performance",
@@ -145,7 +152,8 @@ TABLE_HOTSPOTS = Check(
 # M_ACTIVE_STATEMENTS does not have; here it is the time since
 # LAST_EXECUTED_TIME of a statement whose STATEMENT_STATUS is ACTIVE, and the
 # user comes from M_CONNECTIONS (LAST_EXECUTED_TIME, STATEMENT_STATUS,
-# ALLOCATED_MEMORY_SIZE: unverified). The caller's own connection is left out.
+# ALLOCATED_MEMORY_SIZE). The caller's own connection is left out.
+# on-prem: verified 2026-11-10 on SPS07 rev 79
 LONG_RUNNING = Check(
     name="longRunning",
     category="performance",
@@ -170,6 +178,7 @@ LONG_RUNNING = Check(
 # on-prem: M_CS_COLUMNS as in hana-cli, named columns instead of *, with
 # schema and table as exact binds (hana-cli: LIKE patterns). COUNT is quoted:
 # it is also a function name.
+# on-prem: verified 2026-11-10 on SPS07 rev 79
 COLUMN_STATS = Check(
     name="columnStats",
     category="performance",
@@ -191,9 +200,10 @@ COLUMN_STATS = Check(
 )
 
 # on-prem: M_CS_TABLES as in hana-cli: the share of a column table partition's
-# memory held in its delta store (LAST_MERGE_TIME and RAW_RECORD_COUNT_IN_DELTA:
-# unverified).
-# cost: unverified on a large system (whole M_CS_TABLES sorted when no schema)
+# memory held in its delta store (LAST_MERGE_TIME and RAW_RECORD_COUNT_IN_DELTA).
+# on-prem: verified 2026-11-10 on SPS07 rev 79
+# cost: within the probe's 20 s on an S/4 tenant with a schema bind (2026-11-10);
+# unverified without a schema (whole M_CS_TABLES sorted)
 FRAGMENTATION_CHECK = Check(
     name="fragmentationCheck",
     category="performance",
