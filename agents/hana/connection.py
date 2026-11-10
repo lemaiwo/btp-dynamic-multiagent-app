@@ -55,11 +55,27 @@ logger = logging.getLogger(__name__)
 DEFAULT_ENCRYPT = True
 CONNECT_TIMEOUT_MS = 15000
 QUERY_TIMEOUT_SECONDS = 20
+CALL_DEADLINE_SECONDS = 45
+"""How long a caller waits for its connection thread. Above connectTimeout
+(15 s) plus the query timeout (20 s); on expiry the caller gets ``timeout``
+while the thread keeps its slot until it really ends."""
 MAX_CONCURRENT = 4
 """Connections at a time per process; a thread that runs on after its caller
 was cancelled keeps its slot until it ends."""
 
 READ_ONLY_STATEMENT = "SET TRANSACTION READ ONLY"
+# The SELECT guard allows unqualified M_* names and does not check unqualified
+# function calls; HANA resolves both in the session's current schema first,
+# and the destination's user may have a schema of its own with look-alikes.
+# Pinning SYS makes an unqualified name mean the monitoring view. Run after
+# SET TRANSACTION READ ONLY (SET SCHEMA is a session setting, not a write):
+# unverified on the landscape.
+SCHEMA_STATEMENT = "SET SCHEMA SYS"
+# hana.* destination properties this layer reads. hana.database is accepted
+# and ignored: the first system's destination carries it, and a tenant is
+# reached on its own mapped SQL port, so no databaseName is sent.
+_HANA_PROPERTIES = frozenset({"hana.encrypt", "hana.sslHostNameInCertificate",
+                              "hana.database"})
 
 _HOST_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?")
 _MAX_LOCATION_ID = 100
@@ -67,8 +83,14 @@ _LOGIN_CODES = frozenset({10, 414, 663})
 _NOT_AUTHORIZED_CODES = frozenset({258})
 _TIMEOUT_CODES = frozenset({1024, 613})
 # hdbcli's client-side codes of a connection that failed or broke.
+# hdbcli's client-side code of a connection that could not be made. The
+# probe saw it for a refused CONNECT at the Cloud Connector and for a TLS
+# login against a port without TLS (that one stays `unreachable`). Which
+# words its text holds per cause was never recorded (texts are not printed),
+# so the word classification in map_driver_error is not observed on a
+# landscape; nor is any other negative code, which stays `sql_error` with
+# its code (e.g. -10807).
 _CONNECT_CODES = frozenset({-10709})
-_CONNECTION_LOST_CODES = frozenset({-10807})
 
 
 @dataclass(frozen=True, repr=False)
@@ -153,6 +175,10 @@ def settings_from_properties(props: Mapping[str, Any], name: str) -> HanaTarget:
     if location is not None and (
             not isinstance(location, str) or len(location) > _MAX_LOCATION_ID):
         raise _refuse(name, "CloudConnectorLocationId is not a location id")
+    if any(isinstance(k, str) and k.startswith("hana.") and k not in _HANA_PROPERTIES
+           for k in props):
+        raise _refuse(name, "a hana.* property other than hana.encrypt, "
+                            "hana.sslHostNameInCertificate or hana.database")
     raw_encrypt = props.get("hana.encrypt")
     if raw_encrypt is None:
         encrypt = DEFAULT_ENCRYPT
@@ -205,6 +231,8 @@ def _driver_error_class() -> type[BaseException] | None:
 
 
 def _int_code(exc: BaseException) -> int | None:
+    if isinstance(exc, OSError):
+        return None  # an errno is no SQL code
     code = getattr(exc, "errorcode", None)
     if code is None and exc.args:
         code = exc.args[0]
@@ -230,10 +258,8 @@ def map_driver_error(exc: BaseException) -> HanaError:
             text = str(getattr(exc, "errortext", "") or "").lower()
             if "timed out" in text or "timeout" in text:
                 return HanaError("timeout")
-            if "refused" in text or "proxy" in text:
+            if "refused" in text:
                 return HanaError("proxy_refused")
-            return HanaError("unreachable")
-        if code in _CONNECTION_LOST_CODES:
             return HanaError("unreachable")
         return HanaError("sql_error", sql_code=code)
     if isinstance(exc, ConnectionRefusedError):
@@ -347,6 +373,8 @@ def _execute(system: str, kwargs: dict[str, Any], sql: str, binds: tuple,
         cursor = conn.cursor()
         step = "read_only"
         cursor.execute(READ_ONLY_STATEMENT)
+        step = "set_schema"
+        cursor.execute(SCHEMA_STATEMENT)
         step = "setquerytimeout"
         cursor.setquerytimeout(QUERY_TIMEOUT_SECONDS)
         step = "execute"
@@ -389,9 +417,15 @@ async def _in_slot(system: str, kwargs: dict[str, Any], sql: str, binds: tuple,
             fut.exception()  # retrieved: no "never retrieved" warning
 
     future.add_done_callback(_done)
-    # The thread cannot be cancelled: a cancelled caller leaves it running
-    # in its slot, so the cap counts connections, not callers.
-    return await asyncio.shield(future)
+    # The thread cannot be cancelled: a cancelled or timed-out caller leaves
+    # it running in its slot, so the cap counts connections, not callers.
+    try:
+        return await asyncio.wait_for(asyncio.shield(future), CALL_DEADLINE_SECONDS)
+    except TimeoutError:
+        if future.done():
+            raise  # the thread's own TimeoutError: mapped like any failure
+        logger.warning("hana: call deadline passed for system %s", system)
+        raise HanaError("timeout") from None
 
 
 async def run_query(system: HanaSystem, sql: str, binds: Sequence[Any],
@@ -438,7 +472,8 @@ async def run_query(system: HanaSystem, sql: str, binds: Sequence[Any],
 
 
 __all__ = [
-    "CONNECT_TIMEOUT_MS", "DEFAULT_ENCRYPT", "MAX_CONCURRENT", "QUERY_TIMEOUT_SECONDS",
+    "CALL_DEADLINE_SECONDS", "CONNECT_TIMEOUT_MS", "DEFAULT_ENCRYPT", "MAX_CONCURRENT",
+    "QUERY_TIMEOUT_SECONDS",
     "HanaSystem", "HanaTarget", "Socks5Proxy", "connect_kwargs", "map_driver_error",
     "run_query", "settings_from_properties",
 ]

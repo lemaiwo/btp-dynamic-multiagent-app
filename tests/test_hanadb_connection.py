@@ -145,6 +145,8 @@ def test_ssl_host_property_read():
     h.tcp_props(Address=f"{h.HOST}:0"),
     h.tcp_props(Address=f"{h.HOST}:abc"),
     h.http_props(**{"hana.sslHostNameInCertificate": "bad host/x"}),
+    h.http_props(**{"hana.sslTrustStore": "x"}),
+    h.http_props(**{"hana.Encrypt": "false"}),
 ], ids=lambda p: ",".join(sorted(p)) if isinstance(p, dict) else str(p))
 def test_bad_destination_refused(props, caplog):
     caplog.set_level(logging.DEBUG)
@@ -233,6 +235,7 @@ async def test_run_query_sequence_and_result(monkeypatch):
         ("setautocommit", False),
         ("cursor",),
         ("read_only",),
+        ("set_schema",),
         ("setquerytimeout", QUERY_TIMEOUT_SECONDS),
         ("execute", "SELECT A, B FROM M_X WHERE A = ?", ("1",)),
         ("fetchmany", 6),
@@ -276,7 +279,8 @@ async def test_run_query_runs_in_a_thread(monkeypatch):
 
 
 @pytest.mark.parametrize("step", [
-    "setautocommit", "cursor", "read_only", "setquerytimeout", "execute", "fetchmany"])
+    "setautocommit", "cursor", "read_only", "set_schema", "setquerytimeout", "execute",
+    "fetchmany"])
 async def test_rollback_and_close_on_every_failure(monkeypatch, step, caplog):
     caplog.set_level(logging.DEBUG)
     db = h.install(monkeypatch, h.FakeDbapi(fail_at={step: h.driver_error(339, "boom")}))
@@ -286,7 +290,7 @@ async def test_rollback_and_close_on_every_failure(monkeypatch, step, caplog):
     steps = db.steps()
     assert "rollback" in steps and steps[-1] == "close"
     assert "commit" not in steps
-    if step in ("setautocommit", "cursor", "read_only"):
+    if step in ("setautocommit", "cursor", "read_only", "set_schema"):
         assert "execute" not in steps
     _no_secret(str(info.value.to_dict()))
     assert info.value.__cause__ is None
@@ -379,10 +383,12 @@ async def test_cancelled_caller_keeps_slot_until_thread_ends(monkeypatch):
     (h.driver_error(-10709, "Connection failed (RTE:[89006] System call 'connect' "
                             "failed, rc=111:Connection refused)"), "proxy_refused"),
     (h.driver_error(-10709, "Connection failed (proxy server refused)"), "proxy_refused"),
+    (h.driver_error(-10709, "Connection failed (proxy handshake)"), "unreachable"),
+    (h.driver_error(-10709, "Connection failed (SSL handshake failed)"), "unreachable"),
     (h.driver_error(-10709, "Connection failed (RTE:[89008] Socket timed out)"), "timeout"),
     (h.driver_error(-10709, "Connection failed (RTE:[89001] Cannot resolve host)"),
      "unreachable"),
-    (h.driver_error(-10807, "Connection down"), "unreachable"),
+    (h.driver_error(-10807, "Connection down"), "sql_error"),
     (ConnectionRefusedError(f"{h.HOST} {h.MARKER}"), "proxy_refused"),
     (TimeoutError(f"{h.HOST} {h.MARKER}"), "timeout"),
     (OSError(f"{h.HOST} {h.MARKER}"), "unreachable"),
@@ -510,3 +516,74 @@ def test_log_lines_name_no_exception_text():
     for call in calls:
         assert "str(exc" not in call and "exc_info" not in call
         assert ".host" not in call and ".user" not in call
+
+
+# ---- fix round 1 -------------------------------------------------------------------------
+
+
+def test_schema_statement_is_fixed():
+    assert connection.SCHEMA_STATEMENT == "SET SCHEMA SYS"
+
+
+def test_hana_database_property_accepted_and_ignored():
+    target = settings_from_properties(h.http_props(**{"hana.database": "SIB"}), "sib")
+    kwargs = connect_kwargs(target, h.TOKEN, PROXY)
+    assert "databaseName" not in kwargs
+    assert "SIB" not in repr(target)
+
+
+def test_unknown_hana_property_named_by_rule_not_value(caplog):
+    caplog.set_level(logging.DEBUG)
+    with pytest.raises(HanaError) as info:
+        settings_from_properties(h.http_props(**{"hana.sslTrustStore": h.MARKER}), "sib")
+    assert info.value.code == "destination_error"
+    _logs_clean(caplog)
+    assert any("hana." in r.getMessage() for r in caplog.records)
+
+
+def test_connect_kwargs_encrypt_off_is_the_landscape_set():
+    target = settings_from_properties(h.http_props(**{"hana.encrypt": "false"}), "sib")
+    kwargs = connect_kwargs(target, h.TOKEN, PROXY)
+    assert kwargs["encrypt"] == "false"
+    assert not [k for k in kwargs if k.startswith("ssl")]
+
+
+def test_10807_keeps_its_sql_code(monkeypatch):
+    h.install(monkeypatch)
+    err = map_driver_error(h.driver_error(-10807, "Connection down"))
+    assert err.to_dict()["sql_code"] == -10807
+
+
+def test_os_errno_is_not_logged_as_sql_code(monkeypatch, caplog):
+    caplog.set_level(logging.DEBUG)
+    db = h.install(monkeypatch, h.FakeDbapi(
+        fail_at={"connect": ConnectionRefusedError(111, h.MARKER)}))
+    with pytest.raises(HanaError) as info:
+        await_ = run_query(_system(), "SELECT 1 FROM DUMMY", [], 1)
+        asyncio.run(await_)
+    assert info.value.code == "proxy_refused"
+    assert db.steps() == ["connect"]
+    text = " ".join(r.getMessage() for r in caplog.records)
+    assert "sql_code" not in text and "ConnectionRefusedError" in text
+
+
+async def test_call_deadline_raises_timeout_and_keeps_slot(monkeypatch, caplog):
+    caplog.set_level(logging.DEBUG)
+    gate = threading.Event()
+    db = h.install(monkeypatch, h.FakeDbapi(gate=gate))
+    assert connection.CALL_DEADLINE_SECONDS == 45
+    monkeypatch.setattr(connection, "CALL_DEADLINE_SECONDS", 0.1)
+    with pytest.raises(HanaError) as info:
+        await run_query(_system(), "SELECT 1 FROM DUMMY", [], 1)
+    assert info.value.code == "timeout"
+    assert db.inside == 1  # the thread still runs
+    monkeypatch.setattr(connection, "CALL_DEADLINE_SECONDS", 5)
+    more = [asyncio.create_task(run_query(_system(), "SELECT 1 FROM DUMMY", [], 1))
+            for _ in range(4)]
+    await asyncio.sleep(0.1)
+    assert len(db.connect_kwargs) == 4  # 1 timed-out thread + 3: the slot is still taken
+    gate.set()
+    await asyncio.gather(*more)
+    assert len(db.connect_kwargs) == 5
+    assert db.peak <= MAX_CONCURRENT
+    _logs_clean(caplog)

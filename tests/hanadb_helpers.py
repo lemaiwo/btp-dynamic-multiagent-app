@@ -68,6 +68,9 @@ class FakeCursor:
         if sql == "SET TRANSACTION READ ONLY":
             self._step("read_only")
             return
+        if sql == "SET SCHEMA SYS":
+            self._step("set_schema")
+            return
         if params is None:
             self._step("execute", sql)
         else:
