@@ -1793,7 +1793,7 @@ def _catalogue_part(signature: Any) -> list[Any]:
 
 def _entry_signatures(rows: Any) -> dict[str, Any]:
     """``{agent name: _entry_signature}`` of the agents that have OData,
-    InA, Bitbucket or Git access at all: what an import compares before and
+    InA, Bitbucket, Git, HANA or reconcile access at all: what an import compares before and
     after."""
     out: dict[str, Any] = {}
     for row in rows:
@@ -3269,7 +3269,8 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
         )
     if not (reload_outcome["reloaded"] or reload_outcome["reload_failed"]):
         # The other way an import closes access: an agent's own
-        # `builtin:odata` or `builtin:bitbucket` entry changed or went, or
+        # `builtin:odata`, `builtin:ina`, `builtin:bitbucket`, `builtin:git`,
+        # `builtin:hana` or `builtin:reconcile` entry changed or went, or
         # the agent was removed or disabled, with no catalogue service in
         # use touched. Same rule as an
         # agent save (`_reload_for_changed_entry`); one rebuild at most.
@@ -3277,7 +3278,7 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
             odata_after = _entry_signatures(await list_agents(session))
         if odata_after != odata_before:
             reload_outcome = await reload_running_agents(
-                "import with a changed OData or Bitbucket entry of an agent"
+                "import with a changed data, review, Git or HANA entry of an agent"
             )
 
     # An import can attach, detach or change any source: the data catalogue
@@ -3912,15 +3913,14 @@ async def _hana_destination_health(
     properties are read with the application's token, as the toolset does,
     and only the ``Authentication`` type is reported. A failure is the fixed
     text ending in a code (`agents.odata.destinations.destination_failure`),
-    the resolver's own text goes to the log with URLs masked; no host, user
-    or driver text ever reaches the answer."""
+    and the log names the system, the destination and that code only; no
+    host, user, resolver or driver text reaches the answer or the log."""
     from agents.destination import (
         MISSING_BINDING_MESSAGE,
         DestinationError,
         DestinationResolver,
     )
     from agents.odata.destinations import destination_failure
-    from agents.odata.preview import plain
 
     def _entry(system: str, destination: str) -> dict[str, Any]:
         return {
@@ -3958,10 +3958,12 @@ async def _hana_destination_health(
             entry["state"] = "resolvable"
         except DestinationError as e:
             code, entry["error"] = destination_failure(str(e))
+            # The code only: the resolver's text can quote the destination
+            # service's answer.
             logger.warning(
                 "credential health: destination '%s' of system '%s' of agent '%s' "
-                "failed (%s): %s",
-                name, system, agent, code, plain(str(e), 400),
+                "failed (%s)",
+                name, system, agent, code,
             )
         except Exception as e:  # noqa: BLE001 - a health check must not 500
             entry["error"] = f"the destination could not be checked ({type(e).__name__})"

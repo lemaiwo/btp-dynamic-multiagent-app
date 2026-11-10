@@ -135,3 +135,48 @@ def test_a_run_records_and_the_chat_card_shows_the_length_only():
     shown = _preview_args("run_select", {"system": "sib", "sql": SQL, "top": 100})
     assert shown == "system=sib, sql=<57 chars>, top=100"
     assert "M_SERVICES" in _preview_args("run_check", {"sql": SQL})
+
+
+@pytest.mark.parametrize("args", [
+    ["SELECT", SQL], (SQL,), 42, {"sql": ["SELECT", SQL]}, {"system": "sib", "sql": None},
+    {"system": "sib", "query": SQL}, b"SELECT HOST FROM SYS.M_SERVICES"])
+def test_run_select_of_any_other_shape_is_shown_as_its_length_only(args):
+    from agents.run_activity import _detail_for, redact_args
+
+    said = _detail_for("hana_run_select", args)
+    assert "M_SERVICES" not in said and said.startswith("<") and said.endswith(" chars>")
+    shown = redact_args("run_select", args)
+    assert isinstance(shown, str) and "M_SERVICES" not in shown
+
+
+def test_redact_args_hands_back_the_object_to_show():
+    from agents.run_activity import redact_args
+
+    args = {"system": "sib", "sql": SQL, "top": 100}
+    assert redact_args("hana_0_run_select", args) == {"system": "sib", "sql": "<57 chars>",
+                                                      "top": 100}
+    assert args["sql"] == SQL  # the caller's object is not changed
+    assert redact_args("run_check", args) is args
+    assert redact_args("run_select", None) is None
+
+
+def test_the_classic_chat_tool_card_shows_the_length_only():
+    from agents.chat_app import _tool_card_input
+
+    shown = _tool_card_input("hana_run_select", {"system": "sib", "sql": SQL, "top": 100})
+    assert shown == {"system": "sib", "sql": "<57 chars>", "top": 100}
+    assert _tool_card_input("run_check", {"sql": SQL}) == {"sql": SQL}
+    assert _tool_card_input("run_check", None) == {}
+    assert "M_SERVICES" not in str(_tool_card_input("run_select", f"not json {SQL}"))
+
+
+def test_the_classic_chat_sink_uses_the_card_helper():
+    """The sink is a closure inside the ASGI call: its tool card must take
+    its input from `_tool_card_input`, never from `update.args` itself."""
+    import inspect
+
+    import agents.chat_app as chat_app
+
+    source = inspect.getsource(chat_app)
+    assert "input=update.args" not in source
+    assert "input=_tool_card_input(name, update.args)" in source

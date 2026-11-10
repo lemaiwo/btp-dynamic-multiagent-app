@@ -29,6 +29,12 @@ os.environ.pop("MCP_URL_ALLOWLIST", None)
 import pytest  # noqa: E402
 from pydantic import ValidationError  # noqa: E402
 
+from agents.odata import admin_routes as _admin_routes  # noqa: E402
+
+# The real seam, taken before `tests/conftest.py` stubs it for each test
+# ("nothing is running yet"); the import reload test puts it back.
+REAL_LIVE_REGISTRY = _admin_routes._live_registry
+
 URL = "builtin:hana"
 SECRET = "Zx9secret"
 BASE = {"systems": [{"name": "prd", "destination": "HANA_PRD"}]}
@@ -447,7 +453,7 @@ class _NoSession:
         return False
 
 
-async def test_credential_health_lists_one_entry_per_system(monkeypatch):
+async def test_credential_health_lists_one_entry_per_system(monkeypatch, caplog):
     import agents.admin as admin
     import agents.destination as dest_mod
     from agents.destination import DestinationError, DestinationServiceConfig
@@ -496,6 +502,8 @@ async def test_credential_health_lists_one_entry_per_system(monkeypatch):
                    "state": "resolvable", "auth_type": "BasicAuthentication", "error": None}
     assert sysdb["system"] == "sysdb" and sysdb["state"] == "error"
     assert SECRET not in json.dumps(entries)
+    # The log names the system and the code, never the resolver's text.
+    assert "system 'sysdb'" in caplog.text and SECRET not in caplog.text
 
 
 async def test_credential_health_of_a_refused_block_is_one_fixed_error(monkeypatch):
@@ -512,3 +520,56 @@ async def test_credential_health_of_a_refused_block_is_one_fixed_error(monkeypat
     assert entry["state"] == "error" and entry["system"] == "" and entry["destination"] == ""
     assert entry["error"].startswith("oauth.systems[0].name:")
     assert SECRET not in json.dumps(entry)
+
+
+# --- a bundle import that changes the entry reloads -----------------------------
+
+@pytest.mark.usefixtures("real_agents_and_mcp")
+async def test_an_import_that_drops_allow_select_reloads(monkeypatch):
+    from httpx import ASGITransport, AsyncClient
+    from pydantic_ai.models.test import TestModel
+
+    import agents.registry as registry_module
+    import app as app_module
+    from agents.chat_app import dynamic_chat_app
+    from agents.db import init_db
+    from agents.odata import admin_routes
+
+    await init_db()
+    await _wipe()
+    monkeypatch.setattr(registry_module, "get_model", lambda *a, **k: TestModel())
+    monkeypatch.setattr(admin_routes, "_live_registry", REAL_LIVE_REGISTRY)
+    registry = registry_module.registry
+    monkeypatch.setattr(registry, "_build", None)
+    async with AsyncClient(transport=ASGITransport(app=app_module.app),
+                           base_url="http://test") as client:
+        r = await client.post("/admin/api/agents", json={
+            "name": "dba", "description": "d", "instructions": "i",
+            "mcp_servers": [_server(_copy(FULL))], "expose_chat": False})
+        assert r.status_code == 201, r.text
+        await registry.reload()
+        assert "run_select" in await _tool_names(registry.build.specialists["dba"])
+
+        reloads: list[int] = []
+        real_reload = registry.reload
+
+        async def reload():
+            reloads.append(1)
+            return await real_reload()
+
+        monkeypatch.setattr(registry, "reload", reload)
+        monkeypatch.setattr(dynamic_chat_app, "refresh", lambda: None)
+
+        r = await client.get("/admin/api/export")
+        agents = r.json()["agents"]
+        (server,) = [s for s in agents[0]["mcp_servers"] if s.get("url") == URL]
+        server["oauth"].pop("allow_select", None)
+        r = await client.post("/admin/api/import", json={"agents": agents})
+        assert r.status_code == 200, r.text
+        assert r.json()["reloaded"] is True and reloads == [1]
+        assert await _tool_names(registry.build.specialists["dba"]) == TOOLS
+
+        # Unchanged entry: no reload.
+        agents[0]["description"] = "another text"
+        r = await client.post("/admin/api/import", json={"agents": agents})
+        assert r.status_code == 200 and r.json()["reloaded"] is False and reloads == [1]

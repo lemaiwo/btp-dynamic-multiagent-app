@@ -29,6 +29,7 @@ from uuid import uuid4
 
 from agents.progress import ProgressUpdate, current_progress
 from agents.registry import registry
+from agents.run_activity import redact_args
 from agents.shared import available_models, get_model
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,14 @@ _DELEGATE_PREFIX = "delegate_"
 _HB_QUIET_S = float(os.environ.get("CHAT_HEARTBEAT_QUIET_SECONDS", "1.5"))
 _HB_TICK_S = float(os.environ.get("CHAT_HEARTBEAT_TICK_SECONDS", "2.5"))
 _HB_POLL_S = 0.5
+
+
+def _tool_card_input(name: str, args: object) -> object:
+    """What a specialist's tool card shows as its input: the arguments as
+    `agents.run_activity.redact_args` lets every preview show them (a HANA
+    ``run_select``'s SQL as its length only), ``{}`` when there are none."""
+    shown = redact_args(name, args)
+    return shown if shown is not None else {}
 
 
 @dataclass
@@ -253,7 +262,7 @@ class DynamicChatApp:
                     ToolInputAvailableChunk(
                         tool_call_id=cid,
                         tool_name=name,
-                        input=update.args if update.args is not None else {},
+                        input=_tool_card_input(name, update.args),
                     )
                 )
             elif update.kind == "tool_end":

@@ -62,3 +62,15 @@ def test_it_is_apart_from_the_catalogue_part():
     from agents.admin import _catalogue_part
 
     assert _catalogue_part(_entry_signature(entry(BLOCK))) == []
+
+
+# --- the bundle import ---------------------------------------------------------
+
+def test_the_import_reload_names_every_entry_kind():
+    import inspect
+
+    import agents.admin as admin
+
+    assert "HANA" in inspect.getdoc(admin._entry_signatures)
+    source = inspect.getsource(admin)
+    assert "changed OData or Bitbucket entry of an agent" not in source

@@ -65,26 +65,50 @@ def _detail(args: Any) -> str:
 _SQL_LENGTH_ONLY = re.compile(r"(?:hana_(?:\d+_)?)?run_select")
 
 
-def _detail_for(tool_name: Any, args: Any) -> str:
-    """:func:`_detail` for one tool: the same line, except that a HANA
-    ``run_select`` call shows ``sql=<n chars>`` instead of its SQL. Arguments
-    handed over as JSON text are read as such; a text that is no JSON object
-    is shown as its length alone."""
+def _size(value: Any) -> int:
+    """The length of a value as text: a string's own, anything else's JSON."""
+    if isinstance(value, str):
+        return len(value)
+    return len(json.dumps(value, default=str))
+
+
+def redact_args(tool_name: Any, args: Any) -> Any:
+    """The arguments of one tool call as every preview may show them: the
+    run activity (:func:`_detail_for`), the web chat's tool card and the
+    classic chat's tool card (``agents/chat_app.py``).
+
+    For a HANA ``run_select`` (plain or prefixed) the ``sql`` value becomes
+    ``"<n chars>"`` in a new object (the caller's is not changed). It fails
+    closed: arguments handed over as JSON text are read as such, and any
+    shape other than an object with a string ``sql`` is shown as the length
+    of the whole, ``"<n chars>"``. Every other tool's arguments are returned
+    as they are (the same object).
+
+    Known limit: the web chat also stores pydantic-ai's ``new_messages()`` of
+    each turn (``chat_messages.model_json``, the conversation history the next
+    turn is given), which holds the real tool-call arguments, SQL included.
+    That history is not redacted here; it is the model's own context, not a
+    preview."""
     if not (isinstance(tool_name, str) and _SQL_LENGTH_ONLY.fullmatch(tool_name)):
-        return _detail(args)
-    if isinstance(args, str):
+        return args
+    if args is None:
+        return None
+    shown = args
+    if isinstance(shown, str):
         try:
-            parsed = json.loads(args)
+            shown = json.loads(shown)
         except ValueError:
-            parsed = None
-        if not isinstance(parsed, dict):
             return f"<{len(args)} chars>"
-        args = parsed
-    if isinstance(args, dict) and "sql" in args:
-        sql = args["sql"]
-        size = len(sql) if isinstance(sql, str) else len(json.dumps(sql, default=str))
-        args = {**args, "sql": f"<{size} chars>"}
-    return _detail(args)
+    if isinstance(shown, dict) and isinstance(shown.get("sql"), str):
+        return {**shown, "sql": f"<{len(shown['sql'])} chars>"}
+    return f"<{_size(args)} chars>"
+
+
+def _detail_for(tool_name: Any, args: Any) -> str:
+    """:func:`_detail` of the arguments :func:`redact_args` lets a preview
+    show: the same line, except that a HANA ``run_select`` call shows
+    ``sql=<n chars>`` (or only the length of the whole) instead of its SQL."""
+    return _detail(redact_args(tool_name, args))
 
 
 def _now() -> str:
