@@ -19,6 +19,7 @@ written to the run row once, when the run ends, so it stays readable after.
 from __future__ import annotations
 
 import json
+import re
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
@@ -56,6 +57,34 @@ def _detail(args: Any) -> str:
             parts.append(f"{key}={shown}")
         return _clip(", ".join(parts), _DETAIL_CHARS)
     return _clip(str(args), _DETAIL_CHARS)
+
+
+# ``builtin:hana``'s run_select, plain or prefixed (`hana_`, `hana_0_`): its
+# ``sql`` is model-written text that can quote values out of the database it
+# reads, so the preview keeps its length only.
+_SQL_LENGTH_ONLY = re.compile(r"(?:hana_(?:\d+_)?)?run_select")
+
+
+def _detail_for(tool_name: Any, args: Any) -> str:
+    """:func:`_detail` for one tool: the same line, except that a HANA
+    ``run_select`` call shows ``sql=<n chars>`` instead of its SQL. Arguments
+    handed over as JSON text are read as such; a text that is no JSON object
+    is shown as its length alone."""
+    if not (isinstance(tool_name, str) and _SQL_LENGTH_ONLY.fullmatch(tool_name)):
+        return _detail(args)
+    if isinstance(args, str):
+        try:
+            parsed = json.loads(args)
+        except ValueError:
+            parsed = None
+        if not isinstance(parsed, dict):
+            return f"<{len(args)} chars>"
+        args = parsed
+    if isinstance(args, dict) and "sql" in args:
+        sql = args["sql"]
+        size = len(sql) if isinstance(sql, str) else len(json.dumps(sql, default=str))
+        args = {**args, "sql": f"<{size} chars>"}
+    return _detail(args)
 
 
 def _now() -> str:
@@ -96,7 +125,8 @@ class RunActivity:
             event = {
                 "ts": _now(), "agent": update.agent, "kind": "tool",
                 "id": update.tool_call_id, "tool": update.tool_name or "?",
-                "detail": _detail(update.args), "status": "running", "output": "",
+                "detail": _detail_for(update.tool_name, update.args),
+                "status": "running", "output": "",
             }
             if update.tool_call_id:
                 self._open[update.tool_call_id] = event

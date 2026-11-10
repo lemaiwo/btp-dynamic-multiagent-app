@@ -147,6 +147,7 @@ from agents.git_config import clean_entry as clean_git_entry
 from agents.hana import BUILTIN_HANA_URL
 from agents.hana.config import HANA_SINGLE_ENTRY_MESSAGE
 from agents.hana.config import check_entry as check_hana_entry
+from agents.hana.config import pins_of as hana_pins_of
 from agents.ina import BUILTIN_INA_URL
 from agents.ina.models import QUERY_NAME_RE, check_query_names, validate_ina_query
 from agents.invoke_config import check_result_schema, clean_limits
@@ -1639,9 +1640,9 @@ async def api_create_agent(payload: AgentPayload) -> dict[str, Any]:
 
 def _entry_signature(servers: Any, enabled: Any = True) -> list[Any]:
     """What an agent's ``builtin:odata``, ``builtin:ina``, ``builtin:bitbucket``,
-    ``builtin:git`` and ``builtin:reconcile`` entries let it do: the part of an agent row whose
-    change must reach the running build at once. ``[]`` for an agent with
-    none of these entries.
+    ``builtin:git``, ``builtin:hana`` and ``builtin:reconcile`` entries let it
+    do: the part of an agent row whose change must reach the running build
+    at once. ``[]`` for an agent with none of these entries.
 
     Per OData entry the attached services (sorted) and whether it may write;
     order-free, so a save that only reorders is no change; per InA entry its
@@ -1698,6 +1699,25 @@ def _entry_signature(servers: Any, enabled: Any = True) -> list[Any]:
         except ValueError:
             stored = {"refused": [server.get("auth_mode"), block]}
         git.append((BUILTIN_GIT_URL, json.dumps(stored, sort_keys=True, default=str)))
+    # A ``builtin:hana`` entry the same way, read as the toolset reads it
+    # (`agents.hana.config.pins_of`): the systems and Allow SELECT come from
+    # the build, so an unticked "Allow SELECT", a system taken out or a
+    # changed destination must not wait for a manual reload. Systems sorted
+    # by name: an edit that only reorders them is no change.
+    hana = []
+    for server in servers:
+        if not isinstance(server, dict) or _server_key(server.get("url")) != BUILTIN_HANA_URL:
+            continue
+        block = server.get("oauth")
+        try:
+            if server.get("auth_mode") != AUTH_MODE_DESTINATION:
+                raise ValueError("not a destination entry")
+            pins = hana_pins_of(block)
+            stored: Any = {"systems": sorted(pins.systems),
+                           "allow_select": pins.allow_select}
+        except ValueError:
+            stored = {"refused": [server.get("auth_mode"), block]}
+        hana.append((BUILTIN_HANA_URL, json.dumps(stored, sort_keys=True, default=str)))
     # The queries an agent may run are read from the build as well: one taken
     # out of the entry must not stay runnable until a manual reload.
     ina = []
@@ -1720,7 +1740,8 @@ def _entry_signature(servers: Any, enabled: Any = True) -> list[Any]:
             "" if block.get(k) is None else str(block.get(k))
             for k in ("arc1_server", "target", "batch_size", "mismatch_cap")
         )))
-    return sorted(odata) + sorted(bitbucket) + sorted(git) + sorted(ina) + sorted(reconcile)
+    return (sorted(odata) + sorted(bitbucket) + sorted(git) + sorted(hana) + sorted(ina)
+            + sorted(reconcile))
 
 
 async def _reload_for_changed_entry(before: Any, after: Any, what: str) -> dict[str, bool]:
@@ -3800,6 +3821,12 @@ async def _destination_health() -> list[dict[str, Any]]:
                     await _ina_destination_health(row.name, oauth, queries, config, resolvers)
                 )
                 continue
+            if _server_key(srv.get("url")) == BUILTIN_HANA_URL:
+                # One destination per system: one entry per system.
+                out.extend(
+                    await _hana_destination_health(row.name, srv.get("oauth"), config, resolvers)
+                )
+                continue
             name = str(oauth.get("destination") or "").strip()
             user_context = oauth.get("user_context") is True
             entry: dict[str, Any] = {
@@ -3865,6 +3892,84 @@ async def _destination_health() -> list[dict[str, Any]]:
                     f"OAuth2JWTBearer or OAuth2SAMLBearerAssertion"
                 )
             out.append(entry)
+    return out
+
+
+async def _hana_destination_health(
+    agent: str,
+    oauth: Any,
+    config: Any,
+    resolvers: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """The `_destination_health` entries of one ``builtin:hana`` entry: one
+    per system, ``{agent, server_key, system, destination, user_context,
+    state, auth_type, error}``.
+
+    The block is read as the toolset reads it (`agents.hana.config.pins_of`);
+    a block it refuses is ONE entry in state ``error`` whose text is the
+    reading's own (field and rule, never a value) and that names no system.
+    A system's destination is a TCP destination (no URL to resolve): its
+    properties are read with the application's token, as the toolset does,
+    and only the ``Authentication`` type is reported. A failure is the fixed
+    text ending in a code (`agents.odata.destinations.destination_failure`),
+    the resolver's own text goes to the log with URLs masked; no host, user
+    or driver text ever reaches the answer."""
+    from agents.destination import (
+        MISSING_BINDING_MESSAGE,
+        DestinationError,
+        DestinationResolver,
+    )
+    from agents.odata.destinations import destination_failure
+    from agents.odata.preview import plain
+
+    def _entry(system: str, destination: str) -> dict[str, Any]:
+        return {
+            "agent": agent,
+            "server_key": BUILTIN_HANA_URL,
+            "system": system,
+            "destination": destination,
+            "user_context": False,
+            "state": "error",
+            "auth_type": "",
+            "error": None,
+        }
+
+    try:
+        pins = hana_pins_of(oauth)
+    except ValueError as refused:
+        entry = _entry("", "")
+        entry["error"] = str(refused)
+        return [entry]
+    out: list[dict[str, Any]] = []
+    for system, name in pins.systems:
+        entry = _entry(system, name)
+        out.append(entry)
+        if config is None:
+            entry["state"] = "unbound"
+            entry["error"] = MISSING_BINDING_MESSAGE
+            continue
+        resolver = resolvers.get(name)
+        if resolver is None:
+            resolver = DestinationResolver(name, config, require_credential=False)
+            resolvers[name] = resolver
+        try:
+            props = await resolver.resolve_properties()
+            entry["auth_type"] = str(getattr(props, "auth_type", "") or "")
+            entry["state"] = "resolvable"
+        except DestinationError as e:
+            code, entry["error"] = destination_failure(str(e))
+            logger.warning(
+                "credential health: destination '%s' of system '%s' of agent '%s' "
+                "failed (%s): %s",
+                name, system, agent, code, plain(str(e), 400),
+            )
+        except Exception as e:  # noqa: BLE001 - a health check must not 500
+            entry["error"] = f"the destination could not be checked ({type(e).__name__})"
+            logger.warning(
+                "credential health: destination '%s' of system '%s' of agent '%s' "
+                "failed (%s)",
+                name, system, agent, type(e).__name__,
+            )
     return out
 
 

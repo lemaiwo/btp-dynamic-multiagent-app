@@ -40,6 +40,8 @@ from agents.bitbucket_tools import activity_summary as bitbucket_activity_summar
 from agents.git_config import BUILTIN_GIT_URL
 from agents.git_tools import activity_summary as git_activity_summary
 from agents.builtins import build_builtin_toolset, is_builtin_url
+from agents.hana import BUILTIN_HANA_URL
+from agents.hana.tools import activity_summary as hana_activity_summary
 from agents.ina import BUILTIN_INA_URL
 from agents.ina.tools import NoUsableQueryError, attached_queries
 from agents.ina.tools import activity_summary as ina_activity_summary
@@ -233,6 +235,13 @@ def _short_tool_output(result) -> str:
             return fixed
         # The InA tools return SAP figures and member keys: counts only.
         fixed = ina_activity_summary(
+            getattr(result, "tool_name", None), getattr(result, "content", None)
+        )
+        if fixed is not None:
+            return fixed
+        # The HANA tools return database rows (and run_select whatever the
+        # model selected): counts, fixed words, a check name and codes only.
+        fixed = hana_activity_summary(
             getattr(result, "tool_name", None), getattr(result, "content", None)
         )
         if fixed is not None:
@@ -1024,6 +1033,15 @@ async def build_orchestrator() -> BuildResult:
                 "the agent is built without the InA tools",
                 row.name,
             )
+        # And for builtin:hana: the second entry could carry wider access
+        # (allow_select, another system) than the one somebody reviewed.
+        no_hana = sum(_server_key_of(s) == BUILTIN_HANA_URL for s in specs) > 1
+        if no_hana:
+            logger.warning(
+                "Agent '%s': its row holds more than one builtin:hana entry; "
+                "the agent is built without the HANA tools",
+                row.name,
+            )
         # This agent's remote MCP servers by endpoint, for a built-in that
         # works through a sibling entry (builtin:reconcile reads ECC through
         # the agent's ARC-1 server, whose own auth carries the user). Per
@@ -1036,6 +1054,8 @@ async def build_orchestrator() -> BuildResult:
             if no_git and _server_key_of(spec) == BUILTIN_GIT_URL:
                 continue
             if no_ina and _server_key_of(spec) == BUILTIN_INA_URL:
+                continue
+            if no_hana and _server_key_of(spec) == BUILTIN_HANA_URL:
                 continue
             server_name = row.name if idx == 0 else f"{row.name}-{idx}"
             try:

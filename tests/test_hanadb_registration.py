@@ -1,11 +1,9 @@
 """``builtin:hana`` at the admin gate and in storage: the storage cleaner,
 the gate's 422 texts (field and rule, never the value), one entry per agent,
 the canonical URL, the refusal of other auth modes and of the hana keys on
-another entry, and the gate's block equal to storage's.
-
-The toolset factory and the registry build come in a later task; until
-``builtin:hana`` is in ``agents.builtins._FACTORIES`` the fixture below adds
-the URL to ``BUILTIN_URLS`` for these tests only (a no-op afterwards).
+another entry, and the gate's block equal to storage's; the factory table,
+the entry in a real registry build, the denial in ABAP Assistant sessions and
+the credential health entries (one per system).
 
 Run:  python -m pytest tests/test_hanadb_registration.py
 """
@@ -13,6 +11,7 @@ Run:  python -m pytest tests/test_hanadb_registration.py
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -44,14 +43,6 @@ GIT = {"url": "builtin:git", "auth_mode": "destination",
 BITBUCKET = {"url": "builtin:bitbucket", "auth_mode": "destination",
              "oauth": {"destination": "BB", "workspace": "acme-ws",
                        "repositories": ["svc-a"]}}
-
-
-@pytest.fixture(autouse=True)
-def hana_is_known(monkeypatch):
-    import agents.builtins as builtins
-
-    if URL not in builtins.BUILTIN_URLS:
-        monkeypatch.setattr(builtins, "BUILTIN_URLS", builtins.BUILTIN_URLS | {URL})
 
 
 def _server(block: Any, url: str = URL, mode: str = "destination") -> dict[str, Any]:
@@ -273,3 +264,251 @@ def test_the_hana_keys_belong_to_a_hana_entry_only(url, block):
 def test_a_git_entry_with_a_hana_key_is_refused_by_its_own_reading():
     assert "builtin:git entry holds only" in _refusal(
         {**GIT["oauth"], "allow_select": True}, url="builtin:git")
+
+
+def test_an_update_that_leaves_allow_select_out_stores_none_over_a_row_that_had_it():
+    """No fallback to the row being replaced: the block holds no secret, so a
+    switch an edit leaves out is gone (as for Bitbucket and Git)."""
+    from types import SimpleNamespace
+
+    from agents.db import prepare_servers
+
+    existing = SimpleNamespace(mcp_servers=[_server(_copy(FULL))])
+    primary, _, oauth_json = prepare_servers([_server(_copy(BASE))], existing)
+    assert primary["url"] == URL
+    stored = json.loads(oauth_json)
+    assert stored == BASE and "allow_select" not in stored
+
+
+# --- factory ------------------------------------------------------------------
+
+TOOLS = {"list_systems", "list_checks", "run_check"}
+
+
+def test_hana_is_a_known_builtin():
+    from agents.builtins import BUILTIN_URLS, is_builtin_url
+
+    assert URL in BUILTIN_URLS and is_builtin_url(" BUILTIN:Hana ")
+
+
+def test_the_docstring_table_lists_the_builtin():
+    import agents.builtins as builtins
+
+    assert "builtin:hana        --        --        app (tcp)     --       --" in builtins.__doc__
+
+
+def test_the_factory_builds_without_a_binding_and_registers_run_select_only_when_allowed():
+    from agents.builtins import build_builtin_toolset
+
+    assert set(build_builtin_toolset(URL, _copy(BASE), "destination").tools) == TOOLS
+    assert set(build_builtin_toolset(URL, _copy(FULL), "destination").tools) == TOOLS | {
+        "run_select"}
+
+
+def test_the_factory_refuses_a_bad_block_and_names_the_server_without_the_value():
+    from agents.builtins import build_builtin_toolset
+
+    with pytest.raises(ValueError, match="^oauth.user_context: builtin:hana"):
+        build_builtin_toolset(URL, {**_copy(BASE), "user_context": True}, "destination")
+    for mode in ("app_only", "oauth2", "jwt", "none"):
+        with pytest.raises(ValueError, match=f"^{URL} requires auth_mode=destination"):
+            build_builtin_toolset(URL, _copy(BASE), mode)
+    with pytest.raises(ValueError, match=r"^oauth.systems\[0\].name:") as info:
+        build_builtin_toolset(URL, {"systems": [{"name": SECRET, "destination": "D"}]},
+                              "destination")
+    assert SECRET not in str(info.value)
+    with pytest.raises(ValueError, match="builtin:hana entry needs a config object"):
+        build_builtin_toolset(URL, None, "destination")
+
+
+def test_the_factory_is_handed_its_entry_and_nothing_of_the_context(monkeypatch):
+    import agents.builtins as builtins
+
+    seen: dict[str, Any] = {}
+
+    def fake(oauth, **kw):
+        seen.update(kw, oauth=oauth)
+        return object()
+
+    monkeypatch.setitem(builtins._FACTORIES, URL, fake)
+    builtins.build_builtin_toolset("Builtin:HANA", BASE, "destination",
+                                   context={"agent_name": "dba", "odata_services": {}})
+    assert seen == {"server_key": URL, "auth_mode": "destination", "oauth": BASE}
+
+
+def test_importing_the_builtins_does_not_import_the_driver():
+    import subprocess
+
+    code = ("import sys; import agents.builtins, agents.registry; "
+            "print('hdbcli' in sys.modules)")
+    env = {**os.environ, "DATABASE_URL": "sqlite+aiosqlite:///:memory:"}
+    out = subprocess.run([sys.executable, "-c", code], cwd=ROOT, env=env,
+                         capture_output=True, text=True, timeout=120)
+    assert out.returncode == 0, out.stderr[-2000:]
+    assert out.stdout.strip().splitlines()[-1] == "False"
+
+
+# --- a real registry build ----------------------------------------------------
+
+async def _wipe() -> None:
+    from sqlalchemy import delete
+
+    from agents.db import AgentConfig, SessionLocal, SkillConfig
+
+    async with SessionLocal() as session:
+        await session.execute(delete(AgentConfig))
+        await session.execute(delete(SkillConfig))
+        await session.commit()
+
+
+async def _build(agents: dict[str, list[dict[str, Any]]], raw: dict[str, Any] | None = None):
+    from pydantic_ai.models.test import TestModel
+    from sqlalchemy import select
+
+    from agents import registry as registry_module
+    from agents.db import AgentConfig, SessionLocal, init_db, upsert_agent
+
+    await init_db()
+    await _wipe()
+    async with SessionLocal() as s:
+        for name, servers in agents.items():
+            await upsert_agent(s, name=name, description="d", instructions="i",
+                               mcp_servers=servers)
+        await s.commit()
+        for name, servers in (raw or {}).items():
+            row = (await s.execute(
+                select(AgentConfig).where(AgentConfig.name == name))).scalar_one()
+            row.extra_servers_json = json.dumps(servers)
+        await s.commit()
+    real_get_model = registry_module.get_model
+    registry_module.get_model = lambda *a, **k: TestModel()
+    try:
+        return await registry_module.build_orchestrator()
+    finally:
+        registry_module.get_model = real_get_model
+
+
+async def _tool_names(agent) -> set[str]:
+    from pydantic_ai import RunContext
+    from pydantic_ai.models.test import TestModel
+    from pydantic_ai.usage import RunUsage
+
+    from agents.ide.readonly import ReadOnlyGuard
+
+    ctx = RunContext(deps=None, model=TestModel(), usage=RunUsage())
+    names: set[str] = set()
+    for toolset in getattr(agent, "_user_toolsets", ()) or ():
+        if isinstance(toolset, ReadOnlyGuard):
+            names |= set(await toolset.get_tools(ctx))
+    return names
+
+
+@pytest.mark.usefixtures("real_agents_and_mcp")
+async def test_a_registry_build_gives_the_agent_the_tools_its_entry_allows():
+    build = await _build({"reader": [_server(_copy(BASE))],
+                          "selector": [_server(_copy(FULL))]})
+    assert await _tool_names(build.specialists["reader"]) == TOOLS
+    assert await _tool_names(build.specialists["selector"]) == TOOLS | {"run_select"}
+
+
+@pytest.mark.usefixtures("real_agents_and_mcp")
+async def test_with_a_second_server_the_tools_carry_the_hana_prefix():
+    build = await _build({"dba": [_server(_copy(BASE)), NOTES]})
+    names = await _tool_names(build.specialists["dba"])
+    assert {"hana_" + n for n in TOOLS} <= names
+    assert not (TOOLS | {"run_select"}) & names
+
+
+@pytest.mark.usefixtures("real_agents_and_mcp")
+async def test_a_row_written_by_hand_with_two_hana_entries_gets_no_hana_tools(caplog):
+    caplog.set_level(logging.WARNING)
+    build = await _build({"dba": [NOTES]},
+                         raw={"dba": [_server(_copy(BASE)), _server(_copy(FULL))]})
+    names = await _tool_names(build.specialists["dba"])
+    assert names and not any(n.startswith("hana_") for n in names)
+    assert caplog.text.count("more than one builtin:hana entry") == 1
+    assert "HANA_PRD" not in caplog.text and "sysdb" not in caplog.text
+
+
+# --- credential health --------------------------------------------------------
+
+class _Row:
+    def __init__(self, name, servers, enabled=True):
+        self.name = name
+        self.mcp_servers = servers
+        self.enabled = enabled
+
+
+class _NoSession:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
+async def test_credential_health_lists_one_entry_per_system(monkeypatch):
+    import agents.admin as admin
+    import agents.destination as dest_mod
+    from agents.destination import DestinationError, DestinationServiceConfig
+
+    rows = [_Row("dba", [_server(_copy(FULL))]),
+            _Row("off", [_server(_copy(BASE))], enabled=False)]
+    monkeypatch.setattr(admin, "SessionLocal", lambda: _NoSession())
+
+    async def fake_list_agents(session):
+        return rows
+
+    monkeypatch.setattr(admin, "list_agents", fake_list_agents)
+    unbound = await admin._destination_health()
+    assert [(e["system"], e["destination"], e["state"]) for e in unbound] == [
+        ("prd", "HANA_PRD", "unbound"), ("sysdb", "HANA.SYS-DB", "unbound")]
+
+    monkeypatch.setattr(
+        dest_mod, "config_from_environment",
+        lambda env: DestinationServiceConfig("id", "placeholder", "https://uaa/oauth/token",
+                                             "https://api"),
+    )
+    asked: list[str] = []
+
+    class FakeProps:
+        auth_type = "BasicAuthentication"
+
+    class FakeResolverCls:
+        def __init__(self, name, config, **kw):
+            self.name = name
+
+        async def resolve(self, **kw):  # a TCP destination has no URL to resolve
+            raise AssertionError("resolve() called for a builtin:hana destination")
+
+        async def resolve_properties(self, **kw):
+            asked.append(self.name)
+            if self.name == "HANA.SYS-DB":
+                raise DestinationError(f"500 from https://{SECRET}.example.com/destinations")
+            return FakeProps()
+
+    monkeypatch.setattr(dest_mod, "DestinationResolver", FakeResolverCls)
+    entries = await admin._destination_health()
+    assert asked == ["HANA_PRD", "HANA.SYS-DB"]
+    prd, sysdb = entries
+    assert prd == {"agent": "dba", "server_key": URL, "system": "prd",
+                   "destination": "HANA_PRD", "user_context": False,
+                   "state": "resolvable", "auth_type": "BasicAuthentication", "error": None}
+    assert sysdb["system"] == "sysdb" and sysdb["state"] == "error"
+    assert SECRET not in json.dumps(entries)
+
+
+async def test_credential_health_of_a_refused_block_is_one_fixed_error(monkeypatch):
+    import agents.admin as admin
+
+    rows = [_Row("dba", [_server({"systems": [{"name": SECRET, "destination": "D"}]})])]
+    monkeypatch.setattr(admin, "SessionLocal", lambda: _NoSession())
+
+    async def fake_list_agents(session):
+        return rows
+
+    monkeypatch.setattr(admin, "list_agents", fake_list_agents)
+    (entry,) = await admin._destination_health()
+    assert entry["state"] == "error" and entry["system"] == "" and entry["destination"] == ""
+    assert entry["error"].startswith("oauth.systems[0].name:")
+    assert SECRET not in json.dumps(entry)
