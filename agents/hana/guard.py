@@ -33,6 +33,12 @@ The rules, in the order they are checked:
     such a name nor ``(SELECT ...)``: a table function, ``LATERAL``,
     ``JSON_TABLE``, ``AS OF``, ``TABLESAMPLE``, a parenthesised join; and a
     schema-qualified function call outside those two schemas, or a quoted one.
+    Then, for model-written SQL only, the deny-list (:data:`DENIED_VIEWS`,
+    :data:`DENIED_SYS_PREFIX`): an allowed reference to ``M_INIFILE_CONTENTS``
+    or ``M_CONFIGURATION_PARAMETER_VALUES`` (unqualified or ``SYS.``) or to a
+    ``SYS.P_*`` object is refused too. The registered checks pass
+    ``fixed=True``, which skips the deny-list and nothing else: ``iniContents``,
+    ``iniFiles`` and ``backupStatus`` read the ini contents for named keys.
 
 How table references are found: the walker reads the tokens once, keeping a
 frame per parenthesis level. In a query frame ``FROM`` opens the FROM list;
@@ -66,11 +72,21 @@ from dataclasses import dataclass
 
 from agents.hana.sqltokens import SelectRefused, Token, tokenize
 
-__all__ = ["MAX_SQL_CHARS", "SelectRefused", "check_select"]
+__all__ = ["DENIED_SYS_PREFIX", "DENIED_VIEWS", "MAX_SQL_CHARS", "SelectRefused",
+           "check_select"]
 
 MAX_SQL_CHARS = 4000
 
 ALLOWED_SCHEMAS = frozenset({"SYS", "_SYS_STATISTICS"})
+
+#: Monitoring views ``run_select`` may not read although the allow rule would
+#: let them through: they hold the ini and configuration values the fixed
+#: ``iniContents`` check deliberately hides. Matched unqualified or with
+#: ``SYS.``, after the allow rule's upper-casing (a quoted name verbatim).
+DENIED_VIEWS = frozenset({"M_INIFILE_CONTENTS", "M_CONFIGURATION_PARAMETER_VALUES"})
+#: ``SYS.P_*``: HANA's internal persistence tables (users, password hashes,
+#: principals); never for model-written SQL.
+DENIED_SYS_PREFIX = "P_"
 
 #: Keywords that have no place in a read: data and schema changes, sessions,
 #: transactions, procedures. Refused wherever they stand outside a literal or
@@ -120,8 +136,13 @@ _EXPRESSION_FROM_FUNCTIONS = frozenset(
 )
 
 
-def check_select(sql: str) -> None:
-    """Return when ``sql`` is one read of the monitoring views; else raise."""
+def check_select(sql: str, *, fixed: bool = False) -> None:
+    """Return when ``sql`` is one read of the monitoring views; else raise.
+
+    ``fixed=True`` is for the registered checks only (their SQL is ours, and
+    the masking of their answers is theirs): it skips the deny-list and no
+    other rule. ``run_select`` keeps the strict default.
+    """
     if not isinstance(sql, str):
         raise SelectRefused("unreadable")
     if len(sql) > MAX_SQL_CHARS:
@@ -133,7 +154,7 @@ def check_select(sql: str) -> None:
         raise SelectRefused("one_statement")
     if not tokens or not tokens[0].is_word("SELECT", "WITH"):
         raise SelectRefused("select_only")
-    _Walker(tokens).run()
+    _Walker(tokens, deny=not fixed).run()
 
 
 @dataclass
@@ -144,8 +165,9 @@ class _Frame:
 
 
 class _Walker:
-    def __init__(self, tokens: list[Token]) -> None:
+    def __init__(self, tokens: list[Token], *, deny: bool = True) -> None:
         self.tokens = tokens
+        self.deny = deny
         self.size = len(tokens)
         # CTE name -> index of the ")" that closes its body: visible after it.
         self.ctes: dict[str, int] = {}
@@ -269,10 +291,19 @@ class _Walker:
             if visible_after is not None and index > visible_after:
                 return
             if name.startswith("M_"):
+                self._check_denied(None, name)
                 return
         elif len(parts) == 2 and parts[0].value in ALLOWED_SCHEMAS and parts[1].value:
+            self._check_denied(parts[0].value, parts[1].value)
             return
         raise SelectRefused("table_not_allowed")
+
+    def _check_denied(self, schema: str | None, name: str) -> None:
+        """The deny-list, after the allow rule (a CTE never reaches it)."""
+        if not self.deny or schema not in (None, "SYS"):
+            return
+        if name in DENIED_VIEWS or (schema == "SYS" and name.startswith(DENIED_SYS_PREFIX)):
+            raise SelectRefused("table_not_allowed")
 
     def _after_reference(self, index: int) -> int:
         token = self._at(index)

@@ -355,3 +355,66 @@ def test_set_operator_shaped_like_a_call_does_not_end_the_from_list(word: str) -
 )
 def test_round_2_legitimate_shapes_still_pass(sql: str) -> None:
     check_select(sql)
+
+
+# ---- final review: the deny-list of model-written SQL ------------------------------------
+# With Allow SELECT a model could read the very ini values the iniContents check
+# hides, or HANA's internal persistence tables. These are refused for
+# run_select; the fixed checks (check_select(..., fixed=True)) still read the
+# ini contents view.
+
+DENIED_NAMES = [
+    "M_INIFILE_CONTENTS", "SYS.M_INIFILE_CONTENTS", '"SYS"."M_INIFILE_CONTENTS"',
+    'SYS."M_INIFILE_CONTENTS"', "m_inifile_contents", "sys.m_inifile_contents",
+    "M_CONFIGURATION_PARAMETER_VALUES", "SYS.M_CONFIGURATION_PARAMETER_VALUES",
+    '"M_CONFIGURATION_PARAMETER_VALUES"',
+    "SYS.P_USERS_", "sys.p_password_", '"SYS"."P_PRINCIPALS_"',
+]
+
+POSITIONS = [
+    "SELECT * FROM {t}",
+    "SELECT * FROM M_SERVICES s JOIN {t} x ON s.HOST = x.HOST",
+    "SELECT * FROM M_SERVICES, {t}",
+    "SELECT * FROM M_SERVICES WHERE HOST IN (SELECT HOST FROM {t})",
+    "SELECT (SELECT COUNT(*) FROM {t}) AS N FROM M_SERVICES",
+    "WITH c AS (SELECT * FROM {t}) SELECT * FROM c",
+    "SELECT HOST FROM M_SERVICES UNION ALL SELECT HOST FROM {t}",
+    "SELECT * FROM (SELECT * FROM {t}) q",
+]
+
+
+@pytest.mark.parametrize("position", POSITIONS)
+@pytest.mark.parametrize("name", DENIED_NAMES)
+def test_denied_views_are_refused_in_every_position(name: str, position: str) -> None:
+    with pytest.raises(SelectRefused) as info:
+        check_select(position.format(t=name))
+    assert info.value.rule == "table_not_allowed"
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT * FROM SYS.M_INIFILES",
+    "SELECT * FROM M_INIFILE_CONTENT_HISTORY",
+    "SELECT * FROM SYS.M_CONFIGURATION_PARAMETER_VALUES_X",
+    "SELECT * FROM _SYS_STATISTICS.P_SOMETHING",
+    'SELECT * FROM SYS."p_lower_quoted"',
+    "SELECT * FROM SYS.PRINCIPALS",
+    "WITH M_INIFILE_CONTENTS AS (SELECT * FROM M_SERVICES) SELECT * FROM M_INIFILE_CONTENTS",
+    "WITH P_X AS (SELECT * FROM M_SERVICES) SELECT * FROM P_X",
+])
+def test_names_outside_the_deny_list_still_pass(sql: str) -> None:
+    check_select(sql)
+
+
+@pytest.mark.parametrize("name", DENIED_NAMES)
+def test_fixed_checks_skip_only_the_deny_list(name: str) -> None:
+    check_select(f"SELECT * FROM {name}", fixed=True)
+    with pytest.raises(SelectRefused):
+        check_select("SELECT * FROM SAPABAP1.VBAK", fixed=True)
+
+
+def test_fixed_is_keyword_only_and_off_by_default() -> None:
+    import inspect
+
+    parameter = inspect.signature(check_select).parameters["fixed"]
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is False

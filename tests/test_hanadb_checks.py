@@ -272,7 +272,9 @@ def _assert_guard(check: Check, statement: Statement,
                   exceptions: dict[tuple[str, str], str]) -> None:
     key = (check.name, statement.label)
     try:
-        check_select(statement.sql)
+        # fixed=True: a registered check may read what the deny-list keeps
+        # from model-written SQL (the ini contents for named keys).
+        check_select(statement.sql, fixed=True)
     except SelectRefused:
         assert key in exceptions, f"{key} fails the SELECT guard and is not excepted"
         assert exceptions[key].strip() and "\n" not in exceptions[key]
@@ -636,3 +638,16 @@ def test_main_without_dump_is_usage_error() -> None:
         [sys.executable, "-m", "agents.hana.checks"],
         cwd=ROOT, capture_output=True, text=True)
     assert out.returncode == 2
+
+
+def test_the_ini_checks_need_the_fixed_switch() -> None:
+    # The checks that read the ini contents pass only as fixed checks: the
+    # same SQL written by a model is refused (the deny-list of run_select).
+    readers = [(c, s) for c in EVERY_CHECK for s in c.statements
+               if "M_INIFILE_CONTENTS" in s.sql]
+    assert {c.name for c, _ in readers} >= {"iniContents", "iniFiles", "backupStatus"}
+    for _, statement in readers:
+        check_select(statement.sql, fixed=True)
+        with pytest.raises(SelectRefused) as info:
+            check_select(statement.sql)
+        assert info.value.rule == "table_not_allowed"

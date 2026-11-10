@@ -122,7 +122,8 @@ def test_descriptions_state_defaults_categories_and_select_rules() -> None:
         assert name not in run_check  # categories, not the checks
     select = build(OAUTH_SELECT).tools["run_select"].description
     for words in ("SYS.<view>", "_SYS_STATISTICS.<view>", "M_*", "SYS.DUMMY",
-                  "comment", ";"):
+                  "comment", ";", "M_INIFILE_CONTENTS", "M_CONFIGURATION_PARAMETER_VALUES",
+                  "SYS.P_*"):
         assert words in select
 
 
@@ -431,6 +432,19 @@ async def test_run_select_guard_refusal(db: h.FakeDbapi, sql: Any, rule: str) ->
     assert answer["error"]["rule"] == rule
     _clean(answer, "customer4711", "KNA1")
     assert db.calls == []
+
+
+@pytest.mark.parametrize("sql", [
+    'SELECT "KEY", "VALUE" FROM M_INIFILE_CONTENTS',
+    "SELECT * FROM SYS.M_CONFIGURATION_PARAMETER_VALUES",
+    "SELECT * FROM SYS.P_USERS_",
+])
+async def test_run_select_refuses_the_deny_list(db: h.FakeDbapi, sql: str) -> None:
+    answer = await call(build(OAUTH_SELECT), "run_select", system="erp_tenant", sql=sql)
+    assert answer["error"]["code"] == "select_refused"
+    assert answer["error"]["rule"] == "table_not_allowed"
+    assert db.calls == []
+    _clean(answer, "INIFILE", "P_USERS_", "CONFIGURATION")
 
 
 async def test_run_select_unknown_system(db: h.FakeDbapi) -> None:

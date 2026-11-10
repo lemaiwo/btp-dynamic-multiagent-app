@@ -1015,7 +1015,19 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     body, and `(SELECT ...)`; after `FROM` / `JOIN` / `APPLY` / a `,` of a
     FROM list a table function, `LATERAL`, `JSON_TABLE`, `AS OF`,
     `TABLESAMPLE` or a parenthesised join is refused, and so is a
-    schema-qualified call outside those two schemas or a quoted one. One walk
+    schema-qualified call outside those two schemas or a quoted one. **The
+    deny-list**, applied to a reference AFTER the allow rule and only to
+    model-written SQL: `M_INIFILE_CONTENTS` and
+    `M_CONFIGURATION_PARAMETER_VALUES` (unqualified or `SYS.`) and every
+    `SYS.P_*` object (HANA's internal persistence tables) are
+    `table_not_allowed` in every position a reference can stand (a CTE of
+    such a name is still a CTE); quoted names compared verbatim after the
+    allow rule's upper-casing of words (`DENIED_VIEWS`, `DENIED_SYS_PREFIX`).
+    `check_select(sql, *, fixed=False)`: `fixed=True` skips the deny-list and
+    nothing else, for the registered checks only (`iniContents`, `iniFiles`
+    and `backupStatus` read the ini contents for named keys;
+    `tests/test_hanadb_checks.py` validates every registered statement with
+    it); `run_select` keeps the strict default. One walk
     with a frame per parenthesis level: **only reserved words end a FROM
     list** (`WHERE` and `HAVING` followed by a condition, `GROUP BY`, `ORDER
     BY`, `LIMIT <n>`, a set operator followed by `ALL`, `DISTINCT`, `SELECT`
@@ -1050,7 +1062,13 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     [{label, columns, rows, row_count, truncated}]}`) and, ONLY with
     `allow_select`, `run_select(system, sql, top=100)` (`top` 1..500; the
     guard first, nothing sent on a refusal; what it selected comes back
-    unmasked, which is what the switch is for). Without the switch
+    unmasked, which is what the switch is for). **What Allow SELECT
+    exposes**: the whole `SYS` catalogue and every monitoring view the
+    database user can read, among them statement texts WITH their literal
+    values (`M_SQL_PLAN_CACHE`, `M_EXPENSIVE_STATEMENTS`, ...), bind values
+    (the `PARAMETERS` columns), session and user names, client hosts and
+    trace contents; the deny-list keeps out only the ini / configuration
+    values and the `SYS.P_*` tables. Without the switch
     `run_select` is not registered, and a `requires_select` check is neither
     listed nor runnable (`unknown_check`, as if it did not exist).
     **Nothing the model sent is echoed**: a refusal is `{"error": {code,

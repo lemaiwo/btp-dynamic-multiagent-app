@@ -84,7 +84,7 @@ def assert_registered(name: str, category: str, args: set[str], *,
     assert tuple(s.label for s in check.statements) == parts
     for statement in check.statements:
         assert tokenize(statement.sql)
-        check_select(statement.sql)
+        check_select(statement.sql, fixed=True)
         assert star_columns(statement.sql) == 0, "select named columns"
     return check
 
