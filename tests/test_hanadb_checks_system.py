@@ -32,7 +32,31 @@ EXPECTED: dict[str, tuple[tuple[str, ...], frozenset[str]]] = {
     "featureUsage": (("",), frozenset({"top"})),
     "iniFiles": (("",), frozenset({"top"})),
     "iniContents": (("",), frozenset({"top", "object"})),
+    # composite (task 13b)
+    "healthCheck": (("overview", "databases", "disks", "memory", "connections",
+                     "transactions", "backups"), frozenset({"top"})),
+    "diagnose": (("services", "memory", "alerts", "blocked", "last_backup"),
+                 frozenset({"top"})),
+    "recommendations": (("read_tables", "statements", "caches", "large_tables", "blocked",
+                         "memory"), frozenset({"top"})),
+    "workloadManagement": (("workload", "classes"), frozenset({"top"})),
 }
+
+COMPOSITE = ("healthCheck", "diagnose", "recommendations", "workloadManagement")
+
+
+@pytest.mark.parametrize("name", COMPOSITE)
+def test_composite_parts_read_no_statement_text(name: str) -> None:
+    """Only the SELECTs of hana-cli's composite commands: no statement text
+    leaves through them (so nothing to mask), and the large views are limited."""
+    check = get_check(name)
+    assert check.composite and check.masked_columns == frozenset()
+    for statement in check.statements:
+        words = {t.value for t in tokenize(statement.sql) if t.kind == "word"}
+        assert "STATEMENT_STRING" not in words
+        large = {"M_TABLE_STATISTICS", "M_SQL_PLAN_CACHE", "M_CS_TABLES", "WORKLOAD_CLASSES"}
+        if words & large:
+            assert "top_plus_one" in statement.binds
 
 
 def _factory(name: str, destination: str) -> HanaSystem:
@@ -68,11 +92,12 @@ def test_registered_with_category_and_args(name: str) -> None:
     for statement in check.statements:
         tokens = tokenize(statement.sql)
         assert tokens and tokens[0].is_word("SELECT")
-        # named columns, never SELECT * (COUNT(*) is fine: "(" before it)
+        # named columns, never SELECT * / t.* (COUNT(*) and a product are fine)
         for i, token in enumerate(tokens):
             if token.is_symbol("*"):
                 before = tokens[i - 1]
-                assert before.is_symbol("("), "a * outside COUNT(*)"
+                assert not (before.is_word("SELECT", "DISTINCT") or before.is_symbol(",", ".")
+                            or before.kind == "param"), "a select-list *"
 
 
 @pytest.mark.parametrize("name", list(EXPECTED))

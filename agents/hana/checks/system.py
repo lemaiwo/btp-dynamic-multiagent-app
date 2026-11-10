@@ -236,3 +236,207 @@ register(
         args=frozenset({"top", "object"}),
     ),
 )
+
+
+# ---- composite checks (task 13b) ------------------------------------------------------
+#
+# hana-cli's JavaScript scoring (thresholds, HEALTHY / WARNING verdicts) is not
+# ported: these checks answer the figures, and the model judges them.
+
+_MEMORY_USE = (
+    "SELECT HOST, ALLOCATION_LIMIT, INSTANCE_TOTAL_MEMORY_USED_SIZE,"
+    " INSTANCE_TOTAL_MEMORY_ALLOCATED_SIZE, FREE_PHYSICAL_MEMORY, USED_PHYSICAL_MEMORY,"
+    " CASE WHEN ALLOCATION_LIMIT > 0"
+    " THEN ROUND(100.0 * INSTANCE_TOTAL_MEMORY_USED_SIZE / ALLOCATION_LIMIT, 2)"
+    " END AS USED_PERCENT_OF_LIMIT"
+    " FROM SYS.M_HOST_RESOURCE_UTILIZATION ORDER BY HOST"
+)
+"""Memory per host. on-prem: hana-cli reads INSTANCE_TOTAL_MEMORY_* from
+M_HOST_INFORMATION (a key/value view on HANA 2.0) and TOTAL_MEMORY_* from
+M_HOST_RESOURCE_UTILIZATION; both live in M_HOST_RESOURCE_UTILIZATION as
+INSTANCE_TOTAL_MEMORY_* and ALLOCATION_LIMIT."""
+
+_BLOCKED = (
+    "SELECT COUNT(*) AS BLOCKED_COUNT,"
+    " MAX(SECONDS_BETWEEN(BLOCKED_TIME, CURRENT_TIMESTAMP)) AS MAX_WAIT_SECONDS"
+    " FROM SYS.M_BLOCKED_TRANSACTIONS"
+)
+"""Lock waits now. on-prem: hana-cli counts SYS.M_LOCKS (LOCK_WAIT_TIME), a
+HANA Cloud view; HANA 2.0 reports waiting transactions in M_BLOCKED_TRANSACTIONS."""
+
+register(
+    Check(  # on-prem: unverified (M_DATABASES columns, M_TRANSACTIONS status values)
+        name="healthCheck",
+        category="system",
+        purpose=(
+            "Health figures: overview, databases, disks, memory, connections, transactions,"
+            " last backups."
+        ),
+        source="bin/healthCheck.js",
+        statements=(
+            Statement(
+                "overview",
+                "SELECT SECTION, NAME, STATUS, VALUE FROM SYS.M_SYSTEM_OVERVIEW"
+                " ORDER BY SECTION, NAME",
+                (),
+            ),
+            # on-prem: hana-cli's replication columns are no part of M_DATABASES;
+            # replication has its own check (replicationStatus).
+            Statement(
+                "databases",
+                "SELECT DATABASE_NAME, ACTIVE_STATUS, ACTIVE_STATUS_DETAILS, RESTART_MODE"
+                " FROM SYS.M_DATABASES ORDER BY DATABASE_NAME",
+                (),
+            ),
+            Statement(
+                "disks",
+                "SELECT HOST, USAGE_TYPE, PATH, TOTAL_SIZE, USED_SIZE FROM SYS.M_DISKS"
+                " ORDER BY HOST, USAGE_TYPE",
+                (),
+            ),
+            Statement("memory", _MEMORY_USE, ()),
+            # on-prem: M_SESSIONS (HANA Cloud) is M_CONNECTIONS on HANA 2.0.
+            Statement(
+                "connections",
+                "SELECT CONNECTION_STATUS, COUNT(*) AS CONNECTION_COUNT FROM SYS.M_CONNECTIONS"
+                " GROUP BY CONNECTION_STATUS ORDER BY CONNECTION_STATUS",
+                (),
+            ),
+            # on-prem: grouped by status and type instead of hana-cli's filter on
+            # TRANSACTION_STATUS = 'RUNNING', a value HANA 2.0 does not report.
+            Statement(
+                "transactions",
+                "SELECT TRANSACTION_STATUS, TRANSACTION_TYPE, COUNT(*) AS TRANSACTION_COUNT,"
+                " COUNT(DISTINCT CONNECTION_ID) AS CONNECTION_COUNT FROM SYS.M_TRANSACTIONS"
+                " GROUP BY TRANSACTION_STATUS, TRANSACTION_TYPE"
+                " ORDER BY TRANSACTION_STATUS, TRANSACTION_TYPE",
+                (),
+            ),
+            # on-prem: M_BACKUP_CATALOG_ENTRIES is M_BACKUP_CATALOG; the latest
+            # start and end per backup type and state, not one row.
+            Statement(
+                "backups",
+                "SELECT ENTRY_TYPE_NAME, STATE_NAME, COUNT(*) AS BACKUP_COUNT,"
+                " MAX(SYS_START_TIME) AS LAST_START_TIME, MAX(SYS_END_TIME) AS LAST_END_TIME"
+                " FROM SYS.M_BACKUP_CATALOG GROUP BY ENTRY_TYPE_NAME, STATE_NAME"
+                " ORDER BY ENTRY_TYPE_NAME, STATE_NAME",
+                (),
+            ),
+        ),
+        max_rows_cap=200,
+    ),
+    Check(  # on-prem: unverified (_SYS_STATISTICS.STATISTICS_CURRENT_ALERTS, BLOCKED_TIME)
+        name="diagnose",
+        category="system",
+        purpose=(
+            "Quick diagnosis: inactive services, memory per host, alerts by rating, lock"
+            " waits, last data backup."
+        ),
+        source="bin/diagnose.js",
+        statements=(
+            Statement(
+                "services",
+                "SELECT HOST, PORT, SERVICE_NAME, ACTIVE_STATUS, DETAIL FROM SYS.M_SERVICES"
+                " WHERE ACTIVE_STATUS <> 'YES' ORDER BY HOST, PORT",
+                (),
+            ),
+            Statement("memory", _MEMORY_USE, ()),
+            # on-prem: SYS.M_ALERTS is HANA Cloud; the statistics server keeps the
+            # current alerts in _SYS_STATISTICS (rating 1 information .. 5 error).
+            Statement(
+                "alerts",
+                "SELECT ALERT_RATING, COUNT(*) AS ALERT_COUNT"
+                " FROM _SYS_STATISTICS.STATISTICS_CURRENT_ALERTS"
+                " GROUP BY ALERT_RATING ORDER BY ALERT_RATING DESC",
+                (),
+            ),
+            Statement("blocked", _BLOCKED, ()),
+            Statement(
+                "last_backup",
+                "SELECT MAX(SYS_END_TIME) AS LAST_SUCCESSFUL_DATA_BACKUP FROM SYS.M_BACKUP_CATALOG"
+                " WHERE STATE_NAME = 'successful' AND ENTRY_TYPE_NAME = 'complete data backup'",
+                (),
+            ),
+        ),
+        max_rows_cap=200,
+    ),
+    Check(  # on-prem: unverified (M_TABLE_STATISTICS and M_CACHES columns)
+        name="recommendations",
+        category="system",
+        purpose=(
+            "Tuning figures: most read tables, costliest statements, caches, large or"
+            " unmerged tables, lock waits, memory."
+        ),
+        source="bin/recommendations.js",
+        statements=(
+            # on-prem: hana-cli's SCAN_COUNT > RECORD_COUNT is no column pair of
+            # M_TABLE_STATISTICS on HANA 2.0; the most read tables instead.
+            Statement(
+                "read_tables",
+                "SELECT TOP ? SCHEMA_NAME, TABLE_NAME, READ_COUNT, WRITE_COUNT, SELECT_COUNT"
+                " FROM SYS.M_TABLE_STATISTICS ORDER BY READ_COUNT DESC",
+                ("top_plus_one",),
+            ),
+            # on-prem: TOTAL_EXECUTION_TIME and EXECUTION_COUNT per statement hash
+            # are M_SQL_PLAN_CACHE columns (M_EXPENSIVE_STATEMENTS holds one row per
+            # execution and only while its trace is on). No statement text.
+            Statement(
+                "statements",
+                "SELECT TOP ? STATEMENT_HASH, EXECUTION_COUNT, TOTAL_EXECUTION_TIME,"
+                " AVG_EXECUTION_TIME FROM SYS.M_SQL_PLAN_CACHE"
+                " ORDER BY TOTAL_EXECUTION_TIME DESC",
+                ("top_plus_one",),
+            ),
+            # on-prem: CACHE_HIT_RATIO / RESULT_CACHE_HIT_RATIO do not exist; the
+            # counts per cache instead.
+            Statement(
+                "caches",
+                "SELECT HOST, PORT, CACHE_ID, TOTAL_SIZE, USED_SIZE, ENTRY_COUNT, HIT_COUNT,"
+                " MISS_COUNT FROM SYS.M_CACHES ORDER BY HOST, PORT, CACHE_ID",
+                (),
+            ),
+            # on-prem: MEMORY_SIZE_IN_TOTAL is a column of M_CS_TABLES (there is no
+            # COMPRESSION_RATIO); a large delta or a stale compression shows here.
+            Statement(
+                "large_tables",
+                "SELECT TOP ? SCHEMA_NAME, TABLE_NAME, RECORD_COUNT, MEMORY_SIZE_IN_TOTAL,"
+                " MEMORY_SIZE_IN_DELTA, LAST_COMPRESSED_RECORD_COUNT FROM SYS.M_CS_TABLES"
+                " ORDER BY MEMORY_SIZE_IN_TOTAL DESC",
+                ("top_plus_one",),
+            ),
+            Statement("blocked", _BLOCKED, ()),
+            Statement("memory", _MEMORY_USE, ()),
+        ),
+        max_rows_cap=100,
+    ),
+    Check(  # on-prem: unverified (M_WORKLOAD columns, SYS.WORKLOAD_CLASSES columns)
+        name="workloadManagement",
+        category="system",
+        purpose=(
+            "Workload counters per service and the workload classes with their limits"
+            " (no catalogue discovery)."
+        ),
+        source="bin/workloadManagement.js",
+        statements=(
+            Statement(
+                "workload",
+                "SELECT HOST, PORT, EXECUTION_COUNT, COMPILATION_COUNT,"
+                " UPDATE_TRANSACTION_COUNT, COMMIT_COUNT, ROLLBACK_COUNT FROM SYS.M_WORKLOAD"
+                " ORDER BY HOST, PORT",
+                (),
+            ),
+            # hana-cli discovers the workload views through SYS.TABLES and
+            # SYS.TABLE_COLUMNS (catalogue reads, Phase 2); the on-premise view of
+            # the classes is named here instead.
+            Statement(
+                "classes",
+                "SELECT TOP ? WORKLOAD_CLASS_NAME, PRIORITY, STATEMENT_MEMORY_LIMIT,"
+                " STATEMENT_THREAD_LIMIT, TOTAL_STATEMENT_MEMORY_LIMIT,"
+                " TOTAL_STATEMENT_THREAD_LIMIT, IS_ENABLED FROM SYS.WORKLOAD_CLASSES"
+                " ORDER BY WORKLOAD_CLASS_NAME",
+                ("top_plus_one",),
+            ),
+        ),
+        max_rows_cap=200,
+    ),
+)
