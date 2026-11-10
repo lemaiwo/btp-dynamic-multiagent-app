@@ -1,0 +1,512 @@
+"""The connection layer of ``builtin:hana`` on a fake hdbcli.
+
+No landscape and no real connection: ``tests/hanadb_helpers.py`` injects a
+fake ``hdbcli`` package. Every error text of the fake holds the database
+host, the user and a unique marker; none of them may reach an answer or a
+log record.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import logging
+import threading
+
+import pytest
+
+from agents.destination import DestinationError
+from agents.hana import connection
+from agents.hana.connection import (
+    CONNECT_TIMEOUT_MS,
+    DEFAULT_ENCRYPT,
+    MAX_CONCURRENT,
+    QUERY_TIMEOUT_SECONDS,
+    HanaSystem,
+    HanaTarget,
+    Socks5Proxy,
+    connect_kwargs,
+    map_driver_error,
+    run_query,
+    settings_from_properties,
+)
+from agents.hana.errors import ERROR_CODES, MESSAGES, HanaError
+from tests import hanadb_helpers as h
+
+SECRETS = (h.MARKER, h.HOST, h.USER, h.PASSWORD, h.TOKEN)
+
+
+def _no_secret(text: str) -> None:
+    for secret in SECRETS:
+        assert secret not in text
+
+
+def _logs_clean(caplog: pytest.LogCaptureFixture) -> None:
+    for record in caplog.records:
+        _no_secret(record.getMessage())
+        assert record.exc_info is None
+
+
+def _system(**kw) -> HanaSystem:
+    return HanaSystem(
+        "sib_tenant", "hana-test",
+        resolver=kw.pop("resolver", h.FakeResolver()),
+        tokens=kw.pop("tokens", h.FakeTokens()),
+    )
+
+
+# ---- errors ---------------------------------------------------------------------------
+
+
+def test_error_codes_are_the_closed_list():
+    assert ERROR_CODES == frozenset({
+        "destination_error", "proxy_refused", "unreachable", "login_failed",
+        "not_authorized", "timeout", "unknown_system", "unknown_check",
+        "invalid_argument", "select_refused", "result_too_large", "sql_error"})
+    assert set(MESSAGES) == ERROR_CODES
+
+
+def test_hana_error_has_fixed_message_and_dict():
+    err = HanaError("timeout")
+    assert err.code == "timeout"
+    assert err.message == MESSAGES["timeout"]
+    assert err.to_dict() == {"code": "timeout", "message": MESSAGES["timeout"]}
+    assert str(err) == MESSAGES["timeout"]
+
+
+def test_hana_error_sql_code_only_as_integer():
+    assert HanaError("sql_error", sql_code=339).to_dict()["sql_code"] == 339
+    assert "sql_code" not in HanaError("sql_error", sql_code="339").to_dict()
+    assert "sql_code" not in HanaError("sql_error", sql_code=True).to_dict()
+
+
+def test_hana_error_refuses_an_unknown_code():
+    with pytest.raises(ValueError):
+        HanaError("whatever")
+
+
+# ---- settings_from_properties ------------------------------------------------------------
+
+
+def test_http_shape_gives_target():
+    target = settings_from_properties(h.http_props(), "sib")
+    assert isinstance(target, HanaTarget)
+    assert (target.host, target.port) == (h.HOST, 30015)
+    assert (target.user, target.password) == (h.USER, h.PASSWORD)
+    assert target.location_id is None
+    assert target.encrypt is DEFAULT_ENCRYPT
+    assert target.ssl_host is None
+
+
+def test_tcp_shape_gives_target():
+    target = settings_from_properties(
+        h.tcp_props(CloudConnectorLocationId="loc1"), "sib")
+    assert (target.host, target.port) == (h.HOST, 30013)
+    assert target.location_id == "loc1"
+
+
+def test_default_encrypt_is_on():
+    assert DEFAULT_ENCRYPT is True
+
+
+@pytest.mark.parametrize("value,expected", [("false", False), ("true", True)])
+def test_hana_encrypt_property(value, expected):
+    target = settings_from_properties(h.http_props(**{"hana.encrypt": value}), "sib")
+    assert target.encrypt is expected
+
+
+@pytest.mark.parametrize("value", ["False", "no", "0", "", " false", "TRUE"])
+def test_hana_encrypt_other_value_refused(value):
+    with pytest.raises(HanaError) as info:
+        settings_from_properties(h.http_props(**{"hana.encrypt": value}), "sib")
+    assert info.value.code == "destination_error"
+
+
+def test_ssl_host_property_read():
+    target = settings_from_properties(
+        h.http_props(**{"hana.sslHostNameInCertificate": "db.example.invalid"}), "sib")
+    assert target.ssl_host == "db.example.invalid"
+
+
+@pytest.mark.parametrize("props", [
+    h.http_props(ProxyType="Internet"),
+    h.http_props(ProxyType=None),
+    h.http_props(User=None),
+    h.http_props(Password=None),
+    h.http_props(User=""),
+    h.http_props(URL=f"https://{h.HOST}:30015"),
+    h.http_props(URL=f"http://{h.HOST}"),
+    h.http_props(URL=f"http://u:p@{h.HOST}:30015"),
+    h.http_props(URL=f"http://{h.HOST}:30015/x?y=1"),
+    h.http_props(URL=f"http://{h.HOST}:99999"),
+    h.http_props(Authentication="NoAuthentication"),
+    h.http_props(Type="RFC"),
+    h.tcp_props(Address=h.HOST),
+    h.tcp_props(Address=f"{h.HOST}:0"),
+    h.tcp_props(Address=f"{h.HOST}:abc"),
+    h.http_props(**{"hana.sslHostNameInCertificate": "bad host/x"}),
+], ids=lambda p: ",".join(sorted(p)) if isinstance(p, dict) else str(p))
+def test_bad_destination_refused(props, caplog):
+    caplog.set_level(logging.DEBUG)
+    with pytest.raises(HanaError) as info:
+        settings_from_properties(props, "sib")
+    assert info.value.code == "destination_error"
+    _no_secret(str(info.value.to_dict()))
+    _logs_clean(caplog)
+
+
+def test_target_repr_shows_no_credential_or_host():
+    target = settings_from_properties(
+        h.http_props(CloudConnectorLocationId="loc1"), "sib")
+    text = repr(target) + str(target)
+    _no_secret(text)
+    assert "loc1" not in text
+
+
+# ---- connect_kwargs ----------------------------------------------------------------------
+
+PROXY = Socks5Proxy("connectivity-proxy.internal", 20004)
+
+
+def test_connect_kwargs_props_variant_unencrypted():
+    target = settings_from_properties(h.http_props(**{"hana.encrypt": "false"}), "sib")
+    assert connect_kwargs(target, h.TOKEN, PROXY) == {
+        "address": h.HOST,
+        "port": 30015,
+        "user": h.USER,
+        "password": h.PASSWORD,
+        "proxyHostname": "connectivity-proxy.internal",
+        "proxyPort": "20004",
+        "proxyUserName": h.TOKEN,
+        "connectTimeout": str(CONNECT_TIMEOUT_MS),
+        "encrypt": "false",
+    }
+    assert CONNECT_TIMEOUT_MS == 15000
+
+
+def test_connect_kwargs_encrypted_validates_always():
+    target = settings_from_properties(h.http_props(), "sib")
+    kwargs = connect_kwargs(target, h.TOKEN, PROXY)
+    assert kwargs["encrypt"] == "true"
+    assert kwargs["sslValidateCertificate"] == "true"
+    assert "sslHostNameInCertificate" not in kwargs
+    target = settings_from_properties(
+        h.http_props(**{"hana.sslHostNameInCertificate": "db.example.invalid"}), "sib")
+    kwargs = connect_kwargs(target, h.TOKEN, PROXY)
+    assert kwargs["sslHostNameInCertificate"] == "db.example.invalid"
+
+
+def test_connect_kwargs_no_ssl_keys_without_encrypt():
+    target = settings_from_properties(
+        h.http_props(**{"hana.encrypt": "false",
+                        "hana.sslHostNameInCertificate": "db.example.invalid"}), "sib")
+    kwargs = connect_kwargs(target, h.TOKEN, PROXY)
+    assert "sslValidateCertificate" not in kwargs
+    assert "sslHostNameInCertificate" not in kwargs
+
+
+def test_connect_kwargs_location_id_goes_into_proxy_password():
+    target = settings_from_properties(
+        h.http_props(CloudConnectorLocationId="loc1", **{"hana.encrypt": "false"}), "sib")
+    kwargs = connect_kwargs(target, h.TOKEN, PROXY)
+    assert kwargs["proxyPassword"] == "1." + base64.b64encode(b"loc1").decode()
+    assert "proxyScpAccount" not in kwargs
+
+
+def test_connect_kwargs_without_location_has_no_proxy_password():
+    target = settings_from_properties(h.http_props(), "sib")
+    assert "proxyPassword" not in connect_kwargs(target, h.TOKEN, PROXY)
+
+
+# ---- run_query ---------------------------------------------------------------------------
+
+
+async def test_run_query_sequence_and_result(monkeypatch):
+    db = h.install(monkeypatch, h.FakeDbapi(rows=[(1, "x"), (2, "y")]))
+    columns, rows, truncated = await run_query(
+        _system(), "SELECT A, B FROM M_X WHERE A = ?", ["1"], 5)
+    assert columns == ["A", "B"]
+    assert rows == [(1, "x"), (2, "y")]
+    assert truncated is False
+    assert db.calls == [
+        ("connect",),
+        ("setautocommit", False),
+        ("cursor",),
+        ("read_only",),
+        ("setquerytimeout", QUERY_TIMEOUT_SECONDS),
+        ("execute", "SELECT A, B FROM M_X WHERE A = ?", ("1",)),
+        ("fetchmany", 6),
+        ("rollback",),
+        ("cursor_close",),
+        ("close",),
+    ]
+    assert QUERY_TIMEOUT_SECONDS == 20
+    assert "commit" not in db.steps()
+    assert db.connect_kwargs[0]["proxyUserName"] == h.TOKEN
+    assert db.connect_kwargs[0]["proxyPort"] == "20004"
+
+
+async def test_run_query_without_binds(monkeypatch):
+    db = h.install(monkeypatch)
+    await run_query(_system(), "SELECT 1 FROM DUMMY", [], 1)
+    assert ("execute", "SELECT 1 FROM DUMMY") in db.calls
+
+
+async def test_run_query_truncates(monkeypatch):
+    h.install(monkeypatch, h.FakeDbapi(rows=[(i, i) for i in range(10)]))
+    columns, rows, truncated = await run_query(_system(), "SELECT A, B FROM M_X", [], 3)
+    assert rows == [(0, 0), (1, 1), (2, 2)]
+    assert truncated is True
+
+
+async def test_run_query_runs_in_a_thread(monkeypatch):
+    db = h.install(monkeypatch)
+    seen = []
+    original = db.connect
+
+    def connect(**kw):
+        seen.append(threading.current_thread() is threading.main_thread())
+        return original(**kw)
+
+    monkeypatch.setattr(db, "connect", connect)
+    import sys
+    monkeypatch.setattr(sys.modules["hdbcli.dbapi"], "connect", connect)
+    await run_query(_system(), "SELECT 1 FROM DUMMY", [], 1)
+    assert seen == [False]
+
+
+@pytest.mark.parametrize("step", [
+    "setautocommit", "cursor", "read_only", "setquerytimeout", "execute", "fetchmany"])
+async def test_rollback_and_close_on_every_failure(monkeypatch, step, caplog):
+    caplog.set_level(logging.DEBUG)
+    db = h.install(monkeypatch, h.FakeDbapi(fail_at={step: h.driver_error(339, "boom")}))
+    with pytest.raises(HanaError) as info:
+        await run_query(_system(), "SELECT A FROM M_X", [], 1)
+    assert info.value.code == "sql_error"
+    steps = db.steps()
+    assert "rollback" in steps and steps[-1] == "close"
+    assert "commit" not in steps
+    if step in ("setautocommit", "cursor", "read_only"):
+        assert "execute" not in steps
+    _no_secret(str(info.value.to_dict()))
+    assert info.value.__cause__ is None
+    _logs_clean(caplog)
+
+
+async def test_rollback_failure_still_closes(monkeypatch, caplog):
+    caplog.set_level(logging.DEBUG)
+    db = h.install(monkeypatch, h.FakeDbapi(
+        rows=[(1, 2)], fail_at={"rollback": h.driver_error(-10807, "lost")}))
+    _, rows, _ = await run_query(_system(), "SELECT A FROM M_X", [], 1)
+    assert rows == [(1, 2)]
+    assert db.steps()[-1] == "close"
+    _logs_clean(caplog)
+
+
+async def test_connect_failure_closes_nothing_and_maps(monkeypatch, caplog):
+    caplog.set_level(logging.DEBUG)
+    db = h.install(monkeypatch, h.FakeDbapi(
+        fail_at={"connect": h.driver_error(10, "authentication failed")}))
+    with pytest.raises(HanaError) as info:
+        await run_query(_system(), "SELECT A FROM M_X", [], 1)
+    assert info.value.code == "login_failed"
+    assert db.steps() == ["connect"]
+    _logs_clean(caplog)
+    assert any("sib_tenant" in r.getMessage() and "connect" in r.getMessage()
+               for r in caplog.records)
+
+
+@pytest.mark.parametrize("max_rows", [0, -1, True, "5", 1.5])
+async def test_run_query_refuses_bad_max_rows(monkeypatch, max_rows):
+    db = h.install(monkeypatch)
+    with pytest.raises(HanaError) as info:
+        await run_query(_system(), "SELECT 1 FROM DUMMY", [], max_rows)
+    assert info.value.code == "invalid_argument"
+    assert db.calls == []
+
+
+async def test_at_most_four_at_a_time(monkeypatch):
+    gate = threading.Event()
+    db = h.install(monkeypatch, h.FakeDbapi(gate=gate))
+    assert MAX_CONCURRENT == 4
+    tasks = [asyncio.create_task(run_query(_system(), "SELECT 1 FROM DUMMY", [], 1))
+             for _ in range(5)]
+    for _ in range(200):
+        if db.inside == 4:
+            break
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.05)
+    assert db.inside == 4
+    assert len(db.connect_kwargs) == 4
+    gate.set()
+    await asyncio.gather(*tasks)
+    assert db.peak == 4
+    assert len(db.connect_kwargs) == 5
+
+
+async def test_cancelled_caller_keeps_slot_until_thread_ends(monkeypatch):
+    gate = threading.Event()
+    db = h.install(monkeypatch, h.FakeDbapi(gate=gate))
+    tasks = [asyncio.create_task(run_query(_system(), "SELECT 1 FROM DUMMY", [], 1))
+             for _ in range(4)]
+    for _ in range(200):
+        if db.inside == 4:
+            break
+        await asyncio.sleep(0.01)
+    for t in tasks:
+        t.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    fifth = asyncio.create_task(run_query(_system(), "SELECT 1 FROM DUMMY", [], 1))
+    await asyncio.sleep(0.05)
+    assert len(db.connect_kwargs) == 4  # the fifth still waits for a slot
+    gate.set()
+    await fifth
+    assert len(db.connect_kwargs) == 5
+    assert db.peak <= 4
+
+
+# ---- error mapping -----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("exc,code", [
+    (h.driver_error(10, "authentication failed"), "login_failed"),
+    (h.driver_error(414, "user is forced to change password"), "login_failed"),
+    (h.driver_error(663, "user is locked"), "login_failed"),
+    (h.driver_error(258, "insufficient privilege"), "not_authorized"),
+    (h.driver_error(1024, "timeout"), "timeout"),
+    (h.driver_error(613, "execution aborted by timeout"), "timeout"),
+    (h.driver_error(339, "invalid number"), "sql_error"),
+    (h.driver_error(-10709, "Connection failed (RTE:[89006] System call 'connect' "
+                            "failed, rc=111:Connection refused)"), "proxy_refused"),
+    (h.driver_error(-10709, "Connection failed (proxy server refused)"), "proxy_refused"),
+    (h.driver_error(-10709, "Connection failed (RTE:[89008] Socket timed out)"), "timeout"),
+    (h.driver_error(-10709, "Connection failed (RTE:[89001] Cannot resolve host)"),
+     "unreachable"),
+    (h.driver_error(-10807, "Connection down"), "unreachable"),
+    (ConnectionRefusedError(f"{h.HOST} {h.MARKER}"), "proxy_refused"),
+    (TimeoutError(f"{h.HOST} {h.MARKER}"), "timeout"),
+    (OSError(f"{h.HOST} {h.MARKER}"), "unreachable"),
+])
+def test_map_driver_error(monkeypatch, exc, code, caplog):
+    caplog.set_level(logging.DEBUG)
+    h.install(monkeypatch)
+    err = map_driver_error(exc)
+    assert isinstance(err, HanaError)
+    assert err.code == code
+    _no_secret(str(err.to_dict()))
+    _no_secret(str(err))
+    _logs_clean(caplog)
+
+
+def test_sql_error_carries_integer_code_only(monkeypatch):
+    h.install(monkeypatch)
+    err = map_driver_error(h.driver_error(339, "invalid number"))
+    assert err.to_dict() == {"code": "sql_error", "message": MESSAGES["sql_error"],
+                             "sql_code": 339}
+    err = map_driver_error(h.driver_error("339", "odd code"))
+    assert "sql_code" not in err.to_dict()
+
+
+def test_unexpected_exception_is_sql_error_without_text(monkeypatch):
+    h.install(monkeypatch)
+    err = map_driver_error(RuntimeError(h.MARKER))
+    assert err.code == "sql_error"
+    _no_secret(str(err.to_dict()))
+
+
+# ---- destination, binding, token ---------------------------------------------------------
+
+
+async def test_destination_service_failure(monkeypatch, caplog):
+    caplog.set_level(logging.DEBUG)
+    db = h.install(monkeypatch)
+    resolver = h.FakeResolver(error=DestinationError(f"404 for {h.HOST} {h.MARKER}"))
+    with pytest.raises(HanaError) as info:
+        await run_query(_system(resolver=resolver), "SELECT 1 FROM DUMMY", [], 1)
+    assert info.value.code == "destination_error"
+    assert db.calls == []
+    _logs_clean(caplog)
+
+
+async def test_bad_destination_properties(monkeypatch):
+    db = h.install(monkeypatch)
+    resolver = h.FakeResolver(h.http_props(ProxyType="Internet"))
+    with pytest.raises(HanaError) as info:
+        await run_query(_system(resolver=resolver), "SELECT 1 FROM DUMMY", [], 1)
+    assert info.value.code == "destination_error"
+    assert db.calls == []
+
+
+async def test_no_socks5_port(monkeypatch):
+    db = h.install(monkeypatch)
+    with pytest.raises(HanaError) as info:
+        await run_query(_system(tokens=h.FakeTokens(socks5_port=None)),
+                        "SELECT 1 FROM DUMMY", [], 1)
+    assert info.value.code == "destination_error"
+    assert info.value.message == MESSAGES["destination_error"]
+    assert db.calls == []
+
+
+async def test_no_connectivity_binding(monkeypatch, caplog):
+    caplog.set_level(logging.DEBUG)
+    db = h.install(monkeypatch)
+    import agents.destination as destination
+
+    monkeypatch.setattr(destination, "connectivity_from_environment", lambda: None)
+    system = HanaSystem("sib_tenant", "hana-test", resolver=h.FakeResolver())
+    with pytest.raises(HanaError) as info:
+        await run_query(system, "SELECT 1 FROM DUMMY", [], 1)
+    assert info.value.code == "destination_error"
+    assert db.calls == []
+    assert any("connectivity" in r.getMessage() for r in caplog.records)
+
+
+async def test_no_destination_binding(monkeypatch):
+    db = h.install(monkeypatch)
+    import agents.destination as destination
+
+    def refuse(*a, **kw):
+        raise DestinationError("no binding")
+
+    monkeypatch.setattr(destination, "resolver_from_environment", refuse)
+    system = HanaSystem("sib_tenant", "hana-test", tokens=h.FakeTokens())
+    with pytest.raises(HanaError) as info:
+        await run_query(system, "SELECT 1 FROM DUMMY", [], 1)
+    assert info.value.code == "destination_error"
+    assert db.calls == []
+
+
+async def test_token_failure_is_proxy_refused(monkeypatch, caplog):
+    caplog.set_level(logging.DEBUG)
+    db = h.install(monkeypatch)
+    tokens = h.FakeTokens(error=DestinationError(f"returned 401 {h.MARKER}"))
+    with pytest.raises(HanaError) as info:
+        await run_query(_system(tokens=tokens), "SELECT 1 FROM DUMMY", [], 1)
+    assert info.value.code == "proxy_refused"
+    assert db.calls == []
+    _logs_clean(caplog)
+
+
+def test_system_repr_names_no_destination_internals():
+    system = _system()
+    assert "sib_tenant" in repr(system)
+
+
+def test_hdbcli_not_imported_at_module_load():
+    import inspect
+
+    source = inspect.getsource(connection)
+    head = source.split("\ndef ", 1)[0]
+    assert "import hdbcli" not in head and "from hdbcli" not in head
+
+
+def test_log_lines_name_no_exception_text():
+    import inspect
+    import re
+
+    source = inspect.getsource(connection)
+    calls = re.findall(r"logger\.\w+\((.*?)\)\n", source, flags=re.S)
+    assert calls
+    for call in calls:
+        assert "str(exc" not in call and "exc_info" not in call
+        assert ".host" not in call and ".user" not in call
