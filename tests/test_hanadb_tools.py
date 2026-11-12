@@ -538,3 +538,102 @@ async def test_run_check_reads_a_statement_lob_only_up_to_its_per_value_cap(
     assert tools.CHECK_LOB_CHARS == 4096
     masked = answer["rows"][0][1]
     assert "KNA1" in masked and "customer4711" not in masked
+
+
+# ---- Phases 2 and 3: other_schema, the per-check LOB cap, truncated_columns -------------
+
+PAIR = Check(name="schemaPair", category="schema", purpose="Two schemas.",
+             source="bin/schemaPair.js",
+             statements=(Statement("", "SELECT A FROM SYS.TABLES "
+                                       "WHERE SCHEMA_NAME = ? OR SCHEMA_NAME = ?",
+                                   ("schema", "other_schema")),),
+             args=frozenset({"top", "schema", "other_schema"}),
+             required=frozenset({"other_schema"}))
+
+SOURCE = Check(name="viewSource", category="database", purpose="A view definition.",
+               source="bin/viewSource.js",
+               statements=(Statement("", "SELECT VIEW_NAME, DEFINITION FROM SYS.VIEWS", ()),),
+               lob_chars=20_000)
+
+SOURCE_PARTS = Check(name="procSource", category="database", purpose="Procedure parts.",
+                     source="bin/procSource.js",
+                     statements=(Statement("head", "SELECT A, B FROM SYS.PROCEDURES", ()),
+                                 Statement("body", "SELECT C FROM SYS.PROCEDURES", ())))
+
+
+async def test_run_check_binds_other_schema(db: h.FakeDbapi) -> None:
+    register(PAIR)
+    db.description = (("A",),)
+    db.rows = [(1,)]
+    await call(build(), "run_check", system="erp_tenant", check="schemaPair",
+               schema="S1", other_schema="S2")
+    executed = [c for c in db.calls if c[0] == "execute"][0]
+    assert executed[2] == ("S1", "S2")
+    answer = await call(build(), "run_check", system="erp_tenant", check="schemaPair",
+                        schema="S1", other_schema="evil schema'x")
+    assert answer["error"]["argument"] == "other_schema"
+    _clean(answer, "evil schema'x")
+    answer = await call(build(), "run_check", system="erp_tenant", check="alerts",
+                        other_schema="S2")
+    assert answer["error"]["argument"] == "other_schema"
+    assert answer["error"]["rule"] == "not an argument of this check"
+
+
+async def test_list_checks_shows_other_schema() -> None:
+    register(PAIR)
+    answer = await call(build(), "list_checks", category="schema")
+    pair = next(c for c in answer["checks"] if c["name"] == "schemaPair")
+    assert [a["name"] for a in pair["arguments"]] == ["schema", "top", "other_schema"]
+    by_name = {a["name"]: a for a in pair["arguments"]}
+    assert by_name["other_schema"] == {
+        "name": "other_schema", "required": True,
+        "rule": "an identifier (letters, digits, _ $ # . /)"}
+    assert by_name["schema"]["default"] is None
+
+
+def test_run_check_doc_names_other_schema_and_truncated_columns() -> None:
+    doc = tools._run_check_doc(False)
+    assert "other_schema: " in doc and "truncated_columns" in doc
+    run_check = build().tools["run_check"]
+    assert "other_schema" in run_check.function_schema.json_schema["properties"]
+
+
+async def test_run_check_reads_a_lob_up_to_the_checks_own_cap(db: h.FakeDbapi) -> None:
+    register(SOURCE)
+    lob = h.FakeLob("d" * 30_000, db=db)
+    db.description = (("VIEW_NAME",), ("DEFINITION",))
+    db.rows = [("V1", lob)]
+    answer = await call(build(), "run_check", system="erp_tenant", check="viewSource")
+    assert lob.reads == [20_001]
+    assert answer["rows"][0][1].startswith("d" * 20_000)
+    assert answer["truncated_columns"] == ["DEFINITION"]
+
+
+async def test_no_truncated_columns_when_nothing_was_cut(db: h.FakeDbapi) -> None:
+    register(SOURCE)
+    db.description = (("VIEW_NAME",), ("DEFINITION",))
+    db.rows = [("V1", h.FakeLob("short", db=db))]
+    answer = await call(build(), "run_check", system="erp_tenant", check="viewSource")
+    assert "truncated_columns" not in answer
+    assert answer["rows"] == [["V1", "short"]]
+
+
+async def test_truncated_columns_per_part_sorted(db: h.FakeDbapi) -> None:
+    register(SOURCE_PARTS)
+    db.description = (("B",), ("A",))
+    db.rows = [(h.FakeLob("b" * 5000, db=db), h.FakeLob("a" * 5000, db=db))]
+    answer = await call(build(), "run_check", system="erp_tenant", check="procSource")
+    assert [p.get("truncated_columns") for p in answer["parts"]] == [["A", "B"], ["A", "B"]]
+    db.rows = [(h.FakeLob("b", db=db), h.FakeLob("a", db=db))]
+    answer = await call(build(), "run_check", system="erp_tenant", check="procSource")
+    assert all("truncated_columns" not in p for p in answer["parts"])
+
+
+async def test_masked_lob_cut_is_named_too(db: h.FakeDbapi) -> None:
+    # A statement text read past the default cap is cut before it is masked;
+    # the column is named although the masking drops the marker.
+    lob = h.FakeLob(STATEMENT + " " * 5000 + "x", db=db)
+    db.description = (("A",), ("STATEMENT_STRING",))
+    db.rows = [(1, lob)]
+    answer = await call(build(), "run_check", system="erp_tenant", check="longRunning")
+    assert answer["truncated_columns"] == ["STATEMENT_STRING"]

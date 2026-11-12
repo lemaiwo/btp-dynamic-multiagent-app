@@ -3,10 +3,11 @@
 A check is DATA: a name (hana-cli's command name), a category, a one-line
 purpose, the upstream file it was derived from, and one or more fixed SQL
 statements whose only variable parts are ``?`` bind parameters. The model
-picks a check by name and passes at most five arguments (``schema``,
-``object``, ``top``, ``hours``, ``host``); it never supplies SQL. Every argument is
-checked here, before anything is sent, and a refusal names the argument and
-the rule, never the value: the value is model output and may hold anything.
+picks a check by name and passes at most six arguments (``schema``,
+``object``, ``top``, ``hours``, ``host``, ``other_schema``); it never supplies
+SQL. Every argument is checked here, before anything is sent, and a refusal
+names the argument and the rule, never the value: the value is model output
+and may hold anything.
 
 Standard library and the package's own pure modules only (no ``hdbcli``, no
 pydantic-ai, no ``agents.db``): the registry is imported by the admin gate and
@@ -52,6 +53,10 @@ letters, digits, ``.``, ``_`` and ``-``, at most 255 characters, as
 
 MAX_PURPOSE = 120
 MAX_ROWS = 500
+MAX_LOB_CHARS = 20_000
+"""The highest per-value LOB cap a check may set (:attr:`Check.lob_chars`): an
+object definition (a view's or a procedure's source) is read up to this many
+characters, a third of the answer's 60,000 character cap."""
 _FORBIDDEN_MARKERS = ("{", "}", "%s", "%(")
 
 
@@ -84,6 +89,10 @@ ARGS: dict[str, Arg] = {
     # The sample is a host that does not exist: the probe's run of a check
     # that binds it fails harmlessly (SPS07 answers SQL code 8).
     "host": Arg("host", "host", None, sample="probe-no-such-host"),
+    # The second schema of a check that compares two (schema checks): the
+    # same rule as `schema`, bound as given. Last, so the order of the
+    # arguments a check lists and of the first refusal stays as it was.
+    "other_schema": Arg("other_schema", "ident", None, sample="SYS"),
 }
 """The closed set of arguments. A statement binds only these names."""
 
@@ -146,6 +155,12 @@ class Check:
     """Arguments the caller must give (a subset of ``args``). Without them a
     ``WHERE X = ?`` would bind NULL and answer no rows, which reads like "no
     data"; a refusal naming the argument tells the model what is missing."""
+    lob_chars: int | None = None
+    """What is read of each LOB value, 1..:data:`MAX_LOB_CHARS` characters;
+    ``None`` is the toolset's ``CHECK_LOB_CHARS`` (4,096, enough for a
+    statement text the masking cuts to 300). An object definition sets
+    20,000. A value read only in part ends in the connection's cut marker,
+    and the answer names its column in ``truncated_columns``."""
 
     @property
     def composite(self) -> bool:
@@ -182,6 +197,10 @@ def validate_check(check: Check) -> None:
     if (not isinstance(check.max_rows_cap, int) or isinstance(check.max_rows_cap, bool)
             or not 1 <= check.max_rows_cap <= MAX_ROWS):
         raise refuse(f"max_rows_cap is not 1..{MAX_ROWS}")
+    if check.lob_chars is not None and (
+            not isinstance(check.lob_chars, int) or isinstance(check.lob_chars, bool)
+            or not 1 <= check.lob_chars <= MAX_LOB_CHARS):
+        raise refuse(f"lob_chars is not None or 1..{MAX_LOB_CHARS}")
     if not isinstance(check.requires_select, bool):
         raise refuse("requires_select is not a boolean")
     statements = check.statements
@@ -308,6 +327,7 @@ def resolve_args(
     top: Any = None,
     hours: Any = None,
     host: Any = None,
+    other_schema: Any = None,
 ) -> dict[str, Any]:
     """The values of the arguments ``check`` declares, defaults filled in.
 
@@ -318,7 +338,7 @@ def resolve_args(
     is :class:`InvalidArgument` naming the argument and the rule only.
     """
     given = {"schema": schema, "object": object, "top": top, "hours": hours,
-             "host": host}
+             "host": host, "other_schema": other_schema}
     resolved: dict[str, Any] = {}
     for name in ARGS:  # a fixed order: the first refused argument is deterministic
         value = given[name]
@@ -398,16 +418,25 @@ def build_answer(
 # ---- --dump -------------------------------------------------------------------------
 
 
-def dump_entries() -> list[dict[str, Any]]:
+def dump_entries(categories: Iterable[str] | None = None) -> list[dict[str, Any]]:
     """``[{name, sql, binds}]`` for ``scripts/probe_hana_connectivity.py --checks-file``.
 
     One entry per statement (a composite check's as ``<name>.<label>``), with
     the sample values of :data:`ARGS` (``SYS``, ``DUMMY``, 1, 24,
-    ``probe-no-such-host``; ``top_plus_one`` 2)
-    as binds.
+    ``probe-no-such-host``, ``other_schema`` ``SYS``; ``top_plus_one`` 2)
+    as binds. ``categories`` keeps the checks of those categories only (a
+    landscape run of one phase's checks); a name that is not one of
+    :data:`CATEGORIES` is a ``ValueError`` that does not repeat it.
     """
+    wanted: set[str] | None = None
+    if categories is not None:
+        wanted = set(categories)
+        if not wanted <= set(CATEGORIES):
+            raise ValueError("categories: not one of CATEGORIES")
     entries = []
     for check in _REGISTRY.values():
+        if wanted is not None and check.category not in wanted:
+            continue
         for statement in check.statements:
             name = f"{check.name}.{statement.label}" if statement.label else check.name
             entries.append({

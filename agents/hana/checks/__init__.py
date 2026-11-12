@@ -3,7 +3,9 @@
 An agent runs a check by name (``run_check``); it never writes SQL. The data
 model, the argument rules and the registry live in :mod:`.base`; each category
 module (:mod:`.monitoring`, :mod:`.performance`, :mod:`.system`,
-:mod:`.backup`) registers its checks at import, which this package does below.
+:mod:`.backup`, :mod:`.database`, :mod:`.inspection` (category ``database``),
+:mod:`.schema`, :mod:`.security`) registers its checks at import, which this
+package does below.
 ``python -m agents.hana.checks --dump`` prints the statements in the form
 ``scripts/probe_hana_connectivity.py --checks-file`` reads.
 
@@ -19,7 +21,16 @@ source file in `Check.source`.
 from __future__ import annotations
 
 # The category modules register their checks at import.
-from agents.hana.checks import backup, monitoring, performance, system  # noqa: F401
+from agents.hana.checks import (  # noqa: F401
+    backup,
+    database,
+    inspection,
+    monitoring,
+    performance,
+    schema,
+    security,
+    system,
+)
 from agents.hana.checks.base import (
     ARGS,
     CATEGORIES,

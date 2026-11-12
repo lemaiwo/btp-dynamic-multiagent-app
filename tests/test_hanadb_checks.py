@@ -661,3 +661,119 @@ def test_no_registered_check_reads_a_p_table() -> None:
     for check in EVERY_CHECK:
         for statement in check.statements:
             assert not re.search(r"(?i)\b(SYS|_SYS_STATISTICS)\s*\.\s*\"?P_", statement.sql)
+
+
+# ---- Phases 2 and 3: other_schema, lob_chars, --category ------------------------------
+
+DUMMY_PAIR = Check(
+    name="dummyPair", category="schema", purpose="Dummy check comparing two schemas.",
+    source="bin/dummyPair.js",
+    statements=(Statement(
+        "", "SELECT TOP ? TABLE_NAME FROM SYS.TABLES WHERE SCHEMA_NAME = ? OR SCHEMA_NAME = ?",
+        ("top_plus_one", "schema", "other_schema")),),
+    args=frozenset({"top", "schema", "other_schema"}),
+    required=frozenset({"schema", "other_schema"}),
+)
+
+
+def test_other_schema_is_an_identifier_argument() -> None:
+    arg = ARGS["other_schema"]
+    assert arg.kind == "ident" and arg.default is None and arg.sample == "SYS"
+    assert arg.rule == ARGS["schema"].rule
+    base.validate_check(DUMMY_PAIR)
+    args = base.resolve_args(DUMMY_PAIR, schema="SAPABAP1", other_schema="my.pkg/S$1")
+    assert args == {"top": 50, "schema": "SAPABAP1", "other_schema": "my.pkg/S$1"}
+    assert base.bind_values(DUMMY_PAIR.statements[0], args) == (51, "SAPABAP1", "my.pkg/S$1")
+
+
+@pytest.mark.parametrize("value", ["", "1ABC", "A B", "A'B", "x" * 128, 5, SECRET])
+def test_bad_other_schema_names_the_argument_not_the_value(value) -> None:
+    with pytest.raises(InvalidArgument) as info:
+        base.resolve_args(DUMMY_PAIR, schema="SYS", other_schema=value)
+    assert info.value.argument == "other_schema"
+    assert info.value.rule == ARGS["other_schema"].rule
+    assert SECRET not in json.dumps(info.value.to_dict()) + str(info.value)
+
+
+def test_other_schema_required_and_undeclared() -> None:
+    with pytest.raises(InvalidArgument) as info:
+        base.resolve_args(DUMMY_PAIR, schema="SYS")
+    assert (info.value.argument, info.value.rule) == ("other_schema", base.REQUIRED_RULE)
+    with pytest.raises(InvalidArgument) as info:
+        base.resolve_args(DUMMY_TWO, other_schema="SYS")
+    assert (info.value.argument, info.value.rule) == ("other_schema", base.UNDECLARED_RULE)
+    assert "other_schema" not in base.resolve_args(DUMMY_TWO)
+
+
+def test_other_schema_dump_sample(monkeypatch) -> None:
+    monkeypatch.setattr(base, "_REGISTRY", {})
+    registry.register(DUMMY_PAIR)
+    assert base.dump_entries()[0]["binds"] == [2, "SYS", "SYS"]
+
+
+def test_lob_chars_defaults_to_none_and_is_validated() -> None:
+    import dataclasses
+
+    assert DUMMY_ONE.lob_chars is None
+    assert base.MAX_LOB_CHARS == 20_000
+    for good in (1, 4096, 20_000):
+        base.validate_check(dataclasses.replace(DUMMY_ONE, lob_chars=good))
+    for bad in (0, -1, 20_001, True, 4096.0, "4096"):
+        with pytest.raises(ValueError, match="lob_chars"):
+            base.validate_check(dataclasses.replace(DUMMY_ONE, lob_chars=bad))
+
+
+def test_dump_entries_filter_by_category(dummies) -> None:
+    assert [e["name"] for e in base.dump_entries(categories=["performance"])] == [
+        "dummyTwo.summary", "dummyTwo.recent"]
+    assert [e["name"] for e in base.dump_entries(categories=("monitoring", "performance"))
+            ] == ["dummyOne", "dummyTwo.summary", "dummyTwo.recent"]
+    assert base.dump_entries(categories=["schema"]) == []
+    assert base.dump_entries(categories=None) == base.dump_entries()
+    with pytest.raises(ValueError) as info:
+        base.dump_entries(categories=["nosuchcategory"])
+    assert "nosuchcategory" not in str(info.value)
+
+
+def test_dump_command_filters_by_category() -> None:
+    out = subprocess.run(
+        [sys.executable, "-m", "agents.hana.checks", "--dump", "--category", "backup,system"],
+        cwd=ROOT, capture_output=True, text=True, check=True)
+    entries = json.loads(out.stdout)
+    assert entries == base.dump_entries(categories=["backup", "system"])
+    names = {e["name"].split(".")[0] for e in entries}
+    assert names and all(
+        registry.get_check(n).category in ("backup", "system") for n in names)
+    out = subprocess.run(
+        [sys.executable, "-m", "agents.hana.checks", "--dump", "--category", "database,schema"],
+        cwd=ROOT, capture_output=True, text=True, check=True)
+    assert json.loads(out.stdout) == base.dump_entries(categories=["database", "schema"])
+
+
+@pytest.mark.parametrize("value", ["evilCategoryX", "backup,evilCategoryX", "backup,", ""])
+def test_dump_command_refuses_an_unknown_category_without_echo(value) -> None:
+    out = subprocess.run(
+        [sys.executable, "-m", "agents.hana.checks", "--dump", "--category", value],
+        cwd=ROOT, capture_output=True, text=True)
+    assert out.returncode == 2
+    assert out.stdout == ""
+    assert "evilCategoryX" not in out.stderr
+
+
+def test_category_needs_dump() -> None:
+    out = subprocess.run(
+        [sys.executable, "-m", "agents.hana.checks", "--category", "backup"],
+        cwd=ROOT, capture_output=True, text=True)
+    assert out.returncode == 2 and out.stdout == ""
+
+
+def test_registered_names_are_unique_and_every_module_is_loaded() -> None:
+    import importlib
+
+    names = [c.name for c in registry.all_checks()]
+    assert len(set(names)) == len(names)
+    for module in ("backup", "database", "inspection", "monitoring", "performance",
+                   "schema", "security", "system"):
+        loaded = importlib.import_module(f"agents.hana.checks.{module}")
+        for check in getattr(loaded, "CHECKS", ()):
+            assert registry.get_check(check.name) is check
