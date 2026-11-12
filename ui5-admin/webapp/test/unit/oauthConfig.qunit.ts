@@ -106,6 +106,12 @@ QUnit.test("destination keeps Jira filters, and Slack its channel pin", function
     assert.deepEqual(Object.keys(slack).sort(), ["allow_send", "channels", "destination", "lookback"]);
 });
 
+QUnit.test("builtin:ariba is sent as exactly its destination name", function (assert) {
+    const out = oauthConfig.cleanOAuth(fullForm({ destination: " MY_ARIBA ", user_context: true, spaces: "X", api_base: "/x" }), "destination", "builtin:ariba") as Record<string, unknown>;
+    assert.deepEqual(out, { destination: "MY_ARIBA" }, "no user_context, no pins, nothing of another built-in");
+    assert.notOk(oauthConfig.supportsUserContext("builtin:ariba"), "reads as the technical user");
+});
+
 QUnit.test("destination keeps the Confluence space pin and api base, nothing of Jira's", function (assert) {
     const out = oauthConfig.cleanOAuth(fullForm({ spaces: " shERPa, DOCS " }), "destination", "builtin:confluence") as Record<string, unknown>;
     assert.deepEqual(Object.keys(out).sort(), ["api_base", "destination", "spaces"]);
