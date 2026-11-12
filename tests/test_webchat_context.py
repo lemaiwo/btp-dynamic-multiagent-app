@@ -408,6 +408,33 @@ async def test_tools_name_the_delegation_targets_the_access_allows(client, roles
         ("delegate_abap_dev", "abap-dev"), ("delegate_hidden", "hidden")]
 
 
+async def test_a_withheld_hana_entry_is_no_connector_of_the_context(client):
+    """A row whose HANA tools the build withholds (a hand-written basic-chat
+    row) does not list builtin:hana; an advanced one does."""
+    hana = {"url": "builtin:hana", "auth_mode": "destination",
+            "oauth": {"systems": [{"name": "prd", "destination": "HANA_SECRET_DEST"}]}}
+    async with SessionLocal() as s:
+        for name, tier in (("dba-basic", "basic"), ("dba-adv", "advanced")):
+            s.add(AgentConfig(name=name, description="d", instructions="x",
+                              mcp_url="builtin:sapnotes", auth_mode="none",
+                              enabled=1, expose_chat=1, tier=tier,
+                              extra_servers_json=json.dumps([hana])))
+        await s.commit()
+
+    async def connectors(ref: str, access: str) -> list[str]:
+        # No validator here: everyone may open an advanced conversation.
+        cid = await conversation(client, agent_ref=ref, access=access)
+        out = await get_context(client, cid)
+        return [t["name"] for t in out["tools"] if t["kind"] == "connector"]
+
+    assert await connectors("admin:dba-basic", "basic") == ["builtin:sapnotes"]
+    assert await connectors("admin:dba-adv", "advanced") == [
+        "builtin:sapnotes", "builtin:hana"]
+    assert "HANA_SECRET_DEST" not in json.dumps(
+        (await get_context(client, await conversation(
+            client, agent_ref="admin:dba-adv", access="advanced")))["tools"])
+
+
 async def test_an_admin_agent_lists_its_connectors_and_the_data_catalogue(client):
     # Run straight (`admin:<name>`), an admin agent has its own servers: one
     # `connector` entry per label (built-in canonical URL or MCP host; never a

@@ -125,21 +125,6 @@ def check_entry(cfg: Any) -> None:
             "or a number does not set it")
 
 
-def asks_to_select(cfg: Any) -> bool:
-    """Whether a block asks for ``run_select``, checked or not:
-    ``allow_select`` holds anything but ``false`` / nothing.
-
-    It decides whether ``run_select`` is registered; the rules about who may
-    reach the agent (no invoke API, chat only at tier advanced, never a
-    peer, no sharing) hold for every ``builtin:hana`` entry
-    (`agents.db.check_hana_reach`). Wider than :func:`pins_of` on purpose, as
-    ``agents.bitbucket_config.asks_to_approve``: a hand-written ``"true"``
-    gives no toolset at all, and still must not read as "does not select"."""
-    return isinstance(cfg, dict) and (
-        cfg.get("allow_select") is not None and cfg.get("allow_select") is not False
-    )
-
-
 def clean_entry(cfg: Any) -> dict[str, Any]:
     """The block as it is stored: checked, its own keys only, fixed order, a
     new object. ``allow_select`` only as ``true``."""
@@ -153,7 +138,10 @@ def clean_entry(cfg: Any) -> dict[str, Any]:
 
 
 def pins_of(cfg: Any) -> Pins:
-    """The checked block as the toolset reads it."""
+    """The checked block as the toolset reads it. ``allow_select`` is true
+    only for exactly ``true`` and decides whether ``run_select`` is
+    registered; the reach rules hold for every ``builtin:hana`` entry,
+    whatever it says (`agents.db.check_hana_reach`)."""
     cleaned = clean_entry(cfg)
     return Pins(
         systems=tuple((s["name"], s["destination"]) for s in cleaned["systems"]),

@@ -1233,8 +1233,8 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     argument) with its definition at `lob_chars` 4,000 and at most 8 rows,
     so a long member is cut (`truncated_columns`), not refused (a worst case
     measured as the model receives it, a third `"` and a third line feeds,
-    fits the 60,000 cap; so does one 20,000 character definition with its
-    other parts). **Never
+    fits the 60,000 cap; so does one 20,000 character definition with ten
+    rows in each listed part). **Never
     selected by the new categories**: rows of a user table, passwords and
     password hashes, key material and root key hashes, certificate bodies
     (and subject alternative names, fingerprints), audit log rows (only the
@@ -1295,8 +1295,8 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   cannot be `expose_invoke` (`HANA_INVOKE_MESSAGE`), may be chat-exposed
   only at tier `advanced` (`HANA_CHAT_MESSAGE`), and may not be named in
   any agent's `peers` (any other row, enabled or not; `_HANA_PEER_RULE`);
-  `allow_select` (`asks_to_select`) decides only whether `run_select` is
-  registered. A stored row that breaks the rules (written by hand, or a
+  `allow_select` decides only whether `run_select` is registered (exactly
+  `true`, `pins_of`). A stored row that breaks the rules (written by hand, or a
   Phase 1 row saved as basic chat or invoke without `allow_select`, which
   was valid before 2.41.0) still loads and the app starts, but it is built
   WITHOUT the HANA tools (its other servers stay), and no delegation tool is

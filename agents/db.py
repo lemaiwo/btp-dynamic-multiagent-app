@@ -5681,16 +5681,6 @@ def has_hana_entry(servers: Any) -> bool:
     return bool(_hana_entries(servers))
 
 
-def hana_selects(servers: Any) -> bool:
-    """Whether a server list holds a ``builtin:hana`` entry that asks for
-    ``run_select`` (`agents.hana.config.asks_to_select`; a hand-written
-    ``"true"`` counts). It decides only whether ``run_select`` is
-    registered: the reach rules (`check_hana_reach`) hold for every entry."""
-    from agents.hana.config import asks_to_select
-
-    return any(asks_to_select(s.get("oauth")) for s in _hana_entries(servers))
-
-
 # A builtin:hana entry connects as each destination's technical user, whose
 # privileges on the first landscape are wide (decided 2026-11-10). Its fixed
 # checks read object source code of any schema, the database users with

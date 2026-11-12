@@ -13,7 +13,8 @@ R2  An agent with a ``builtin:hana`` entry, with or without ``allow_select``
     b. is chat-exposed only with tier ``advanced``;
     c. is nobody's peer (it may have peers of its own).
     The scheduler run endpoint and Run now stay allowed. ``allow_select``
-    (``asks_to_select``) decides only whether ``run_select`` is registered.
+    decides only whether ``run_select`` is registered (exactly ``true``,
+    ``agents.hana.config.pins_of``).
 
 Modelled on the approving ``builtin:bitbucket`` agent
 (`tests/test_bitbucket_reach.py`): refused at the save gate, by storage (the
@@ -101,20 +102,6 @@ async def _names() -> list[str]:
 
     async with SessionLocal() as s:
         return sorted(r.name for r in await list_agents(s))
-
-
-# --- the predicate ---------------------------------------------------------------
-
-@pytest.mark.parametrize("cfg, expected", [
-    (SELECTING, True), ({**READING, "allow_select": "true"}, True),
-    ({**READING, "allow_select": 1}, True), ({**READING, "allow_select": "false"}, True),
-    (READING, False), ({**READING, "allow_select": False}, False),
-    ({**READING, "allow_select": None}, False), (None, False), ("x", False),
-])
-def test_asks_to_select_reads_anything_but_false_or_absent_as_selecting(cfg, expected):
-    from agents.hana.config import asks_to_select
-
-    assert asks_to_select(cfg) is expected
 
 
 # --- the messages ---------------------------------------------------------------
@@ -540,6 +527,21 @@ async def test_a_build_gives_no_hana_tools_to_a_hand_written_true_on_basic_chat(
     names = await _tool_names(build.specialists["dba"])
     assert names and not any("hana" in n or n in READ_TOOLS | {"run_select"} for n in names)
     assert NO_HANA_TOOLS in _warnings(caplog)
+
+
+@pytest.mark.usefixtures("real_agents_and_mcp")
+async def test_a_row_with_two_hana_entries_on_basic_chat_gets_one_warning(caplog):
+    """Withheld for two reasons, said once: the HANA tools are already gone."""
+    caplog.set_level(logging.INFO)
+    build = await _build(
+        [_agent("dba", NOTES, expose_chat=False)],
+        raw={"dba": {"expose_chat": 1, "extra_servers_json": json.dumps(
+            [entry(READING), entry(SELECTING)])}})
+    names = await _tool_names(build.specialists["dba"])
+    assert names and not any("hana" in n or n in READ_TOOLS | {"run_select"} for n in names)
+    said = _warnings(caplog)
+    assert said.count("built without the HANA tools") == 1
+    assert "more than one builtin:hana entry" in said
 
 
 @pytest.mark.usefixtures("real_agents_and_mcp")

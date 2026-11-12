@@ -211,6 +211,28 @@ def _has_hana(specs: list) -> bool:
     return any(isinstance(s, dict) and _server_key_of(s) == BUILTIN_HANA_URL for s in specs)
 
 
+def _hana_count(specs: list) -> int:
+    return sum(isinstance(s, dict) and _server_key_of(s) == BUILTIN_HANA_URL for s in specs)
+
+
+def _hana_reach_broken(row: Any, specs: list) -> bool:
+    """A row with a ``builtin:hana`` entry exposed to the invoke API or to
+    chat at a tier other than advanced (refused at every save; a row written
+    by hand or stored before the rule covered every entry)."""
+    return _has_hana(specs) and (
+        bool(getattr(row, "expose_invoke", 0))
+        or (bool(row.expose_chat) and (getattr(row, "tier", None) or "basic") != "advanced")
+    )
+
+
+def hana_withheld(row: Any) -> bool:
+    """Whether the build gives this row no HANA tools: two ``builtin:hana``
+    entries, or the reach rules broken. One reading for the build and the web
+    chat's context view."""
+    specs = row.mcp_servers
+    return _hana_count(specs) > 1 or _hana_reach_broken(row, specs)
+
+
 def _short_tool_output(result) -> str:
     """A compact, single-blob preview of a specialist tool's return value.
 
@@ -1041,7 +1063,7 @@ async def build_orchestrator() -> BuildResult:
             )
         # And for builtin:hana: the second entry could carry wider access
         # (allow_select, another system) than the one somebody reviewed.
-        no_hana = sum(_server_key_of(s) == BUILTIN_HANA_URL for s in specs) > 1
+        no_hana = _hana_count(specs) > 1
         if no_hana:
             logger.warning(
                 "Agent '%s': its row holds more than one builtin:hana entry; "
@@ -1056,11 +1078,9 @@ async def build_orchestrator() -> BuildResult:
         # review of Phases 2 and 3). The save gate and storage refuse the
         # rest; a row written by hand, or stored before the rule covered
         # every entry, passes neither, so it is built here without the HANA
-        # tools: the agent and its other servers stay.
-        if _has_hana(specs) and (
-            bool(getattr(row, "expose_invoke", 0))
-            or (bool(row.expose_chat) and (row.tier or "basic") != "advanced")
-        ):
+        # tools: the agent and its other servers stay. One WARNING per row:
+        # a row already without them for two entries is not warned again.
+        elif _hana_reach_broken(row, specs):
             no_hana = True
             # The agent and the rule only: no system, destination or value.
             logger.warning(
