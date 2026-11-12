@@ -56,11 +56,12 @@ sub-agents included; the poll answer lists those rows (service, entity set,
 operation, the key SAP returned for a create, outcome) and nothing else.
 
 Rows and locks. A run is a ``job_runs`` row with ``trigger="invoke"`` and
-``created_by`` the caller, ``timeout_seconds`` 300 so the stale sweep agrees
-with the timeout here. One run per (principal, agent) at a time (409 with the
-running id) and at most ``INVOKE_MAX_CONCURRENT`` per app instance (429);
-both are in memory, per process, as is the job runner's start lock. Invoke
-rows do not count as the scheduler's overlap lock (``active_job_run``).
+``created_by`` the caller, ``timeout_seconds`` the run limit
+(``INVOKE_TIMEOUT_SECONDS``, default 300) plus a margin so the stale sweep
+agrees with the timeout here. One run per (principal, agent) at a time (409
+with the running id) and at most ``INVOKE_MAX_CONCURRENT`` per app instance
+(429); both are in memory, per process, as is the job runner's start lock.
+Invoke rows do not count as the scheduler's overlap lock (``active_job_run``).
 
 Errors to the caller are stable codes with fixed texts; an exception's text
 goes to the row (masked by ``describe_exception``, read by admins) and the
@@ -73,6 +74,7 @@ import asyncio
 import functools
 import json
 import logging
+import math
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -127,6 +129,7 @@ router = APIRouter(tags=["invoke"])
 
 TRIGGER = "invoke"
 INVOKE_TIMEOUT_SECONDS = 300
+MAX_INVOKE_TIMEOUT_SECONDS = 3600
 # The row's timeout_seconds (read by the stale sweep) is the deadline plus
 # this: the sweep counts from started_at, the deadline from the task's start.
 ROW_TIMEOUT_MARGIN_SECONDS = 60
@@ -195,6 +198,18 @@ def _env_positive(name: str, default: float) -> float:
     if not value > 0 or value == float("inf"):
         logger.warning("%s is not a positive number; using %s", name, default)
         return default
+    return value
+
+
+def invoke_timeout() -> float:
+    """``INVOKE_TIMEOUT_SECONDS`` (default 300, at most 3600): the deadline
+    around one invoke run, read per call. The module constant is the default,
+    so a test can still patch it."""
+    value = _env_positive("INVOKE_TIMEOUT_SECONDS", INVOKE_TIMEOUT_SECONDS)
+    if value > MAX_INVOKE_TIMEOUT_SECONDS:
+        logger.warning("INVOKE_TIMEOUT_SECONDS is above %d; using %d",
+                       MAX_INVOKE_TIMEOUT_SECONDS, MAX_INVOKE_TIMEOUT_SECONDS)
+        return float(MAX_INVOKE_TIMEOUT_SECONDS)
     return value
 
 
@@ -464,10 +479,11 @@ async def _execute(run_id: str, activity: Any, agent_id: int, principal: str, te
     ``ROW_TIMEOUT_MARGIN_SECONDS``, so a stale sweep never takes a live run.
     """
     box = ResultBox(schema=None)
+    limit = invoke_timeout()
     try:
         for item in attachments:
             activity.record_attachment(item.name, item.media_type, item.size)
-        async with asyncio.timeout(INVOKE_TIMEOUT_SECONDS) as deadline:
+        async with asyncio.timeout(limit) as deadline:
             try:
                 outcome = await _attempt(agent_id, principal, text, attachments, box)
             except TimeoutError:
@@ -477,7 +493,7 @@ async def _execute(run_id: str, activity: Any, agent_id: int, principal: str, te
                 raise RuntimeError("a call inside the run timed out") from None
     except TimeoutError:
         outcome = {"status": "failed",
-                   "error": f"timeout: the run exceeded {INVOKE_TIMEOUT_SECONDS}s"}
+                   "error": f"timeout: the run exceeded {limit:g}s"}
     except asyncio.CancelledError:
         await asyncio.shield(_interrupted(run_id, state))
         raise
@@ -631,7 +647,7 @@ async def invoke_agent(
         async with SessionLocal() as session:
             row = await create_job_run(
                 session, agent=agent, trigger=TRIGGER, created_by=principal,
-                timeout_seconds=INVOKE_TIMEOUT_SECONDS + ROW_TIMEOUT_MARGIN_SECONDS,
+                timeout_seconds=math.ceil(invoke_timeout()) + ROW_TIMEOUT_MARGIN_SECONDS,
             )
         run_id = row.id
         _active[key] = run_id
