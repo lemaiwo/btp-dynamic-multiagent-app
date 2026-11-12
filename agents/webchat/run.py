@@ -47,6 +47,14 @@ orchestrator); a ref that names nothing usable fails the turn with
 specialist run straight holds its build's ``in_flight`` counter, as a
 delegation does, so a reload does not close its MCP clients mid-turn.
 
+A file a tool hands to the model (a ``BinaryContent`` whose ``identifier``
+starts with ``tool:``, such as the supplier PDF of ``builtin:ariba``'s
+``read_document``) is the model's for that turn only: the stored
+``model_json`` holds :data:`TOOL_FILE_PLACEHOLDER` in its place
+(:func:`without_tool_files`), so the bytes are not kept with the
+conversation and not sent again with a later turn's history. The user's own
+uploads (identifier = the ``chat_files`` id) are kept as before.
+
 Exception text reaches the stream and the row only through
 ``agents.errors.describe_exception``. The turns are per process (one app
 instance, like the other runners); the run lock is the database row.
@@ -60,7 +68,7 @@ import logging
 import os
 import time
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 from uuid import uuid4
 from xml.sax.saxutils import quoteattr
@@ -71,11 +79,13 @@ from pydantic_ai.messages import (
     FunctionToolResultEvent,
     ModelMessage,
     ModelMessagesTypeAdapter,
+    ModelRequest,
     PartDeltaEvent,
     PartStartEvent,
     RetryPromptPart,
     TextPart,
     TextPartDelta,
+    UserPromptPart,
 )
 
 from agents.access import BASIC, current_access
@@ -600,6 +610,39 @@ def build_prompt(text: str, uploads: list[Upload],
     return prompt
 
 
+# The identifier prefix of a file a tool handed to the model (never an upload:
+# those carry their `chat_files` id), and what the stored turn says instead.
+TOOL_FILE_PREFIX = "tool:"
+TOOL_FILE_PLACEHOLDER = "[document read by a tool; not kept in the conversation]"
+
+
+def _tool_file(item: Any) -> bool:
+    return isinstance(item, BinaryContent) and str(item.identifier or "").startswith(
+        TOOL_FILE_PREFIX)
+
+
+def without_tool_files(messages: list[ModelMessage]) -> list[ModelMessage]:
+    """``messages`` with every tool-handed file replaced by the placeholder
+    text. A new list of new requests where something was replaced; every other
+    message and part is the original object."""
+    out: list[ModelMessage] = []
+    for message in messages:
+        if not isinstance(message, ModelRequest) or not any(
+            isinstance(p, UserPromptPart) and not isinstance(p.content, str)
+            and any(_tool_file(i) for i in p.content) for p in message.parts
+        ):
+            out.append(message)
+            continue
+        parts = [
+            replace(p, content=[TOOL_FILE_PLACEHOLDER if _tool_file(i) else i
+                                for i in p.content])
+            if isinstance(p, UserPromptPart) and not isinstance(p.content, str) else p
+            for p in message.parts
+        ]
+        out.append(replace(message, parts=parts))
+    return out
+
+
 def load_history(stored: list[str]) -> list[ModelMessage]:
     """The concatenated ``model_json`` of the earlier turns; a row that does
     not parse is left out (logged by position only)."""
@@ -809,7 +852,8 @@ async def _run(turn: Turn, data: TurnInput) -> None:
             )
             output = result.output
             content = output if isinstance(output, str) else str(output)
-            model_json = result.new_messages_json().decode("utf-8")
+            model_json = ModelMessagesTypeAdapter.dump_json(
+                without_tool_files(result.new_messages())).decode("utf-8")
             status = "done"
             # Whatever is still open is closed first, so the usage part is
             # the last part and its event comes after every agent frame.

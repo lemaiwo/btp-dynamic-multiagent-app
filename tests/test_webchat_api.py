@@ -772,3 +772,71 @@ def test_a_peer_delegation_of_a_specialist_is_not_a_tool_card():
                             tool_name="SAPQuery", args={"q": "y"}, delegation_id="d1"))
     kinds = [(p["type"], p.get("name")) for p in rec.parts]
     assert kinds == [("tool", "SAPQuery")]
+
+
+# ---------------------------------------------------------------------------
+# A file a tool hands to the model is not kept with the conversation
+# ---------------------------------------------------------------------------
+TOOL_PDF = b"%PDF-1.7\n" + b"SUPPLIER-PDF-BYTES" * 8
+
+
+async def read_supplier_file(ctx: RunContext, document_id: str) -> Any:
+    """A tool that hands the model a PDF the way ``builtin:ariba`` does."""
+    from pydantic_ai import BinaryContent, ToolReturn
+
+    return ToolReturn(return_value={"format": "pdf", "pages": 1}, content=[
+        "the PDF follows",
+        BinaryContent(data=TOOL_PDF, media_type="application/pdf",
+                      identifier=f"tool:ariba:{document_id}"),
+    ])
+
+
+async def test_a_tool_pdf_is_not_stored_or_sent_again(client, monkeypatch,
+                                                      real_agents_and_mcp):
+    import base64
+
+    from pydantic_ai.messages import BinaryContent
+
+    seen: list[list[Any]] = []
+
+    async def stream(messages, info):
+        seen.append(list(messages))
+        if len(seen) == 1:
+            yield {0: DeltaToolCall(name="read_supplier_file",
+                                    json_args=json.dumps({"document_id": "D1"}),
+                                    tool_call_id="read-1")}
+            return
+        yield "Read it."
+
+    agent = use_model(monkeypatch, real_agents_and_mcp, stream)
+    agent.tool(name="read_supplier_file")(read_supplier_file)
+    cid = await new_conversation(client)
+    first = frames((await client.post(
+        f"{API}/conversations/{cid}/messages",
+        **form(text="Review it", files=[("shot.png", PNG_BYTES, "image/png")])
+    )).text)
+    assert first[-1][1]["status"] == "done"
+
+    # Inside the turn the model had the PDF.
+    def binaries(messages):
+        return [item for m in messages if isinstance(m, ModelRequest) for p in m.parts
+                if isinstance(p, UserPromptPart) and not isinstance(p.content, str)
+                for item in p.content if isinstance(item, BinaryContent)]
+
+    assert [b.identifier for b in binaries(seen[1])][-1] == "tool:ariba:D1"
+
+    async with SessionLocal() as s:
+        stored = (await s.execute(select(ChatMessage.model_json).where(
+            ChatMessage.conversation_id == cid, ChatMessage.role == "assistant"))
+        ).scalar_one()
+    assert base64.b64encode(TOOL_PDF).decode() not in stored
+    assert "[document read by a tool; not kept in the conversation]" in stored
+    # The user's upload is kept, by its file id.
+    assert base64.b64encode(PNG_BYTES).decode() in stored
+
+    second = frames((await client.post(f"{API}/conversations/{cid}/messages",
+                                       **form(text="And now?"))).text)
+    assert second[-1][1]["status"] == "done"
+    history = binaries(seen[-1])
+    assert [b.media_type for b in history] == ["image/png"]
+    assert not any(str(b.identifier).startswith("tool:") for b in history)

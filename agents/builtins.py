@@ -33,6 +33,7 @@ builtin:ina        --        --        user / app    --       --
 builtin:sharepoint --        app (ro)  app (ro)      --       --
 builtin:bitbucket  --        --        app           --       --
 builtin:confluence --        --        app           --       --
+builtin:ariba      --        --        app           --       --
 builtin:git        --        --        app           --       --
 builtin:reconcile  --        --        --            default  --
 ================== ========= ========= ============= ======== ========
@@ -76,6 +77,13 @@ destination and has no per-user mode: ``user_context`` is refused. Its config
 block pins the space keys (``spaces``) and the REST prefix (``api_base``); see
 :mod:`agents.confluence_tools`.
 
+``builtin:ariba`` reads SAP Ariba sourcing events, the suppliers invited to
+them and the PDFs a supplier uploaded with its bid, through the Event
+Management API, as the technical user of a destination (the destination holds
+the API key and the realm); it has no per-user mode: ``user_context`` is
+refused. Its config block is the destination name alone; see
+:mod:`agents.ariba_tools`.
+
 ``builtin:git`` reads and writes Git repositories on GitHub, Bitbucket Cloud
 or GitLab as the technical user of a destination and has no per-user mode:
 ``user_context`` is refused. Its config block names the provider, pins the
@@ -102,6 +110,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from agents.ariba_tools import BUILTIN_ARIBA_URL, ariba_toolset
 from agents.bitbucket_config import BUILTIN_BITBUCKET_URL
 from agents.bitbucket_tools import bitbucket_toolset
 from agents.confluence_tools import BUILTIN_CONFLUENCE_URL, confluence_toolset
@@ -139,6 +148,7 @@ _FACTORIES: dict[str, Callable[..., Any]] = {
     BUILTIN_SHAREPOINT_URL: sharepoint_toolset,
     BUILTIN_BITBUCKET_URL: bitbucket_toolset,
     BUILTIN_CONFLUENCE_URL: confluence_toolset,
+    BUILTIN_ARIBA_URL: ariba_toolset,
     BUILTIN_GIT_URL: git_toolset,
     BUILTIN_RECONCILE_URL: reconcile_toolset,
 }
