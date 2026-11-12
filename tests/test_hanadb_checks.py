@@ -780,10 +780,26 @@ def test_registered_names_are_unique_and_every_module_is_loaded() -> None:
 
 
 # Words that never stand as a column (or alias) of a registered statement:
-# free text, password hashes, secrets. String literals are exempt (a value
-# compared in a WHERE, e.g. a key name of an ini allow-list, is no column).
-NEVER_SELECTED_WORDS = frozenset(
-    {"COMMENTS", "COMMENT", "PASSWORD_HASH", "SECRET", "TOKEN", "PASSPHRASE"})
+# free text, password hashes, secrets, expression and query texts that can
+# embed literals, personal data and file-system paths. The union of the
+# per-module lists (inspection, schema, database, security), held here for
+# every module so a check moved or added elsewhere is held to it too. String
+# literals are exempt (a value compared in a WHERE, e.g. a key name of an ini
+# allow-list, is no column).
+NEVER_SELECTED_WORDS = frozenset({
+    "COMMENTS", "COMMENT", "PASSWORD_HASH", "SECRET", "TOKEN", "PASSPHRASE",
+    "DEFAULT_VALUE", "CHECK_CONDITION", "RESET_BY_QUERY", "PRAGMAS",
+    "USER_PARAMETERS", "EXTERNAL_IDENTITY", "PATH",
+})
+# Checks that may name one of those words, and why. PATH: the Phase 1 checks
+# ``disks`` and ``healthCheck`` read ``M_DISKS.PATH``, the mount point of a
+# data / log / trace volume on the database host (registered and verified on
+# a landscape in 2.40.0); the rule against PATH is about the audit trail,
+# key and volume file paths of the security checks (``M_VOLUMES.PATH``).
+NEVER_SELECTED_EXEMPT: dict[str, frozenset[str]] = {
+    "disks": frozenset({"PATH"}),
+    "healthCheck": frozenset({"PATH"}),
+}
 # Functions whose argument list may hold a FROM that is no table reference.
 _EXPRESSION_FROM = frozenset(
     {"EXTRACT", "TRIM", "SUBSTRING", "SUBSTR_REGEXPR", "OCCURRENCES_REGEXPR",
@@ -847,5 +863,21 @@ def test_column_and_table_rules_across_modules(check: Check, statement: Statemen
     if "DEFINITION" in words:
         assert check.name.startswith("inspect") and check.lob_chars is not None, \
             "DEFINITION is read only by an inspect* check with lob_chars"
-    assert not words & NEVER_SELECTED_WORDS, sorted(words & NEVER_SELECTED_WORDS)
+    never = NEVER_SELECTED_WORDS - NEVER_SELECTED_EXEMPT.get(check.name, frozenset())
+    assert not words & never, sorted(words & never)
     assert _bad_table_references(tokens) == []
+
+
+def test_the_shared_rules_run_over_the_whole_registry() -> None:
+    """The parametrized test above skips silently on an empty registry: the
+    registry of Phases 1 to 3 holds 139 statements."""
+    assert len(_registered_statements()) > 100
+
+
+def test_the_exemptions_are_still_needed() -> None:
+    """An exemption names a registered check that still uses the word."""
+    for name, words in NEVER_SELECTED_EXEMPT.items():
+        check = registry.get_check(name)
+        used = {t.value for s in check.statements for t in tokenize(s.sql)
+                if t.kind in ("word", "quoted")}
+        assert words <= used, name
