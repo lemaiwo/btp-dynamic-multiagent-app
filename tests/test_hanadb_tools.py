@@ -598,6 +598,21 @@ def test_run_check_doc_names_other_schema_and_truncated_columns() -> None:
     assert "other_schema" in run_check.function_schema.json_schema["properties"]
 
 
+def test_the_tool_docs_describe_every_phase_not_only_monitoring() -> None:
+    """Phases 2 and 3 added catalogue, schema and security checks: the docs
+    speak of checks, and ``object`` names what those checks take."""
+    toolset = build()
+    for doc in (tools._run_check_doc(False), tools._run_check_doc(True),
+                toolset.tools["run_check"].description,
+                toolset.tools["list_checks"].description):
+        assert "monitoring check" not in doc
+    doc = tools._run_check_doc(False)
+    assert "Run one registered check" in doc
+    for kind in ("table", "view", "index", "procedure", "library", "user", "role"):
+        assert kind in doc.split("object: ", 1)[1].split("top: ", 1)[0], kind
+    assert "List the checks `run_check` can run" in toolset.tools["list_checks"].description
+
+
 async def test_run_check_reads_a_lob_up_to_the_checks_own_cap(db: h.FakeDbapi) -> None:
     register(SOURCE)
     lob = h.FakeLob("d" * 30_000, db=db)

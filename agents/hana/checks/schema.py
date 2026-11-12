@@ -3,7 +3,7 @@
 Each check is data: ``register(Check(...))`` at import, with its SQL as a
 constant and every variable part a ``?`` bind (see :mod:`.base`).
 
-Phase 3: checks across one or two schemas; a check that compares two declares
+Phase 2: checks across one or two schemas; a check that compares two declares
 ``other_schema`` (same rule as ``schema``, bound as given).
 
 The target is on-premise SAP HANA 2.0 (SPS07); a ``# on-prem:`` comment per

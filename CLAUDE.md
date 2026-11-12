@@ -1246,7 +1246,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     grantee and grantor names (the security checks; certificate DNs too); the
     database account name in `status` (`CURRENT_USER`, possibly a person's):
     all of it reaches the model and the stored chat history like any tool
-    return. **Not ported from hana-cli**: its JavaScript diff, recursion,
+    return; the `object` argument of `inspectUser` / `grantChains` /
+    `privilegeAnalysis` (a user or role name) is kept in the run activity's
+    argument preview. **Not ported from hana-cli**: its JavaScript diff, recursion,
     scoring and drawing (`compareSchema` and `erdDiagram` return rows,
     `dependencies` and `grantChains` one level per call, `securityScan` no
     score), the CDS / hdbtable / hdbview conversions, `_SYS_BI` calculation
@@ -1254,7 +1256,11 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     **Tests across modules**: `tests/test_hanadb_checks.py`
     (`test_column_and_table_rules_across_modules`, over every registered
     statement: `DEFINITION` only in an `inspect*` check with `lob_chars`; no
-    COMMENTS, COMMENT, PASSWORD_HASH, SECRET, TOKEN or PASSPHRASE; only
+    COMMENTS, COMMENT, PASSWORD_HASH, SECRET, TOKEN, PASSPHRASE,
+    DEFAULT_VALUE, CHECK_CONDITION, RESET_BY_QUERY, PRAGMAS, USER_PARAMETERS,
+    EXTERNAL_IDENTITY or PATH (`disks` and `healthCheck` exempted from PATH by
+    name: `M_DISKS.PATH`, a volume's mount point); more than 100 statements
+    (a test of its own, so an empty registry fails); only
     `SYS.`, `_SYS_STATISTICS.`, `M_*`, a CTE or a subquery after FROM / JOIN),
     and per module test files that pin names, binds and never-selected
     columns; `tests/test_hanadb_checks_security.py` holds a column

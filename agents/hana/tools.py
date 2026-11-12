@@ -144,7 +144,7 @@ def _categories(allow_select: bool) -> list[str]:
 def _run_check_doc(allow_select: bool) -> str:
     categories = ", ".join(_categories(allow_select)) or "none registered yet"
     top, hours = ARGS["top"], ARGS["hours"]
-    return f"""Run one registered monitoring check on a system and return its rows:
+    return f"""Run one registered check on a system and return its rows:
 `{{system, check, columns, rows, row_count, truncated}}`, or for a check of
 several parts `{{system, check, parts: [{{label, columns, rows, row_count,
 truncated}}]}}`. Call `list_checks` first: it names every check you may run
@@ -165,7 +165,9 @@ Args:
     check: A check name from `list_checks`.
     schema: A schema name to narrow the check to, as the catalogue writes it
         (usually upper case). Default: all schemas.
-    object: An object (table, view) name to narrow the check to.
+    object: The name the check's purpose names (a table, view, index,
+        procedure, function, trigger, library, user, role, ...), written like
+        `schema`; for a list check, a name to narrow it to.
     top: The most rows to return, {top.low} to {top.high} (some checks allow
         fewer). Default {top.default}.
     hours: How many hours back to look, {hours.low} to {hours.high}. Default
@@ -264,7 +266,7 @@ def hana_toolset(
         return {"systems": [{"name": name} for name in systems]}
 
     async def list_checks(category: str | None = None) -> dict[str, Any]:
-        """List the monitoring checks `run_check` can run: `{checks: [{name,
+        """List the checks `run_check` can run: `{checks: [{name,
         category, purpose, arguments: [{name, default, rule}]}]}`. An argument
         the check cannot run without has `required: true` instead of a
         `default`: always pass it.
