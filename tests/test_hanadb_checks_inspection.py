@@ -41,8 +41,10 @@ PARTS: dict[str, tuple[str, ...]] = {
 WITH_DEFINITION = {"inspectProcedure", "inspectFunction", "inspectView", "inspectTrigger",
                    "inspectLibrary", "inspectLibMember"}
 
-# Free text somebody typed, or not in the documented on-prem views.
-FORBIDDEN_COLUMNS = {"COMMENTS", "COMMENT", "DESCRIPTION", "PRAGMAS"}
+# Never selected: free text somebody typed, expression text that can embed
+# literals (the same rule as the schema checks), or not in the documented views.
+FORBIDDEN_COLUMNS = {"COMMENTS", "COMMENT", "DESCRIPTION", "PRAGMAS", "DEFAULT_VALUE",
+                     "CHECK_CONDITION"}
 
 _REFERENCE = re.compile(r"\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_.]*|\()")
 
@@ -71,7 +73,7 @@ def test_registered_with_required_schema_and_object(name: str) -> None:
 def test_definitions_are_read_up_to_20000_characters(name: str) -> None:
     check = registry.get_check(name)
     if name in WITH_DEFINITION:
-        assert check.lob_chars == 20_000
+        assert check.lob_chars == (5_000 if name == "inspectLibMember" else 20_000)
         assert any("DEFINITION" in _words(s.sql) for s in check.statements)
     else:
         assert check.lob_chars is None
@@ -109,6 +111,15 @@ def test_lib_member_lists_every_member_with_its_definition() -> None:
     members = check.statements[1].sql
     assert {"MEMBER_NAME", "MEMBER_TYPE", "ACCESS_MODE", "DEFINITION"} <= _words(members)
     assert "member" in check.purpose.lower()
+
+
+def test_lib_member_fits_the_lob_budget() -> None:
+    # Every member's definition at its cap stays inside the 60,001 character
+    # budget of one statement: a library of long members is cut, not refused.
+    check = registry.get_check("inspectLibMember")
+    assert check.lob_chars == 5_000 and check.max_rows_cap == 10
+    assert check.max_rows_cap * check.lob_chars < 60_001
+    assert "5,000" in check.purpose and "10" in check.purpose
 
 
 def test_table_has_no_definition_and_no_row_preview() -> None:

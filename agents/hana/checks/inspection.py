@@ -26,8 +26,11 @@ What is read and what is not:
   branch over ``_SYS_BI.BIMC_*`` (outside the schemas the guard allows):
   a calculation view is inspected through ``SYS.VIEWS`` like any column view.
 - ``inspectLibMember``: hana-cli takes a member name, which the closed
-  arguments cannot carry (``object`` is the library). The check lists every
-  member of the library with type, access mode and definition instead.
+  arguments cannot carry (``object`` is the library). The check lists the
+  members of the library (at most 10, each definition up to 5,000
+  characters) with type and access mode instead.
+- ``DEFAULT_VALUE`` and ``CHECK_CONDITION`` are never selected: expression
+  text that can embed literals (the same rule as :mod:`.schema`).
 
 The target is on-premise SAP HANA 2.0 (SPS07). Column lists follow hana-cli's
 HANA 2 branch (``utils/dbInspect.js``) and the SAP HANA system view reference;
@@ -45,6 +48,8 @@ _REQUIRED = frozenset({"schema", "object"})
 _ONE = ("schema", "object")
 _MANY = ("top_plus_one", "schema", "object")
 _DEFINITION_CHARS = 20_000
+_MEMBER_ROWS = 10
+_MEMBER_CHARS = 5_000
 
 # on-prem: TABLES with hana-cli's HANA 2 columns, plus IS_COLUMN_TABLE; the
 # runtime size (RECORD_COUNT, TABLE_SIZE per host and port) from M_TABLES, a
@@ -82,7 +87,7 @@ INSPECT_TABLE = Check(
         Statement(
             "columns",
             "SELECT TOP ? COLUMN_NAME, POSITION, DATA_TYPE_NAME, OFFSET, LENGTH, SCALE,"
-            " IS_NULLABLE, DEFAULT_VALUE, COLUMN_ID"
+            " IS_NULLABLE, COLUMN_ID"
             " FROM SYS.TABLE_COLUMNS"
             " WHERE SCHEMA_NAME = ? AND TABLE_NAME = ?"
             " ORDER BY POSITION",
@@ -91,7 +96,7 @@ INSPECT_TABLE = Check(
         Statement(
             "constraints",
             "SELECT TOP ? CONSTRAINT_NAME, COLUMN_NAME, POSITION, IS_PRIMARY_KEY,"
-            " IS_UNIQUE_KEY, CHECK_CONDITION"
+            " IS_UNIQUE_KEY"
             " FROM SYS.CONSTRAINTS"
             " WHERE SCHEMA_NAME = ? AND TABLE_NAME = ?"
             " ORDER BY CONSTRAINT_NAME, POSITION",
@@ -258,7 +263,7 @@ INSPECT_VIEW = Check(
         Statement(
             "columns",
             "SELECT TOP ? COLUMN_NAME, POSITION, DATA_TYPE_NAME, OFFSET, LENGTH, SCALE,"
-            " IS_NULLABLE, DEFAULT_VALUE, COLUMN_ID"
+            " IS_NULLABLE, COLUMN_ID"
             f" FROM SYS.VIEW_COLUMNS{_VIEW_OID}"
             " ORDER BY POSITION",
             _MANY,
@@ -354,17 +359,19 @@ INSPECT_LIBRARY = Check(
 )
 
 # on-prem: hana-cli reads ONE member by name; the closed arguments have no
-# member name (`object` is the library), so every member is listed with its
-# own definition, by name. PRAGMAS and COMMENTS of hana-cli are left out
-# (not in the documented LIBRARY_MEMBERS; COMMENTS is free text). Many long
-# members can pass the answer's 60,000 characters (`result_too_large`): a
-# smaller `top` reads the first members only.
+# member name (`object` is the library), so the members are listed with their
+# own definitions, by name. PRAGMAS and COMMENTS of hana-cli are left out
+# (not in the documented LIBRARY_MEMBERS; COMMENTS is free text). At most 10
+# members of at most 5,000 characters each (`_MEMBER_ROWS`, `_MEMBER_CHARS`):
+# 50,000 characters stay inside the statement's 60,001 character LOB budget,
+# so a library of long members is cut (`truncated`, `truncated_columns`), not
+# refused as `result_too_large`.
 # on-prem: not yet run
 INSPECT_LIB_MEMBER = Check(
     name="inspectLibMember",
     category="database",
-    purpose=("Every member of one library (no member argument) with type, access mode and"
-             " definition; lower top if too large."),
+    purpose=("Members of one library (no member argument; at most 10) with type, access mode,"
+             " definition up to 5,000 characters."),
     source="bin/inspectLibMember.js",
     statements=(
         _LIBRARY_HEADER,
@@ -379,7 +386,8 @@ INSPECT_LIB_MEMBER = Check(
     ),
     args=_ARGS,
     required=_REQUIRED,
-    lob_chars=_DEFINITION_CHARS,
+    max_rows_cap=_MEMBER_ROWS,
+    lob_chars=_MEMBER_CHARS,
 )
 
 CHECKS: tuple[Check, ...] = (
