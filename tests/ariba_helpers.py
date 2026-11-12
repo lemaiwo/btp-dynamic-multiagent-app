@@ -33,6 +33,11 @@ QUESTION = "Upload your technical offer"
 FILE_A = "alpha-offer.pdf"
 FILE_B = "beta-offer.pdf"
 BUYER_FILE = "terms-and-conditions.pdf"
+# Attachment ids in the form a real realm uses (15 characters of the base64
+# alphabet, seen 2026-11-12): `+`, `/` and `=` must survive the trip.
+ATT_ALPHA = "Zx7Qa+Lm2/Pq9R="
+ATT_BETA = "Bt4Yw+Kn8Hd3Fs0"
+ATT_BUYER = "Tc1Vb+Gj5/Mx6Ne"
 SECRETS = (TOKEN, "tok-SECRET", API_KEY, REALM, USER, SUPPLIER_NAME_A, SUPPLIER_NAME_B,
            EVENT_TITLE, QUESTION, FILE_A, FILE_B, BUYER_FILE)
 
@@ -184,13 +189,13 @@ def bids() -> dict[str, Any]:
     money = {"title": "Price", "fieldId": "PRICE", "valueTypeName": "Money",
              "value": {"moneyValue": {"amount": 1, "currency": "EUR"}}}
     return {"payload": [
-        bid_row(SUPPLIER_A, "1000000001", [attachment_term("Att0AlphaOffer1", FILE_A)]),
+        bid_row(SUPPLIER_A, "1000000001", [attachment_term(ATT_ALPHA, FILE_A)]),
         bid_row(SUPPLIER_A, "1000000002", [attachment_term(
-            "Att0BuyerTerms1", BUYER_FILE, field_id="BUYERDOC", content_type=None)]),
+            ATT_BUYER, BUYER_FILE, field_id="BUYERDOC", content_type=None)]),
         bid_row(SUPPLIER_A, "1000000003", [money]),
-        bid_row(SUPPLIER_B, "1000000001", [attachment_term("Att0BetaOffer01", FILE_B)]),
+        bid_row(SUPPLIER_B, "1000000001", [attachment_term(ATT_BETA, FILE_B)]),
         bid_row(SUPPLIER_B, "1000000002", [attachment_term(
-            "Att0BuyerTerms1", BUYER_FILE, field_id="BUYERDOC", content_type=None)]),
+            ATT_BUYER, BUYER_FILE, field_id="BUYERDOC", content_type=None)]),
         bid_row(SUPPLIER_B, "1000000003", []),
     ]}
 

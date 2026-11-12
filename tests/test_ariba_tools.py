@@ -23,9 +23,13 @@ from agents.ariba_tools import (
     AribaError,
     activity_summary,
     ariba_toolset,
+    opaque_document_id,
 )
 from tests.ariba_helpers import (
     API_KEY,
+    ATT_ALPHA,
+    ATT_BETA,
+    ATT_BUYER,
     BUYER_FILE,
     EVENT,
     EVENT_TITLE,
@@ -60,6 +64,10 @@ from tests.ariba_pdf_helpers import (
 )
 
 NOW_MS = 1_790_000_100_000
+ALPHA_DOC = opaque_document_id(EVENT, SUPPLIER_A, "1000000001", "RQAATTACH", ATT_ALPHA)
+BUYER_DOC = opaque_document_id(EVENT, SUPPLIER_A, "1000000002", "BUYERDOC", ATT_BUYER)
+BETA_DOC = opaque_document_id(EVENT, SUPPLIER_B, "1000000001", "RQAATTACH", ATT_BETA)
+SHEET_DOC = opaque_document_id(EVENT, SUPPLIER_A, "1000000001", "RQAATTACH", "Att0Sheet")
 
 
 def build(fake: FakeAriba, *, resolver: FakeResolver | None = None,
@@ -208,22 +216,127 @@ async def test_list_documents_lists_the_suppliers_uploads():
     toolset, client, _ = build(fake)
     result = await call(toolset, "list_documents", EVENT, SUPPLIER_A)
     assert result == {"documents": [
-        {"document_id": "Att0AlphaOffer1", "question": QUESTION, "file_name": FILE_A,
-         "content_type": "application/pdf", "size": 2048, "buyer_document": False},
-        {"document_id": "Att0BuyerTerms1", "question": QUESTION, "file_name": BUYER_FILE,
-         "content_type": None, "size": 2048, "buyer_document": True},
+        {"document_id": ALPHA_DOC, "readable": True, "question": QUESTION,
+         "file_name": FILE_A, "content_type": "application/pdf", "size": 2048,
+         "buyer_document": False},
+        {"document_id": BUYER_DOC, "readable": True, "question": QUESTION,
+         "file_name": BUYER_FILE, "content_type": None, "size": 2048,
+         "buyer_document": True},
     ]}
     assert fake.paths() == [f"/events/{EVENT}/supplierInvitations",
                             f"/events/{EVENT}/supplierBids"]
-    # The ids of the download stay here; the model never names them.
-    assert "1000000001" not in repr(result) and "RQAATTACH" not in repr(result)
-    ref = client.document_ref(EVENT, SUPPLIER_A, "Att0AlphaOffer1")
-    assert (ref.event_id, ref.supplier, ref.document_id) == (EVENT, SUPPLIER_A, "Att0AlphaOffer1")
+    # The ids of the download stay here; the model never names them, nor
+    # Ariba's own attachment id.
+    for kept in ("1000000001", "RQAATTACH", ATT_ALPHA, ATT_BUYER):
+        assert kept not in repr(result)
+    ref = client.document_ref(EVENT, SUPPLIER_A, ALPHA_DOC)
+    assert (ref.event_id, ref.supplier, ref.document_id) == (EVENT, SUPPLIER_A, ALPHA_DOC)
+    assert ref.attachment_id == ATT_ALPHA
     assert (ref.item_id, ref.field_id, ref.alternative_id) == (
         "1000000001", "RQAATTACH", "AL0000000001")
     assert (ref.content_type, ref.size) == ("application/pdf", 2048)
-    buyer = client.document_ref(EVENT, SUPPLIER_A, "Att0BuyerTerms1")
-    assert (buyer.item_id, buyer.field_id) == ("1000000002", "BUYERDOC")
+    buyer = client.document_ref(EVENT, SUPPLIER_A, BUYER_DOC)
+    assert (buyer.item_id, buyer.field_id, buyer.attachment_id) == (
+        "1000000002", "BUYERDOC", ATT_BUYER)
+
+
+def test_a_document_id_is_short_opaque_and_stable():
+    first = opaque_document_id(EVENT, SUPPLIER_A, "1000000001", "RQAATTACH", ATT_ALPHA)
+    assert first == ALPHA_DOC and len(first) <= 16
+    assert first.isalnum() and first == first.lower()
+    others = {opaque_document_id(EVENT, SUPPLIER_A, "1000000001", "RQAATTACH", other)
+              for other in (ATT_BETA, ATT_BUYER)}
+    others.add(opaque_document_id(EVENT, SUPPLIER_B, "1000000001", "RQAATTACH", ATT_ALPHA))
+    others.add(opaque_document_id(EVENT, SUPPLIER_A, "1000000002", "RQAATTACH", ATT_ALPHA))
+    assert first not in others and len(others) == 4
+
+
+async def test_two_uploads_whose_short_ids_collide_get_distinct_ids(monkeypatch):
+    real = ariba_tools.opaque_document_id
+
+    def colliding(*parts, length=ariba_tools.DOCUMENT_ID_CHARS):
+        # Every id the same at the short length: only a longer one tells them apart.
+        return "d0000000000" if length == ariba_tools.DOCUMENT_ID_CHARS else real(
+            *parts, length=length)
+
+    monkeypatch.setattr(ariba_tools, "opaque_document_id", colliding)
+    fake = standard()
+    toolset, client, _ = build(fake)
+    first = (await call(toolset, "list_documents", EVENT, SUPPLIER_A))["documents"]
+    ids = [d["document_id"] for d in first]
+    assert len(set(ids)) == 2 and ids[0] == "d0000000000"
+    again = (await call(toolset, "list_documents", EVENT, SUPPLIER_A))["documents"]
+    assert [d["document_id"] for d in again] == ids
+    assert {client.document_ref(EVENT, SUPPLIER_A, i).attachment_id for i in ids} == {
+        ATT_ALPHA, ATT_BUYER}
+
+
+@pytest.mark.parametrize("att_id,wire", [
+    ("Zx7Qa+Lm2/Pq9R=", b"Zx7Qa+Lm2%2FPq9R="),
+    ("Ab3Cd+Ef4Gh5Ij6", b"Ab3Cd+Ef4Gh5Ij6"),
+    ("Kl7Mn8Op9Qr0St=", b"Kl7Mn8Op9Qr0St="),
+    ("Uv1/Wx2/Yz3/Ab4", b"Uv1%2FWx2%2FYz3%2FAb4"),
+])
+async def test_an_attachment_id_goes_out_as_one_path_segment(att_id, wire):
+    rows = [bid_row(SUPPLIER_A, "1000000001", [{
+        "fieldId": "RQAATTACH", "value": {"attachmentValue": {
+            "id": att_id, "fileName": FILE_A, "contentType": "application/pdf"}}}])]
+    path = f"/events/{EVENT}/supplierBids/{SUPPLIER_A}/attachments/{att_id}/content"
+    fake = standard().on(f"/events/{EVENT}/supplierBids", J(200, {"payload": rows}))
+    fake.on(path, document(unsigned_pdf()))
+    toolset, _, _ = build(fake)
+    (doc,) = (await call(toolset, "list_documents", EVENT, SUPPLIER_A))["documents"]
+    assert doc["readable"] is True
+    answer = await call(toolset, "read_document", EVENT, SUPPLIER_A, doc["document_id"])
+    assert isinstance(answer, ToolReturn)
+    request = fake.requests[-1]
+    raw = request.url.raw_path.partition(b"?")[0]
+    assert raw == (b"/api/sourcing-event/v2/prod/events/" + EVENT.encode()
+                   + b"/supplierBids/" + SUPPLIER_A.encode() + b"/attachments/" + wire
+                   + b"/content")
+    assert request.url.host == "ariba.example.test"
+    assert request.url.params["realm"] == REALM
+
+
+async def test_an_upload_that_cannot_be_addressed_is_listed_unreadable():
+    long_name = "n" * 300 + ".pdf"
+    rows = [
+        bid_row(SUPPLIER_A, "1000000001", [
+            {"fieldId": "RQAATTACH", "value": {"attachmentValue": {
+                "id": "Att0Long", "fileName": long_name, "contentLength": True,
+                "contentType": "text/html; x=<script>"}}},
+            {"fieldId": "bad field", "value": {"attachmentValue": {
+                "id": "Att0BadField", "fileName": "a.pdf"}}},
+            {"fieldId": "RQAATTACH", "value": {"attachmentValue": {
+                "id": "../x", "fileName": "b.pdf"}}},
+            {"fieldId": "RQAATTACH", "value": {"attachmentValue": {
+                "id": "a" * 129, "fileName": "c.pdf"}}},
+            {"value": {"attachmentValue": {"id": ATT_BUYER, "fileName": BUYER_FILE}}},
+        ]),
+        {**bid_row(SUPPLIER_A, "x", [{"fieldId": "RQAATTACH", "value": {
+            "attachmentValue": {"id": "Att0NoItem", "fileName": "d.pdf"}}}]),
+         "itemId": None, "item": {"title": QUESTION, "terms": [{
+             "fieldId": "RQAATTACH", "value": {"attachmentValue": {
+                 "id": "Att0NoItem", "fileName": "d.pdf"}}}]}},
+        bid_row(SUPPLIER_B, "1000000002", [{"fieldId": "BUYERDOC", "value": {
+            "attachmentValue": {"id": ATT_BUYER, "fileName": BUYER_FILE}}}]),
+    ]
+    fake = standard().on(f"/events/{EVENT}/supplierBids", J(200, {"payload": rows}))
+    toolset, client, _ = build(fake)
+    result = await call(toolset, "list_documents", EVENT, SUPPLIER_A)
+    docs = result["documents"]
+    assert [d["readable"] for d in docs] == [True, False, False, False, False, False]
+    assert docs[0]["document_id"] and all(d["document_id"] is None for d in docs[1:])
+    assert docs[0]["file_name"].removesuffix("…[truncated]") == long_name[:255]
+    assert docs[0]["size"] is None and docs[0]["content_type"] is None
+    assert [d["file_name"] for d in docs[1:]] == ["a.pdf", "b.pdf", "c.pdf", BUYER_FILE,
+                                                  "d.pdf"]
+    # Unreadable, and still compared by Ariba's id: the buyer's file.
+    assert [d["buyer_document"] for d in docs] == [False, False, False, False, True, False]
+    assert all(d["question"] == QUESTION for d in docs)
+    assert activity_summary("list_documents", result) == (
+        "list_documents: 6 documents, 5 unreadable")
+    assert len(client._documents) == 1
 
 
 async def test_list_documents_reuses_the_invitations_get_event_read():
@@ -237,28 +350,11 @@ async def test_list_documents_reuses_the_invitations_get_event_read():
 async def test_a_document_of_one_responding_supplier_alone_is_no_buyer_document():
     rows = [bid_row(SUPPLIER_A, "1000000002", [{
         "fieldId": "BUYERDOC", "value": {"attachmentValue": {
-            "id": "Att0BuyerTerms1", "fileName": BUYER_FILE, "contentLength": 10}}}])]
+            "id": ATT_BUYER, "fileName": BUYER_FILE, "contentLength": 10}}}])]
     fake = standard().on(f"/events/{EVENT}/supplierBids", J(200, {"payload": rows}))
     toolset, _, _ = build(fake)
     result = await call(toolset, "list_documents", EVENT, SUPPLIER_A)
     assert [d["buyer_document"] for d in result["documents"]] == [False]
-
-
-async def test_list_documents_skips_attachments_without_usable_ids_and_cuts_names():
-    long_name = "n" * 300 + ".pdf"
-    rows = [bid_row(SUPPLIER_A, "1000000001", [
-        {"fieldId": "RQAATTACH", "value": {"attachmentValue": {
-            "id": "Att0Long", "fileName": long_name, "contentLength": True,
-            "contentType": "text/html; x=<script>"}}},
-        {"fieldId": "bad field", "value": {"attachmentValue": {"id": "Att0BadField"}}},
-        {"fieldId": "RQAATTACH", "value": {"attachmentValue": {"id": "../x"}}},
-    ])]
-    fake = standard().on(f"/events/{EVENT}/supplierBids", J(200, {"payload": rows}))
-    toolset, _, _ = build(fake)
-    (doc,) = (await call(toolset, "list_documents", EVENT, SUPPLIER_A))["documents"]
-    assert doc["document_id"] == "Att0Long"
-    assert doc["file_name"].removesuffix("…[truncated]") == long_name[:255]
-    assert doc["size"] is None and doc["content_type"] is None
 
 
 async def test_list_documents_refuses_a_supplier_that_is_not_invited():
@@ -282,11 +378,11 @@ async def test_sealed_bids_are_bids_sealed_and_no_body_is_read():
 async def test_document_ref_refuses_what_was_not_listed():
     toolset, client, _ = build(standard())
     with pytest.raises(AribaError) as err:
-        client.document_ref(EVENT, SUPPLIER_A, "Att0AlphaOffer1")
+        client.document_ref(EVENT, SUPPLIER_A, ALPHA_DOC)
     assert err.value.code == "unknown_document"
     await call(toolset, "list_documents", EVENT, SUPPLIER_A)
     with pytest.raises(AribaError) as err:
-        client.document_ref(EVENT, SUPPLIER_B, "Att0AlphaOffer1")  # another supplier's
+        client.document_ref(EVENT, SUPPLIER_B, ALPHA_DOC)  # another supplier's
     assert err.value.code == "unknown_document"
     with pytest.raises(AribaError) as err:
         client.document_ref(EVENT, SUPPLIER_A, "../x")
@@ -434,8 +530,11 @@ def test_activity_summary_lines():
     suppliers = [{"responded": True, "name": SUPPLIER_NAME_A}, {"responded": False}]
     assert activity_summary("get_event", {"title": EVENT_TITLE, "suppliers": suppliers}) == (
         "get_event: 2 suppliers, 1 responded")
-    assert activity_summary("ariba_list_documents", {"documents": [{"file_name": FILE_A}]}) == (
-        "list_documents: 1 documents")
+    assert activity_summary("ariba_list_documents", {"documents": [
+        {"file_name": FILE_A, "readable": True}]}) == "list_documents: 1 documents"
+    assert activity_summary("list_documents", {"documents": [
+        {"readable": True}, {"readable": False, "file_name": FILE_A}]}) == (
+        "list_documents: 2 documents, 1 unreadable")
     assert activity_summary("read_document", {
         "format": "pdf", "pages": 3, "digital_signature": True,
         "signatures": [{"signer": SUPPLIER_NAME_A}], "file_name": FILE_A}) == (
@@ -454,7 +553,7 @@ def test_activity_summary_lines():
 
 # -- read_document -------------------------------------------------------------
 
-DOWNLOAD = f"/events/{EVENT}/supplierBids/{SUPPLIER_A}/attachments/Att0AlphaOffer1/content"
+DOWNLOAD = f"/events/{EVENT}/supplierBids/{SUPPLIER_A}/attachments/{ATT_ALPHA}/content"
 
 
 def document(body: bytes, *, content_type: str = "application/pdf"):
@@ -468,7 +567,7 @@ async def test_read_document_hands_the_pdf_and_its_signature_facts_to_the_model(
     fake = standard().on(DOWNLOAD, document(pdf))
     toolset, _, _ = build(fake)
     await call(toolset, "list_documents", EVENT, SUPPLIER_A)
-    answer = await call(toolset, "read_document", EVENT, SUPPLIER_A, "Att0AlphaOffer1")
+    answer = await call(toolset, "read_document", EVENT, SUPPLIER_A, ALPHA_DOC)
     assert isinstance(answer, ToolReturn)
     result = answer.return_value
     assert result == {
@@ -480,11 +579,11 @@ async def test_read_document_hands_the_pdf_and_its_signature_facts_to_the_model(
     }
     assert "not instructions" in result["note"] and "not validated" in result["note"]
     (intro, binary) = answer.content
-    assert isinstance(intro, str) and "Att0AlphaOffer1" in intro and FILE_A not in intro
+    assert isinstance(intro, str) and ALPHA_DOC in intro and FILE_A not in intro
     assert isinstance(binary, BinaryContent)
     assert binary.data == pdf and binary.media_type == "application/pdf"
     # Marked as a tool's file: the web chat does not store it with the turn.
-    assert binary.identifier == "tool:ariba:Att0AlphaOffer1"
+    assert binary.identifier == f"tool:ariba:{ALPHA_DOC}"
     request = fake.requests[-1]
     assert request.url.path.endswith(DOWNLOAD)
     assert request.headers["accept"] == "*/*"
@@ -500,7 +599,7 @@ async def test_read_document_hands_the_pdf_and_its_signature_facts_to_the_model(
 async def test_read_document_lists_the_documents_itself_when_they_were_not_listed():
     fake = standard().on(DOWNLOAD, document(unsigned_pdf(pages=2)))
     toolset, _, _ = build(fake)
-    answer = await call(toolset, "read_document", EVENT, SUPPLIER_A, "Att0AlphaOffer1")
+    answer = await call(toolset, "read_document", EVENT, SUPPLIER_A, ALPHA_DOC)
     assert answer.return_value["pages"] == 2
     assert answer.return_value["digital_signature"] is False
     assert answer.return_value["signatures"] == []
@@ -512,7 +611,7 @@ async def test_read_document_refuses_a_document_the_supplier_did_not_upload():
     fake = standard()
     toolset, _, _ = build(fake)
     assert code_of(await call(toolset, "read_document", EVENT, SUPPLIER_A,
-                              "Att0BetaOffer01")) == "unknown_document"
+                              BETA_DOC)) == "unknown_document"
     assert code_of(await call(toolset, "read_document", EVENT, SUPPLIER_A, "../x")) == (
         "invalid_id")
     assert not any("/attachments/" in p for p in fake.paths())
@@ -527,7 +626,7 @@ async def test_a_file_that_is_no_pdf_is_unsupported_type_with_its_name_and_type(
     fake = standard().on(f"/events/{EVENT}/supplierBids", J(200, {"payload": rows}))
     fake.on(path, document(xlsx_like(), content_type=xlsx))
     toolset, _, _ = build(fake)
-    result = await call(toolset, "read_document", EVENT, SUPPLIER_A, "Att0Sheet")
+    result = await call(toolset, "read_document", EVENT, SUPPLIER_A, SHEET_DOC)
     assert code_of(result) == "unsupported_type"
     assert result["error"]["file_name"] == "prices.xlsx"
     assert result["error"]["content_type"] == xlsx
@@ -536,7 +635,7 @@ async def test_a_file_that_is_no_pdf_is_unsupported_type_with_its_name_and_type(
 async def test_a_declared_pdf_whose_bytes_are_not_one_is_not_a_pdf():
     fake = standard().on(DOWNLOAD, document(b"<html>sign in</html>" * 10))
     toolset, _, _ = build(fake)
-    result = await call(toolset, "read_document", EVENT, SUPPLIER_A, "Att0AlphaOffer1")
+    result = await call(toolset, "read_document", EVENT, SUPPLIER_A, ALPHA_DOC)
     assert code_of(result) == "not_a_pdf"
     assert (result["error"]["file_name"], result["error"]["content_type"]) == (
         FILE_A, "application/pdf")
@@ -545,7 +644,7 @@ async def test_a_declared_pdf_whose_bytes_are_not_one_is_not_a_pdf():
 async def test_a_pdf_whose_pages_cannot_be_told_is_not_a_pdf():
     fake = standard().on(DOWNLOAD, document(b"%PDF-1.7\n" + b"garbage" * 100))
     toolset, _, _ = build(fake)
-    result = await call(toolset, "read_document", EVENT, SUPPLIER_A, "Att0AlphaOffer1")
+    result = await call(toolset, "read_document", EVENT, SUPPLIER_A, ALPHA_DOC)
     assert code_of(result) == "not_a_pdf"
 
 
@@ -553,14 +652,14 @@ async def test_a_download_over_the_cap_is_too_large(monkeypatch):
     monkeypatch.setattr(ariba_tools, "MAX_DOCUMENT_BYTES", 500)
     fake = standard().on(DOWNLOAD, document(unsigned_pdf()))
     toolset, _, _ = build(fake)
-    result = await call(toolset, "read_document", EVENT, SUPPLIER_A, "Att0AlphaOffer1")
+    result = await call(toolset, "read_document", EVENT, SUPPLIER_A, ALPHA_DOC)
     assert code_of(result) == "too_large"
 
 
 async def test_a_pdf_over_twenty_pages_is_too_large():
     fake = standard().on(DOWNLOAD, document(unsigned_pdf(pages=21)))
     toolset, _, _ = build(fake)
-    result = await call(toolset, "read_document", EVENT, SUPPLIER_A, "Att0AlphaOffer1")
+    result = await call(toolset, "read_document", EVENT, SUPPLIER_A, ALPHA_DOC)
     assert code_of(result) == "too_large"
     assert "20 pages" in result["error"]["message"]
 
@@ -576,14 +675,14 @@ async def test_the_inspection_runs_in_a_worker_thread(monkeypatch):
     monkeypatch.setattr(ariba_tools.asyncio, "to_thread", recording)
     fake = standard().on(DOWNLOAD, document(unsigned_pdf()))
     toolset, _, _ = build(fake)
-    await call(toolset, "read_document", EVENT, SUPPLIER_A, "Att0AlphaOffer1")
+    await call(toolset, "read_document", EVENT, SUPPLIER_A, ALPHA_DOC)
     assert seen == [ariba_tools.ariba_pdf.inspect]
 
 
 async def test_a_signer_name_is_filtered_like_any_text_from_ariba():
     fake = standard().on(DOWNLOAD, document(signed_pdf(signer="Evil‮Name\nNext")))
     toolset, _, _ = build(fake)
-    answer = await call(toolset, "read_document", EVENT, SUPPLIER_A, "Att0AlphaOffer1")
+    answer = await call(toolset, "read_document", EVENT, SUPPLIER_A, ALPHA_DOC)
     (sig,) = answer.return_value["signatures"]
     assert "‮" not in sig["signer"] and "\n" not in sig["signer"]
 
@@ -592,14 +691,14 @@ async def test_a_pdf_that_hides_pages_behind_a_decoy_page_tree_is_too_large():
     pdf = unsigned_pdf(pages=25).replace(b"/Count 25", b"/Count 01")
     fake = standard().on(DOWNLOAD, document(pdf))
     toolset, _, _ = build(fake)
-    result = await call(toolset, "read_document", EVENT, SUPPLIER_A, "Att0AlphaOffer1")
+    result = await call(toolset, "read_document", EVENT, SUPPLIER_A, ALPHA_DOC)
     assert code_of(result) == "too_large"
 
 
 async def test_a_signed_pdf_of_twenty_pages_is_not_refused():
     fake = standard().on(DOWNLOAD, document(signed_pdf(unsigned_pdf(pages=20))))
     toolset, _, _ = build(fake)
-    answer = await call(toolset, "read_document", EVENT, SUPPLIER_A, "Att0AlphaOffer1")
+    answer = await call(toolset, "read_document", EVENT, SUPPLIER_A, ALPHA_DOC)
     assert answer.return_value["pages"] == 20
 
 
@@ -608,7 +707,7 @@ async def test_an_unreadable_signature_is_no_digital_signature():
     fake = standard().on(DOWNLOAD, document(pdf))
     toolset, _, _ = build(fake)
     result = (await call(toolset, "read_document", EVENT, SUPPLIER_A,
-                         "Att0AlphaOffer1")).return_value
+                         ALPHA_DOC)).return_value
     assert result["digital_signature"] is False and result["unreadable_signatures"] == 1
     assert result["signatures"][0]["readable"] is False
     assert activity_summary("read_document", result) == "read_document: pdf, 1 pages, unsigned"
@@ -617,7 +716,7 @@ async def test_an_unreadable_signature_is_no_digital_signature():
 async def test_a_missing_document_is_not_found_without_naming_an_event():
     fake = standard().on(DOWNLOAD, S(404))
     toolset, _, _ = build(fake)
-    result = await call(toolset, "read_document", EVENT, SUPPLIER_A, "Att0AlphaOffer1")
+    result = await call(toolset, "read_document", EVENT, SUPPLIER_A, ALPHA_DOC)
     assert code_of(result) == "not_found"
     assert "document" in result["error"]["message"]
     assert "event" not in result["error"]["message"]
@@ -629,7 +728,7 @@ async def test_a_missing_document_is_not_found_without_naming_an_event():
 
 # -- the per-run document budget -----------------------------------------------
 
-READ = (EVENT, SUPPLIER_A, "Att0AlphaOffer1")
+READ = (EVENT, SUPPLIER_A, ALPHA_DOC)
 
 
 async def test_the_seventh_document_of_a_run_is_refused_and_another_run_has_its_own():
@@ -670,7 +769,7 @@ async def test_the_bytes_of_a_run_are_bounded_after_the_download(monkeypatch):
     toolset, client, _ = build(fake)
     await call(toolset, "list_documents", EVENT, SUPPLIER_A)
     # No listed size: only the bytes read can tell.
-    key = (EVENT, SUPPLIER_A, "Att0AlphaOffer1")
+    key = (EVENT, SUPPLIER_A, ALPHA_DOC)
     client._documents[key] = dataclasses.replace(client._documents[key], size=None)
     assert isinstance(await call(toolset, "read_document", *READ), ToolReturn)
     downloads = sum(r.url.path.endswith(DOWNLOAD) for r in fake.requests)
@@ -709,3 +808,42 @@ async def test_a_call_without_a_run_id_shares_one_bucket_and_the_table_is_bounde
     for run in ("a", "b", "c"):
         await call(toolset, "read_document", *READ, run_id=run)
     assert len(client._budgets) <= 2
+
+
+async def test_a_long_run_keeps_its_budget_while_it_keeps_reading(monkeypatch):
+    # The hour counts from the run's LAST read, not its first.
+    monkeypatch.setattr(ariba_tools, "MAX_RUN_DOCUMENTS", 2)
+    fake = standard().on(DOWNLOAD, document(unsigned_pdf()))
+    toolset, _, clock = build(fake)
+    assert isinstance(await call(toolset, "read_document", *READ, run_id="long"), ToolReturn)
+    clock.now += 3000
+    assert isinstance(await call(toolset, "read_document", *READ, run_id="long"), ToolReturn)
+    clock.now += 3000
+    assert code_of(await call(toolset, "read_document", *READ, run_id="long")) == (
+        "document_budget")
+    # A refused call is an access too.
+    clock.now += 3000
+    assert code_of(await call(toolset, "read_document", *READ, run_id="long")) == (
+        "document_budget")
+
+
+async def test_an_eviction_during_the_download_does_not_reset_the_counters(monkeypatch):
+    monkeypatch.setattr(ariba_tools, "MAX_RUN_DOCUMENTS", 2)
+    monkeypatch.setattr(ariba_tools, "MAX_RUN_BUDGETS", 1)
+    fake = standard()
+    toolset, client, _ = build(fake)
+    pdf = unsigned_pdf()
+    evict = {"on": False}
+
+    def download(request):
+        if evict["on"]:
+            client._budget("intruder")  # another run's read pushes this run out
+        return httpx.Response(200, content=pdf, headers={"content-type": "application/pdf"})
+
+    fake.on(DOWNLOAD, download)
+    assert isinstance(await call(toolset, "read_document", *READ, run_id="r1"), ToolReturn)
+    evict["on"] = True
+    assert isinstance(await call(toolset, "read_document", *READ, run_id="r1"), ToolReturn)
+    evict["on"] = False
+    assert code_of(await call(toolset, "read_document", *READ, run_id="r1")) == (
+        "document_budget")

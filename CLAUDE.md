@@ -2002,10 +2002,25 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `get_event(event_id)` (title, state, type and the invited suppliers with
   `supplier` id, name, `responded`, `bid_status`, `submitted`; no contact,
   address or e-mail), `list_documents(event_id, supplier)` (the supplier's
-  uploads from `supplierBids`: `document_id`, `question`, `file_name`,
-  `content_type`, `size`, `buyer_document` for a buyer file Ariba repeats for
-  every responding supplier; `bids_sealed` while the event is open: Ariba
-  answers 403) and `read_document(event_id, supplier, document_id)` (a
+  uploads from `supplierBids`: `document_id`, `readable`, `question`,
+  `file_name`, `content_type`, `size`, `buyer_document` for a buyer file Ariba
+  repeats for every responding supplier, compared by Ariba's attachment ids;
+  `bids_sealed` while the event is open: Ariba answers 403). **The
+  `document_id` is the toolset's own**, never Ariba's: `d` plus hex digits of a
+  SHA-256 over event, supplier, item, field and attachment id
+  (`opaque_document_id`, 10 digits, lengthened by 2 at a time when two uploads
+  of one list would share it), stable within the toolset. Ariba's attachment
+  ids are base64-style (15 characters, seen on a real realm 2026-11-12: `+`
+  occurs, `/` and `=` belong to the alphabet; 2.40.0 required `[A-Za-z0-9_.-]`
+  and silently dropped such uploads): one is used when it matches
+  `[A-Za-z0-9+/=_.-]{1,128}` without a `.` / `..` part and goes out as ONE path
+  segment (`attachment_segment`: `/` as `%2F`, `+` and `=` literal, as the
+  probe sent `+`), through `BitbucketAuth`, the `DestinationAuth` that moves a
+  request by its raw path (the base class rebuilds the URL from the decoded
+  path and would split at the `/`). An upload whose attachment, item or field
+  id is missing or not of its form is still listed, with `document_id: null`
+  and `readable: false` (activity line `list_documents: n documents,
+  u unreadable`). `read_document(event_id, supplier, document_id)` (a
   document `list_documents` listed in this toolset: ids stay server-side; the
   download is streamed up to 10 MB with `Accept: */*`, PDF only (by its bytes),
   at most 20 pages judged on `pages_upper_bound` (a decoy page tree cannot
@@ -2023,8 +2038,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   the remaining suppliers in separate sub-agent tasks or a new run"), checked
   before the download (the count, the listed size when known) and after the
   inspection (pages, bytes read); a refused document consumes nothing; the
-  table is per toolset, at most 256 runs, an hour each (a call without a run
-  id shares one bucket). Calls are sequential and paced
+  table is per toolset, at most 256 runs, each dropped an hour after its last
+  access (a long run keeps its budget; the check after the download updates the
+  entry the check before it read, put back if another run's read evicted it;
+  a call without a run id shares one bucket). Calls are sequential and paced
   (at least 1 s apart, per toolset), a 429 is repeated after 5, 15 and 30 s,
   then `throttled`; no redirect is followed; the body of an error status is
   never read. Text from Ariba (titles, names, file names, statuses) is filtered
