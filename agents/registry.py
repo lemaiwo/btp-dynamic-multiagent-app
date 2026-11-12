@@ -41,7 +41,6 @@ from agents.git_config import BUILTIN_GIT_URL
 from agents.git_tools import activity_summary as git_activity_summary
 from agents.builtins import build_builtin_toolset, is_builtin_url
 from agents.hana import BUILTIN_HANA_URL
-from agents.hana.config import asks_to_select
 from agents.hana.connection import soft_reset_login_state as soft_reset_hana_logins
 from agents.hana.tools import activity_summary as hana_activity_summary
 from agents.ina import BUILTIN_INA_URL
@@ -210,26 +209,6 @@ def _approves(specs: list) -> bool:
 def _has_hana(specs: list) -> bool:
     """Whether an agent's row holds a ``builtin:hana`` entry (any spelling)."""
     return any(isinstance(s, dict) and _server_key_of(s) == BUILTIN_HANA_URL for s in specs)
-
-
-def _selects(specs: list) -> bool:
-    """Whether an agent's row holds a ``builtin:hana`` entry that asks for
-    ``run_select``, read as widely as `asks_to_select` reads a block: the
-    rows judged here may have passed no gate."""
-    return any(
-        isinstance(s, dict) and _server_key_of(s) == BUILTIN_HANA_URL
-        and asks_to_select(s.get("oauth"))
-        for s in specs
-    )
-
-
-def _without_select(spec: dict) -> dict:
-    """A ``builtin:hana`` entry as if ``allow_select`` were absent: the
-    toolset is then built with the fixed checks only, no ``run_select``."""
-    oauth = spec.get("oauth")
-    if not isinstance(oauth, dict):
-        return spec
-    return {**spec, "oauth": {k: v for k, v in oauth.items() if k != "allow_select"}}
 
 
 def _short_tool_output(result) -> str:
@@ -1069,23 +1048,24 @@ async def build_orchestrator() -> BuildResult:
                 "the agent is built without the HANA tools",
                 row.name,
             )
-        # An agent whose builtin:hana entry may run SELECT (model-written SQL
-        # as a technical user with wide privileges) is never reached through
-        # the invoke API and is chat-exposed only at tier advanced (decided
-        # 2026-11-10). The save gate and storage refuse the rest; a row
-        # written by hand passes neither, so it is closed here on the side
-        # that keeps monitoring working: the HANA toolset is built as if
-        # allow_select were absent (the fixed checks, no run_select).
-        hana_no_select = _selects(specs) and (
+        # An agent with a builtin:hana entry (with or without allow_select:
+        # the fixed checks read object source, database users, grants and
+        # audit policies as a technical user with wide privileges) is never
+        # reached through the invoke API and is chat-exposed only at tier
+        # advanced (decided 2026-11-10, widened to every entry at the final
+        # review of Phases 2 and 3). The save gate and storage refuse the
+        # rest; a row written by hand, or stored before the rule covered
+        # every entry, passes neither, so it is built here without the HANA
+        # tools: the agent and its other servers stay.
+        if _has_hana(specs) and (
             bool(getattr(row, "expose_invoke", 0))
             or (bool(row.expose_chat) and (row.tier or "basic") != "advanced")
-        )
-        if hana_no_select:
+        ):
+            no_hana = True
             # The agent and the rule only: no system, destination or value.
             logger.warning(
-                "Agent '%s' may run SELECT through its builtin:hana entry and is "
-                "exposed to the invoke API or to basic chat; the agent is built "
-                "without run_select",
+                "Agent '%s' has a builtin:hana entry and is exposed to the invoke "
+                "API or to basic chat; the agent is built without the HANA tools",
                 row.name,
             )
         # This agent's remote MCP servers by endpoint, for a built-in that
@@ -1108,8 +1088,6 @@ async def build_orchestrator() -> BuildResult:
                 if is_builtin_url(spec["url"]):
                     # Served in-process: no MCP connection, but the same oauth
                     # block and the same stored per-user token.
-                    if hana_no_select and _server_key_of(spec) == BUILTIN_HANA_URL:
-                        spec = _without_select(spec)
                     toolset = build_builtin_toolset(
                         spec["url"],
                         spec.get("oauth"),
@@ -1328,12 +1306,12 @@ async def build_orchestrator() -> BuildResult:
                     row.name, peer_row.name,
                 )
                 continue
-            # Nor to an agent that may run SELECT through builtin:hana: a basic
-            # chat user could steer it through the delegating agent (R2c).
-            if _selects(peer_row.mcp_servers):
+            # Nor to an agent with a builtin:hana entry: a basic chat user
+            # could steer it through the delegating agent (R2c).
+            if _has_hana(peer_row.mcp_servers):
                 logger.warning(
-                    "Agent '%s' lists the peer '%s', whose builtin:hana entry may run "
-                    "SELECT; no delegation tool is attached",
+                    "Agent '%s' lists the peer '%s', which has a builtin:hana "
+                    "entry; no delegation tool is attached",
                     row.name, peer_row.name,
                 )
                 continue

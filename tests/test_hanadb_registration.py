@@ -201,7 +201,7 @@ def test_the_gates_block_round_trips_through_storage(block):
 
     payload = AgentPayload.model_validate({
         "name": "hana-reader", "description": "d", "instructions": "i",
-        # Advanced: a chat-exposed agent that may run SELECT must be (task 20b).
+        # Advanced: a chat-exposed agent with a hana entry must be (task 20b).
         "tier": "advanced",
         "mcp_servers": [NOTES, _server(_copy(block), "Builtin:HANA/"), _copy(GIT)]})
     servers = payload.to_servers_list()
@@ -402,7 +402,7 @@ async def _build(agents: dict[str, list[dict[str, Any]]], raw: dict[str, Any] | 
     await _wipe()
     async with SessionLocal() as s:
         for name, servers in agents.items():
-            # Advanced: a chat-exposed agent that may run SELECT must be
+            # Advanced: a chat-exposed agent with a hana entry must be
             # (task 20b, tests/test_hanadb_reach.py).
             await upsert_agent(s, name=name, description="d", instructions="i",
                                mcp_servers=servers, tier="advanced")

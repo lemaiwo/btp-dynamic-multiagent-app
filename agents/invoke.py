@@ -97,7 +97,7 @@ from agents.db import (
     create_job_run,
     get_agent_by_slug,
     get_job_run,
-    hana_selects,
+    has_hana_entry,
 )
 from agents.errors import describe_exception
 from agents.invoke_config import (
@@ -602,9 +602,10 @@ async def invoke_agent(
         agent = await get_agent_by_slug(session, slug)
     if (agent is None or not agent.enabled or not agent.expose_invoke
             or bitbucket_approves(agent.mcp_servers)
-            # Model-written SQL as a technical user never runs from here
-            # (builtin:hana, allow_select): refused at every save as well.
-            or hana_selects(agent.mcp_servers)):
+            # A builtin:hana entry (with or without allow_select) reads the
+            # database as a technical user: never from here, refused at
+            # every save as well.
+            or has_hana_entry(agent.mcp_servers)):
         raise HTTPException(status_code=404, detail=NOT_FOUND)
 
     # The slot is taken BEFORE the body is read: a refused caller (a repeat

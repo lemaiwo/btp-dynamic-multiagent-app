@@ -129,12 +129,12 @@ def asks_to_select(cfg: Any) -> bool:
     """Whether a block asks for ``run_select``, checked or not:
     ``allow_select`` holds anything but ``false`` / nothing.
 
-    For the rules about who may reach an agent that may run SELECT (no invoke
-    API, chat only at tier advanced, never a peer), which also judge rows no
-    gate has seen. Wider than :func:`pins_of` on purpose, as
+    It decides whether ``run_select`` is registered; the rules about who may
+    reach the agent (no invoke API, chat only at tier advanced, never a
+    peer, no sharing) hold for every ``builtin:hana`` entry
+    (`agents.db.check_hana_reach`). Wider than :func:`pins_of` on purpose, as
     ``agents.bitbucket_config.asks_to_approve``: a hand-written ``"true"``
-    gives no toolset at all, and still must not read as "does not select"
-    to those rules."""
+    gives no toolset at all, and still must not read as "does not select"."""
     return isinstance(cfg, dict) and (
         cfg.get("allow_select") is not None and cfg.get("allow_select") is not False
     )

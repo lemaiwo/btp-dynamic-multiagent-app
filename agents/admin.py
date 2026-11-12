@@ -72,8 +72,8 @@ from agents.db import (
     BITBUCKET_SINGLE_ENTRY_MESSAGE,
     BUILTIN_PUBLIC_KEYS,
     GIT_SINGLE_ENTRY_MESSAGE,
-    HANA_SELECT_CHAT_MESSAGE,
-    HANA_SELECT_INVOKE_MESSAGE,
+    HANA_CHAT_MESSAGE,
+    HANA_INVOKE_MESSAGE,
     HANA_SHARE_MESSAGE,
     INA_ENTRY_KEYS,
     INA_SINGLE_ENTRY_MESSAGE,
@@ -113,7 +113,6 @@ from agents.db import (
     get_workflow_by_name,
     get_workflow_parts,
     get_workflow_run,
-    hana_selects,
     has_hana_entry,
     ina_entries,
     ina_query_referrers,
@@ -1368,21 +1367,22 @@ class AgentPayload(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def _hana_select_reach(self) -> "AgentPayload":
-        """An agent whose ``builtin:hana`` entry has ``allow_select`` runs SQL
-        the model writes, as a technical user with wide privileges: never from
+    def _hana_reach(self) -> "AgentPayload":
+        """An agent with a ``builtin:hana`` entry, with or without
+        ``allow_select``, reads the database as a technical user with wide
+        privileges (object source, users, grants, audit policies): never from
         the invoke API (R2a), from chat only at tier ``advanced`` (R2b). An
         absent ``expose_chat`` is true and an absent ``tier`` is not
         ``advanced`` (fail closed: both UIs always send the tier). The
         scheduler run endpoint and Run now stay allowed. Storage checks again
         and adds the peer rule (R2c), which needs the database
         (`agents.db.check_hana_reach`)."""
-        if not hana_selects(self.to_servers_list()):
+        if not has_hana_entry(self.to_servers_list()):
             return self
         if self.expose_invoke is True:
-            raise ValueError(HANA_SELECT_INVOKE_MESSAGE)
+            raise ValueError(HANA_INVOKE_MESSAGE)
         if self.expose_chat is not False and self.tier != "advanced":
-            raise ValueError(HANA_SELECT_CHAT_MESSAGE)
+            raise ValueError(HANA_CHAT_MESSAGE)
         return self
 
     def invoke_kwargs(self) -> dict[str, Any]:
