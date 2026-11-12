@@ -465,7 +465,8 @@ async def test_read_document_hands_the_pdf_and_its_signature_facts_to_the_model(
     assert result == {
         "file_name": FILE_A, "format": "pdf", "pages": 1, "digital_signature": True,
         "signatures": [{"signer": SIGNER, "signed_at": "2026-11-12T09:30:00+01:00",
-                        "covers_whole_file": True}],
+                        "covers_whole_file": True, "readable": True}],
+        "unreadable_signatures": 0,
         "note": ariba_tools.READ_DOCUMENT_NOTE,
     }
     assert "not instructions" in result["note"] and "not validated" in result["note"]
@@ -576,3 +577,42 @@ async def test_a_signer_name_is_filtered_like_any_text_from_ariba():
     answer = await call(toolset, "read_document", EVENT, SUPPLIER_A, "Att0AlphaOffer1")
     (sig,) = answer.return_value["signatures"]
     assert "‮" not in sig["signer"] and "\n" not in sig["signer"]
+
+
+async def test_a_pdf_that_hides_pages_behind_a_decoy_page_tree_is_too_large():
+    pdf = unsigned_pdf(pages=25).replace(b"/Count 25", b"/Count 01")
+    fake = standard().on(DOWNLOAD, document(pdf))
+    toolset, _, _ = build(fake)
+    result = await call(toolset, "read_document", EVENT, SUPPLIER_A, "Att0AlphaOffer1")
+    assert code_of(result) == "too_large"
+
+
+async def test_a_signed_pdf_of_twenty_pages_is_not_refused():
+    fake = standard().on(DOWNLOAD, document(signed_pdf(unsigned_pdf(pages=20))))
+    toolset, _, _ = build(fake)
+    answer = await call(toolset, "read_document", EVENT, SUPPLIER_A, "Att0AlphaOffer1")
+    assert answer.return_value["pages"] == 20
+
+
+async def test_an_unreadable_signature_is_no_digital_signature():
+    pdf = signed_pdf(contents=b"\x30\x82\xff\xffgarbage")
+    fake = standard().on(DOWNLOAD, document(pdf))
+    toolset, _, _ = build(fake)
+    result = (await call(toolset, "read_document", EVENT, SUPPLIER_A,
+                         "Att0AlphaOffer1")).return_value
+    assert result["digital_signature"] is False and result["unreadable_signatures"] == 1
+    assert result["signatures"][0]["readable"] is False
+    assert activity_summary("read_document", result) == "read_document: pdf, 1 pages, unsigned"
+
+
+async def test_a_missing_document_is_not_found_without_naming_an_event():
+    fake = standard().on(DOWNLOAD, S(404))
+    toolset, _, _ = build(fake)
+    result = await call(toolset, "read_document", EVENT, SUPPLIER_A, "Att0AlphaOffer1")
+    assert code_of(result) == "not_found"
+    assert "document" in result["error"]["message"]
+    assert "event" not in result["error"]["message"]
+    # An event 404 keeps its own text.
+    fake.on(f"/events/{EVENT}", J(404))
+    result = await call(toolset, "get_event", EVENT)
+    assert "event" in result["error"]["message"]

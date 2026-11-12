@@ -52,21 +52,38 @@ def _certificate(common_name: str, *, ca: bool, issuer=None, issuer_key=None):
     return cert, key
 
 
-def pkcs7_detached(data: bytes, signer: str = SIGNER, *, with_ca: bool = True) -> bytes:
-    """A detached PKCS#7 over ``data``; with ``with_ca`` the CA certificate is
-    put FIRST in the bag, so the reader must skip it to find the signer."""
+def pkcs7_detached(data: bytes, signer: str = SIGNER, *, with_ca: bool = True,
+                   decoy: str | None = None) -> bytes:
+    """A detached PKCS#7 over ``data`` whose certificate bag is, in this
+    order: the CA certificate (``with_ca``), a ``decoy`` end-entity
+    certificate of the same CA that did NOT sign, the signer's. So the reader
+    must skip the CA, and only the SignerInfo tells decoy and signer apart.
+
+    The bag order is set by hand: cryptography 50's ``add_signer`` drops the
+    certificates added before it, and DER sorts the SET OF; the certificates
+    are permuted in place (same total length, no length to rewrite)."""
     ca_cert, ca_key = _certificate(CA_NAME, ca=True)
     cert, key = _certificate(signer, ca=False, issuer=ca_cert, issuer_key=ca_key)
-    builder = pkcs7.PKCS7SignatureBuilder().set_data(data)
-    if with_ca:
-        builder = builder.add_certificate(ca_cert)
-    builder = builder.add_signer(cert, key, hashes.SHA256())
-    return builder.sign(serialization.Encoding.DER, [pkcs7.PKCS7Options.DetachedSignature])
+    bag = [ca_cert] if with_ca else []
+    if decoy is not None:
+        bag.append(_certificate(decoy, ca=False, issuer=ca_cert, issuer_key=ca_key)[0])
+    bag.append(cert)
+    builder = pkcs7.PKCS7SignatureBuilder().set_data(data).add_signer(
+        cert, key, hashes.SHA256())
+    for extra in bag[:-1]:
+        builder = builder.add_certificate(extra)
+    der = builder.sign(serialization.Encoding.DER, [pkcs7.PKCS7Options.DetachedSignature])
+    blobs = [c.public_bytes(serialization.Encoding.DER) for c in bag]
+    starts = sorted(der.index(b) for b in blobs)
+    end = starts[0] + sum(len(b) for b in blobs)
+    assert all(der.find(b, starts[0], end) >= 0 for b in blobs)
+    return der[:starts[0]] + b"".join(blobs) + der[end:]
 
 
 def signed_pdf(base: bytes | None = None, *, signer: str = SIGNER,
                signed_at: bytes | None = b"D:20261112093000+01'00'",
-               with_ca: bool = True, contents: bytes | None = None,
+               with_ca: bool = True, decoy: str | None = None,
+               contents: bytes | None = None,
                rewrite_page: bool = True, sig_type: bytes = b"/Type /Sig ") -> bytes:
     """``base`` plus one signature revision. ``contents`` replaces the PKCS#7
     (raw bytes hex-encoded into the placeholder) for broken-signature tests."""
@@ -91,7 +108,7 @@ def signed_pdf(base: bytes | None = None, *, signer: str = SIGNER,
     doc = doc.replace(b"[0000000000 0000000000 0000000000 0000000000]", filled, 1)
     assert len(filled) == len(b"[0000000000 0000000000 0000000000 0000000000]")
     signature = contents if contents is not None else pkcs7_detached(
-        doc[:start] + doc[end:], signer, with_ca=with_ca)
+        doc[:start] + doc[end:], signer, with_ca=with_ca, decoy=decoy)
     hexed = signature.hex().encode().ljust(PLACEHOLDER_HEX, b"0")
     assert len(hexed) == PLACEHOLDER_HEX
     return doc[:start + 1] + hexed + doc[end - 1:]
