@@ -2818,6 +2818,7 @@ def _clean_bitbucket_entry(oauth: Any, mode: str) -> dict[str, Any]:
 # builtin:git: provider, destination, repositories, base branch, branch prefix
 # and the two write switches. Nothing else is stored for it.
 _GIT_URL = "builtin:git"
+_ARIBA_URL = "builtin:ariba"
 
 
 def _clean_git_entry(oauth: Any, mode: str) -> dict[str, Any]:
@@ -3063,6 +3064,7 @@ def prepare_servers(
     ina_seen = False
     bitbucket_seen = False
     git_seen = False
+    ariba_seen = False
     reconcile_seen = False
     for s in mcp_servers:
         url = (s.get("url") or "").strip()
@@ -3117,6 +3119,17 @@ def prepare_servers(
             if git_seen:
                 raise ValueError(GIT_SINGLE_ENTRY_MESSAGE)
             git_seen = True
+        elif url.rstrip("/").lower() == _ARIBA_URL:
+            # Stored under exactly this spelling and counted after it is
+            # settled, as builtin:git is. On 'destination' only: the factory
+            # refuses any other mode, so such a row would drop the whole
+            # agent at the next registry build.
+            url = _ARIBA_URL
+            if mode != AUTH_MODE_DESTINATION:
+                raise ValueError(ARIBA_MODE_MESSAGE)
+            if ariba_seen:
+                raise ValueError(ARIBA_SINGLE_ENTRY_MESSAGE)
+            ariba_seen = True
         elif url.rstrip("/").lower() == BUILTIN_RECONCILE_URL:
             # Stored under exactly this spelling, as builtin:git is. On 'none'
             # only: the factory refuses any other mode, so such a row would
@@ -5466,6 +5479,10 @@ _SMTP_DEST_KEYS = ("destination", "recipients", "from")
 # destination's technical user. `spaces` may arrive as a list (a bundle);
 # the generic cleaner stores it comma-separated.
 _CONFLUENCE_DEST_KEYS = ("destination", "spaces", "api_base")
+# builtin:ariba: the destination name alone. URL, API key, realm and the
+# technical user are the destination's (`URL.headers.*`, `URL.queries.*`);
+# no user_context, as for builtin:confluence.
+_ARIBA_DEST_KEYS = ("destination",)
 
 _DEST_KEYS_BY_URL: dict[str, tuple[str, ...]] = {
     "builtin:gmail": _GMAIL_DEST_KEYS,
@@ -5475,6 +5492,7 @@ _DEST_KEYS_BY_URL: dict[str, tuple[str, ...]] = {
     "builtin:sapnotedetail": _SAPNOTEDETAIL_DEST_KEYS,
     "builtin:smtp": _SMTP_DEST_KEYS,
     "builtin:confluence": _CONFLUENCE_DEST_KEYS,
+    _ARIBA_URL: _ARIBA_DEST_KEYS,
 }
 # builtin:odata is not in the map above on purpose: its entry stores no
 # destination. Which destination a call goes through, and whether as the
@@ -5626,6 +5644,17 @@ BITBUCKET_SINGLE_ENTRY_MESSAGE = (
 GIT_SINGLE_ENTRY_MESSAGE = (
     "an agent may have at most one builtin:git entry; pin every repository it "
     "uses in that entry's oauth.repositories"
+)
+# Two entries would share the server key and their tools' names, so which
+# destination a call went through could not be told. Public for the gate.
+ARIBA_SINGLE_ENTRY_MESSAGE = (
+    "an agent may have at most one builtin:ariba entry; it reads the realm of "
+    "the one destination it names"
+)
+ARIBA_MODE_MESSAGE = (
+    "builtin:ariba requires auth_mode=destination: it holds no credential of its "
+    "own and reaches Ariba only through the BTP destination named in "
+    "oauth.destination"
 )
 _ODATA_MODE_MESSAGE = (
     "builtin:odata requires auth_mode=destination: every catalogue service "

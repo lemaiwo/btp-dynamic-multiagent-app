@@ -473,6 +473,8 @@ async def test_read_document_hands_the_pdf_and_its_signature_facts_to_the_model(
     assert isinstance(intro, str) and "Att0AlphaOffer1" in intro and FILE_A not in intro
     assert isinstance(binary, BinaryContent)
     assert binary.data == pdf and binary.media_type == "application/pdf"
+    # Marked as a tool's file: the web chat does not store it with the turn.
+    assert binary.identifier == "tool:ariba:Att0AlphaOffer1"
     request = fake.requests[-1]
     assert request.url.path.endswith(DOWNLOAD)
     assert request.headers["accept"] == "*/*"
