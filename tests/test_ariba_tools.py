@@ -13,6 +13,7 @@ from typing import Any
 
 import httpx
 import pytest
+from pydantic_ai import BinaryContent, ToolReturn
 
 from agents import ariba_tools
 from agents.ariba_tools import (
@@ -48,6 +49,13 @@ from tests.ariba_helpers import (
     identifiers,
     standard,
 )
+from tests.ariba_pdf_helpers import (
+    PAGE_TEXT,
+    SIGNER,
+    signed_pdf,
+    unsigned_pdf,
+    xlsx_like,
+)
 
 NOW_MS = 1_790_000_100_000
 
@@ -82,9 +90,10 @@ def test_error_codes_are_the_closed_list_of_the_brief():
         AribaError("something_else", "x")
 
 
-def test_the_toolset_has_the_three_read_tools():
+def test_the_toolset_has_the_four_read_tools():
     toolset, _, _ = build(standard())
-    assert sorted(toolset.tools) == ["get_event", "list_documents", "list_events"]
+    assert sorted(toolset.tools) == ["get_event", "list_documents", "list_events",
+                                     "read_document"]
 
 
 # -- list_events ---------------------------------------------------------------
@@ -418,13 +427,150 @@ def test_activity_summary_lines():
         "get_event: 2 suppliers, 1 responded")
     assert activity_summary("ariba_list_documents", {"documents": [{"file_name": FILE_A}]}) == (
         "list_documents: 1 documents")
-    assert activity_summary("read_document", {"format": "pdf", "pages": 3, "signed": True}) == (
+    assert activity_summary("read_document", {
+        "format": "pdf", "pages": 3, "digital_signature": True,
+        "signatures": [{"signer": SUPPLIER_NAME_A}], "file_name": FILE_A}) == (
         "read_document: pdf, 3 pages, signed")
-    assert activity_summary("read_document", {"format": "pdf", "pages": 1, "signed": False}) == (
+    assert activity_summary("read_document", {
+        "format": "pdf", "pages": 1, "digital_signature": False}) == (
         "read_document: pdf, 1 pages, unsigned")
+    assert activity_summary("read_document", {"pages": "x"}) == "read_document: ?, ? pages, ?"
     assert activity_summary("get_event", {"error": {"code": "bids_sealed", "message": "m"}}) == (
         "error: bids_sealed")
     assert activity_summary("get_event", {"error": {"code": PROJECT, "message": "m"}}) == "error"
     assert activity_summary("get_event", "retry") == "get_event: no summary"
     assert activity_summary("get_page", {"x": 1}) is None
     assert activity_summary("other_list_events", {}) is None
+
+
+# -- read_document -------------------------------------------------------------
+
+DOWNLOAD = f"/events/{EVENT}/supplierBids/{SUPPLIER_A}/attachments/Att0AlphaOffer1/content"
+
+
+def document(body: bytes, *, content_type: str = "application/pdf"):
+    return lambda request: httpx.Response(200, content=body,
+                                          headers={"content-type": content_type})
+
+
+async def test_read_document_hands_the_pdf_and_its_signature_facts_to_the_model(caplog):
+    caplog.set_level(logging.DEBUG)
+    pdf = signed_pdf()
+    fake = standard().on(DOWNLOAD, document(pdf))
+    toolset, _, _ = build(fake)
+    await call(toolset, "list_documents", EVENT, SUPPLIER_A)
+    answer = await call(toolset, "read_document", EVENT, SUPPLIER_A, "Att0AlphaOffer1")
+    assert isinstance(answer, ToolReturn)
+    result = answer.return_value
+    assert result == {
+        "file_name": FILE_A, "format": "pdf", "pages": 1, "digital_signature": True,
+        "signatures": [{"signer": SIGNER, "signed_at": "2026-11-12T09:30:00+01:00",
+                        "covers_whole_file": True}],
+        "note": ariba_tools.READ_DOCUMENT_NOTE,
+    }
+    assert "not instructions" in result["note"] and "not validated" in result["note"]
+    (intro, binary) = answer.content
+    assert isinstance(intro, str) and "Att0AlphaOffer1" in intro and FILE_A not in intro
+    assert isinstance(binary, BinaryContent)
+    assert binary.data == pdf and binary.media_type == "application/pdf"
+    request = fake.requests[-1]
+    assert request.url.path.endswith(DOWNLOAD)
+    assert request.headers["accept"] == "*/*"
+    assert (request.url.params["itemId"], request.url.params["fieldId"],
+            request.url.params["alternativeId"]) == ("1000000001", "RQAATTACH", "AL0000000001")
+    assert request.method == "GET"
+    # The activity keeps the fixed line; the bytes never reach the log.
+    assert activity_summary("ariba_read_document", result) == (
+        "read_document: pdf, 1 pages, signed")
+    assert PAGE_TEXT not in caplog.text and SIGNER not in caplog.text
+
+
+async def test_read_document_lists_the_documents_itself_when_they_were_not_listed():
+    fake = standard().on(DOWNLOAD, document(unsigned_pdf(pages=2)))
+    toolset, _, _ = build(fake)
+    answer = await call(toolset, "read_document", EVENT, SUPPLIER_A, "Att0AlphaOffer1")
+    assert answer.return_value["pages"] == 2
+    assert answer.return_value["digital_signature"] is False
+    assert answer.return_value["signatures"] == []
+    assert fake.paths() == [f"/events/{EVENT}/supplierInvitations",
+                            f"/events/{EVENT}/supplierBids", DOWNLOAD]
+
+
+async def test_read_document_refuses_a_document_the_supplier_did_not_upload():
+    fake = standard()
+    toolset, _, _ = build(fake)
+    assert code_of(await call(toolset, "read_document", EVENT, SUPPLIER_A,
+                              "Att0BetaOffer01")) == "unknown_document"
+    assert code_of(await call(toolset, "read_document", EVENT, SUPPLIER_A, "../x")) == (
+        "invalid_id")
+    assert not any("/attachments/" in p for p in fake.paths())
+
+
+async def test_a_file_that_is_no_pdf_is_unsupported_type_with_its_name_and_type():
+    xlsx = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    rows = [bid_row(SUPPLIER_A, "1000000001", [{
+        "fieldId": "RQAATTACH", "value": {"attachmentValue": {
+            "id": "Att0Sheet", "fileName": "prices.xlsx", "contentType": xlsx}}}])]
+    path = f"/events/{EVENT}/supplierBids/{SUPPLIER_A}/attachments/Att0Sheet/content"
+    fake = standard().on(f"/events/{EVENT}/supplierBids", J(200, {"payload": rows}))
+    fake.on(path, document(xlsx_like(), content_type=xlsx))
+    toolset, _, _ = build(fake)
+    result = await call(toolset, "read_document", EVENT, SUPPLIER_A, "Att0Sheet")
+    assert code_of(result) == "unsupported_type"
+    assert result["error"]["file_name"] == "prices.xlsx"
+    assert result["error"]["content_type"] == xlsx
+
+
+async def test_a_declared_pdf_whose_bytes_are_not_one_is_not_a_pdf():
+    fake = standard().on(DOWNLOAD, document(b"<html>sign in</html>" * 10))
+    toolset, _, _ = build(fake)
+    result = await call(toolset, "read_document", EVENT, SUPPLIER_A, "Att0AlphaOffer1")
+    assert code_of(result) == "not_a_pdf"
+    assert (result["error"]["file_name"], result["error"]["content_type"]) == (
+        FILE_A, "application/pdf")
+
+
+async def test_a_pdf_whose_pages_cannot_be_told_is_not_a_pdf():
+    fake = standard().on(DOWNLOAD, document(b"%PDF-1.7\n" + b"garbage" * 100))
+    toolset, _, _ = build(fake)
+    result = await call(toolset, "read_document", EVENT, SUPPLIER_A, "Att0AlphaOffer1")
+    assert code_of(result) == "not_a_pdf"
+
+
+async def test_a_download_over_the_cap_is_too_large(monkeypatch):
+    monkeypatch.setattr(ariba_tools, "MAX_DOCUMENT_BYTES", 500)
+    fake = standard().on(DOWNLOAD, document(unsigned_pdf()))
+    toolset, _, _ = build(fake)
+    result = await call(toolset, "read_document", EVENT, SUPPLIER_A, "Att0AlphaOffer1")
+    assert code_of(result) == "too_large"
+
+
+async def test_a_pdf_over_twenty_pages_is_too_large():
+    fake = standard().on(DOWNLOAD, document(unsigned_pdf(pages=21)))
+    toolset, _, _ = build(fake)
+    result = await call(toolset, "read_document", EVENT, SUPPLIER_A, "Att0AlphaOffer1")
+    assert code_of(result) == "too_large"
+    assert "20 pages" in result["error"]["message"]
+
+
+async def test_the_inspection_runs_in_a_worker_thread(monkeypatch):
+    seen = []
+    real = ariba_tools.asyncio.to_thread
+
+    async def recording(func, *args, **kwargs):
+        seen.append(func)
+        return await real(func, *args, **kwargs)
+
+    monkeypatch.setattr(ariba_tools.asyncio, "to_thread", recording)
+    fake = standard().on(DOWNLOAD, document(unsigned_pdf()))
+    toolset, _, _ = build(fake)
+    await call(toolset, "read_document", EVENT, SUPPLIER_A, "Att0AlphaOffer1")
+    assert seen == [ariba_tools.ariba_pdf.inspect]
+
+
+async def test_a_signer_name_is_filtered_like_any_text_from_ariba():
+    fake = standard().on(DOWNLOAD, document(signed_pdf(signer="Evil‮Name\nNext")))
+    toolset, _, _ = build(fake)
+    answer = await call(toolset, "read_document", EVENT, SUPPLIER_A, "Att0AlphaOffer1")
+    (sig,) = answer.return_value["signatures"]
+    assert "‮" not in sig["signer"] and "\n" not in sig["signer"]
