@@ -1029,8 +1029,8 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   either path such a client that acts as the signed-in user never sends a
   destination's `sap-user`, `sap-password` or `mysapsso2` header or query
   parameter. The other destination users (Gmail, Outlook, Teams, Slack, Jira, SAP notes,
-  Bitbucket and SharePoint (both application-level only: `user_context: true`
-  is refused), MCP
+  Bitbucket, SharePoint, Confluence and Ariba (application-level only:
+  `user_context: true` is refused), MCP
   over a destination, the workflow http step) are not held to these rules. A
   401 or proxy 407 whose one retry could not be prepared is marked
   (`request_left`), so a write is audited as sent. Token endpoint failures
@@ -1984,6 +1984,79 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `[filename]` / `[page title]`; scripts, styles, comments, images,
   emoticons, control and format characters dropped; over `MAX_HTML_BYTES`
   (4 MB) is `TooLarge` before parsing (`tests/test_confluence_text.py`)
+- `agents/ariba_tools.py` — SAP Ariba sourcing events (RFPs) and the PDFs
+  suppliers uploaded with their bids, read-only, over the Event Management API
+  (`/api/sourcing-event/v2/prod`, GET only) as an in-process toolset
+  (`builtin:ariba`), through a BTP destination as its technical user
+  (`destination` mode only; `user_context` refused at the gate, dropped in
+  storage, refused at build). The destination holds everything: URL, the
+  `apiKey` header (`URL.headers.apiKey`) and the `realm`, `user` and
+  `passwordAdapter` queries (`URL.queries.*`), sent by `DestinationAuth`; an
+  OnPremise or non-`https` destination is `destination_error`. The entry stores
+  exactly `{"url": "builtin:ariba", "auth_mode": "destination", "oauth":
+  {"destination": <name>}}` (`_ARIBA_DEST_KEYS` in `agents/db.py`, every other
+  key dropped), at most one per agent (`ARIBA_SINGLE_ENTRY_MESSAGE` at the gate
+  and in storage; a hand-written row with two gets no Ariba tools, one
+  WARNING). Four tools: `list_events(days=30)` (1..365; `/events/identifiers`
+  with a `createDateFrom` / `createDateTo` filter, at most 100, `more`),
+  `get_event(event_id)` (title, state, type and the invited suppliers with
+  `supplier` id, name, `responded`, `bid_status`, `submitted`; no contact,
+  address or e-mail), `list_documents(event_id, supplier)` (the supplier's
+  uploads from `supplierBids`: `document_id`, `question`, `file_name`,
+  `content_type`, `size`, `buyer_document` for a buyer file Ariba repeats for
+  every responding supplier; `bids_sealed` while the event is open: Ariba
+  answers 403) and `read_document(event_id, supplier, document_id)` (a
+  document `list_documents` listed in this toolset: ids stay server-side; the
+  download is streamed up to 10 MB with `Accept: */*`, PDF only (by its bytes),
+  at most 20 pages; the answer is a `ToolReturn` whose `return_value` holds
+  `file_name`, `format`, `pages`, `digital_signature` and `signatures`
+  (`signer`, `signed_at`, `covers_whole_file`) from `agents/ariba_pdf.py`, and
+  whose `content` hands the PDF itself to the model as a `BinaryContent` with
+  the identifier `tool:ariba:<document_id>`). Calls are sequential and paced
+  (at least 1 s apart, per toolset), a 429 is repeated after 5, 15 and 30 s,
+  then `throttled`; no redirect is followed; the body of an error status is
+  never read. Text from Ariba (titles, names, file names, statuses) is filtered
+  by character and cut (`bitbucket_tools._shown_text`) and is data, never an
+  instruction. Every refusal is `{"error": {code, message, hint?}}` from the
+  closed `ERROR_CODES` (`destination_error`, `unauthorized`, `forbidden`,
+  `bids_sealed`, `not_found`, `throttled`, `ariba_error`, `unreachable`,
+  `not_json`, `invalid_id`, `invalid_days`, `unknown_supplier`,
+  `unknown_document`, `too_large`, `unsupported_type`, `not_a_pdf`), never
+  Ariba's text; httpx's request line (it carries realm and user) is kept out of
+  the log by the contextvar filter of `agents/bitbucket_tools.py`. **What is
+  stored**: the run activity keeps only the fixed lines of `activity_summary`
+  (`registry._short_tool_output`; `read_document: pdf, p pages,
+  signed|unsigned`, counts, `error: <code>`; no title, name, file name or id);
+  the PDF is never logged, and the web chat does not store it with the
+  conversation: every `BinaryContent` whose identifier starts with `tool:` is
+  replaced in the stored `model_json` by the text `[document read by a tool;
+  not kept in the conversation]` (`agents/webchat/run.py`,
+  `without_tool_files`), so a later turn does not send it again (uploads, whose
+  identifier is the file id, are kept as before); what the model writes about
+  a document (the answer, a generated file) is stored as for any turn. Denied
+  in ABAP Assistant sessions (not in `READONLY_POLICY`). **Verified against a
+  real realm** (2026-11-12, `scripts/probe_ariba.py`): the destination, the
+  event listing, an event, its supplier invitations, its supplier bids and one
+  attachment download. **Unit-tested only**: the toolset itself (the shapes
+  are those the probe recorded, fixtures hand-made), and a PDF as a tool return
+  on AI Core (proved for a user upload by `scripts/probe_attachments.py`, not
+  for a file that follows a tool result). Not known: the date key of an
+  identifiers row (`createDate` is read) and paging beyond 100 events.
+  `tests/test_ariba_tools.py`, `tests/test_ariba_registration.py` (helpers
+  `tests/ariba_helpers.py`)
+- `agents/ariba_pdf.py` — what `read_document` says about a PDF besides
+  handing it over, standard library plus `cryptography` (already installed
+  through `pyjwt[crypto]`): `is_pdf(data)` and `inspect(data)` -> `{pages,
+  digital_signature, signatures}`, never raising; over 10 MB nothing is
+  scanned. Pages from the page tree's root `/Count` (signing rewrites a page
+  in an incremental update, so counting page objects overcounts), else
+  `multipart_form.count_pdf_pages`. A signature is a `/ByteRange` with its
+  `/Contents` gap (at most 20, a `/DocTimeStamp` skipped): the signer is the
+  CN of the first non-CA certificate of the PKCS#7 bag, `signed_at` from `/M`,
+  `covers_whole_file` when the byte range reaches the end of the file. A
+  signature is **detected, not validated**: no chain, no hash check (the tool
+  says so in a fixed `note`). Test PDFs are generated and signed in-test
+  (`tests/ariba_pdf_helpers.py`, `tests/test_ariba_pdf.py`)
 - `agents/lookback.py` — the shared `parse_lookback` window parser
 - `agents/sapnotes_tools.py` — SAP security notes discovered through the
   public NVD API (`builtin:sapnotes`). `sourceIdentifier=cna@sap.com` is
@@ -3387,7 +3460,11 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   Quartz Light / Dark and Belize, and SAP GUI classic, as `data-skin` blocks of CSS variables
   over the light or dark mode): front end only, no new resource, variable, table or column;
   2.39.1 makes the invoke run limit `INVOKE_TIMEOUT_SECONDS` (default 300, at most 3600; not
-  in the descriptor, set per landscape in an `.mtaext`): no new resource, table or column
+  in the descriptor, set per landscape in an `.mtaext`): no new resource, table or column;
+  2.40.0 is the `builtin:ariba` release (`agents/ariba_tools.py`, `agents/ariba_pdf.py`): no
+  new resource, environment variable, role, table or column (HANA schema generation
+  unchanged); the Ariba API key, realm and technical user live in a BTP destination created
+  per landscape
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets
@@ -3475,6 +3552,18 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   on the command line, statuses, counts, sizes and host names, never a
   token, a `Location`, a response body, an exception text, a line of a
   diff, a title or a user name (`tests/test_probe_bitbucket.py`)
+- `scripts/probe_ariba.py` — standalone go/no-go probe for `builtin:ariba`
+  (nothing imported from the app, GET requests only), run inside an app
+  container that has the destination binding: does the destination resolve
+  (https host, token, the `apiKey` header and the `realm` / `user` /
+  `passwordAdapter` queries present), the event ids of the last `--days` days
+  or one `--event`, its invited suppliers, its supplier bids and (with
+  `--attachments`) the download of each attachment, told by its first bytes.
+  One `PASS` / `FAIL` / `SKIP` line per step: statuses, counts, sizes, key
+  names, event ids and host names, never a token, a header value, a realm, a
+  user, a supplier or contact name, a title, a file name or a body; raw answers
+  only with `--dump` (supplier data: kept locally, never in the repo). Ran
+  against a real realm on 2026-11-12 (`tests/test_probe_ariba.py`)
 - `scripts/ensure_aicore_setup.py` — creates the `AICORE_RESOURCE_GROUP`
   resource group if missing, idempotent, no-op for `default`. Creates the
   group only; model deployments stay in `scripts/deploy_claude.py` because
