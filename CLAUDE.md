@@ -1287,15 +1287,25 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `check_hana_reach` in `agents/db.py` (called by `upsert_agent` and the
   admin update route), the registry build, and the invoke API's 404): an
   agent with a `builtin:hana` entry cannot `share_tools`
-  (`HANA_SHARE_MESSAGE`; a hand-written sharing row shares nothing). An
-  entry that asks to select (`asks_to_select`: `allow_select` anything but
-  `false` / absent, so a hand-written `"true"` counts) cannot be
-  `expose_invoke`, may be chat-exposed only at tier `advanced`, and may not
-  be named in any agent's `peers` (any other row, enabled or not); a
-  hand-written row exposed to the invoke API or to basic chat is built
-  without `run_select` (the fixed checks stay), and no delegation tool is
-  attached to such a peer, each with one WARNING. Such an agent runs from
-  advanced chat, the scheduler run endpoint or an admin's Run now. Accepted
+  (`HANA_SHARE_MESSAGE`; a hand-written sharing row shares nothing). **Every**
+  agent with a `builtin:hana` entry, with or without `allow_select` (widened
+  from Allow SELECT alone at the final review of Phases 2 and 3: the fixed
+  checks read object source of any schema, the database users with their
+  lock and login state, grants, audit policies and the password policy),
+  cannot be `expose_invoke` (`HANA_INVOKE_MESSAGE`), may be chat-exposed
+  only at tier `advanced` (`HANA_CHAT_MESSAGE`), and may not be named in
+  any agent's `peers` (any other row, enabled or not; `_HANA_PEER_RULE`);
+  `allow_select` (`asks_to_select`) decides only whether `run_select` is
+  registered. A stored row that breaks the rules (written by hand, or a
+  Phase 1 row saved as basic chat or invoke without `allow_select`, which
+  was valid before 2.41.0) still loads and the app starts, but it is built
+  WITHOUT the HANA tools (its other servers stay), and no delegation tool is
+  attached to a peer with a hana entry, each with one WARNING; its next
+  save must comply. The web chat needs no code of its own: such an agent is
+  advanced, so the tier gate keeps it from a basic user's catalogue,
+  consults and conversations (`tests/test_webchat_user_agents.py`). Such an
+  agent runs from advanced chat, the scheduler run endpoint or an admin's
+  Run now. Accepted
   gaps: a workflow step may name such an agent; an advanced user's personal
   agent may consult one; the agent's own deep sub-agents share its tools;
   `check_hana_reach` takes no row lock (the build closes what it misses).
@@ -3877,7 +3887,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   security checks of `builtin:hana` (39 checks, 68 in all; `run_check`'s `other_schema`,
   `truncated_columns`): no new resource, environment variable, role, table or column (HANA
   schema generation unchanged, still 11); the catalogue and security checks need
-  `CATALOG READ` for the database user; not yet run on a landscape
+  `CATALOG READ` for the database user; not yet run on a landscape; the reach rules now
+  apply to every builtin:hana entry: chat only at tier advanced, never the invoke API,
+  never a peer; a stored row that breaks them is built without the HANA tools
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets
