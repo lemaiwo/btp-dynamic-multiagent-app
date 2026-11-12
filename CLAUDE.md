@@ -1230,8 +1230,11 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     `inspectFunction`, `inspectView`, `inspectTrigger`, `inspectLibrary` read
     the catalogue's `DEFINITION` column with `lob_chars` 20,000;
     `inspectLibMember` lists EVERY member of the library (there is no member
-    argument) with its definition at `lob_chars` 5,000 and at most 10 rows,
-    so a long member is cut (`truncated_columns`), not refused. **Never
+    argument) with its definition at `lob_chars` 4,000 and at most 8 rows,
+    so a long member is cut (`truncated_columns`), not refused (a worst case
+    measured as the model receives it, a third `"` and a third line feeds,
+    fits the 60,000 cap; so does one 20,000 character definition with its
+    other parts). **Never
     selected by the new categories**: rows of a user table, passwords and
     password hashes, key material and root key hashes, certificate bodies
     (and subject alternative names, fingerprints), audit log rows (only the

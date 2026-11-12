@@ -27,7 +27,7 @@ What is read and what is not:
   a calculation view is inspected through ``SYS.VIEWS`` like any column view.
 - ``inspectLibMember``: hana-cli takes a member name, which the closed
   arguments cannot carry (``object`` is the library). The check lists the
-  members of the library (at most 10, each definition up to 5,000
+  members of the library (at most 8, each definition up to 4,000
   characters) with type and access mode instead.
 - ``DEFAULT_VALUE`` and ``CHECK_CONDITION`` are never selected: expression
   text that can embed literals (the same rule as :mod:`.schema`).
@@ -48,8 +48,8 @@ _REQUIRED = frozenset({"schema", "object"})
 _ONE = ("schema", "object")
 _MANY = ("top_plus_one", "schema", "object")
 _DEFINITION_CHARS = 20_000
-_MEMBER_ROWS = 10
-_MEMBER_CHARS = 5_000
+_MEMBER_ROWS = 8
+_MEMBER_CHARS = 4_000
 
 # on-prem: TABLES with hana-cli's HANA 2 columns, plus IS_COLUMN_TABLE; the
 # runtime size (RECORD_COUNT, TABLE_SIZE per host and port) from M_TABLES, a
@@ -361,17 +361,22 @@ INSPECT_LIBRARY = Check(
 # on-prem: hana-cli reads ONE member by name; the closed arguments have no
 # member name (`object` is the library), so the members are listed with their
 # own definitions, by name. PRAGMAS and COMMENTS of hana-cli are left out
-# (not in the documented LIBRARY_MEMBERS; COMMENTS is free text). At most 10
-# members of at most 5,000 characters each (`_MEMBER_ROWS`, `_MEMBER_CHARS`):
-# 50,000 characters stay inside the statement's 60,001 character LOB budget,
-# so a library of long members is cut (`truncated`, `truncated_columns`), not
-# refused as `result_too_large`.
+# (not in the documented LIBRARY_MEMBERS; COMMENTS is free text). At most 8
+# members of at most 4,000 characters each (`_MEMBER_ROWS`, `_MEMBER_CHARS`):
+# 32,000 characters stay inside the statement's 60,001 character LOB budget,
+# and the answer stays under the 60,000 character cap as the model receives
+# it, where a `"` or a line feed of the source is escaped to two characters
+# (a source of a third of each, measured by
+# `tests/test_hanadb_checks_inspection.py`), so a library of long members is
+# cut (`truncated`, `truncated_columns`), not refused as `result_too_large`.
+# A source made almost wholly of such characters (or of control characters,
+# escaped to six) can still be refused, never cut.
 # on-prem: not yet run
 INSPECT_LIB_MEMBER = Check(
     name="inspectLibMember",
     category="database",
-    purpose=("Members of one library (no member argument; at most 10) with type, access mode,"
-             " definition up to 5,000 characters."),
+    purpose=("Members of one library (no member argument; at most 8) with type, access mode,"
+             " definition up to 4,000 characters."),
     source="bin/inspectLibMember.js",
     statements=(
         _LIBRARY_HEADER,
