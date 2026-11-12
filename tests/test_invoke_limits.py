@@ -7,6 +7,7 @@ Run:  .venv/bin/python -m pytest tests/test_invoke_limits.py -q
 from __future__ import annotations
 
 import json
+import logging
 import sys
 from pathlib import Path
 
@@ -15,6 +16,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from agents import invoke  # noqa: E402
 from agents.invoke_config import (  # noqa: E402
     InvokeConfigError,
     InvokeLimits,
@@ -23,6 +25,7 @@ from agents.invoke_config import (  # noqa: E402
     parse_limits,
     validate,
 )
+from tests.test_invoke_api import _clean, client  # noqa: E402,F401,F811
 
 
 def test_defaults():
@@ -91,3 +94,61 @@ def test_the_subset_is_enforced():
     assert validate(schema, {"id": "ab", "n": 1.0}) == []
     assert validate({"type": "object", "properties": {"e": {"enum": [1]}}}, {"e": True}) == [
         "$.e: must be one of the allowed values"]
+
+
+# ---------------------------------------------------------------------------
+# The run deadline: INVOKE_TIMEOUT_SECONDS, read per call
+# ---------------------------------------------------------------------------
+def test_invoke_timeout_default_and_env(monkeypatch):
+    monkeypatch.delenv("INVOKE_TIMEOUT_SECONDS", raising=False)
+    assert invoke.invoke_timeout() == 300
+    monkeypatch.setenv("INVOKE_TIMEOUT_SECONDS", "1800")
+    assert invoke.invoke_timeout() == 1800
+
+
+@pytest.mark.parametrize("bad", ["abc", "0", "-5"])
+def test_invoke_timeout_bad_value_is_the_default(monkeypatch, caplog, bad):
+    monkeypatch.setenv("INVOKE_TIMEOUT_SECONDS", bad)
+    with caplog.at_level(logging.WARNING, logger=invoke.logger.name):
+        assert invoke.invoke_timeout() == 300
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    text = warnings[0].getMessage()
+    assert text == "INVOKE_TIMEOUT_SECONDS is not a positive number; using 300"
+
+
+def test_invoke_timeout_is_capped(monkeypatch, caplog):
+    monkeypatch.setenv("INVOKE_TIMEOUT_SECONDS", "99999")
+    with caplog.at_level(logging.WARNING, logger=invoke.logger.name):
+        assert invoke.invoke_timeout() == invoke.MAX_INVOKE_TIMEOUT_SECONDS == 3600
+    assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
+
+
+def test_the_module_constant_is_still_the_default(monkeypatch):
+    monkeypatch.delenv("INVOKE_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.setattr(invoke, "INVOKE_TIMEOUT_SECONDS", 0.05)
+    assert invoke.invoke_timeout() == 0.05
+
+
+async def test_the_row_timeout_follows_the_env(client, monkeypatch):  # noqa: F811
+    from tests.test_invoke_api import (
+        SLUG,
+        JobRun,
+        SessionLocal,
+        Specialist,
+        form,
+        make_agent,
+        submits_valid,
+        use_specialist,
+        wait_done,
+    )
+
+    use_specialist(monkeypatch, Specialist(submits_valid))
+    monkeypatch.setenv("INVOKE_TIMEOUT_SECONDS", "1800")
+    await make_agent()
+    r = await client.post(f"/api/invoke/{SLUG}", **form())
+    assert r.status_code == 202
+    await wait_done(client, r.json()["run_id"])
+    async with SessionLocal() as s:
+        row = await s.get(JobRun, r.json()["run_id"])
+    assert row.timeout_seconds == 1860

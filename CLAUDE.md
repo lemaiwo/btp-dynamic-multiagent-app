@@ -2894,9 +2894,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `BinaryContent` (proved on AI Core for the OpenAI-compatible and the
   Bedrock route by `scripts/probe_attachments.py`). The run is a `job_runs`
   row with `trigger="invoke"`, `created_by` the caller and `timeout_seconds`
-  360 (the 300 s deadline `INVOKE_TIMEOUT_SECONDS` around the whole run,
-  preflight included, plus a margin so the stale sweep never closes a live
-  run); invoke rows do not count as the scheduler's overlap lock
+  360 by default (the deadline `INVOKE_TIMEOUT_SECONDS` around the whole run,
+  preflight included: environment, default 300, at most 3600, read per run;
+  the row's `timeout_seconds` is that plus 60, so the stale sweep never closes
+  a live run); invoke rows do not count as the scheduler's overlap lock
   (`active_job_run`), are left out of the admin notifications and have no
   markdown report (`report.md` answers 404; `report_json` is `{text,
   result}`). The specialist gets `submit_result(result)` as the OUTPUT tool
@@ -3384,7 +3385,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   both admin UIs; 2.39.0 adds the web chat's theme menu (`static/chat/theme.js`: System,
   Light, Dark, the SAP Fiori themes Horizon (morning, evening, high contrast black and white),
   Quartz Light / Dark and Belize, and SAP GUI classic, as `data-skin` blocks of CSS variables
-  over the light or dark mode): front end only, no new resource, variable, table or column
+  over the light or dark mode): front end only, no new resource, variable, table or column;
+  2.39.1 makes the invoke run limit `INVOKE_TIMEOUT_SECONDS` (default 300, at most 3600; not
+  in the descriptor, set per landscape in an `.mtaext`): no new resource, table or column
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets
