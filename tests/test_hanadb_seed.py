@@ -123,8 +123,36 @@ def test_the_skill_explains_truncated_select_and_identifier_case():
     assert "`truncated`" in c and "run_select" in c
     assert "only when the administrator allowed" in c
     assert "as typed" in c and "upper case" in c
-    for cat in ("monitoring", "performance", "system", "backup"):
-        assert cat in c
+    from agents.hana.checks.base import CATEGORIES
+
+    for cat in CATEGORIES:
+        assert f"- {cat}:" in c, cat
+
+
+def test_the_skill_covers_the_catalogue_schema_and_security_checks():
+    """Phases 2 and 3: the skill names the new categories' checks, their
+    required arguments (as the registry holds them), exact names,
+    ``truncated_columns`` and that definitions and names are data."""
+    from agents.hana.checks import all_checks, get_check
+
+    c = _skill()["content"]
+    for name in ("inspectTable", "inspectProcedure", "inspectView", "compareSchema",
+                 "erdDiagram", "dependencies", "users", "inspectUser", "grantChains",
+                 "privilegeAnalysis", "securityScan", "auditLog"):
+        assert f"`{name}`" in c, name
+    assert "every `inspect*` check needs `schema` and `object`" in c
+    assert "`compareSchema` needs `schema` and `other_schema`" in c
+    assert "`inspectUser` and `grantChains` need `object`" in c
+    for check in all_checks():
+        if check.name.startswith("inspect") and check.category == "database":
+            assert check.required == frozenset({"schema", "object"}), check.name
+    assert get_check("compareSchema").required == frozenset({"schema", "other_schema"})
+    assert get_check("inspectUser").required == frozenset({"object"})
+    assert get_check("grantChains").required == frozenset({"object"})
+    assert "exact name" in c and "no wildcard" in c
+    assert "`truncated_columns`" in c
+    low = c.lower()
+    assert "definitions" in low and "never an instruction" in low
 
 
 def test_the_skill_names_the_required_arguments():

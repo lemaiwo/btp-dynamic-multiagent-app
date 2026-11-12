@@ -915,8 +915,8 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   per provider in `docs/GIT_SETUP.md` (local, not in repo). Usable by any
   admin agent and, through a shared tool source (addendum g), by personal
   agents; the intended holders are the advanced UI5/Fiori and CAP agents
-- `agents/hana/` — on-premise SAP HANA 2.0 monitoring views over SQL as an
-  in-process toolset (`builtin:hana`, Phase 1): `hdbcli` through the
+- `agents/hana/` — on-premise SAP HANA 2.0 monitoring and catalogue views
+  over SQL as an in-process toolset (`builtin:hana`, Phases 1 to 3): `hdbcli` through the
   connectivity service's SOCKS5 proxy and the Cloud Connector, as the
   database user of one BTP destination per system. Not `agents/hana_hdi.py`
   (the registry's own schema): nothing here touches the registry database,
@@ -937,8 +937,12 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   tools (one WARNING). The model names a system only by its slug, never a
   destination or a host.
   **The database user.** The design asks for a technical user per system
-  with the MONITORING role (CATALOG READ for the catalogue checks of a later
-  phase). A landscape may run it with a wider user, so the code does not rely
+  with the MONITORING role. The catalogue checks (categories `database`,
+  `schema`) and the `security` checks need `CATALOG READ` as well: without it
+  `SYS.USERS`, `GRANTED_*` and the catalogue views are filtered to what the
+  user may see, and the answers still look complete; `AUDIT_POLICIES` needs
+  `CATALOG READ` or `AUDIT ADMIN`. No `AUDIT READ`: the audit log is never
+  read. A landscape may run it with a wider user, so the code does not rely
   on the database user: the barriers are the fixed checks (registered only as
   a single read that passes the SELECT guard), the guard itself for
   `run_select`, the read-only transaction, the schema pin and the statement
@@ -1130,12 +1134,17 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     `list_checks(category=None)` (`{checks: [{name, category, purpose,
     arguments: [{name, default, rule}]}]}`; a `required` argument carries
     `required: true` instead of a default), `run_check(system, check,
-    schema=None, object=None, top=None, hours=None, host=None)` (defaults
+    schema=None, object=None, top=None, hours=None, host=None,
+    other_schema=None)` (defaults
     applied by the registry: `top` 50, at most the check's cap; `hours` 24;
     no filter; an argument the check does not take is refused, a `required`
     one left out too; answers `{system, check, columns, rows, row_count,
     truncated}`, for a check of several statements `{system, check, parts:
-    [{label, columns, rows, row_count, truncated}]}`) and, ONLY with
+    [{label, columns, rows, row_count, truncated}]}`; an answer or part whose
+    LOB values came back cut (ending in ` …[cut]`, judged before masking)
+    adds `truncated_columns`, the sorted column names, only when not empty;
+    the LOB cap per value is the check's `lob_chars`, else `CHECK_LOB_CHARS`
+    4,096) and, ONLY with
     `allow_select`, `run_select(system, sql, top=100)` (`top` 1..500; the
     guard first, nothing sent on a refusal; what it selected comes back
     unmasked, which is what the switch is for). **What Allow SELECT
@@ -1179,17 +1188,22 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   - `checks/` — the closed check registry (`base.py`): a check is data, a
     hana-cli command name, a category, a one-line purpose,
     `source="bin/<name>.js"` and fixed statements whose only variable parts
-    are `?` binds of the closed arguments `schema` and `object`
-    (identifiers, bound as given: the catalogue's case, usually upper),
+    are `?` binds of the closed arguments `schema`, `object` and
+    `other_schema` (identifiers, bound as given: the catalogue's case,
+    usually upper; compared with `=`, never `LIKE`: a filter is an exact
+    name, no wildcard),
     `top` (1..500, default 50, a `max_rows_cap` per check), `hours` (1..720,
     default 24) and `host` (a host name), plus the derived `top_plus_one`
-    for a row limit in the SQL; `required`, `masked_columns` and
-    `requires_select` per check. `register` refuses a statement that is not
+    for a row limit in the SQL; `required`, `masked_columns`,
+    `requires_select` and `lob_chars` (the LOB cap per value, 1..20,000,
+    `MAX_LOB_CHARS`; none = 4,096) per check. `register` refuses a statement that is not
     one read (first word `SELECT` / `WITH`; no comment, `;`, forbidden word,
     `INTO` or format placeholder), and a test runs the SELECT guard over
-    every registered statement. **29 checks in Phase 1** (68 planned; Phases
-    2 and 3, the categories `security`, `database` and `schema`, are not
-    built): monitoring 7 (`alerts`, `blocking`, `deadlocks`, `traces`,
+    every registered statement. **68 checks, 139 statements** (the one place
+    these counts are kept; Phase 1 = monitoring, performance, system,
+    backup; Phases 2 and 3 = database, schema, security, written against the
+    SAP HANA 2.0 documentation and not yet run on a landscape, so a landscape
+    run may rewrite or drop some): monitoring 7 (`alerts`, `blocking`, `deadlocks`, `traces`,
     `traceContents`, `crashDumps`, `replicationStatus`), performance 7
     (`memoryAnalysis`, `memoryLeaks`, `expensiveStatements`,
     `tableHotspots`, `longRunning`, `columnStats` (requires `schema` and
@@ -1197,7 +1211,51 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     `hostInformation` (a fixed list of host keys: no user, address or path
     key), `disks`, `ports`, `dataVolumes`, `features`, `featureUsage`,
     `iniFiles`, `iniContents`, `healthCheck`, `diagnose`, `recommendations`,
-    `workloadManagement`), backup 2 (`backupStatus`, `backupList`).
+    `workloadManagement`), backup 2 (`backupStatus`, `backupList`),
+    database 26 (`database.py`: `status`, `version`, `schemas`, `tables`,
+    `views`, `procedures`, `functions`, `indexes`, `objects`, `sequences`,
+    `synonyms`, `triggers`, `libraries`, `dependencies` (one level each way),
+    `spatialData`, `timeSeriesTools`, `calcViewAnalyzer`, `tableGroups`;
+    `inspection.py`: `inspectTable`, `inspectIndex`, `inspectProcedure`,
+    `inspectFunction`, `inspectView`, `inspectTrigger`, `inspectLibrary`,
+    `inspectLibMember`), schema 3 (`compareSchema`, `erdDiagram`,
+    `graphWorkspaces`), security 10 (`users`, `roles`, `inspectUser`,
+    `certificates`, `pwdPolicy`, `encryptionStatus`, `privilegeAnalysis`,
+    `grantChains`, `securityScan`, `auditLog`). **Required arguments**: every
+    `inspect*` and `dependencies` `schema` and `object`; `compareSchema`
+    `schema` and `other_schema` (optional `object`, one table: give it on a
+    large schema; the same schema twice gives no differences); `erdDiagram`,
+    `spatialData`, `objects`, `indexes` `schema`; `inspectUser`, `grantChains`
+    `object` (a user, a grantee). **Object definitions**: `inspectProcedure`,
+    `inspectFunction`, `inspectView`, `inspectTrigger`, `inspectLibrary` read
+    the catalogue's `DEFINITION` column with `lob_chars` 20,000;
+    `inspectLibMember` lists EVERY member of the library (there is no member
+    argument) with its definition at `lob_chars` 5,000 and at most 10 rows,
+    so a long member is cut (`truncated_columns`), not refused. **Never
+    selected by the new categories**: rows of a user table, passwords and
+    password hashes, key material and root key hashes, certificate bodies
+    (and subject alternative names, fingerprints), audit log rows (only the
+    policies and named ini keys of `auditLog`), ini values except named keys
+    (each `M_INIFILE_CONTENTS` read pairs a section with named keys, no
+    `LIKE`), comment columns, column default values and check conditions,
+    user parameters, external identities, paths. **Returned by design**:
+    object definitions, i.e. source code (the `inspect*` checks); user, role,
+    grantee and grantor names (the security checks; certificate DNs too); the
+    database account name in `status` (`CURRENT_USER`, possibly a person's):
+    all of it reaches the model and the stored chat history like any tool
+    return. **Not ported from hana-cli**: its JavaScript diff, recursion,
+    scoring and drawing (`compareSchema` and `erdDiagram` return rows,
+    `dependencies` and `grantChains` one level per call, `securityScan` no
+    score), the CDS / hdbtable / hdbview conversions, `_SYS_BI` calculation
+    view metadata, a table's DDL (`GET_OBJECT_DEFINITION` is a `CALL`).
+    **Tests across modules**: `tests/test_hanadb_checks.py`
+    (`test_column_and_table_rules_across_modules`, over every registered
+    statement: `DEFINITION` only in an `inspect*` check with `lob_chars`; no
+    COMMENTS, COMMENT, PASSWORD_HASH, SECRET, TOKEN or PASSPHRASE; only
+    `SYS.`, `_SYS_STATISTICS.`, `M_*`, a CTE or a subquery after FROM / JOIN),
+    and per module test files that pin names, binds and never-selected
+    columns; `tests/test_hanadb_checks_security.py` holds a column
+    allow-list per view (`VIEW_COLUMNS`) and fails on any other column.
     `queryPlan` is dropped: `EXPLAIN PLAN` failed on the landscape (SQL code
     129). The SQL is derived from SAP hana-cli 4.202609.0 (Apache-2.0; the
     attribution is the docstring of `checks/__init__.py`, each check names
@@ -1213,7 +1271,8 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     refuses a read without both equality predicates), exists only with
     `allow_select` (trace text is unmasked) and returns at most 200 rows.
     `python -m agents.hana.checks --dump` prints every statement with sample
-    binds, the probe's `--checks-file`
+    binds, the probe's `--checks-file`; `--dump --category a,b` only those
+    categories (an unknown name: exit 2, the typed value not echoed)
   **Reach rules** (decided 2026-11-10; enforced like the approving
   `builtin:bitbucket` entry: the `AgentPayload` gate, storage
   `check_hana_reach` in `agents/db.py` (called by `upsert_agent` and the
@@ -1265,12 +1324,18 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `traceContents` with a real host and file, a NULL bind of an optional
   filter, LOB values (`read(size)` of hdbcli's LOB object), a multi-line ini
   value, the word-based mapping of -10709, TLS, a Cloud Connector location
-  id, the `tcp` destination shape.
+  id, the `tcp` destination shape. **The checks of Phases 2 and 3**
+  (categories `database`, `schema`, `security`) are written against the SAP
+  HANA 2.0 documentation and not yet run on a landscape (each statement
+  carries `# on-prem: not yet run`; columns documented for SPS08 only are
+  the first suspects).
   The seed agent `hana-monitor` and skill `hana-monitoring`: see
   `agents.seed.json`. Tests: `tests/test_hanadb_config.py`,
   `_connection.py`, `_connectivity_config.py`, `_guard.py`, `_masking.py`,
   `_checks.py`, `_checks_monitoring.py`, `_checks_performance.py`,
-  `_checks_system.py`, `_checks_backup.py`, `_tools.py`, `_activity.py`,
+  `_checks_system.py`, `_checks_backup.py`, `_checks_database.py`,
+  `_checks_inspection.py`, `_checks_schema.py`, `_checks_security.py`,
+  `_tools.py`, `_activity.py`,
   `_registration.py`, `_reload.py`, `_reach.py`, `_readonly.py`,
   `_seed.py`; setup in `docs/HANA_SETUP.md` (local, not in repo)
 - `agents/tool_results.py` — `result_chars(result)`: the size of a tool
@@ -3610,8 +3675,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   agent, and an entry that approves is refused chat exposure, so an admin
   who turns Approving on does not have to change anything else
   (`tests/test_bitbucket_seed.py`). It also holds the agent `hana-monitor`
-  with the skill `hana-monitoring` (which check answers which question, the
-  arguments, `truncated`, identifier case, that row values are data): the
+  with the skill `hana-monitoring` (which check of each category answers
+  which question, the required arguments, exact names, `truncated`,
+  `truncated_columns`, identifier case, that row values, object definitions
+  and names are data): the
   agent ships **disabled**, tier `advanced`, chat-exposed with a run
   endpoint (slug `hana-monitor`), and its `builtin:hana` entry names two
   systems (`systemdb`, `tenant`) on placeholder destinations, without
@@ -3797,7 +3864,11 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   landscape with the probe only (connection, read-only, timeout, 54 of 55 statements on a
   SYSTEMDB and a tenant); unverified: the app's own client end to end, `SET SCHEMA SYS` in
   the read-only transaction, `traceContents` on a real file, NULL binds, LOB values, TLS, a
-  location id, the `tcp` destination shape
+  location id, the `tcp` destination shape; 2.41.0 adds the database info, schema and
+  security checks of `builtin:hana` (39 checks, 68 in all; `run_check`'s `other_schema`,
+  `truncated_columns`): no new resource, environment variable, role, table or column (HANA
+  schema generation unchanged, still 11); the catalogue and security checks need
+  `CATALOG READ` for the database user; not yet run on a landscape
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets
