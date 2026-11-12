@@ -91,14 +91,56 @@ def test_no_source_free_text_grantor_or_host_is_selected(name: str) -> None:
         assert not words & NEVER, (name, statement.label, words & NEVER)
 
 
+def _references(sql: str) -> list[tuple[str, str]]:
+    """(first, second) token values after every FROM, JOIN and comma of a FROM
+    list: the place a table reference stands."""
+    tokens = tokenize(sql)
+    refs = []
+    in_from = False
+    depth_of_from: list[int] = []
+    depth = 0
+    for index, token in enumerate(tokens):
+        if token.is_symbol("("):
+            depth += 1
+        elif token.is_symbol(")"):
+            depth -= 1
+            while depth_of_from and depth_of_from[-1] > depth:
+                depth_of_from.pop()
+            in_from = bool(depth_of_from) and depth_of_from[-1] == depth
+        opens = token.is_word("FROM", "JOIN")
+        comma = token.is_symbol(",") and in_from and depth_of_from[-1] == depth
+        if opens or comma:
+            nxt = tokens[index + 1]
+            after = tokens[index + 2] if index + 2 < len(tokens) else nxt
+            refs.append((nxt.value or nxt.text, after.text))
+            if opens:
+                in_from = True
+                depth_of_from.append(depth)
+        elif token.is_word("WHERE", "GROUP", "ORDER", "HAVING", "ON"):
+            if depth_of_from and depth_of_from[-1] == depth:
+                depth_of_from.pop()
+            in_from = False
+    return refs
+
+
+@pytest.mark.parametrize("sql, expected", [
+    ("SELECT A FROM SYS.T1 X, SYS.T2 Y WHERE A = 1", [("SYS", "."), ("SYS", ".")]),
+    ("SELECT A FROM SYS.T1 JOIN APP.T2 ON 1 = 1", [("SYS", "."), ("APP", ".")]),
+    ("SELECT A, B FROM SYS.T1 ORDER BY A, B", [("SYS", ".")]),
+])
+def test_references_reads_from_join_and_comma_lists(sql, expected) -> None:
+    assert _references(sql) == expected
+
+
 @pytest.mark.parametrize("name", EXPECTED)
 def test_only_catalogue_views_are_read(name: str) -> None:
-    # Every FROM names a SYS view: no table of an application, no _SYS_BI.
+    # Every FROM, JOIN and FROM-list comma names a SYS view: no application
+    # table, no _SYS_BI.
     for statement in registry.get_check(name).statements:
-        tokens = tokenize(statement.sql)
-        for index, token in enumerate(tokens):
-            if token.is_word("FROM"):
-                assert tokens[index + 1].is_word("SYS"), (name, statement.label)
+        refs = _references(statement.sql)
+        assert refs, (name, statement.label)
+        for first, after in refs:
+            assert (first, after) == ("SYS", "."), (name, statement.label, first)
         assert "_SYS_BI" not in statement.sql
 
 
@@ -106,16 +148,42 @@ def test_dependencies_needs_schema_and_object_and_compares_names() -> None:
     check = registry.get_check("dependencies")
     assert check.required == frozenset({"schema", "object"})
     for statement in check.statements:
-        assert " LIKE " not in statement.sql
+        assert "LIKE" not in _words(statement.sql)
         assert statement.binds == ("top_plus_one", "schema", "object")
 
 
-def test_list_filters_use_like_with_the_bound_value() -> None:
+def test_filters_compare_exact_names() -> None:
+    # The identifier rule lets no wildcard through, and LIKE would read an _
+    # as "any character": every filter is an exact name.
+    for check in database.CHECKS:
+        for statement in check.statements:
+            for token in tokenize(statement.sql):
+                if token.is_word("LIKE"):
+                    # the one LIKE is spatialData's fixed type pattern
+                    assert check.name == "spatialData"
+                    assert "LIKE 'ST\\_%' ESCAPE" in statement.sql
     for name in ("tables", "views", "procedures", "functions", "indexes", "objects",
                  "sequences", "synonyms", "libraries"):
         sql = registry.get_check(name).statements[0].sql
         assert sql.count("CAST(? AS NVARCHAR(256)) IS NULL OR") == 2
-        assert sql.count(" LIKE ?") == 2
+        assert sql.count(" = ?") == 2
+    triggers = registry.get_check("triggers").statements[0].sql
+    assert "TRIGGER_NAME = ? OR SUBJECT_TABLE_NAME = ?" in triggers
+
+
+@pytest.mark.parametrize("name", ["spatialData", "objects", "indexes"])
+def test_wide_scans_require_a_schema(name: str) -> None:
+    check = registry.get_check(name)
+    assert check.required == frozenset({"schema"})
+    assert "one schema" in check.purpose
+
+
+@pytest.mark.parametrize("name", ["spatialData", "objects", "indexes"])
+async def test_wide_scans_refused_without_schema(monkeypatch, name: str) -> None:
+    answer, executes = await run_on_fake(monkeypatch, name, ["A"], [("x",)])
+    assert answer["error"]["code"] == "invalid_argument"
+    assert answer["error"]["argument"] == "schema"
+    assert executes == []
 
 
 def test_status_reads_named_session_keys_and_no_grantor() -> None:
@@ -159,14 +227,14 @@ RUNS: dict[str, tuple[dict, list[tuple]]] = {
     "views": ({"schema": "S", "object": "V"}, [(51, "S", "S", "V", "V")]),
     "procedures": ({}, [(51, *NONE2, *NONE2)]),
     "functions": ({}, [(51, *NONE2, *NONE2)]),
-    "indexes": ({}, [(51, *NONE2, *NONE2)]),
-    "objects": ({}, [(51, *NONE2, *NONE2)]),
+    "indexes": ({"schema": "S"}, [(51, "S", "S", *NONE2)]),
+    "objects": ({"schema": "S"}, [(51, "S", "S", *NONE2)]),
     "sequences": ({}, [(51, *NONE2, *NONE2)]),
     "synonyms": ({}, [(51, *NONE2, *NONE2)]),
     "triggers": ({"object": "T"}, [(51, None, None, "T", "T", "T")]),
     "libraries": ({}, [(51, *NONE2, *NONE2)]),
     "dependencies": ({"schema": "S", "object": "O"}, [(51, "S", "O"), (51, "S", "O")]),
-    "spatialData": ({}, [(51, *NONE2, *NONE2)]),
+    "spatialData": ({"schema": "S"}, [(51, "S", "S", *NONE2)]),
     "timeSeriesTools": ({}, [(51, *NONE2, *NONE2), (51, *NONE2, *NONE2)]),
     "calcViewAnalyzer": ({}, [(51, *NONE2, *NONE2), (51, *NONE2)]),
     "tableGroups": ({}, [(51, *NONE2, *NONE2), (51, *NONE2, *NONE2)]),

@@ -13,12 +13,17 @@ hana-cli's analysis commands; whatever hana-cli computes in JavaScript or
 reads from the tables themselves (a recursive tree, time buckets of a series
 table, fixed "forecast" rows) is left out.
 
-Optional ``schema`` / ``object`` filters: where hana-cli takes a pattern it
-compares with ``LIKE``, and so do the list checks here, with the bound value
-as the pattern. The argument rule (letters, digits, ``_ $ # . /``) lets no
-``%`` or ``*`` through, so the filter is in effect a name; an ``_`` in it
-matches any one character (the safe direction: more rows, never fewer).
-``dependencies`` names one object and compares with ``=``.
+Optional ``schema`` / ``object`` filters compare with ``=``: an exact name.
+hana-cli takes a ``LIKE`` pattern there, but the argument rule (letters,
+digits, ``_ $ # . /``) lets no ``%`` or ``*`` through, and with ``LIKE`` an
+``_`` would match any character: ``MY_TABLE`` would also return ``MYXTABLE``,
+a superset the model would read as the exact answer. ``spatialData``,
+``objects`` and ``indexes`` require ``schema``: unfiltered, they scan and sort
+the whole catalogue, and ``top`` bounds the rows, not the work.
+
+``status`` hands the model ``CURRENT_USER``, the database account of the
+destination; that may be a person's account, and the name then stays in the
+run activity and the chat's stored history like any tool result.
 
 The target is on-premise SAP HANA 2.0 (SPS07); a ``# on-prem:`` comment per
 check says how it differs from hana-cli. The columns are those of the SAP
@@ -33,12 +38,12 @@ from __future__ import annotations
 from agents.hana.checks.base import Check, Statement, register
 
 
-def _like(column: str) -> str:
-    """The optional pattern filter on ``column``: no value, no filter."""
-    return f"(CAST(? AS NVARCHAR(256)) IS NULL OR {column} LIKE ?)"
+def _named(column: str) -> str:
+    """The optional exact-name filter on ``column``: no value, no filter."""
+    return f"(CAST(? AS NVARCHAR(256)) IS NULL OR {column} = ?)"
 
 
-_SCHEMA_LIKE = _like("SCHEMA_NAME")
+_IN_SCHEMA = _named("SCHEMA_NAME")
 _SCHEMA = ("schema", "schema")
 _OBJECT = ("object", "object")
 
@@ -55,7 +60,9 @@ _SESSION_KEYS = (
 # GRANTED_PRIVILEGES with GRANTOR. Here: CURRENT_SCHEMA is left out (the app
 # pins the session to SYS, so it always says SYS); the session context is
 # read for named keys only; roles and privileges are names, without GRANTOR
-# (a user name) and without the column of a column privilege.
+# (a user name) and without the column of a column privilege. The user
+# part answers the database account name (possibly a person's), which the
+# model sees and the run activity / chat history keep.
 # on-prem: not yet run
 STATUS = Check(
     name="status",
@@ -127,7 +134,7 @@ SCHEMAS = Check(
         "",
         "SELECT TOP ? SCHEMA_NAME, SCHEMA_OWNER, HAS_PRIVILEGES, CREATE_TIME"
         " FROM SYS.SCHEMAS"
-        f" WHERE {_SCHEMA_LIKE}"
+        f" WHERE {_IN_SCHEMA}"
         " ORDER BY SCHEMA_NAME",
         ("top_plus_one", *_SCHEMA),
     ),),
@@ -149,7 +156,7 @@ TABLES = Check(
         "SELECT TOP ? SCHEMA_NAME, TABLE_NAME, TABLE_TYPE, IS_COLUMN_TABLE, IS_TEMPORARY,"
         " HAS_PRIMARY_KEY, CREATE_TIME"
         " FROM SYS.TABLES"
-        f" WHERE {_SCHEMA_LIKE} AND {_like('TABLE_NAME')}"
+        f" WHERE {_IN_SCHEMA} AND {_named('TABLE_NAME')}"
         " ORDER BY SCHEMA_NAME, TABLE_NAME",
         ("top_plus_one", *_SCHEMA, *_OBJECT),
     ),),
@@ -168,7 +175,7 @@ VIEWS = Check(
         "",
         "SELECT TOP ? SCHEMA_NAME, VIEW_NAME, VIEW_TYPE, IS_VALID, HAS_PARAMETERS, CREATE_TIME"
         " FROM SYS.VIEWS"
-        f" WHERE {_SCHEMA_LIKE} AND {_like('VIEW_NAME')}"
+        f" WHERE {_IN_SCHEMA} AND {_named('VIEW_NAME')}"
         " ORDER BY SCHEMA_NAME, VIEW_NAME",
         ("top_plus_one", *_SCHEMA, *_OBJECT),
     ),),
@@ -188,7 +195,7 @@ PROCEDURES = Check(
         "SELECT TOP ? SCHEMA_NAME, PROCEDURE_NAME, PROCEDURE_TYPE, SQL_SECURITY, READ_ONLY,"
         " IS_VALID, OWNER_NAME, CREATE_TIME"
         " FROM SYS.PROCEDURES"
-        f" WHERE {_SCHEMA_LIKE} AND {_like('PROCEDURE_NAME')}"
+        f" WHERE {_IN_SCHEMA} AND {_named('PROCEDURE_NAME')}"
         " ORDER BY SCHEMA_NAME, PROCEDURE_NAME",
         ("top_plus_one", *_SCHEMA, *_OBJECT),
     ),),
@@ -208,7 +215,7 @@ FUNCTIONS = Check(
         "SELECT TOP ? SCHEMA_NAME, FUNCTION_NAME, FUNCTION_USAGE_TYPE, SQL_SECURITY, IS_VALID,"
         " OWNER_NAME, CREATE_TIME"
         " FROM SYS.FUNCTIONS"
-        f" WHERE {_SCHEMA_LIKE} AND {_like('FUNCTION_NAME')}"
+        f" WHERE {_IN_SCHEMA} AND {_named('FUNCTION_NAME')}"
         " ORDER BY SCHEMA_NAME, FUNCTION_NAME",
         ("top_plus_one", *_SCHEMA, *_OBJECT),
     ),),
@@ -221,18 +228,19 @@ FUNCTIONS = Check(
 INDEXES = Check(
     name="indexes",
     category="database",
-    purpose="Indexes with their table, index type, constraint and create time.",
+    purpose="Indexes of one schema with their table, index type, constraint and create time.",
     source="bin/indexes.js",
     statements=(Statement(
         "",
         "SELECT TOP ? SCHEMA_NAME, TABLE_NAME, INDEX_NAME, INDEX_TYPE, \"CONSTRAINT\","
         " CREATE_TIME"
         " FROM SYS.INDEXES"
-        f" WHERE {_SCHEMA_LIKE} AND {_like('INDEX_NAME')}"
+        f" WHERE {_IN_SCHEMA} AND {_named('INDEX_NAME')}"
         " ORDER BY SCHEMA_NAME, TABLE_NAME, INDEX_NAME",
         ("top_plus_one", *_SCHEMA, *_OBJECT),
     ),),
     args=frozenset({"top", "schema", "object"}),
+    required=frozenset({"schema"}),
 )
 
 # on-prem: as hana-cli without OBJECT_OID and OBJECT_CATEGORY.
@@ -240,17 +248,18 @@ INDEXES = Check(
 OBJECTS = Check(
     name="objects",
     category="database",
-    purpose="Catalogue objects of every type with schema, name and type.",
+    purpose="Catalogue objects of every type in one schema, with name and type.",
     source="bin/objects.js",
     statements=(Statement(
         "",
         "SELECT TOP ? SCHEMA_NAME, OBJECT_NAME, OBJECT_TYPE"
         " FROM SYS.OBJECTS"
-        f" WHERE {_SCHEMA_LIKE} AND {_like('OBJECT_NAME')}"
+        f" WHERE {_IN_SCHEMA} AND {_named('OBJECT_NAME')}"
         " ORDER BY OBJECT_TYPE, SCHEMA_NAME, OBJECT_NAME",
         ("top_plus_one", *_SCHEMA, *_OBJECT),
     ),),
     args=frozenset({"top", "schema", "object"}),
+    required=frozenset({"schema"}),
 )
 
 # on-prem: hana-cli reads M_SEQUENCES (cache statistics with CURRENT_VALUE);
@@ -268,7 +277,7 @@ SEQUENCES = Check(
         "SELECT TOP ? SCHEMA_NAME, SEQUENCE_NAME, START_NUMBER, MIN_VALUE, MAX_VALUE,"
         " INCREMENT_BY, IS_CYCLED, CACHE_SIZE, CREATE_TIME"
         " FROM SYS.SEQUENCES"
-        f" WHERE {_SCHEMA_LIKE} AND {_like('SEQUENCE_NAME')}"
+        f" WHERE {_IN_SCHEMA} AND {_named('SEQUENCE_NAME')}"
         " ORDER BY SCHEMA_NAME, SEQUENCE_NAME",
         ("top_plus_one", *_SCHEMA, *_OBJECT),
     ),),
@@ -288,7 +297,7 @@ SYNONYMS = Check(
         "SELECT TOP ? SCHEMA_NAME, SYNONYM_NAME, OBJECT_SCHEMA, OBJECT_NAME, OBJECT_TYPE,"
         " IS_VALID, CREATE_TIME"
         " FROM SYS.SYNONYMS"
-        f" WHERE {_SCHEMA_LIKE} AND {_like('SYNONYM_NAME')}"
+        f" WHERE {_IN_SCHEMA} AND {_named('SYNONYM_NAME')}"
         " ORDER BY SCHEMA_NAME, SYNONYM_NAME",
         ("top_plus_one", *_SCHEMA, *_OBJECT),
     ),),
@@ -310,9 +319,9 @@ TRIGGERS = Check(
         " SUBJECT_TABLE_NAME, TRIGGER_ACTION_TIME, TRIGGER_EVENT, TRIGGERED_ACTION_LEVEL,"
         " IS_VALID, IS_ENABLED, CREATE_TIME"
         " FROM SYS.TRIGGERS"
-        f" WHERE {_SCHEMA_LIKE}"
-        " AND (CAST(? AS NVARCHAR(256)) IS NULL OR TRIGGER_NAME LIKE ?"
-        " OR SUBJECT_TABLE_NAME LIKE ?)"
+        f" WHERE {_IN_SCHEMA}"
+        " AND (CAST(? AS NVARCHAR(256)) IS NULL OR TRIGGER_NAME = ?"
+        " OR SUBJECT_TABLE_NAME = ?)"
         " ORDER BY SCHEMA_NAME, TRIGGER_NAME",
         ("top_plus_one", *_SCHEMA, "object", "object", "object"),
     ),),
@@ -331,7 +340,7 @@ LIBRARIES = Check(
         "",
         "SELECT TOP ? SCHEMA_NAME, LIBRARY_NAME, LIBRARY_TYPE, IS_VALID, CREATE_TIME"
         " FROM SYS.LIBRARIES"
-        f" WHERE {_SCHEMA_LIKE} AND {_like('LIBRARY_NAME')}"
+        f" WHERE {_IN_SCHEMA} AND {_named('LIBRARY_NAME')}"
         " ORDER BY SCHEMA_NAME, LIBRARY_NAME",
         ("top_plus_one", *_SCHEMA, *_OBJECT),
     ),),
@@ -381,19 +390,21 @@ DEPENDENCIES = Check(
 SPATIAL_DATA = Check(
     name="spatialData",
     category="database",
-    purpose="Table columns of a spatial type (ST_GEOMETRY, ST_POINT, ...), names only, no values.",
+    purpose=("Table columns of a spatial type (ST_GEOMETRY, ST_POINT, ...) in one schema,"
+             " names only, no values."),
     source="bin/spatialData.js",
     statements=(Statement(
         "",
         "SELECT TOP ? SCHEMA_NAME, TABLE_NAME, COLUMN_NAME, DATA_TYPE_NAME, POSITION"
         " FROM SYS.TABLE_COLUMNS"
-        f" WHERE {_SCHEMA_LIKE} AND {_like('TABLE_NAME')}"
+        f" WHERE {_IN_SCHEMA} AND {_named('TABLE_NAME')}"
         " AND (DATA_TYPE_NAME LIKE 'ST\\_%' ESCAPE '\\'"
         " OR DATA_TYPE_NAME IN ('GEOMETRY', 'POINT', 'LINESTRING', 'POLYGON'))"
         " ORDER BY SCHEMA_NAME, TABLE_NAME, POSITION",
         ("top_plus_one", *_SCHEMA, *_OBJECT),
     ),),
     args=frozenset({"top", "schema", "object"}),
+    required=frozenset({"schema"}),
 )
 
 # on-prem: hana-cli reads SYS.TIMESERIES_TABLES, which HANA 2.0 does not
@@ -415,7 +426,7 @@ TIME_SERIES_TOOLS = Check(
             " INCREMENT_BY, IS_MISSING_ALLOWED, PERIOD_START_COLUMN, PERIOD_END_COLUMN,"
             " PERIOD_INSTANT_COLUMN"
             " FROM SYS.SERIES_TABLES"
-            f" WHERE {_SCHEMA_LIKE} AND {_like('TABLE_NAME')}"
+            f" WHERE {_IN_SCHEMA} AND {_named('TABLE_NAME')}"
             " ORDER BY SCHEMA_NAME, TABLE_NAME",
             ("top_plus_one", *_SCHEMA, *_OBJECT),
         ),
@@ -423,7 +434,7 @@ TIME_SERIES_TOOLS = Check(
             "series_keys",
             "SELECT TOP ? SCHEMA_NAME, TABLE_NAME, COLUMN_NAME, POSITION"
             " FROM SYS.SERIES_KEY_COLUMNS"
-            f" WHERE {_SCHEMA_LIKE} AND {_like('TABLE_NAME')}"
+            f" WHERE {_IN_SCHEMA} AND {_named('TABLE_NAME')}"
             " ORDER BY SCHEMA_NAME, TABLE_NAME, POSITION",
             ("top_plus_one", *_SCHEMA, *_OBJECT),
         ),
@@ -448,7 +459,7 @@ CALC_VIEW_ANALYZER = Check(
             "views",
             "SELECT TOP ? SCHEMA_NAME, VIEW_NAME, IS_VALID, HAS_PARAMETERS, HAS_CACHE, CREATE_TIME"
             " FROM SYS.VIEWS"
-            f" WHERE VIEW_TYPE = 'CALC' AND {_SCHEMA_LIKE} AND {_like('VIEW_NAME')}"
+            f" WHERE VIEW_TYPE = 'CALC' AND {_IN_SCHEMA} AND {_named('VIEW_NAME')}"
             " ORDER BY SCHEMA_NAME, VIEW_NAME",
             ("top_plus_one", *_SCHEMA, *_OBJECT),
         ),
@@ -459,7 +470,7 @@ CALC_VIEW_ANALYZER = Check(
             " SUM(CASE WHEN HAS_PARAMETERS = 'TRUE' THEN 1 ELSE 0 END) AS WITH_PARAMETERS,"
             " MAX(CREATE_TIME) AS LATEST_CREATE_TIME"
             " FROM SYS.VIEWS"
-            f" WHERE VIEW_TYPE = 'CALC' AND {_SCHEMA_LIKE}"
+            f" WHERE VIEW_TYPE = 'CALC' AND {_IN_SCHEMA}"
             " GROUP BY SCHEMA_NAME"
             " ORDER BY COUNT(VIEW_NAME) DESC, SCHEMA_NAME",
             ("top_plus_one", *_SCHEMA),
@@ -488,7 +499,7 @@ TABLE_GROUPS = Check(
             " COUNT(TABLE_NAME) AS TABLE_COUNT,"
             " MAX(CASE WHEN IS_GROUP_LEAD = 'TRUE' THEN TABLE_NAME END) AS LEAD_TABLE"
             " FROM SYS.TABLE_GROUPS"
-            f" WHERE {_SCHEMA_LIKE} AND {_like('GROUP_NAME')}"
+            f" WHERE {_IN_SCHEMA} AND {_named('GROUP_NAME')}"
             " GROUP BY SCHEMA_NAME, GROUP_TYPE, SUBTYPE, GROUP_NAME"
             " ORDER BY SCHEMA_NAME, GROUP_TYPE, SUBTYPE, GROUP_NAME",
             ("top_plus_one", *_SCHEMA, *_OBJECT),
@@ -497,7 +508,7 @@ TABLE_GROUPS = Check(
             "tables",
             "SELECT TOP ? SCHEMA_NAME, TABLE_NAME, GROUP_TYPE, SUBTYPE, GROUP_NAME, IS_GROUP_LEAD"
             " FROM SYS.TABLE_GROUPS"
-            f" WHERE {_SCHEMA_LIKE} AND {_like('GROUP_NAME')}"
+            f" WHERE {_IN_SCHEMA} AND {_named('GROUP_NAME')}"
             " ORDER BY SCHEMA_NAME, GROUP_NAME, TABLE_NAME",
             ("top_plus_one", *_SCHEMA, *_OBJECT),
         ),
