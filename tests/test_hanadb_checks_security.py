@@ -59,6 +59,104 @@ NEVER = frozenset({
 })
 
 
+# Per view the module reads, the columns a statement may name. A column that
+# is not listed fails the allow-list test until somebody adds it here on
+# purpose (and says why it may leave the database).
+_USER_ALLOWED = frozenset({
+    "USER_NAME", "USERGROUP_NAME", "CREATOR", "CREATE_TIME", "VALID_FROM", "VALID_UNTIL",
+    "USER_DEACTIVATED", "DEACTIVATION_TIME", "LAST_SUCCESSFUL_CONNECT",
+    "LAST_INVALID_CONNECT_ATTEMPT", "INVALID_CONNECT_ATTEMPTS", "PASSWORD_CHANGE_NEEDED",
+    "IS_PASSWORD_LIFETIME_CHECK_ENABLED", "LAST_PASSWORD_CHANGE_TIME", "IS_PASSWORD_ENABLED",
+})
+_INI_ALLOWED = frozenset({"LAYER_NAME", "SECTION", "FILE_NAME"})  # "KEY"/"VALUE" are quoted
+VIEW_COLUMNS: dict[str, frozenset[str]] = {
+    "USERS": _USER_ALLOWED,
+    "ROLES": frozenset({"ROLE_SCHEMA_NAME", "ROLE_NAME", "CREATOR", "CREATE_TIME"}),
+    "GRANTED_ROLES": frozenset({"GRANTEE", "GRANTEE_TYPE", "ROLE_SCHEMA_NAME", "ROLE_NAME",
+                                "GRANTOR", "IS_GRANTABLE"}),
+    "GRANTED_PRIVILEGES": frozenset({"GRANTEE", "GRANTEE_TYPE", "OBJECT_TYPE", "SCHEMA_NAME",
+                                     "OBJECT_NAME", "PRIVILEGE", "GRANTOR", "IS_GRANTABLE"}),
+    "CERTIFICATES": frozenset({"CERTIFICATE_NAME", "CERTIFICATE_ID",
+                               "SUBJECT_DISTINGUISHED_NAME", "ISSUER_DISTINGUISHED_NAME",
+                               "SERIAL_NUMBER", "VALID_FROM", "VALID_UNTIL",
+                               "PUBLIC_KEY_ALGORITHM", "PUBLIC_KEY_LENGTH",
+                               "SIGNATURE_ALGORITHM"}),
+    "M_PASSWORD_POLICY": frozenset({"PROPERTY"}),
+    "M_ENCRYPTION_OVERVIEW": frozenset({"SCOPE", "IS_ENCRYPTION_ACTIVE", "LAST_CHANGE_TIME"}),
+    "M_PERSISTENCE_ENCRYPTION_STATUS": frozenset({
+        "HOST", "PORT", "ENCRYPTION_ACTIVE", "ENCRYPTION_ACTIVE_AFTER_NEXT_SAVEPOINT",
+        "IS_LATEST_ROOT_KEY_VERSION", "DATA_CONVERSION_ACTIVE"}),
+    "M_INIFILE_CONTENTS": _INI_ALLOWED,
+    "AUDIT_POLICIES": frozenset({
+        "AUDIT_POLICY_NAME", "EVENT_ACTION", "EVENT_STATUS", "EVENT_LEVEL",
+        "IS_AUDIT_POLICY_ACTIVE", "IS_VALID", "USER_NAME", "EXCEPT_USER_NAME", "OBJECT_TYPE",
+        "OBJECT_SCHEMA", "OBJECT_NAME", "TRAIL_TYPE", "RETENTION_PERIOD"}),
+}
+
+# Words that are SQL, functions, the schema, or aliases the module defines:
+# never a column of a view.
+SQL_WORDS = frozenset({
+    "SELECT", "TOP", "FROM", "WHERE", "AND", "OR", "NOT", "IN", "IS", "NULL", "AS", "CAST",
+    "NVARCHAR", "ORDER", "BY", "GROUP", "DESC", "ASC", "LEFT", "JOIN", "ON", "UNION", "ALL",
+    "CASE", "WHEN", "THEN", "ELSE", "END", "COUNT", "SUM", "COALESCE", "DAYS_BETWEEN",
+    "CURRENT_TIMESTAMP", "SYS",
+    # table aliases
+    "R", "G", "F",
+    # column aliases
+    "GRANTEE_COUNT", "DAYS_TO_EXPIRY", "TOTAL_USERS", "ACTIVE_USERS", "DEACTIVATED_USERS",
+    "ACTIVE_CHANGE_NEEDED", "ACTIVE_LIFETIME_UNCHECKED", "ACTIVE_WITH_INVALID_ATTEMPTS",
+    "SYSTEM_PRIVILEGE_COUNT", "GRANTABLE_COUNT", "ROLE_COUNT", "PARENT_ROLE", "VIA_ROLE",
+    "FINDING", "POLICY_COUNT", "ACTIVE_POLICY_COUNT",
+})
+
+
+def _views(sql: str) -> set[str]:
+    tokens = tokenize(sql)
+    return {tokens[i + 2].value for i, t in enumerate(tokens[:-2])
+            if t.is_word("SYS") and tokens[i + 1].is_symbol(".")}
+
+
+def test_every_selected_column_is_on_its_views_allow_list() -> None:
+    for check, statement in _statements():
+        views = _views(statement.sql)
+        assert views and views <= set(VIEW_COLUMNS), (check.name, statement.label, views)
+        allowed = set().union(*(VIEW_COLUMNS[v] for v in views)) | views
+        stray = _words(statement.sql) - SQL_WORDS - allowed
+        assert not stray, (check.name, statement.label, sorted(stray))
+        quoted = {t.text for t in tokenize(statement.sql) if t.kind not in ("word", "string",
+                                                                            "symbol", "param",
+                                                                            "number")}
+        assert quoted <= {'"KEY"', '"VALUE"'}, (check.name, statement.label, quoted)
+
+
+def test_no_word_names_a_comment_secret_token_or_passphrase() -> None:
+    for check, statement in _statements():
+        for token in tokenize(statement.sql):
+            text = token.text.upper()
+            for part in ("COMMENT", "SECRET", "TOKEN", "PASSPHRASE"):
+                assert part not in text, (check.name, statement.label, part)
+
+
+def test_roles_counts_grantees_once_not_per_role() -> None:
+    sql = registry.get_check("roles").statements[0].sql
+    assert "LEFT JOIN (SELECT ROLE_SCHEMA_NAME, ROLE_NAME, COUNT(GRANTEE)" in sql
+    assert "GROUP BY ROLE_SCHEMA_NAME, ROLE_NAME" in sql
+    assert "G.ROLE_SCHEMA_NAME IS NULL AND R.ROLE_SCHEMA_NAME IS NULL" in sql
+    # No correlated subquery in the select list.
+    assert sql.index("FROM SYS.ROLES R") < sql.index("SELECT ROLE_SCHEMA_NAME")
+
+
+def test_privilege_analysis_is_bounded_without_a_grantee() -> None:
+    check = registry.get_check("privilegeAnalysis")
+    powerful, counts, roles = (s.sql for s in check.statements)
+    assert "OBJECT_TYPE = 'SYSTEMPRIVILEGE' AND PRIVILEGE IN (" in powerful
+    assert "OBJECT_TYPE = 'SYSTEMPRIVILEGE'" in counts
+    for sql in (counts, roles):
+        assert ("((CAST(? AS NVARCHAR(256)) IS NULL AND GRANTEE_TYPE = 'USER')"
+                " OR GRANTEE = ?)") in sql
+    assert "object privileges not counted" in check.purpose
+
+
 def _statements():
     for check in security.CHECKS:
         for statement in check.statements:
@@ -160,6 +258,7 @@ def test_persistence_encryption_reads_status_flags_only() -> None:
 def test_grant_chains_say_one_level_per_part() -> None:
     check = registry.get_check("grantChains")
     assert "one level per part" in check.purpose
+    assert "roles matched by name" in check.purpose
     assert "not read" in registry.get_check("auditLog").purpose
     assert "no score" in registry.get_check("securityScan").purpose
 

@@ -73,7 +73,9 @@ USERS = Check(
 # with LIKE filters; here the schema filter is exact (`schema`; a global role
 # has no schema and is listed only without the filter), COMMENT is left out
 # (free text) and the number of direct grantees is added from GRANTED_ROLES.
-# A role's schema may be NULL, so the count compares it NULL-safe.
+# The count is grouped once and joined (a correlated subquery would run once
+# per role before TOP applies); a role's schema may be NULL, so the join
+# compares it NULL-safe.
 # on-prem: not yet run
 ROLES = Check(
     name="roles",
@@ -83,11 +85,13 @@ ROLES = Check(
     statements=(Statement(
         "",
         "SELECT TOP ? R.ROLE_SCHEMA_NAME, R.ROLE_NAME, R.CREATOR, R.CREATE_TIME,"
-        " (SELECT COUNT(G.GRANTEE) FROM SYS.GRANTED_ROLES G"
-        " WHERE G.ROLE_NAME = R.ROLE_NAME"
-        " AND (G.ROLE_SCHEMA_NAME = R.ROLE_SCHEMA_NAME"
-        " OR (G.ROLE_SCHEMA_NAME IS NULL AND R.ROLE_SCHEMA_NAME IS NULL))) AS GRANTEE_COUNT"
+        " COALESCE(G.GRANTEE_COUNT, 0) AS GRANTEE_COUNT"
         " FROM SYS.ROLES R"
+        " LEFT JOIN (SELECT ROLE_SCHEMA_NAME, ROLE_NAME, COUNT(GRANTEE) AS GRANTEE_COUNT"
+        " FROM SYS.GRANTED_ROLES GROUP BY ROLE_SCHEMA_NAME, ROLE_NAME) G"
+        " ON G.ROLE_NAME = R.ROLE_NAME"
+        " AND (G.ROLE_SCHEMA_NAME = R.ROLE_SCHEMA_NAME"
+        " OR (G.ROLE_SCHEMA_NAME IS NULL AND R.ROLE_SCHEMA_NAME IS NULL))"
         " WHERE (CAST(? AS NVARCHAR(256)) IS NULL OR R.ROLE_SCHEMA_NAME = ?)"
         " ORDER BY R.ROLE_SCHEMA_NAME, R.ROLE_NAME",
         ("top_plus_one", "schema", "schema"),
@@ -260,15 +264,22 @@ _POWERFUL_PRIVILEGES = (
 
 # on-prem: hana-cli lists one user's system privileges, object privileges and
 # roles (the current user by default). Here across grantees, optionally one
-# (`object`): direct grantees of the powerful system privileges, and privilege
-# and role counts per grantee. Grants through roles are not resolved (see
+# (`object`): direct grantees (users and roles) of the powerful system
+# privileges, bounded by that list; and system privilege and role counts per
+# grantee. Without `object` the counts cover users only (GRANTEE_TYPE 'USER')
+# and object privileges are never counted: grouping the whole of
+# GRANTED_PRIVILEGES (object grants run into the hundreds of thousands) could
+# reach the statement timeout. Grants through roles are not resolved (see
 # grantChains).
+_GRANTEE_OR_USERS = (
+    "((CAST(? AS NVARCHAR(256)) IS NULL AND GRANTEE_TYPE = 'USER') OR GRANTEE = ?)")
+
 # on-prem: not yet run
 PRIVILEGE_ANALYSIS = Check(
     name="privilegeAnalysis",
     category="security",
-    purpose=("Direct grantees of powerful system privileges, privilege and role counts per"
-             " grantee; role grants not resolved."),
+    purpose=("Grantees of powerful system privileges; system privilege and role counts per"
+             " user; object privileges not counted."),
     source="bin/privilegeAnalysis.js",
     statements=(
         Statement(
@@ -283,14 +294,13 @@ PRIVILEGE_ANALYSIS = Check(
         ),
         Statement(
             "privilege_counts",
-            "SELECT TOP ? GRANTEE, GRANTEE_TYPE, COUNT(PRIVILEGE) AS PRIVILEGE_COUNT,"
-            " SUM(CASE WHEN OBJECT_TYPE = 'SYSTEMPRIVILEGE' THEN 1 ELSE 0 END)"
-            " AS SYSTEM_PRIVILEGE_COUNT,"
+            "SELECT TOP ? GRANTEE, GRANTEE_TYPE, COUNT(PRIVILEGE) AS SYSTEM_PRIVILEGE_COUNT,"
             " SUM(CASE WHEN IS_GRANTABLE = 'TRUE' THEN 1 ELSE 0 END) AS GRANTABLE_COUNT"
             " FROM SYS.GRANTED_PRIVILEGES"
-            f" WHERE {_OPTIONAL_GRANTEE}"
+            " WHERE OBJECT_TYPE = 'SYSTEMPRIVILEGE'"
+            f" AND {_GRANTEE_OR_USERS}"
             " GROUP BY GRANTEE, GRANTEE_TYPE"
-            " ORDER BY PRIVILEGE_COUNT DESC, GRANTEE",
+            " ORDER BY SYSTEM_PRIVILEGE_COUNT DESC, GRANTEE",
             ("top_plus_one", "object", "object"),
         ),
         Statement(
@@ -298,7 +308,7 @@ PRIVILEGE_ANALYSIS = Check(
             "SELECT TOP ? GRANTEE, GRANTEE_TYPE, COUNT(ROLE_NAME) AS ROLE_COUNT,"
             " SUM(CASE WHEN IS_GRANTABLE = 'TRUE' THEN 1 ELSE 0 END) AS GRANTABLE_COUNT"
             " FROM SYS.GRANTED_ROLES"
-            f" WHERE {_OPTIONAL_GRANTEE}"
+            f" WHERE {_GRANTEE_OR_USERS}"
             " GROUP BY GRANTEE, GRANTEE_TYPE"
             " ORDER BY ROLE_COUNT DESC, GRANTEE",
             ("top_plus_one", "object", "object"),
@@ -320,8 +330,8 @@ _DIRECT_ROLES = "(SELECT ROLE_NAME FROM SYS.GRANTED_ROLES WHERE GRANTEE = ?)"
 GRANT_CHAINS = Check(
     name="grantChains",
     category="security",
-    purpose=("Roles and privileges of a grantee (object), one level per part; go deeper by"
-             " calling again with a role."),
+    purpose=("Roles and privileges of a grantee (object), one level per part, roles matched"
+             " by name; call again with a role."),
     source="bin/grantChains.js",
     statements=(
         Statement(
