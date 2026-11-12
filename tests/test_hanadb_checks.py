@@ -777,3 +777,75 @@ def test_registered_names_are_unique_and_every_module_is_loaded() -> None:
         loaded = importlib.import_module(f"agents.hana.checks.{module}")
         for check in getattr(loaded, "CHECKS", ()):
             assert registry.get_check(check.name) is check
+
+
+# Words that never stand as a column (or alias) of a registered statement:
+# free text, password hashes, secrets. String literals are exempt (a value
+# compared in a WHERE, e.g. a key name of an ini allow-list, is no column).
+NEVER_SELECTED_WORDS = frozenset(
+    {"COMMENTS", "COMMENT", "PASSWORD_HASH", "SECRET", "TOKEN", "PASSPHRASE"})
+# Functions whose argument list may hold a FROM that is no table reference.
+_EXPRESSION_FROM = frozenset(
+    {"EXTRACT", "TRIM", "SUBSTRING", "SUBSTR_REGEXPR", "OCCURRENCES_REGEXPR",
+     "REPLACE_REGEXPR", "LOCATE_REGEXPR"})
+
+
+def _registered_statements() -> list:
+    return [pytest.param(c, s, id=f"{c.name}:{s.label or '-'}")
+            for c in registry.all_checks() for s in c.statements]
+
+
+def _cte_names(tokens: list) -> set[str]:
+    """Names declared as ``<name> AS (`` (a WITH list)."""
+    return {tokens[i].value for i in range(len(tokens) - 2)
+            if tokens[i].kind in ("word", "quoted") and tokens[i + 1].is_word("AS")
+            and tokens[i + 2].is_symbol("(")}
+
+
+def _bad_table_references(tokens: list) -> list[str]:
+    ctes = _cte_names(tokens)
+    opener: list[str] = []  # the word before each open "("
+    bad = []
+    for i, token in enumerate(tokens):
+        if token.is_symbol("("):
+            before = tokens[i - 1] if i else None
+            opener.append(before.value if before is not None and before.kind == "word" else "")
+            continue
+        if token.is_symbol(")"):
+            if opener:
+                opener.pop()
+            continue
+        if not token.is_word("FROM", "JOIN"):
+            continue
+        if token.is_word("FROM") and opener and opener[-1] in _EXPRESSION_FROM:
+            continue
+        nxt = tokens[i + 1] if i + 1 < len(tokens) else None
+        if nxt is None:
+            bad.append(f"{token.value} at end")
+        elif nxt.is_symbol("("):
+            continue  # a subquery
+        elif (nxt.is_word("SYS", "_SYS_STATISTICS") and i + 3 < len(tokens)
+              and tokens[i + 2].is_symbol(".") and tokens[i + 3].kind in ("word", "quoted")):
+            continue
+        elif nxt.kind == "word" and (nxt.value.startswith("M_") or nxt.value in ctes):
+            if i + 2 < len(tokens) and tokens[i + 2].is_symbol("."):
+                bad.append(f"{token.value} {nxt.value}.")
+            continue
+        else:
+            bad.append(f"{token.value} {nxt.value}")
+    return bad
+
+
+@pytest.mark.parametrize("check, statement", _registered_statements())
+def test_column_and_table_rules_across_modules(check: Check, statement: Statement) -> None:
+    """Every registered statement of every module: an object ``DEFINITION`` only
+    in an ``inspect*`` check that sets ``lob_chars``; no free text, hash or
+    secret column; table references only to the catalogue and monitoring
+    schemas, a CTE or a subquery."""
+    tokens = tokenize(statement.sql)
+    words = {t.value for t in tokens if t.kind in ("word", "quoted")}
+    if "DEFINITION" in words:
+        assert check.name.startswith("inspect") and check.lob_chars is not None, \
+            "DEFINITION is read only by an inspect* check with lob_chars"
+    assert not words & NEVER_SELECTED_WORDS, sorted(words & NEVER_SELECTED_WORDS)
+    assert _bad_table_references(tokens) == []

@@ -89,7 +89,7 @@ def test_compare_schema_columns_only_of_tables_in_both() -> None:
 
 
 async def test_compare_schema(monkeypatch) -> None:
-    assert_registered("compareSchema", "schema", {"top", "schema", "other_schema"},
+    assert_registered("compareSchema", "schema", {"top", "schema", "other_schema", "object"},
                       parts=COMPARE_PARTS)
     columns = ["ONLY_IN", "TABLE_NAME"]
     rows = [("schema", "T1"), ("other_schema", "T2")]
@@ -102,7 +102,26 @@ async def test_compare_schema(monkeypatch) -> None:
     binds = [e[2] for e in executes]
     assert binds[0] == (11, "APP_A", "APP_B")
     for later in binds[1:]:
-        assert later == (11, "APP_A", "APP_B", "APP_B", "APP_A")
+        assert later == (11, "APP_A", "APP_B", None, None, "APP_B", "APP_A", None, None)
+
+
+async def test_compare_schema_one_table(monkeypatch) -> None:
+    # A large schema is compared one table at a time: `object` narrows both
+    # sides of parts 2-4; part 1 still lists the tables of one side only.
+    _, executes = await run_on_fake(monkeypatch, "compareSchema", ["A"], [("x",)],
+                                    schema="APP_A", other_schema="APP_B", object="ORDERS")
+    binds = [e[2] for e in executes]
+    assert binds[0] == (51, "APP_A", "APP_B")
+    for later in binds[1:]:
+        assert later == (51, "APP_A", "APP_B", "ORDERS", "ORDERS",
+                         "APP_B", "APP_A", "ORDERS", "ORDERS")
+    assert "object" in registry.get_check("compareSchema").purpose
+
+
+def test_compare_schema_leaves_out_system_index_names() -> None:
+    # `_SYS_TREE_...` names are generated per schema: they would all differ.
+    sql = registry.get_check("compareSchema").statements[2].sql
+    assert sql.count("LEFT(INDEX_NAME, 4) <> '_SYS'") == 2
 
 
 async def test_compare_schema_needs_both_schemas(monkeypatch) -> None:
@@ -131,14 +150,22 @@ async def test_erd_diagram(monkeypatch) -> None:
     binds = [e[2] for e in executes]
     assert binds == [(6, "APP_A", None, None),
                      (6, "APP_A", "APP_A", None, None),
-                     (6, "APP_A", None, None, None)]
+                     (6, "APP_A", None, None, "APP_A", None)]
 
 
 async def test_erd_diagram_one_table(monkeypatch) -> None:
     _, executes = await run_on_fake(monkeypatch, "erdDiagram", ["TABLE_NAME"], [("T",)],
                                     schema="APP_A", object="ORDERS")
     binds = [e[2] for e in executes]
-    assert binds[2] == (51, "APP_A", "ORDERS", "ORDERS", "ORDERS")
+    assert binds[2] == (51, "APP_A", "ORDERS", "ORDERS", "APP_A", "ORDERS")
+
+
+def test_erd_relations_reference_the_table_of_this_schema() -> None:
+    # A same-named table in another schema is not "the" table.
+    check = registry.get_check("erdDiagram")
+    sql = check.statements[2].sql
+    assert "OR (REFERENCED_SCHEMA_NAME = ? AND REFERENCED_TABLE_NAME = ?)" in sql
+    assert "owned by" in check.purpose
 
 
 async def test_graph_workspaces(monkeypatch) -> None:
