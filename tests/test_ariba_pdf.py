@@ -8,6 +8,7 @@ bounded whatever the bytes say.
 from __future__ import annotations
 
 import time
+import warnings
 
 import pytest
 
@@ -21,11 +22,6 @@ from tests.ariba_pdf_helpers import (
     unsigned_pdf,
     xlsx_like,
 )
-
-# The hand-ordered certificate bag of the helper is not a sorted DER SET;
-# cryptography reads it as BER with a warning, as it would a real file's.
-pytestmark = pytest.mark.filterwarnings(
-    "ignore:PKCS#7 certificates could not be parsed as DER")
 
 KEYS = {"pages", "pages_upper_bound", "digital_signature", "signatures",
         "unreadable_signatures"}
@@ -215,3 +211,39 @@ def test_is_pdf_reads_the_header():
     assert not ariba_pdf.is_pdf(xlsx_like())
     assert not ariba_pdf.is_pdf(b"x" * 2000 + b"%PDF-1.4")
     assert not ariba_pdf.is_pdf("%PDF-1.4")
+
+
+# -- a panic in the PKCS#7 reader, and its warning -------------------------------
+
+class FakePanic(BaseException):
+    """What pyo3 raises for a Rust panic: a BaseException, past `except Exception`."""
+
+
+def test_a_panic_in_the_pkcs7_reader_is_an_unreadable_signature(monkeypatch):
+    def panics(der):
+        raise FakePanic("rust panicked")
+
+    monkeypatch.setattr(ariba_pdf.pkcs7, "load_der_pkcs7_certificates", panics)
+    facts = ariba_pdf.inspect(signed_pdf())
+    assert facts["digital_signature"] is False and facts["unreadable_signatures"] == 1
+    assert facts["signatures"][0]["readable"] is False and facts["pages"] == 1
+
+
+@pytest.mark.parametrize("stop", [KeyboardInterrupt, SystemExit, GeneratorExit])
+def test_an_interrupt_is_not_swallowed(monkeypatch, stop):
+    def interrupted(der):
+        raise stop()
+
+    monkeypatch.setattr(ariba_pdf.pkcs7, "load_der_pkcs7_certificates", interrupted)
+    with pytest.raises(stop):
+        ariba_pdf.inspect(signed_pdf())
+
+
+def test_an_unsorted_certificate_bag_warns_nobody():
+    # The helper's hand-ordered bag is not a sorted DER SET: cryptography
+    # warns for it, as it would for a real file's.
+    with warnings.catch_warnings(record=True) as seen:
+        warnings.simplefilter("always")
+        facts = ariba_pdf.inspect(signed_pdf(decoy="Example Decoy"))
+    assert facts["digital_signature"] is True
+    assert not [w for w in seen if "PKCS#7" in str(w.message)]

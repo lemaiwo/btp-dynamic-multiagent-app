@@ -1986,7 +1986,7 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   (4 MB) is `TooLarge` before parsing (`tests/test_confluence_text.py`)
 - `agents/ariba_tools.py` — SAP Ariba sourcing events (RFPs) and the PDFs
   suppliers uploaded with their bids, read-only, over the Event Management API
-  (`/api/sourcing-event/v2/prod`, GET only) as an in-process toolset
+  (`/api/sourcing-event/v2/prod`, GET only against Ariba) as an in-process toolset
   (`builtin:ariba`), through a BTP destination as its technical user
   (`destination` mode only; `user_context` refused at the gate, dropped in
   storage, refused at build). The destination holds everything: URL, the
@@ -2008,11 +2008,23 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   answers 403) and `read_document(event_id, supplier, document_id)` (a
   document `list_documents` listed in this toolset: ids stay server-side; the
   download is streamed up to 10 MB with `Accept: */*`, PDF only (by its bytes),
-  at most 20 pages; the answer is a `ToolReturn` whose `return_value` holds
-  `file_name`, `format`, `pages`, `digital_signature` and `signatures`
-  (`signer`, `signed_at`, `covers_whole_file`) from `agents/ariba_pdf.py`, and
-  whose `content` hands the PDF itself to the model as a `BinaryContent` with
-  the identifier `tool:ariba:<document_id>`). Calls are sequential and paced
+  at most 20 pages judged on `pages_upper_bound` (a decoy page tree cannot
+  lower it; no bound is `not_a_pdf`); a 404 is `not_found` with a text of its
+  own; the answer is a `ToolReturn` whose `return_value` holds `file_name`,
+  `format`, `pages`, `digital_signature`, `signatures` (`signer`, `signed_at`,
+  `covers_whole_file`, `readable`) and `unreadable_signatures` from
+  `agents/ariba_pdf.py`, and whose `content` hands the PDF itself to the model
+  as a `BinaryContent` with the identifier `tool:ariba:<document_id>`). **A
+  per-run budget**: every PDF stays in the run's context and is sent again with
+  each further request, so one agent run (pydantic-ai's `ctx.run_id`, not
+  `current_run_id`: a deep sub-agent's run has its own) reads at most 6
+  documents, 60 pages (by `pages_upper_bound`) and 25 MB (`MAX_RUN_DOCUMENTS`,
+  `MAX_RUN_PAGES`, `MAX_RUN_BYTES`); beyond that `document_budget` ("review
+  the remaining suppliers in separate sub-agent tasks or a new run"), checked
+  before the download (the count, the listed size when known) and after the
+  inspection (pages, bytes read); a refused document consumes nothing; the
+  table is per toolset, at most 256 runs, an hour each (a call without a run
+  id shares one bucket). Calls are sequential and paced
   (at least 1 s apart, per toolset), a 429 is repeated after 5, 15 and 30 s,
   then `throttled`; no redirect is followed; the body of an error status is
   never read. Text from Ariba (titles, names, file names, statuses) is filtered
@@ -2021,7 +2033,8 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   closed `ERROR_CODES` (`destination_error`, `unauthorized`, `forbidden`,
   `bids_sealed`, `not_found`, `throttled`, `ariba_error`, `unreachable`,
   `not_json`, `invalid_id`, `invalid_days`, `unknown_supplier`,
-  `unknown_document`, `too_large`, `unsupported_type`, `not_a_pdf`), never
+  `unknown_document`, `too_large`, `unsupported_type`, `not_a_pdf`,
+  `document_budget`), never
   Ariba's text; httpx's request line (it carries realm and user) is kept out of
   the log by the contextvar filter of `agents/bitbucket_tools.py`. **What is
   stored**: the run activity keeps only the fixed lines of `activity_summary`
@@ -2041,21 +2054,40 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   are those the probe recorded, fixtures hand-made), and a PDF as a tool return
   on AI Core (proved for a user upload by `scripts/probe_attachments.py`, not
   for a file that follows a tool result). Not known: the date key of an
-  identifiers row (`createDate` is read) and paging beyond 100 events.
+  identifiers row (`createDate` is read) and paging beyond 100 events; the
+  supplier invitations and bids are read as one page (paging beyond it is not
+  handled).
   `tests/test_ariba_tools.py`, `tests/test_ariba_registration.py` (helpers
   `tests/ariba_helpers.py`)
 - `agents/ariba_pdf.py` — what `read_document` says about a PDF besides
   handing it over, standard library plus `cryptography` (already installed
   through `pyjwt[crypto]`): `is_pdf(data)` and `inspect(data)` -> `{pages,
-  digital_signature, signatures}`, never raising; over 10 MB nothing is
-  scanned. Pages from the page tree's root `/Count` (signing rewrites a page
-  in an incremental update, so counting page objects overcounts), else
-  `multipart_form.count_pdf_pages`. A signature is a `/ByteRange` with its
-  `/Contents` gap (at most 20, a `/DocTimeStamp` skipped): the signer is the
-  CN of the first non-CA certificate of the PKCS#7 bag, `signed_at` from `/M`,
-  `covers_whole_file` when the byte range reaches the end of the file. A
-  signature is **detected, not validated**: no chain, no hash check (the tool
-  says so in a fixed `note`). Test PDFs are generated and signed in-test
+  pages_upper_bound, digital_signature, signatures, unreadable_signatures}`,
+  never raising (a `BaseException` of the reader, such as pyo3's
+  `PanicException` from `cryptography`, is "cannot tell" too; only
+  `KeyboardInterrupt`, `SystemExit`, `CancelledError` and `GeneratorExit`
+  pass); over 10 MB nothing is scanned. `pages` is the page tree's root
+  `/Count` when its nodes are plain objects (signing rewrites a page in an
+  incremental update, so counting page objects overcounts), else the scan
+  (plain page objects by object number plus those in object streams,
+  `multipart_form.count_pdf_pages`); `pages_upper_bound` is the larger of the
+  two, so a decoy tree with a low `/Count` cannot pass the 20-page cap, which
+  is judged on it. A signature is counted only for a `/ByteRange` whose own
+  `/Contents <hex>` gap sits where `[0 a b c]` says, next to it, in a
+  dictionary of `/Type /Sig` or no `/Type` (a `/DocTimeStamp` or annotation
+  skipped; at most 20); it is `readable` when the PKCS#7 parses with at least
+  one certificate, and `digital_signature` is true only for a readable one
+  (`unreadable_signatures` counts the rest). The signer is the CN of the
+  certificate the SignerInfo names (issuer and serial), else of the first
+  non-CA certificate, else of the first; `signed_at` from `/M`;
+  `covers_whole_file` when the byte range reaches the end of the file.
+  cryptography's warning for an unsorted certificate bag is silenced around
+  that one call. A signature is **detected, not validated**: no chain, no hash
+  check (the tool says so in a fixed `note`). Known limits (fail closed): a
+  form saved with object streams and then signed may count the rewritten page
+  twice (a signed 2-page form reads 3, a signed 20-page form is refused
+  `too_large`); a permission-encrypted PDF whose pages are only in encrypted
+  object streams cannot be counted and is refused as `not_a_pdf`. Test PDFs are generated and signed in-test
   (`tests/ariba_pdf_helpers.py`, `tests/test_ariba_pdf.py`)
 - `agents/lookback.py` — the shared `parse_lookback` window parser
 - `agents/sapnotes_tools.py` — SAP security notes discovered through the
@@ -3553,7 +3585,8 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   token, a `Location`, a response body, an exception text, a line of a
   diff, a title or a user name (`tests/test_probe_bitbucket.py`)
 - `scripts/probe_ariba.py` — standalone go/no-go probe for `builtin:ariba`
-  (nothing imported from the app, GET requests only), run inside an app
+  (nothing imported from the app, GET requests only against Ariba; the one POST
+  is the destination service's token request), run inside an app
   container that has the destination binding: does the destination resolve
   (https host, token, the `apiKey` header and the `realm` / `user` /
   `passwordAdapter` queries present), the event ids of the last `--days` days

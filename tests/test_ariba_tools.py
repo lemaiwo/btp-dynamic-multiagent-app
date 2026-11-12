@@ -8,7 +8,9 @@ reaches the log.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -70,8 +72,14 @@ def build(fake: FakeAriba, *, resolver: FakeResolver | None = None,
     return toolset, toolset.ariba_client, clock
 
 
-async def call(toolset, name: str, *args, **kwargs) -> dict[str, Any]:
-    return await toolset.tools[name].function(*args, **kwargs)
+async def call(toolset, name: str, *args, run_id: str | None = "run-1",
+               **kwargs) -> dict[str, Any]:
+    """A tool's function as pydantic-ai calls it: with a context (only
+    ``run_id`` is read) when the tool takes one."""
+    tool = toolset.tools[name]
+    if tool.takes_ctx:
+        args = (SimpleNamespace(run_id=run_id), *args)
+    return await tool.function(*args, **kwargs)
 
 
 def code_of(result: dict[str, Any]) -> str:
@@ -85,6 +93,7 @@ def test_error_codes_are_the_closed_list_of_the_brief():
         "destination_error", "unauthorized", "forbidden", "bids_sealed", "not_found",
         "throttled", "ariba_error", "unreachable", "not_json", "invalid_id", "invalid_days",
         "unknown_supplier", "unknown_document", "too_large", "unsupported_type", "not_a_pdf",
+        "document_budget",
     })
     with pytest.raises(AssertionError):
         AribaError("something_else", "x")
@@ -616,3 +625,87 @@ async def test_a_missing_document_is_not_found_without_naming_an_event():
     fake.on(f"/events/{EVENT}", J(404))
     result = await call(toolset, "get_event", EVENT)
     assert "event" in result["error"]["message"]
+
+
+# -- the per-run document budget -----------------------------------------------
+
+READ = (EVENT, SUPPLIER_A, "Att0AlphaOffer1")
+
+
+async def test_the_seventh_document_of_a_run_is_refused_and_another_run_has_its_own():
+    assert (ariba_tools.MAX_RUN_DOCUMENTS, ariba_tools.MAX_RUN_PAGES,
+            ariba_tools.MAX_RUN_BYTES) == (6, 60, 25 * 1024 * 1024)
+    fake = standard().on(DOWNLOAD, document(unsigned_pdf()))
+    toolset, _, _ = build(fake)
+    for _ in range(6):
+        assert isinstance(await call(toolset, "read_document", *READ, run_id="r1"),
+                          ToolReturn)
+    downloads = sum(r.url.path.endswith(DOWNLOAD) for r in fake.requests)
+    refused = await call(toolset, "read_document", *READ, run_id="r1")
+    assert code_of(refused) == "document_budget"
+    assert refused["error"]["message"] == (
+        "this run has read as many documents as one run may")
+    assert "separate sub-agent tasks" in refused["error"]["hint"]
+    # Refused before the download.
+    assert sum(r.url.path.endswith(DOWNLOAD) for r in fake.requests) == downloads
+    assert isinstance(await call(toolset, "read_document", *READ, run_id="r2"), ToolReturn)
+    assert activity_summary("read_document", refused) == "error: document_budget"
+
+
+async def test_the_pages_of_a_run_are_bounded_by_the_page_upper_bound(monkeypatch):
+    monkeypatch.setattr(ariba_tools, "MAX_RUN_PAGES", 3)
+    fake = standard().on(DOWNLOAD, document(unsigned_pdf(pages=2)))
+    toolset, _, _ = build(fake)
+    assert isinstance(await call(toolset, "read_document", *READ), ToolReturn)
+    assert code_of(await call(toolset, "read_document", *READ)) == "document_budget"
+    # The refused one consumed nothing: one more page still fits.
+    monkeypatch.setattr(ariba_tools, "MAX_RUN_PAGES", 4)
+    assert isinstance(await call(toolset, "read_document", *READ), ToolReturn)
+
+
+async def test_the_bytes_of_a_run_are_bounded_after_the_download(monkeypatch):
+    pdf = unsigned_pdf()
+    monkeypatch.setattr(ariba_tools, "MAX_RUN_BYTES", len(pdf) + len(pdf) // 2)
+    fake = standard().on(DOWNLOAD, document(pdf))
+    toolset, client, _ = build(fake)
+    await call(toolset, "list_documents", EVENT, SUPPLIER_A)
+    # No listed size: only the bytes read can tell.
+    key = (EVENT, SUPPLIER_A, "Att0AlphaOffer1")
+    client._documents[key] = dataclasses.replace(client._documents[key], size=None)
+    assert isinstance(await call(toolset, "read_document", *READ), ToolReturn)
+    downloads = sum(r.url.path.endswith(DOWNLOAD) for r in fake.requests)
+    assert code_of(await call(toolset, "read_document", *READ)) == "document_budget"
+    assert sum(r.url.path.endswith(DOWNLOAD) for r in fake.requests) == downloads + 1
+
+
+async def test_a_listed_size_over_the_bytes_left_is_refused_before_the_download(monkeypatch):
+    monkeypatch.setattr(ariba_tools, "MAX_RUN_BYTES", 1000)  # the listed size is 2048
+    fake = standard().on(DOWNLOAD, document(unsigned_pdf()))
+    toolset, _, _ = build(fake)
+    assert code_of(await call(toolset, "read_document", *READ)) == "document_budget"
+    assert not any(r.url.path.endswith(DOWNLOAD) for r in fake.requests)
+
+
+async def test_a_refused_document_does_not_consume_the_budget(monkeypatch):
+    monkeypatch.setattr(ariba_tools, "MAX_RUN_DOCUMENTS", 1)
+    fake = standard().on(DOWNLOAD, document(xlsx_like(), content_type="application/zip"))
+    toolset, _, _ = build(fake)
+    assert code_of(await call(toolset, "read_document", *READ)) == "not_a_pdf"
+    fake.on(DOWNLOAD, document(unsigned_pdf(pages=25)))
+    assert code_of(await call(toolset, "read_document", *READ)) == "too_large"
+    fake.on(DOWNLOAD, document(unsigned_pdf()))
+    assert isinstance(await call(toolset, "read_document", *READ), ToolReturn)
+    assert code_of(await call(toolset, "read_document", *READ)) == "document_budget"
+
+
+async def test_a_call_without_a_run_id_shares_one_bucket_and_the_table_is_bounded(monkeypatch):
+    monkeypatch.setattr(ariba_tools, "MAX_RUN_DOCUMENTS", 1)
+    monkeypatch.setattr(ariba_tools, "MAX_RUN_BUDGETS", 2)
+    fake = standard().on(DOWNLOAD, document(unsigned_pdf()))
+    toolset, client, _ = build(fake)
+    assert isinstance(await call(toolset, "read_document", *READ, run_id=None), ToolReturn)
+    assert code_of(await call(toolset, "read_document", *READ, run_id=None)
+                   ) == "document_budget"
+    for run in ("a", "b", "c"):
+        await call(toolset, "read_document", *READ, run_id=run)
+    assert len(client._budgets) <= 2

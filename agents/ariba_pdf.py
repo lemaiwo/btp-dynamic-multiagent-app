@@ -43,7 +43,9 @@ the fallback when the page tree is not visible in plain objects.
 
 from __future__ import annotations
 
+import asyncio
 import re
+import warnings
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -52,6 +54,11 @@ from cryptography.hazmat.primitives.serialization import pkcs7
 from cryptography.x509.oid import NameOID
 
 from agents.multipart_form import count_pdf_pages
+
+# What a reader of somebody else's file may raise is "cannot tell", even a
+# BaseException: cryptography's Rust core panics as pyo3's PanicException,
+# which `except Exception` does not catch. These four still pass.
+_PASS_THROUGH = (KeyboardInterrupt, SystemExit, asyncio.CancelledError, GeneratorExit)
 
 MAX_BYTES = 10 * 1024 * 1024
 MAX_SIGNATURES = 20
@@ -102,11 +109,15 @@ def inspect(data: Any) -> dict[str, Any]:
     facts = _nothing()
     try:
         facts["pages"], facts["pages_upper_bound"] = _pages(data)
-    except Exception:  # noqa: BLE001 -- a hostile file is "cannot tell", never an error
+    except BaseException as exc:  # a hostile file is "cannot tell", never an error
+        if isinstance(exc, _PASS_THROUGH):
+            raise
         facts["pages"] = facts["pages_upper_bound"] = None
     try:
         signatures = _signatures(data)
-    except Exception:  # noqa: BLE001
+    except BaseException as exc:
+        if isinstance(exc, _PASS_THROUGH):
+            raise
         signatures = []
     facts["signatures"] = signatures
     facts["digital_signature"] = any(s["readable"] for s in signatures)
@@ -207,7 +218,9 @@ def _signatures(data: bytes) -> list[dict[str, Any]]:
 def _guarded(read: Any, *args: Any) -> Any:
     try:
         return read(*args)
-    except Exception:  # noqa: BLE001 -- one broken signature is signer: None
+    except BaseException as exc:  # one broken signature is signer: None
+        if isinstance(exc, _PASS_THROUGH):
+            raise
         return None
 
 
@@ -250,7 +263,13 @@ def _signer(data: bytes, gap: tuple[int, int]) -> tuple[bool, str | None]:
     der = _der(bytes.fromhex(hexed.decode("ascii")))
     if der is None:
         return False, None
-    certificates = pkcs7.load_der_pkcs7_certificates(der)
+    with warnings.catch_warnings():
+        # An unsorted certificate bag (common in real files) is read as BER
+        # with a UserWarning per file: not ours to print.
+        warnings.filterwarnings(
+            "ignore", message="PKCS#7 certificates could not be parsed as DER",
+            category=UserWarning)
+        certificates = pkcs7.load_der_pkcs7_certificates(der)
     if not certificates:
         return False, None
     named = _guarded(_signer_id, der)
@@ -316,7 +335,9 @@ def _is_named(certificate: x509.Certificate, issuer: bytes, serial: int) -> bool
     try:
         return (certificate.serial_number == serial
                 and certificate.issuer.public_bytes() == issuer)
-    except Exception:  # noqa: BLE001
+    except BaseException as exc:
+        if isinstance(exc, _PASS_THROUGH):
+            raise
         return False
 
 
@@ -340,7 +361,9 @@ def _der(raw: bytes) -> bytes | None:
 def _is_ca(certificate: x509.Certificate) -> bool:
     try:
         return certificate.extensions.get_extension_for_class(x509.BasicConstraints).value.ca
-    except Exception:  # noqa: BLE001 -- no or unreadable extension: not a CA
+    except BaseException as exc:  # no or unreadable extension: not a CA
+        if isinstance(exc, _PASS_THROUGH):
+            raise
         return False
 
 

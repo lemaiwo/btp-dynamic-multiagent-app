@@ -16,8 +16,8 @@ Without ``--event`` step 2 is replaced by the ids of the events created in the
 last ``--days`` days (``/events/identifiers``; ``GET /events`` needs a filter).
 
 Standalone on purpose: it imports nothing from this app, touches no database
-and changes nothing in Ariba. GET requests only (the one POST is the token
-request to the destination service).
+and changes nothing in Ariba. GET requests only against Ariba (the one POST is
+the token request to the destination service).
 
 It prints one ``PASS`` / ``FAIL`` / ``SKIP`` line per step: statuses, counts,
 sizes, key names, event ids, state names and host names. It never prints a token, a
