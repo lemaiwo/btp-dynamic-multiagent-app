@@ -52,6 +52,7 @@ from pydantic import (
 )
 
 from agents import git_config
+from agents.ariba_tools import BUILTIN_ARIBA_URL
 from agents.auth import current_base_url, current_principal, require_admin
 from agents.bitbucket_config import BUILTIN_BITBUCKET_URL
 from agents.bitbucket_config import check_entry as check_bitbucket_entry
@@ -60,6 +61,8 @@ from agents.builtins import BUILTIN_URLS, is_builtin_url
 from agents.chat_app import dynamic_chat_app
 from agents.confluence_tools import BUILTIN_CONFLUENCE_URL, normalize_spaces
 from agents.db import (
+    ARIBA_MODE_MESSAGE,
+    ARIBA_SINGLE_ENTRY_MESSAGE,
     AUTH_MODE_APP_ONLY,
     AUTH_MODE_DESTINATION,
     AUTH_MODE_JWT,
@@ -930,6 +933,10 @@ class McpServerPayload(BaseModel):
                 "credential of its own and reaches Confluence only through the BTP "
                 "destination named in oauth.destination"
             )
+        if _server_key(self.url) == BUILTIN_ARIBA_URL and self.auth_mode != AUTH_MODE_DESTINATION:
+            # As for Confluence: the destination holds the API key and the
+            # realm, so any other mode would build and then drop the agent.
+            raise ValueError(ARIBA_MODE_MESSAGE)
         # Before the per-mode rules, because the oauth2 branch below returns
         # early for DCR.
         if (
@@ -1342,6 +1349,8 @@ class AgentPayload(BaseModel):
             raise ValueError(GIT_SINGLE_ENTRY_MESSAGE)
         if sum(1 for u in urls if _server_key(u) == BUILTIN_HANA_URL) > 1:
             raise ValueError(HANA_SINGLE_ENTRY_MESSAGE)
+        if sum(1 for u in urls if _server_key(u) == BUILTIN_ARIBA_URL) > 1:
+            raise ValueError(ARIBA_SINGLE_ENTRY_MESSAGE)
         # One reconcile entry, and its ARC-1 sibling in this very list on a
         # mode that acts as the tester (storage checks the same).
         check_reconcile_entries(self.to_servers_list())

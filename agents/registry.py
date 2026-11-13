@@ -36,6 +36,8 @@ from agents.db import (
     odata_entries,
 )
 from agents.bitbucket_config import BUILTIN_BITBUCKET_URL, asks_to_approve
+from agents.ariba_tools import BUILTIN_ARIBA_URL
+from agents.ariba_tools import activity_summary as ariba_activity_summary
 from agents.bitbucket_tools import activity_summary as bitbucket_activity_summary
 from agents.git_config import BUILTIN_GIT_URL
 from agents.git_tools import activity_summary as git_activity_summary
@@ -277,6 +279,13 @@ def _short_tool_output(result) -> str:
         # The reconcile tools return mapping and code-table cell text: counts,
         # a status word and codes only.
         fixed = reconcile_activity_summary(
+            getattr(result, "tool_name", None), getattr(result, "content", None)
+        )
+        if fixed is not None:
+            return fixed
+        # The Ariba tools return supplier names, event titles, file names and
+        # signer names: counts, fixed words and codes only.
+        fixed = ariba_activity_summary(
             getattr(result, "tool_name", None), getattr(result, "content", None)
         )
         if fixed is not None:
@@ -1088,6 +1097,15 @@ async def build_orchestrator() -> BuildResult:
                 "API or to basic chat; the agent is built without the HANA tools",
                 row.name,
             )
+        # And for builtin:ariba: two entries would share the tools' names, so
+        # which destination (realm) a call went through could not be told.
+        no_ariba = sum(_server_key_of(s) == BUILTIN_ARIBA_URL for s in specs) > 1
+        if no_ariba:
+            logger.warning(
+                "Agent '%s': its row holds more than one builtin:ariba entry; "
+                "the agent is built without the Ariba tools",
+                row.name,
+            )
         # This agent's remote MCP servers by endpoint, for a built-in that
         # works through a sibling entry (builtin:reconcile reads ECC through
         # the agent's ARC-1 server, whose own auth carries the user). Per
@@ -1102,6 +1120,8 @@ async def build_orchestrator() -> BuildResult:
             if no_ina and _server_key_of(spec) == BUILTIN_INA_URL:
                 continue
             if no_hana and _server_key_of(spec) == BUILTIN_HANA_URL:
+                continue
+            if no_ariba and _server_key_of(spec) == BUILTIN_ARIBA_URL:
                 continue
             server_name = row.name if idx == 0 else f"{row.name}-{idx}"
             try:

@@ -1718,6 +1718,8 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
               "'builtin:confluence':" in html and "['spaces', 'api_base']" in html)
         check("confluence has its spaces field", 'class="dest-spaces"' in html)
         check("the hint list names builtin:confluence", "builtin:jira, builtin:confluence," in html)
+        check("ariba is a destination built-in with no pinned field", "'builtin:ariba':         []" in html)
+        check("the hint list names builtin:ariba", "builtin:confluence, builtin:ariba," in html)
         # builtin:git (addendum h of the web chat design): destination mode
         # only, as a technical user; provider, repositories, base branch,
         # prefix and two switches, collected by their own function.

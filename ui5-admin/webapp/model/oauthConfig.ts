@@ -63,7 +63,8 @@ const DESTINATION_BUILTIN_KEYS: Record<string, string[]> = {
     "builtin:sapnotes": ["min_score", "lookback"],
     "builtin:sapnotedetail": [],
     "builtin:smtp": ["recipients", "from"],
-    "builtin:confluence": ["spaces", "api_base"]
+    "builtin:confluence": ["spaces", "api_base"],
+    "builtin:ariba": []
 };
 
 /** Built-ins whose destination may act as the signed-in user. */

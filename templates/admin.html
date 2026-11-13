@@ -2680,6 +2680,8 @@ const DESTINATION_FIELDS = {
     // Reads pages as the destination's technical user: no user_context, no
     // comment switch. The space pin and the REST prefix are all it stores.
     'builtin:confluence':    ['spaces', 'api_base'],
+    // Sourcing events as the destination's technical user: only the destination name.
+    'builtin:ariba':         [],
     'builtin:slack':         ['channels', 'lookback', 'allow_send'],
     'builtin:gmail':         ['user_context', 'mailbox'],
     'builtin:outlook':       ['user_context', 'mailbox', 'lookback', 'recipients', 'allow_send', 'theme'],
@@ -3115,7 +3117,7 @@ function syncDestinationFields(row) {
     let hint = '';
     if (!known) {
         hint = 'A destination works with an https MCP server or a built-in toolset (builtin:gmail, builtin:outlook, '
-            + 'builtin:teams, builtin:slack, builtin:jira, builtin:confluence, builtin:smtp, builtin:sharepoint, builtin:bitbucket, builtin:git, builtin:hana, builtin:sapnotes, builtin:sapnotedetail, builtin:odata).';
+            + 'builtin:teams, builtin:slack, builtin:jira, builtin:confluence, builtin:ariba, builtin:smtp, builtin:sharepoint, builtin:bitbucket, builtin:git, builtin:hana, builtin:sapnotes, builtin:sapnotedetail, builtin:odata).';
     } else if (builtin === ODATA_BUILTIN) {
         hint = 'Destination and identity come from each catalogue service. Edit services in the UI5 admin (OData services).';
     } else if (builtin === INA_BUILTIN) {
@@ -3137,6 +3139,8 @@ function syncDestinationFields(row) {
         hint = 'The destination reaches Bitbucket Cloud as a technical user (BasicAuthentication: e-mail and API token). The agent reviews open pull requests to the target branch of this workspace; it can only name a repository and a pull request. Commenting and approving are separate switches; an approval is sent only after the review comment, and only with successful builds unless that check is switched off. Workspace and target branch are stored exactly as typed.';
     } else if (builtin === 'builtin:smtp') {
         hint = 'A destination of Type MAIL: mail.smtp.host/port, mail.user, mail.password, mail.smtp.from. The server certificate is always verified.';
+    } else if (builtin === 'builtin:ariba') {
+        hint = 'Reads RFP events, invited suppliers and submitted documents through a BTP destination. Responses can be read only after the event closes.';
     } else if (builtin === 'builtin:sapnotedetail') {
         hint = 'The me.sap.com session cookie is read from the destination\'s URL.headers.Cookie property.';
     } else if (builtin === 'builtin:sapnotes') {
