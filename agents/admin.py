@@ -75,6 +75,9 @@ from agents.db import (
     BITBUCKET_SINGLE_ENTRY_MESSAGE,
     BUILTIN_PUBLIC_KEYS,
     GIT_SINGLE_ENTRY_MESSAGE,
+    HANA_CHAT_MESSAGE,
+    HANA_INVOKE_MESSAGE,
+    HANA_SHARE_MESSAGE,
     INA_ENTRY_KEYS,
     INA_SINGLE_ENTRY_MESSAGE,
     KEEP,
@@ -92,6 +95,7 @@ from agents.db import (
     bitbucket_approves,
     check_bitbucket_approver_reach,
     check_delegation_name_collision,
+    check_hana_reach,
     check_ina_queries,
     check_odata_services,
     create_ina_query,
@@ -112,6 +116,7 @@ from agents.db import (
     get_workflow_by_name,
     get_workflow_parts,
     get_workflow_run,
+    has_hana_entry,
     ina_entries,
     ina_query_referrers,
     list_agents,
@@ -147,6 +152,10 @@ from agents.deep import DeepConfig, dump_deep_config
 from agents.git_config import BUILTIN_GIT_URL
 from agents.git_config import check_entry as check_git_entry
 from agents.git_config import clean_entry as clean_git_entry
+from agents.hana import BUILTIN_HANA_URL
+from agents.hana.config import HANA_SINGLE_ENTRY_MESSAGE
+from agents.hana.config import check_entry as check_hana_entry
+from agents.hana.config import pins_of as hana_pins_of
 from agents.ina import BUILTIN_INA_URL
 from agents.ina.models import QUERY_NAME_RE, check_query_names, validate_ina_query
 from agents.invoke_config import check_result_schema, clean_limits
@@ -386,6 +395,12 @@ class OAuthClientPayload(BaseModel):
     branch_prefix: StrictStr = Field(default="", max_length=41)
     allow_push: StrictBool = False
     allow_pull_request: StrictBool = False
+    # builtin:hana only. The systems (each a slug and the destination that
+    # reaches that database) and the switch for the agent's own SELECT.
+    # agents/hana/config.py is the gate; `systems` is handed on as received
+    # (a list of objects the gate reads key by key), never trimmed.
+    systems: list[Any] | None = None
+    allow_select: StrictBool = False
     # builtin:reconcile only (auth_mode=none). `arc1_server` names the
     # agent's own ARC-1 server entry by URL; the rest are the run's knobs.
     # Strings like `min_score`; agents/reconcile/config.py is the gate.
@@ -397,12 +412,15 @@ class OAuthClientPayload(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     @field_validator("services", "allow_write", "allow_approve", "allow_push",
-                     "allow_pull_request", mode="before")
+                     "allow_pull_request", "systems", "allow_select", mode="before")
     @classmethod
     def _null_is_absent(cls, v: Any, info: Any) -> Any:
         """A client that serialises an unset field as ``null`` means "not
-        set": no services, no writes. It can only ever close, never open."""
+        set": no services, no systems, no writes. It can only ever close,
+        never open."""
         if v is None:
+            if info.field_name == "systems":
+                return None
             return [] if info.field_name == "services" else False
         return v
 
@@ -580,6 +598,14 @@ class OAuthClientPayload(BaseModel):
             config["allow_push"] = True
         if self.allow_pull_request:
             config["allow_pull_request"] = True
+        if self.systems:
+            # As received: agents/hana/config.py refuses a stray key or a
+            # value of the wrong form, so nothing may be repaired here. An
+            # empty list is "not set", as for `services` (the hana gate then
+            # says the list is required).
+            config["systems"] = copy.deepcopy(self.systems)
+        if self.allow_select:
+            config["allow_select"] = True
         return config
 
 
@@ -779,6 +805,22 @@ class McpServerPayload(BaseModel):
             check_git_entry(oauth)
         return data
 
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_raw_hana_entry(cls, data: Any) -> Any:
+        """The ``builtin:hana`` block as the client sent it, for the reason
+        ``_validate_raw_bitbucket_entry`` gives: afterwards a stray key or the
+        string "true" can no longer be told from a correct entry."""
+        if isinstance(data, dict) and _server_key(data.get("url")) == BUILTIN_HANA_URL:
+            mode = str(data.get("auth_mode") or "").strip().lower()
+            if mode != AUTH_MODE_DESTINATION:
+                raise ValueError(_HANA_MODE_TEXT)
+            oauth = data.get("oauth")
+            if isinstance(oauth, OAuthClientPayload):
+                oauth = {k: getattr(oauth, k) for k in oauth.model_fields_set}
+            check_hana_entry(oauth)
+        return data
+
     @model_validator(mode="after")
     def _validate_oauth(self) -> "McpServerPayload":
         if _server_key(self.url) == BUILTIN_ODATA_URL:
@@ -807,6 +849,20 @@ class McpServerPayload(BaseModel):
             raise ValueError(
                 f"oauth.queries belongs to a {BUILTIN_INA_URL} entry only; no other "
                 "server reads it"
+            )
+        if _server_key(self.url) == BUILTIN_HANA_URL:
+            # Its own rules, as builtin:odata above: no top-level destination
+            # here (each system names its own), so none of the generic
+            # destination rules below apply. Again on the block the route
+            # hands to storage.
+            if self.auth_mode != AUTH_MODE_DESTINATION:
+                raise ValueError(_HANA_MODE_TEXT)
+            check_hana_entry(self.oauth.to_config() if self.oauth else None)
+            return self
+        if self.oauth is not None and (self.oauth.systems or self.oauth.allow_select):
+            raise ValueError(
+                f"oauth.systems and oauth.allow_select belong to a {BUILTIN_HANA_URL} "
+                "entry only; no other server reads them"
             )
         is_reconcile = _server_key(self.url) == BUILTIN_RECONCILE_URL
         if is_reconcile and self.auth_mode != AUTH_MODE_NONE:
@@ -1173,6 +1229,10 @@ class AgentPayload(BaseModel):
         servers = _servers_list(info.data.get("mcp_servers") or [])
         if v is True and bitbucket_approves(servers):
             raise ValueError(BITBUCKET_APPROVER_SHARE_MESSAGE)
+        # Rule R1: a builtin:hana entry connects as a destination's technical
+        # user; no personal agent borrows it (`agents.db.check_hana_reach`).
+        if v is True and has_hana_entry(servers):
+            raise ValueError(HANA_SHARE_MESSAGE)
         return v
 
     @field_validator("result_schema")
@@ -1287,6 +1347,8 @@ class AgentPayload(BaseModel):
             raise ValueError(BITBUCKET_SINGLE_ENTRY_MESSAGE)
         if sum(1 for u in urls if _server_key(u) == BUILTIN_GIT_URL) > 1:
             raise ValueError(GIT_SINGLE_ENTRY_MESSAGE)
+        if sum(1 for u in urls if _server_key(u) == BUILTIN_HANA_URL) > 1:
+            raise ValueError(HANA_SINGLE_ENTRY_MESSAGE)
         if sum(1 for u in urls if _server_key(u) == BUILTIN_ARIBA_URL) > 1:
             raise ValueError(ARIBA_SINGLE_ENTRY_MESSAGE)
         # One reconcile entry, and its ARC-1 sibling in this very list on a
@@ -1311,6 +1373,25 @@ class AgentPayload(BaseModel):
         # The invoke API's caller chooses the prompt as a chat user does.
         if self.expose_invoke is True and bitbucket_approves(self.to_servers_list()):
             raise ValueError(BITBUCKET_APPROVER_INVOKE_MESSAGE)
+        return self
+
+    @model_validator(mode="after")
+    def _hana_reach(self) -> "AgentPayload":
+        """An agent with a ``builtin:hana`` entry, with or without
+        ``allow_select``, reads the database as a technical user with wide
+        privileges (object source, users, grants, audit policies): never from
+        the invoke API (R2a), from chat only at tier ``advanced`` (R2b). An
+        absent ``expose_chat`` is true and an absent ``tier`` is not
+        ``advanced`` (fail closed: both UIs always send the tier). The
+        scheduler run endpoint and Run now stay allowed. Storage checks again
+        and adds the peer rule (R2c), which needs the database
+        (`agents.db.check_hana_reach`)."""
+        if not has_hana_entry(self.to_servers_list()):
+            return self
+        if self.expose_invoke is True:
+            raise ValueError(HANA_INVOKE_MESSAGE)
+        if self.expose_chat is not False and self.tier != "advanced":
+            raise ValueError(HANA_CHAT_MESSAGE)
         return self
 
     def invoke_kwargs(self) -> dict[str, Any]:
@@ -1596,9 +1677,9 @@ async def api_create_agent(payload: AgentPayload) -> dict[str, Any]:
 
 def _entry_signature(servers: Any, enabled: Any = True) -> list[Any]:
     """What an agent's ``builtin:odata``, ``builtin:ina``, ``builtin:bitbucket``,
-    ``builtin:git`` and ``builtin:reconcile`` entries let it do: the part of an agent row whose
-    change must reach the running build at once. ``[]`` for an agent with
-    none of these entries.
+    ``builtin:git``, ``builtin:hana`` and ``builtin:reconcile`` entries let it
+    do: the part of an agent row whose change must reach the running build
+    at once. ``[]`` for an agent with none of these entries.
 
     Per OData entry the attached services (sorted) and whether it may write;
     order-free, so a save that only reorders is no change; per InA entry its
@@ -1655,6 +1736,25 @@ def _entry_signature(servers: Any, enabled: Any = True) -> list[Any]:
         except ValueError:
             stored = {"refused": [server.get("auth_mode"), block]}
         git.append((BUILTIN_GIT_URL, json.dumps(stored, sort_keys=True, default=str)))
+    # A ``builtin:hana`` entry the same way, read as the toolset reads it
+    # (`agents.hana.config.pins_of`): the systems and Allow SELECT come from
+    # the build, so an unticked "Allow SELECT", a system taken out or a
+    # changed destination must not wait for a manual reload. Systems sorted
+    # by name: an edit that only reorders them is no change.
+    hana = []
+    for server in servers:
+        if not isinstance(server, dict) or _server_key(server.get("url")) != BUILTIN_HANA_URL:
+            continue
+        block = server.get("oauth")
+        try:
+            if server.get("auth_mode") != AUTH_MODE_DESTINATION:
+                raise ValueError("not a destination entry")
+            pins = hana_pins_of(block)
+            stored: Any = {"systems": sorted(pins.systems),
+                           "allow_select": pins.allow_select}
+        except ValueError:
+            stored = {"refused": [server.get("auth_mode"), block]}
+        hana.append((BUILTIN_HANA_URL, json.dumps(stored, sort_keys=True, default=str)))
     # The queries an agent may run are read from the build as well: one taken
     # out of the entry must not stay runnable until a manual reload.
     ina = []
@@ -1677,7 +1777,8 @@ def _entry_signature(servers: Any, enabled: Any = True) -> list[Any]:
             "" if block.get(k) is None else str(block.get(k))
             for k in ("arc1_server", "target", "batch_size", "mismatch_cap")
         )))
-    return sorted(odata) + sorted(bitbucket) + sorted(git) + sorted(ina) + sorted(reconcile)
+    return (sorted(odata) + sorted(bitbucket) + sorted(git) + sorted(hana) + sorted(ina)
+            + sorted(reconcile))
 
 
 async def _reload_for_changed_entry(before: Any, after: Any, what: str) -> dict[str, bool]:
@@ -1729,7 +1830,7 @@ def _catalogue_part(signature: Any) -> list[Any]:
 
 def _entry_signatures(rows: Any) -> dict[str, Any]:
     """``{agent name: _entry_signature}`` of the agents that have OData,
-    InA, Bitbucket or Git access at all: what an import compares before and
+    InA, Bitbucket, Git, HANA or reconcile access at all: what an import compares before and
     after."""
     out: dict[str, Any] = {}
     for row in rows:
@@ -1790,6 +1891,19 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
                 stored_name=old_name,
                 servers=prepared_server_list(primary, extras, primary_oauth_json),
                 expose_chat=payload.expose_chat,
+                peers=list(row.peers) if payload.peers is None else payload.peers,
+                expose_invoke=invoke_on,
+                share_tools=share_on,
+            )
+            # The builtin:hana rules on the tier the row will hold (an absent
+            # tier keeps the stored one).
+            await check_hana_reach(
+                session,
+                name=payload.name,
+                stored_name=old_name,
+                servers=prepared_server_list(primary, extras, primary_oauth_json),
+                expose_chat=payload.expose_chat,
+                tier=payload.tier if payload.tier is not None else (row.tier or "basic"),
                 peers=list(row.peers) if payload.peers is None else payload.peers,
                 expose_invoke=invoke_on,
                 share_tools=share_on,
@@ -2528,9 +2642,20 @@ async def api_update_model(payload: ModelPayload) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Reload & restart
 # ---------------------------------------------------------------------------
+def _forget_hana_logins() -> None:
+    """builtin:hana: the admin's Reload and Restart are "I fixed it", so the
+    login state is forgotten in full (failed credentials included). Before the
+    registry reload, whose own soft reset only removes and so cannot bring a
+    forgotten failure back."""
+    from agents.hana.connection import reset_login_state
+
+    reset_login_state()
+
+
 @router.post("/api/reload", dependencies=[Depends(require_admin)])
 async def api_reload() -> dict[str, Any]:
     """Rebuild the orchestrator from the database without restarting."""
+    _forget_hana_logins()
     build = await registry.reload()
     dynamic_chat_app.refresh()
     return {
@@ -2551,6 +2676,7 @@ async def api_restart() -> JSONResponse:
     configured, the in-memory reload alone is sufficient for newly added
     agents to take effect.
     """
+    _forget_hana_logins()
     build = await registry.reload()
     dynamic_chat_app.refresh()
 
@@ -3205,7 +3331,8 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
         )
     if not (reload_outcome["reloaded"] or reload_outcome["reload_failed"]):
         # The other way an import closes access: an agent's own
-        # `builtin:odata` or `builtin:bitbucket` entry changed or went, or
+        # `builtin:odata`, `builtin:ina`, `builtin:bitbucket`, `builtin:git`,
+        # `builtin:hana` or `builtin:reconcile` entry changed or went, or
         # the agent was removed or disabled, with no catalogue service in
         # use touched. Same rule as an
         # agent save (`_reload_for_changed_entry`); one rebuild at most.
@@ -3213,7 +3340,7 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
             odata_after = _entry_signatures(await list_agents(session))
         if odata_after != odata_before:
             reload_outcome = await reload_running_agents(
-                "import with a changed OData or Bitbucket entry of an agent"
+                "import with a changed data, review, Git or HANA entry of an agent"
             )
 
     # An import can attach, detach or change any source: the data catalogue
@@ -3601,6 +3728,11 @@ _INA_MODE_TEXT = (
     "reached through the BTP destination it names, and the entry holds no "
     "credential of its own"
 )
+_HANA_MODE_TEXT = (
+    f"{BUILTIN_HANA_URL} requires auth_mode=destination: it holds no credential of "
+    "its own and reaches each database only through the BTP destination its system "
+    "names"
+)
 
 
 def _validate_ina_entry(cfg: dict[str, Any]) -> None:
@@ -3752,6 +3884,12 @@ async def _destination_health() -> list[dict[str, Any]]:
                     await _ina_destination_health(row.name, oauth, queries, config, resolvers)
                 )
                 continue
+            if _server_key(srv.get("url")) == BUILTIN_HANA_URL:
+                # One destination per system: one entry per system.
+                out.extend(
+                    await _hana_destination_health(row.name, srv.get("oauth"), config, resolvers)
+                )
+                continue
             name = str(oauth.get("destination") or "").strip()
             user_context = oauth.get("user_context") is True
             entry: dict[str, Any] = {
@@ -3817,6 +3955,102 @@ async def _destination_health() -> list[dict[str, Any]]:
                     f"OAuth2JWTBearer or OAuth2SAMLBearerAssertion"
                 )
             out.append(entry)
+    return out
+
+
+async def _hana_destination_health(
+    agent: str,
+    oauth: Any,
+    config: Any,
+    resolvers: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """The `_destination_health` entries of one ``builtin:hana`` entry: one
+    per system, ``{agent, server_key, system, destination, user_context,
+    state, auth_type, error}``.
+
+    The block is read as the toolset reads it (`agents.hana.config.pins_of`);
+    a block it refuses is ONE entry in state ``error`` whose text is the
+    reading's own (field and rule, never a value) and that names no system.
+    A system's destination carries host, port and credential as properties
+    (an HTTP carrier URL or a TCP address, never called): they are read with
+    the application's token and then checked by
+    `agents.hana.connection.settings_from_properties`, exactly as the toolset
+    does before a login (ProxyType, the carrier, User and Password, the
+    ``hana.*`` keys), so a destination the toolset would refuse is not
+    reported ``resolvable``. No SQL login is made. Only the
+    ``Authentication`` type is reported. A resolve failure is the fixed text
+    ending in a code (`agents.odata.destinations.destination_failure`); a
+    refusal of the reading is the fixed text of its code plus the code; the
+    log names the system, the destination and that code (the reading's own
+    WARNING names the rule) only; no host, user, resolver or driver text
+    reaches the answer or the log."""
+    from agents.destination import (
+        MISSING_BINDING_MESSAGE,
+        DestinationError,
+        DestinationResolver,
+    )
+    from agents.hana.connection import settings_from_properties
+    from agents.hana.errors import HanaError
+    from agents.odata.destinations import destination_failure
+
+    def _entry(system: str, destination: str) -> dict[str, Any]:
+        return {
+            "agent": agent,
+            "server_key": BUILTIN_HANA_URL,
+            "system": system,
+            "destination": destination,
+            "user_context": False,
+            "state": "error",
+            "auth_type": "",
+            "error": None,
+        }
+
+    try:
+        pins = hana_pins_of(oauth)
+    except ValueError as refused:
+        entry = _entry("", "")
+        entry["error"] = str(refused)
+        return [entry]
+    out: list[dict[str, Any]] = []
+    for system, name in pins.systems:
+        entry = _entry(system, name)
+        out.append(entry)
+        if config is None:
+            entry["state"] = "unbound"
+            entry["error"] = MISSING_BINDING_MESSAGE
+            continue
+        resolver = resolvers.get(name)
+        if resolver is None:
+            resolver = DestinationResolver(name, config, require_credential=False)
+            resolvers[name] = resolver
+        try:
+            props = await resolver.resolve_properties()
+            entry["auth_type"] = str(getattr(props, "auth_type", "") or "")
+            settings_from_properties(props, system)
+            entry["state"] = "resolvable"
+        except HanaError as e:
+            entry["error"] = f"{e.message} ({e.code})"
+            logger.warning(
+                "credential health: destination '%s' of system '%s' of agent '%s' "
+                "refused (%s)",
+                name, system, agent, e.code,
+            )
+        except DestinationError as e:
+            code, entry["error"] = destination_failure(str(e))
+            # The code only: the resolver's text can quote the destination
+            # service's answer.
+            logger.warning(
+                "credential health: destination '%s' of system '%s' of agent '%s' "
+                "failed (%s)",
+                name, system, agent, code,
+            )
+        except Exception as e:  # noqa: BLE001 - a health check must not 500
+            entry["error"] = f"the destination could not be checked ({type(e).__name__})"
+            logger.warning(
+                "credential health: destination '%s' of system '%s' of agent '%s' "
+                "failed (%s)",
+                name, system, agent, type(e).__name__,
+            )
     return out
 
 

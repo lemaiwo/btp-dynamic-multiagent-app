@@ -486,6 +486,33 @@ async def test_the_catalogue_lists_advanced_agents_only_for_an_advanced_develope
     assert r.status_code == 422
 
 
+async def test_a_hana_agent_is_neither_offered_to_nor_consultable_by_a_basic_user(roles):
+    """A chat-exposed agent with a builtin:hana entry is advanced (storage
+    refuses anything else, `tests/test_hanadb_reach.py`): the tier gate keeps
+    it from a basic user's catalogue and consults without code of its own."""
+    import json as _json
+
+    await admin_agent("btp-admin")
+    await admin_agent("dba")
+    await set_admin("dba", tier="advanced", mcp_url="builtin:hana",
+                    auth_mode="destination",
+                    oauth_json=_json.dumps({"systems": [{"name": "prd",
+                                                         "destination": "HANA_PRD"}]}))
+    for query in ("", "?access=basic", "?access=advanced"):
+        r = await roles.get(f"{API}/catalog{query}", **as_role("user"))
+        assert r.status_code == 200
+        assert [a["name"] for a in r.json()["agents"]] == ["btp-admin"], query
+    r = await roles.get(f"{API}/catalog?access=advanced", **as_role("developer"))
+    assert {a["name"] for a in r.json()["agents"]} == {"btp-admin", "dba"}
+    r = await roles.post(f"{API}/my/agents", json={"name": "Consulter", "instructions": "x",
+                                                   "consults": ["dba"]}, **as_role("user"))
+    assert r.status_code == 422
+    assert [d["loc"] for d in r.json()["detail"]] == [["body", "consults", 0]]
+    r = await roles.post(f"{API}/conversations", json={"agent_ref": "admin:dba"},
+                         **as_role("user"))
+    assert (r.status_code, r.json()) == (422, {"detail": "Unknown agent"})
+
+
 async def test_advanced_conversations_need_the_developer_or_admin_role(
         roles, monkeypatch, real_agents_and_mcp):
     await admin_agent("btp-admin")

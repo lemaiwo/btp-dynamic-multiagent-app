@@ -1738,7 +1738,19 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
               and '<option value="gitlab">GitLab</option>' in html)
         check("git switches use the approved wording",
               "Allow pushing to agent branches" in html and "Allow opening pull requests" in html)
-        check("the hint list names builtin:git", "builtin:bitbucket, builtin:git, builtin:sapnotes," in html)
+        check("the hint list names builtin:git", "builtin:bitbucket, builtin:git, builtin:hana," in html)
+        # builtin:hana: destination mode only, systems and one switch,
+        # collected by their own function.
+        check("hana is a known destination built-in",
+              "'builtin:hana':" in html and "['systems', 'allow_select']" in html
+              and "const HANA_BUILTIN = 'builtin:hana';" in html
+              and "function collectHanaConfig(row)" in html)
+        check("hana is offered under its toolset name",
+              "const HANA_TOOLSET_LABEL = 'SAP HANA (monitoring)';" in html)
+        check("hana has its fields",
+              'class="dest-systems"' in html and 'class="dest-allow_select"' in html
+              and "Allow SELECT on monitoring views" in html)
+        check("the hint list names builtin:hana", "builtin:git, builtin:hana, builtin:sapnotes," in html)
         check("the views placeholder shows a calendar view with its kinds",
               '"kinds": ["Presence", "Guard"]' in html)
         # A stored server on an auth mode this page does not offer (app_only,
@@ -2300,6 +2312,157 @@ assert.throws(() => collectMcpServers(), /Two builtin:git rows/);
 assert.deepStrictEqual(out.oauth, { destination: 'BITBUCKET', workspace: 'acme-ws' });
 assert.strictEqual(row.querySelector('.dest-allow_push').checked, false);
 assert.strictEqual(row.querySelector('.dest-base_branch').value, '');
+// 7e2. builtin:hana: destination mode only; a Systems list (one "name
+//      destination" line per system) and "Allow SELECT", which asks first.
+const HANA_CONFIRM = 'This lets the agent run its own SELECT statements on the system and monitoring views '
+    + '(SYS, _SYS_STATISTICS, M_*) of the listed systems. Catalogue data, statement texts with '
+    + 'their values and trace file contents come back unmasked. Continue?';
+const HANA_OAUTH = { systems: [{ name: 'erp_tenant', destination: 'hana-erp-tenant' },
+                               { name: 'erp_systemdb', destination: 'HANA_ERP.SYS' }],
+                     allow_select: true };
+const hanaUrl = (r, v) => {
+    r.querySelector('.mcp-url').value = v;
+    r.querySelector('.mcp-url').dispatchEvent(new window.Event('input', { bubbles: true }));
+};
+const hanaFire = (el) => el.dispatchEvent(new window.Event('change', { bubbles: true }));
+const hanaAsked = [];
+let hanaAnswer = false;
+global.confirm = (msg) => { hanaAsked.push(msg); return hanaAnswer; };
+({ row, out } = addAndCollect({ url: 'builtin:hana', auth_mode: 'destination',
+    oauth: { ...HANA_OAUTH, user_context: false, has_client_secret: false, project: 'ABC',
+             allow_write: true, repositories: ['a/b'], provider: 'gitlab', allow_push: true } }));
+for (const k of ['systems', 'allow_select']) {
+    assert.strictEqual(row.querySelector('.dest-field-' + k).style.display, '', k + ' is shown');
+}
+for (const k of ['destination', 'user_context', 'project', 'allow_write', 'repositories', 'provider',
+                 'allow_push', 'allow_comment', 'workspace']) {
+    assert.strictEqual(row.querySelector('.dest-field-' + k).style.display, 'none', k + ' is hidden');
+}
+// The stored systems load back, one line each; the stored switch is loaded
+// without asking (nothing was ticked by the admin).
+assert.strictEqual(row.querySelector('.dest-systems').value,
+    'erp_tenant hana-erp-tenant\nerp_systemdb HANA_ERP.SYS');
+assert.strictEqual(row.querySelector('.dest-allow_select').checked, true);
+assert.deepStrictEqual(hanaAsked, []);
+assert.deepStrictEqual(out, { url: 'builtin:hana', auth_mode: 'destination', oauth: HANA_OAUTH });
+assert.strictEqual(row.querySelector('.dest-hint').textContent,
+    'SAP HANA (monitoring). '
+    + 'Reads monitoring and catalogue views of the listed on-premise HANA databases as the database '
+    + 'user of each destination; read only.');
+console.log('HANA:' + JSON.stringify(out));
+// Built from the fields as left: blank lines dropped, the blank around and
+// between the two names is the separator's, the names themselves as typed
+// (the server refuses an upper-case name: no repair here); unticked = absent.
+row.querySelector('.dest-systems').value = '  erp_tenant   hana-erp-tenant \n\n\tErp_X dest.2\n';
+row.querySelector('.dest-allow_select').checked = false;
+assert.deepStrictEqual(collectMcpServers()[0].oauth,
+    { systems: [{ name: 'erp_tenant', destination: 'hana-erp-tenant' },
+                { name: 'Erp_X', destination: 'dest.2' }] });
+// A line that is not exactly two names is refused, naming the line, never its text.
+row.querySelector('.dest-systems').value = 'erp_tenant hana-erp-tenant\nSECRETVALUE';
+assert.throws(() => collectMcpServers(), e => {
+    assert.strictEqual(e.message, 'SAP HANA: line 2 of Systems needs a system name and a destination '
+        + 'name, separated by a space.');
+    return true;
+});
+row.querySelector('.dest-systems').value = 'a b SECRETVALUE';
+assert.throws(() => collectMcpServers(), e => {
+    assert.ok(/line 1 of Systems/.test(e.message));
+    assert.ok(!e.message.includes('SECRETVALUE'));
+    return true;
+});
+row.querySelector('.dest-systems').value = ' \n ';
+assert.throws(() => collectMcpServers(), e => {
+    assert.strictEqual(e.message, 'SAP HANA: list at least one system.');
+    return true;
+});
+// Only a space or a tab separates; CRLF line ends are one break. Any other
+// whitespace stays in the name for the server to refuse (no silent repair).
+row.querySelector('.dest-systems').value = 'erp_tenant\thana-erp-tenant\r\nerp_x  dest.2\r\n';
+assert.deepStrictEqual(collectMcpServers()[0].oauth.systems,
+    [{ name: 'erp_tenant', destination: 'hana-erp-tenant' }, { name: 'erp_x', destination: 'dest.2' }]);
+row.querySelector('.dest-systems').value = 'erp_tenant hana-erp-tenant';
+assert.throws(() => collectMcpServers(), /line 1 of Systems needs a system name and a destination/);
+row.querySelector('.dest-systems').value = 'erp_tenant hana-erp-tenant \nerp_x ﻿dest.2';
+assert.deepStrictEqual(collectMcpServers()[0].oauth.systems,
+    [{ name: 'erp_tenant', destination: 'hana-erp-tenant ' }, { name: 'erp_x', destination: '﻿dest.2' }]);
+row.querySelector('.dest-systems').value = ' ';
+assert.throws(() => collectMcpServers(), /line 1 of Systems/);
+// Ticking "Allow SELECT" asks first, naming no system; Cancel leaves it unticked.
+row.querySelector('.dest-systems').value = 'erp_tenant hana-erp-tenant';
+const selectBox = row.querySelector('.dest-allow_select');
+selectBox.checked = true;
+hanaFire(selectBox);
+assert.deepStrictEqual(hanaAsked, [HANA_CONFIRM]);
+assert.strictEqual(selectBox.checked, false, 'Cancel leaves it unticked');
+assert.deepStrictEqual(collectMcpServers()[0].oauth,
+    { systems: [{ name: 'erp_tenant', destination: 'hana-erp-tenant' }] });
+hanaAnswer = true;
+selectBox.checked = true;
+hanaFire(selectBox);
+assert.strictEqual(hanaAsked.length, 2);
+assert.strictEqual(selectBox.checked, true, 'OK keeps it ticked');
+assert.strictEqual(collectMcpServers()[0].oauth.allow_select, true);
+// Unticking asks nothing.
+selectBox.checked = false;
+hanaFire(selectBox);
+assert.strictEqual(hanaAsked.length, 2);
+// A URL edit to another built-in and back does not carry the tick over.
+selectBox.checked = true;
+hanaUrl(row, 'builtin:git');
+hanaUrl(row, 'builtin:hana');
+assert.strictEqual(selectBox.checked, false, 'the tick does not survive a type change');
+// What the URL passes through while typed changes nothing.
+selectBox.checked = true;
+hanaUrl(row, 'builtin:han');
+hanaUrl(row, '');
+hanaUrl(row, 'builtin:hana');
+assert.strictEqual(selectBox.checked, true, 'a half-typed URL back to hana keeps the tick');
+// Only the destination mode.
+({ row } = addAndCollect({ url: 'builtin:hana', auth_mode: 'destination',
+    oauth: { systems: [{ name: 'erp_tenant', destination: 'hana-erp-tenant' }] } }));
+row.querySelector('.mcp-auth-mode').value = 'jwt';
+assert.throws(() => collectMcpServers(), /builtin:hana needs the auth mode "BTP destination"/);
+// An agent takes one hana entry: two rows (in any spelling) are refused here, not posted.
+row.querySelector('.mcp-auth-mode').value = 'destination';
+addMcpServerRow({ url: 'Builtin:HANA/', auth_mode: 'destination',
+    oauth: { systems: [{ name: 'other', destination: 'hana-other' }] } });
+assert.throws(() => collectMcpServers(), e => {
+    assert.strictEqual(e.message,
+        'Two builtin:hana rows: an agent takes one. List every system in one row.');
+    return true;
+});
+// Another type's block loads no systems and no switch; a stored non-boolean switch is not loaded.
+({ row, out } = addAndCollect({ url: 'builtin:git', auth_mode: 'destination',
+    oauth: { destination: 'GH', provider: 'github', repositories: ['a/b'], allow_select: true,
+             systems: [{ name: 'x', destination: 'y' }] } }));
+assert.strictEqual(row.querySelector('.dest-systems').value, '');
+assert.strictEqual(row.querySelector('.dest-allow_select').checked, false);
+({ row, out } = addAndCollect({ url: 'builtin:hana', auth_mode: 'destination',
+    oauth: { systems: [{ name: 'erp_tenant', destination: 'd' }], allow_select: 'true' } }));
+assert.deepStrictEqual(out.oauth, { systems: [{ name: 'erp_tenant', destination: 'd' }] });
+// A stored system without a string name or destination is shown, the missing
+// part empty (nothing is dropped), so a save refuses that line; an entry
+// with neither part shows as "?", never as a blank line a save would skip.
+document.getElementById('agent-mcp-servers').innerHTML = '';
+addMcpServerRow({ url: 'builtin:hana', auth_mode: 'destination',
+    oauth: { systems: [{ name: 'erp_tenant', destination: 'd' }, { name: 'erp_x' },
+                       { destination: 7 }, null] } });
+row = document.querySelector('.mcp-server-row');
+assert.strictEqual(row.querySelector('.dest-systems').value, 'erp_tenant d\nerp_x \n?\n?');
+assert.throws(() => collectMcpServers(), /line 2 of Systems/);
+row.querySelector('.dest-systems').value = 'erp_tenant d\nerp_x d2\n?\n?';
+assert.throws(() => collectMcpServers(), /line 3 of Systems/);
+// A new row typed as builtin:hana starts empty and unticked.
+document.getElementById('agent-mcp-servers').innerHTML = '';
+addMcpServerRow();
+row = document.querySelector('.mcp-server-row');
+row.querySelector('.mcp-auth-mode').value = 'destination';
+toggleOauthFields(row.querySelector('.mcp-auth-mode'));
+hanaUrl(row, 'builtin:hana');
+assert.strictEqual(row.querySelector('.dest-systems').value, '');
+assert.strictEqual(row.querySelector('.dest-allow_select').checked, false);
+assert.strictEqual(row.querySelector('.dest-field-systems').style.display, '');
 // 7f. builtin:ina (analytical queries) is edited in the UI5 admin. A stored
 //     row is shown with the destination option, its queries as a read-only
 //     line and a fixed note, and goes back as it was loaded; a NEW row cannot
@@ -3092,6 +3255,108 @@ assert.ok(errText({ detail: [{ loc: ['body', 'mcp_servers', 0], type: 'value_err
     assert.deepStrictEqual(calls.map(c => c.slice(0, 2)), [['/admin/api/agents/7', 'PUT']]);
     assert.deepStrictEqual(JSON.parse(calls[0][2]).mcp_servers, [INA_ENTRY],
         'the posted entry is the loaded one');
+
+    // 24c. builtin:hana: "Allow SELECT" covers every system of the entry, so a
+    //      save asks again when it would cover a system no answer covered yet
+    //      (the stored systems of a loaded allow_select entry, or the systems
+    //      at the last OK). One question per save; Cancel sends nothing.
+    {
+        const asked = [];
+        let okAnswer = false;
+        global.confirm = (msg) => { asked.push(msg); return okAnswer; };
+        const putOf = () => calls.filter(c => c[1] === 'PUT');
+        const hanaSent = () => JSON.parse(putOf()[putOf().length - 1][2]).mcp_servers[0];
+        const hanaRow = (oauth) => {
+            document.getElementById('agent-mcp-servers').innerHTML = '';
+            addMcpServerRow({ url: 'builtin:hana', auth_mode: 'destination', oauth });
+            return document.querySelector('.mcp-server-row');
+        };
+        const sys = (r) => r.querySelector('.dest-systems');
+        const box = (r) => r.querySelector('.dest-allow_select');
+        const save = async () => { calls = []; await saveAgent(); };
+        // (a) Stored with allow_select and one system: a second line asks once.
+        let r = hanaRow({ systems: [{ name: 'erp_tenant', destination: 'HANA_ERP_TENANT' }],
+                          allow_select: true });
+        assert.deepStrictEqual(asked, [], 'loading asks nothing');
+        await save();
+        assert.deepStrictEqual(asked, [], 'the stored systems are covered');
+        assert.strictEqual(putOf().length, 1);
+        sys(r).value = 'erp_tenant HANA_ERP_TENANT\nerp_systemdb HANA_ERP_SYS';
+        assert.strictEqual(collectMcpServers()[0].oauth.allow_select, true);
+        assert.deepStrictEqual(asked, [], 'collecting (the unsaved-changes check) asks nothing');
+        await save();
+        assert.deepStrictEqual(asked, [HANA_CONFIRM], 'one question, naming no system');
+        assert.deepStrictEqual(calls, [], 'Cancel sends nothing');
+        assert.strictEqual(box(r).checked, true, 'Cancel leaves the box as it is');
+        assert.strictEqual(sys(r).value, 'erp_tenant HANA_ERP_TENANT\nerp_systemdb HANA_ERP_SYS');
+        okAnswer = true;
+        await save();
+        assert.strictEqual(asked.length, 2, 'asked again at the next save');
+        assert.strictEqual(putOf().length, 1);
+        assert.deepStrictEqual(hanaSent(), { url: 'builtin:hana', auth_mode: 'destination',
+            oauth: { systems: [{ name: 'erp_tenant', destination: 'HANA_ERP_TENANT' },
+                               { name: 'erp_systemdb', destination: 'HANA_ERP_SYS' }],
+                     allow_select: true } });
+        await save();
+        assert.strictEqual(asked.length, 2, 'OK covers the systems it was asked for');
+        assert.strictEqual(putOf().length, 1);
+        // A destination changed on a covered line is a new system.
+        sys(r).value = 'erp_tenant HANA_ERP_OTHER\nerp_systemdb HANA_ERP_SYS';
+        await save();
+        assert.strictEqual(asked.length, 3, 'a changed destination asks');
+        // A system dropped asks nothing: what is left was covered.
+        sys(r).value = 'erp_tenant HANA_ERP_OTHER';
+        await save();
+        assert.strictEqual(asked.length, 3);
+        assert.strictEqual(putOf().length, 1);
+        // (b) Ticked here (OK), then a line added: asked once more at the save.
+        asked.length = 0;
+        r = hanaRow({ systems: [{ name: 'erp_tenant', destination: 'HANA_ERP_TENANT' }] });
+        box(r).checked = true;
+        box(r).dispatchEvent(new window.Event('change', { bubbles: true }));
+        assert.deepStrictEqual(asked, [HANA_CONFIRM], 'ticking asks');
+        await save();
+        assert.strictEqual(asked.length, 1, 'ticked with OK, saved unchanged: not asked again');
+        assert.strictEqual(hanaSent().oauth.allow_select, true);
+        sys(r).value = 'erp_tenant HANA_ERP_TENANT\nerp_systemdb HANA_ERP_SYS';
+        await save();
+        assert.strictEqual(asked.length, 2, 'a system added after the tick asks');
+        assert.strictEqual(putOf().length, 1);
+        // The tick's answer covers the systems listed at that moment.
+        sys(r).value = 'erp_tenant HANA_ERP_TENANT';
+        box(r).checked = false;
+        box(r).dispatchEvent(new window.Event('change', { bubbles: true }));
+        sys(r).value = 'erp_tenant HANA_ERP_TENANT\nerp_systemdb HANA_ERP_SYS';
+        box(r).checked = true;
+        box(r).dispatchEvent(new window.Event('change', { bubbles: true }));
+        assert.strictEqual(asked.length, 3);
+        await save();
+        assert.strictEqual(asked.length, 3, 'covered by the tick');
+        // (c) Unticked: never asked at a save, whatever the systems.
+        asked.length = 0;
+        r = hanaRow({ systems: [{ name: 'erp_tenant', destination: 'HANA_ERP_TENANT' }] });
+        sys(r).value = 'erp_tenant HANA_ERP_TENANT\nerp_systemdb HANA_ERP_SYS';
+        await save();
+        assert.deepStrictEqual(asked, []);
+        assert.strictEqual(putOf().length, 1);
+        assert.strictEqual(hanaSent().oauth.allow_select, undefined);
+        // (d) A URL edit to another type and back forgets what was covered.
+        r = hanaRow({ systems: [{ name: 'erp_tenant', destination: 'HANA_ERP_TENANT' }],
+                      allow_select: true });
+        const urlTo = (v) => {
+            r.querySelector('.mcp-url').value = v;
+            r.querySelector('.mcp-url').dispatchEvent(new window.Event('input', { bubbles: true }));
+        };
+        urlTo('builtin:git');
+        urlTo('builtin:hana');
+        assert.strictEqual(box(r).checked, false);
+        box(r).checked = true;   // set without its change event: no tick question
+        okAnswer = false;
+        await save();
+        assert.deepStrictEqual(asked, [HANA_CONFIRM], 'nothing is covered after a type change');
+        assert.deepStrictEqual(calls, []);
+        global.confirm = () => true;
+    }
 
     // 25. The entry as the live API stored it: load, collect, same entry. The
     //     catalogue here lists by name, the stored entry does not.

@@ -76,7 +76,6 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
-import json
 import logging
 import re
 import time
@@ -99,6 +98,7 @@ from agents.sharepoint_workbook import (
 )
 from agents.sharepoint_workbook import read_calendar as read_calendar_view
 from agents.sharepoint_workbook import read_table as read_table_view
+from agents.tool_results import result_chars as _result_chars
 
 __all__ = ["SharePointFile", "sharepoint_toolset", "activity_summary",
            "BUILTIN_SHAREPOINT_URL"]
@@ -488,28 +488,6 @@ def _timestamp(value: Any) -> str | None:
     if isinstance(value, str) and _TIMESTAMP_RE.fullmatch(value):
         return value
     return None
-
-
-def _result_chars(result: dict[str, Any]) -> int:
-    """The size of a tool result as the model receives it, in characters.
-
-    Measured the way pydantic-ai turns a tool return into the text of the
-    tool message (``ToolReturnPart.model_response_str``: its
-    ``tool_return_ta`` dumped as JSON, which is compact and leaves non-ASCII
-    characters as they are). Should that ever come out shorter than plain
-    ``json.dumps`` without ASCII escapes, the larger of the two counts: the
-    cap must not be passed because of how it was measured.
-    """
-    plain = len(json.dumps(result, ensure_ascii=False, default=str,
-                           separators=(",", ":")))
-    try:
-        # Imported here, not at the top: the admin routes and the built-in
-        # registry import this module, and a renamed name in pydantic-ai must
-        # cost this one measure, not the start of the app.
-        from pydantic_ai.messages import tool_return_ta
-    except ImportError:
-        return plain
-    return max(len(tool_return_ta.dump_json(result).decode()), plain)
 
 
 async def _parse(read: Callable[..., dict[str, Any]], *args: Any) -> dict[str, Any]:

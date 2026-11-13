@@ -94,7 +94,7 @@ from agents.errors import describe_exception, mask_text
 from agents.oauth2 import OAuthAuthorizationRequired
 from agents.progress import ProgressUpdate, current_progress
 from agents.registry import _short_tool_output, registry
-from agents.run_activity import _clip, _detail
+from agents.run_activity import _clip, _detail_for
 from agents.shared import available_models, default_model_name, get_model, run_usage_limits
 from agents.webchat import store, user_agents
 from agents.webchat.docgen import (
@@ -303,9 +303,9 @@ async def sse(turn: Turn, queue: asyncio.Queue) -> AsyncIterator[bytes]:
 # ---------------------------------------------------------------------------
 # What the run did: parts and events
 # ---------------------------------------------------------------------------
-def _preview_args(args: Any) -> str:
+def _preview_args(name: Any, args: Any) -> str:
     try:
-        return mask_text(_detail(args))
+        return mask_text(_detail_for(name, args))
     except Exception:  # noqa: BLE001 - a preview never breaks a run
         return ""
 
@@ -386,7 +386,7 @@ class TurnRecorder:
     def tool_start(self, card_id: str, agent: str, name: str, args: Any,
                    agent_id: str | None = None) -> None:
         part = {"type": "tool", "id": card_id, "agent": agent, "agent_id": agent_id,
-                "name": name, "status": "running", "args": _preview_args(args),
+                "name": name, "status": "running", "args": _preview_args(name, args),
                 "output": "", "duration_ms": None}
         self.parts.append(part)
         self._tools[card_id] = part

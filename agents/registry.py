@@ -42,6 +42,9 @@ from agents.bitbucket_tools import activity_summary as bitbucket_activity_summar
 from agents.git_config import BUILTIN_GIT_URL
 from agents.git_tools import activity_summary as git_activity_summary
 from agents.builtins import build_builtin_toolset, is_builtin_url
+from agents.hana import BUILTIN_HANA_URL
+from agents.hana.connection import soft_reset_login_state as soft_reset_hana_logins
+from agents.hana.tools import activity_summary as hana_activity_summary
 from agents.ina import BUILTIN_INA_URL
 from agents.ina.tools import NoUsableQueryError, attached_queries
 from agents.ina.tools import activity_summary as ina_activity_summary
@@ -205,6 +208,33 @@ def _approves(specs: list) -> bool:
     )
 
 
+def _has_hana(specs: list) -> bool:
+    """Whether an agent's row holds a ``builtin:hana`` entry (any spelling)."""
+    return any(isinstance(s, dict) and _server_key_of(s) == BUILTIN_HANA_URL for s in specs)
+
+
+def _hana_count(specs: list) -> int:
+    return sum(isinstance(s, dict) and _server_key_of(s) == BUILTIN_HANA_URL for s in specs)
+
+
+def _hana_reach_broken(row: Any, specs: list) -> bool:
+    """A row with a ``builtin:hana`` entry exposed to the invoke API or to
+    chat at a tier other than advanced (refused at every save; a row written
+    by hand or stored before the rule covered every entry)."""
+    return _has_hana(specs) and (
+        bool(getattr(row, "expose_invoke", 0))
+        or (bool(row.expose_chat) and (getattr(row, "tier", None) or "basic") != "advanced")
+    )
+
+
+def hana_withheld(row: Any) -> bool:
+    """Whether the build gives this row no HANA tools: two ``builtin:hana``
+    entries, or the reach rules broken. One reading for the build and the web
+    chat's context view."""
+    specs = row.mcp_servers
+    return _hana_count(specs) > 1 or _hana_reach_broken(row, specs)
+
+
 def _short_tool_output(result) -> str:
     """A compact, single-blob preview of a specialist tool's return value.
 
@@ -235,6 +265,13 @@ def _short_tool_output(result) -> str:
             return fixed
         # The InA tools return SAP figures and member keys: counts only.
         fixed = ina_activity_summary(
+            getattr(result, "tool_name", None), getattr(result, "content", None)
+        )
+        if fixed is not None:
+            return fixed
+        # The HANA tools return database rows (and run_select whatever the
+        # model selected): counts, fixed words, a check name and codes only.
+        fixed = hana_activity_summary(
             getattr(result, "tool_name", None), getattr(result, "content", None)
         )
         if fixed is not None:
@@ -1033,6 +1070,33 @@ async def build_orchestrator() -> BuildResult:
                 "the agent is built without the InA tools",
                 row.name,
             )
+        # And for builtin:hana: the second entry could carry wider access
+        # (allow_select, another system) than the one somebody reviewed.
+        no_hana = _hana_count(specs) > 1
+        if no_hana:
+            logger.warning(
+                "Agent '%s': its row holds more than one builtin:hana entry; "
+                "the agent is built without the HANA tools",
+                row.name,
+            )
+        # An agent with a builtin:hana entry (with or without allow_select:
+        # the fixed checks read object source, database users, grants and
+        # audit policies as a technical user with wide privileges) is never
+        # reached through the invoke API and is chat-exposed only at tier
+        # advanced (decided 2026-11-10, widened to every entry at the final
+        # review of Phases 2 and 3). The save gate and storage refuse the
+        # rest; a row written by hand, or stored before the rule covered
+        # every entry, passes neither, so it is built here without the HANA
+        # tools: the agent and its other servers stay. One WARNING per row:
+        # a row already without them for two entries is not warned again.
+        elif _hana_reach_broken(row, specs):
+            no_hana = True
+            # The agent and the rule only: no system, destination or value.
+            logger.warning(
+                "Agent '%s' has a builtin:hana entry and is exposed to the invoke "
+                "API or to basic chat; the agent is built without the HANA tools",
+                row.name,
+            )
         # And for builtin:ariba: two entries would share the tools' names, so
         # which destination (realm) a call went through could not be told.
         no_ariba = sum(_server_key_of(s) == BUILTIN_ARIBA_URL for s in specs) > 1
@@ -1054,6 +1118,8 @@ async def build_orchestrator() -> BuildResult:
             if no_git and _server_key_of(spec) == BUILTIN_GIT_URL:
                 continue
             if no_ina and _server_key_of(spec) == BUILTIN_INA_URL:
+                continue
+            if no_hana and _server_key_of(spec) == BUILTIN_HANA_URL:
                 continue
             if no_ariba and _server_key_of(spec) == BUILTIN_ARIBA_URL:
                 continue
@@ -1153,6 +1219,14 @@ async def build_orchestrator() -> BuildResult:
                 logger.warning(
                     "Agent '%s' shares its tools and its builtin:bitbucket entry "
                     "approves; an approving agent shares nothing with personal agents",
+                    row.name,
+                )
+            elif _has_hana(specs):
+                # Rule R1: a builtin:hana entry's database connections are a
+                # technical user's; refused at the gate and by storage.
+                logger.warning(
+                    "Agent '%s' shares its tools and has a builtin:hana entry; an "
+                    "agent with a builtin:hana entry shares nothing with personal agents",
                     row.name,
                 )
             else:
@@ -1269,6 +1343,15 @@ async def build_orchestrator() -> BuildResult:
                 logger.warning(
                     "Agent '%s' lists the peer '%s', whose builtin:bitbucket entry "
                     "approves; no delegation tool is attached",
+                    row.name, peer_row.name,
+                )
+                continue
+            # Nor to an agent with a builtin:hana entry: a basic chat user
+            # could steer it through the delegating agent (R2c).
+            if _has_hana(peer_row.mcp_servers):
+                logger.warning(
+                    "Agent '%s' lists the peer '%s', which has a builtin:hana "
+                    "entry; no delegation tool is attached",
                     row.name, peer_row.name,
                 )
                 continue
@@ -1597,6 +1680,7 @@ class Registry:
             old = self._build
             new = await build_orchestrator()
             self._build = new
+            soft_reset_hana_logins()  # builtin:hana: keeps failed credentials
             logger.info(
                 "Registry reloaded: %d enabled / %d total specialists",
                 len(new.specialists),

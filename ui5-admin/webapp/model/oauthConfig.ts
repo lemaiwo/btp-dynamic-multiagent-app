@@ -6,6 +6,7 @@ import odataEntry from "./odataEntry";
 import bitbucketEntry from "./bitbucketEntry";
 import gitEntry from "./gitEntry";
 import inaEntry from "./inaEntry";
+import hanaEntry from "./hanaEntry";
 import reconcileEntry from "./reconcileEntry";
 
 /**
@@ -288,6 +289,12 @@ export default {
             // --- ina --- As for OData, first and whatever the mode: exactly
             // the queries; no destination, no user_context.
             return inaEntry.clean(raw) as McpServer["oauth"];
+        }
+        if (key === hanaEntry.HANA_URL) {
+            // --- hana --- As for InA, first and whatever the mode: exactly
+            // the systems and `allow_select` only as true; no top-level
+            // destination, no user_context.
+            return hanaEntry.clean(raw) as McpServer["oauth"];
         }
         if (key === SHAREPOINT_URL) {
             // --- sharepoint --- Before the generic branches: an app-only

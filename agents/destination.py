@@ -881,6 +881,8 @@ class ConnectivityConfig:
     token_url: str
     proxy_host: str
     proxy_port: int
+    # SOCKS5 proxy port (builtin:hana); optional, OData needs only the HTTP one.
+    socks5_port: int | None = None
 
 
 def _proxy_port(value: Any) -> int | None:
@@ -927,6 +929,7 @@ def _connectivity_from_vcap(raw: str | None) -> ConnectivityConfig | None:
                 token_url=_token_url_from_uaa(uaa),
                 proxy_host=host,
                 proxy_port=port,
+                socks5_port=_proxy_port(creds.get("onpremise_socks5_proxy_port")),
             )
     return None
 
@@ -961,6 +964,7 @@ def connectivity_config_from_environment(
             token_url=token_url,
             proxy_host=host,
             proxy_port=port,
+            socks5_port=_proxy_port(environ.get("CONNECTIVITY_SOCKS5_PORT")),
         )
     return None
 

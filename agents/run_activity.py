@@ -19,6 +19,7 @@ written to the run row once, when the run ends, so it stays readable after.
 from __future__ import annotations
 
 import json
+import re
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
@@ -56,6 +57,69 @@ def _detail(args: Any) -> str:
             parts.append(f"{key}={shown}")
         return _clip(", ".join(parts), _DETAIL_CHARS)
     return _clip(str(args), _DETAIL_CHARS)
+
+
+# ``builtin:hana``'s run_select, plain or prefixed (`hana_`, `hana_0_`): its
+# ``sql`` is model-written text that can quote values out of the database it
+# reads, so the preview keeps its length only.
+_SQL_LENGTH_ONLY = re.compile(r"(?:hana_(?:\d+_)?)?run_select")
+
+
+def _size(value: Any) -> int:
+    """The length of a value as text: a string's own, anything else's JSON."""
+    if isinstance(value, str):
+        return len(value)
+    return len(json.dumps(value, default=str))
+
+
+def redact_args(tool_name: Any, args: Any) -> Any:
+    """The arguments of one tool call as every preview may show them: the
+    run activity (:func:`_detail_for`), the web chat's tool card and the
+    classic chat's tool card (``agents/chat_app.py``).
+
+    For a HANA ``run_select`` (plain or prefixed) a new object holds only
+    ``system``, ``sql`` as ``"<n chars>"`` and ``top``, those present, in
+    that order; any other key is dropped (the caller's object is not
+    changed). It fails
+    closed: arguments handed over as JSON text are read as such, and any
+    shape other than an object with a string ``sql`` is shown as the length
+    of the whole, ``"<n chars>"``. Every other tool's arguments are returned
+    as they are (the same object).
+
+    Known limit: the web chat also stores pydantic-ai's ``new_messages()`` of
+    each turn (``chat_messages.model_json``, the conversation history the next
+    turn is given, kept for ``CHAT_RETENTION_DAYS``), which holds the real
+    tool-call arguments, SQL included. In a conversation that runs an admin
+    agent straight (``agent_ref`` ``admin:<name>``) it also holds every tool
+    RETURN of that agent: for ``builtin:hana`` session user names, client
+    hosts, statement texts and the rows of ``run_select``. That history is not
+    redacted here; it is the model's own context, not a preview."""
+    if not (isinstance(tool_name, str) and _SQL_LENGTH_ONLY.fullmatch(tool_name)):
+        return args
+    if args is None:
+        return None
+    shown = args
+    if isinstance(shown, str):
+        try:
+            shown = json.loads(shown)
+        except ValueError:
+            return f"<{len(args)} chars>"
+    if isinstance(shown, dict) and isinstance(shown.get("sql"), str):
+        kept: dict[str, Any] = {}
+        if "system" in shown:
+            kept["system"] = shown["system"]
+        kept["sql"] = f"<{len(shown['sql'])} chars>"
+        if "top" in shown:
+            kept["top"] = shown["top"]
+        return kept
+    return f"<{_size(args)} chars>"
+
+
+def _detail_for(tool_name: Any, args: Any) -> str:
+    """:func:`_detail` of the arguments :func:`redact_args` lets a preview
+    show: the same line, except that a HANA ``run_select`` call shows
+    ``sql=<n chars>`` (or only the length of the whole) instead of its SQL."""
+    return _detail(redact_args(tool_name, args))
 
 
 def _now() -> str:
@@ -96,7 +160,8 @@ class RunActivity:
             event = {
                 "ts": _now(), "agent": update.agent, "kind": "tool",
                 "id": update.tool_call_id, "tool": update.tool_name or "?",
-                "detail": _detail(update.args), "status": "running", "output": "",
+                "detail": _detail_for(update.tool_name, update.args),
+                "status": "running", "output": "",
             }
             if update.tool_call_id:
                 self._open[update.tool_call_id] = event

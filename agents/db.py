@@ -59,6 +59,8 @@ from sqlalchemy.types import TypeDecorator
 
 from agents import hana_hdi, pg_schema
 from agents.db_errors import DatabaseConfigError
+from agents.hana import BUILTIN_HANA_URL
+from agents.hana.config import HANA_SINGLE_ENTRY_MESSAGE  # public here, as GIT_SINGLE_...
 from agents.ina import BUILTIN_INA_URL
 from agents.ina.models import MAX_ENTRY_QUERIES as _INA_MAX_ENTRY_QUERIES
 from agents.ina.models import InaQueryPayload, check_query_names, validate_ina_query
@@ -2839,6 +2841,30 @@ def _clean_git_entry(oauth: Any, mode: str) -> dict[str, Any]:
     return clean_entry(oauth)
 
 
+# builtin:hana: the systems (slug and destination each) and `allow_select`.
+# Nothing else is stored for it.
+_HANA_URL = BUILTIN_HANA_URL
+
+
+def _clean_hana_entry(oauth: Any, mode: str) -> dict[str, Any]:
+    """Normalize the block of a ``builtin:hana`` entry for storage.
+
+    The last gate before the row, whoever the caller is (the seed,
+    ``scripts/import_bundle.py``, a direct ``upsert_agent``): the block is
+    read by ``agents.hana.config`` (the reading the admin gate and the
+    toolset use), a value is stored only in the form that was checked, an
+    unknown key and ``user_context: true`` are a ValueError, and
+    ``allow_select`` is stored only for the JSON boolean ``true``. No
+    fallback to the row being replaced: the block holds no secret (each
+    system's destination holds the credential).
+    """
+    from agents.hana.config import clean_entry
+
+    if mode != AUTH_MODE_DESTINATION:
+        raise ValueError(f"{_HANA_URL} requires auth_mode=destination")
+    return clean_entry(oauth)
+
+
 def _clean_oauth(
     oauth: Any, mode: str, fallback: dict[str, Any] | None, url: str | None = None
 ) -> dict[str, Any] | None:
@@ -2861,6 +2887,10 @@ def _clean_oauth(
         # Its own cleaner, as builtin:bitbucket: a list and the switches are
         # stored only as checked.
         return _clean_git_entry(oauth, mode)
+    if builtin == _HANA_URL:
+        # Its own cleaner, as builtin:git: the systems list and the switch are
+        # stored only as checked, and there is no top-level destination.
+        return _clean_hana_entry(oauth, mode)
     cleaned = _clean_oauth_block(oauth, mode, fallback, url=url)
     if cleaned is not None and builtin in _MAIL_THEME_URLS and isinstance(oauth, dict):
         from agents.mail_render import MailTheme
@@ -3064,6 +3094,7 @@ def prepare_servers(
     ina_seen = False
     bitbucket_seen = False
     git_seen = False
+    hana_seen = False
     ariba_seen = False
     reconcile_seen = False
     for s in mcp_servers:
@@ -3119,6 +3150,13 @@ def prepare_servers(
             if git_seen:
                 raise ValueError(GIT_SINGLE_ENTRY_MESSAGE)
             git_seen = True
+        elif url.rstrip("/").lower() == _HANA_URL:
+            # Stored under exactly this spelling and counted after it is
+            # settled, as builtin:git is.
+            url = _HANA_URL
+            if hana_seen:
+                raise ValueError(HANA_SINGLE_ENTRY_MESSAGE)
+            hana_seen = True
         elif url.rstrip("/").lower() == _ARIBA_URL:
             # Stored under exactly this spelling and counted after it is
             # settled, as builtin:git is. On 'destination' only: the factory
@@ -3321,17 +3359,35 @@ async def upsert_agent(
     )
     # Here for the same reason as the OData check above: the last gate for an
     # approving agent, on the entries and the peer list the row will hold.
+    peers_after = (
+        (list(existing.peers) if existing is not None else [])
+        if isinstance(peers, _Keep) else cleaned_peers
+    )
     await check_bitbucket_approver_reach(
         session,
         name=name,
-        servers=prepared_server_list(primary, extras, primary_oauth_json),
+        servers=prepared,
         expose_chat=bool(expose_chat),
         expose_invoke=invoke_on,
         share_tools=share_on,
-        peers=(
-            (list(existing.peers) if existing is not None else [])
-            if isinstance(peers, _Keep) else cleaned_peers
+        peers=peers_after,
+        ignore_names=ignore_peer_lists_of,
+    )
+    # And for a builtin:hana entry (no sharing; not from the invoke API,
+    # basic chat or a peer), on the tier the row will hold: a kept tier
+    # is the stored one, a new row's is basic.
+    await check_hana_reach(
+        session,
+        name=name,
+        servers=prepared,
+        expose_chat=bool(expose_chat),
+        tier=(
+            ((existing.tier or "basic") if existing is not None else "basic")
+            if isinstance(tier, _Keep) else tier
         ),
+        expose_invoke=invoke_on,
+        share_tools=share_on,
+        peers=peers_after,
         ignore_names=ignore_peer_lists_of,
     )
 
@@ -5626,6 +5682,109 @@ async def check_bitbucket_approver_reach(
         raise ValueError(
             f"peers: {_agent_names(approvers)}: {_BITBUCKET_APPROVER_PEER_RULE}"
         )
+
+
+def _hana_entries(servers: Any) -> list[dict[str, Any]]:
+    """The ``builtin:hana`` entries of a server list, in any spelling of the
+    URL (trimmed, no trailing slash, any case)."""
+    return [
+        s for s in (servers if isinstance(servers, list) else [])
+        if isinstance(s, dict)
+        and str(s.get("url") or "").strip().rstrip("/").lower() == BUILTIN_HANA_URL
+    ]
+
+
+def has_hana_entry(servers: Any) -> bool:
+    """Whether a server list holds a ``builtin:hana`` entry (rule R1)."""
+    return bool(_hana_entries(servers))
+
+
+# A builtin:hana entry connects as each destination's technical user, whose
+# privileges on the first landscape are wide (decided 2026-11-10). Its fixed
+# checks read object source code of any schema, the database users with
+# their lock and login state, grants, audit policies and the password policy
+# (Phases 2 and 3), so EVERY agent with such an entry, with or without
+# allow_select, runs from chat only for advanced users, from the scheduler
+# run endpoint or an admin's Run now, never from the invoke API and never as
+# another agent's peer (a basic chat user could steer it through that agent;
+# decided at the final review of Phases 2 and 3). Fixed texts naming the
+# field and the rule; public for the admin gate and the tests.
+HANA_SHARE_MESSAGE = (
+    "share_tools: an agent with a builtin:hana entry cannot share its tools; "
+    "its database connections are a technical user's, and a personal agent "
+    "would use them with a chat user's prompt"
+)
+HANA_INVOKE_MESSAGE = (
+    "expose_invoke: must be false for an agent with a builtin:hana entry; "
+    "such an agent runs only from advanced chat, the scheduler run endpoint "
+    "or an admin's Run now, never from the invoke API"
+)
+HANA_CHAT_MESSAGE = (
+    "tier: must be advanced for a chat-exposed agent with a builtin:hana "
+    "entry; set tier to advanced, or expose_chat to false"
+)
+_HANA_PEER_RULE = (
+    "an agent with a builtin:hana entry may not be a peer: no agent may "
+    "delegate to an agent with a builtin:hana entry"
+)
+
+
+async def check_hana_reach(
+    session: AsyncSession,
+    *,
+    name: str,
+    servers: list[dict[str, Any]],
+    expose_chat: Any,
+    tier: Any,
+    peers: list[str],
+    stored_name: str | None = None,
+    ignore_names: set[str] | None = None,
+    expose_invoke: Any = False,
+    share_tools: Any = False,
+) -> None:
+    """Refuse an agent write that would make a ``builtin:hana`` agent
+    reachable beyond what the customer allowed (rules R1, R2a-c).
+
+    ``ValueError`` with a fixed text when, as the row is about to be stored,
+    it has a hana entry (`has_hana_entry`, with or without ``allow_select``)
+    and: shares its tools (R1); is exposed to the invoke API (R2a), or to
+    chat at a tier other than ``advanced`` (R2b); or another agent lists it
+    as a peer (R2c, any other row, enabled or not); or when one of its own
+    ``peers`` has a hana entry (R2c). Called next to
+    `check_bitbucket_approver_reach` by every write of an agent, with the
+    same arguments plus the ``tier`` the row will hold; ``stored_name`` and
+    ``ignore_names`` mean what they mean there. The registry build closes
+    the same doors again for rows no gate has seen
+    (`agents.registry.build_orchestrator`).
+    """
+    ignore = ignore_names or set()
+    own = {name, stored_name or name}
+    if has_hana_entry(servers):
+        if share_tools:
+            raise ValueError(HANA_SHARE_MESSAGE)
+        if expose_invoke:
+            raise ValueError(HANA_INVOKE_MESSAGE)
+        if expose_chat and tier != "advanced":
+            raise ValueError(HANA_CHAT_MESSAGE)
+        listers = [
+            r.name for r in await list_agents(session)
+            if r.name not in own and r.name not in ignore and own & set(r.peers)
+        ]
+        if listers:
+            raise ValueError(
+                f"mcp_servers: this agent is a peer of agent(s) "
+                f"{_agent_names(listers)}; {_HANA_PEER_RULE}. Remove it "
+                "from their peers first."
+            )
+    holding = []
+    for peer in peers:
+        if peer in own:
+            continue
+        row = await get_agent_by_name(session, peer)
+        if row is not None and has_hana_entry(row.mcp_servers):
+            holding.append(row.name)
+    if holding:
+        raise ValueError(f"peers: {_agent_names(holding)}: {_HANA_PEER_RULE}")
 
 
 ODATA_SINGLE_ENTRY_MESSAGE = (

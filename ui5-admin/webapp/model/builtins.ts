@@ -127,6 +127,14 @@ export const BUILTINS: BuiltinToolset[] = [
         url: "builtin:git", titleKey: "builtinGit", descriptionKey: "builtinGitDesc",
         defaultAuthMode: "destination", authModes: ["destination"]
     },
+    // --- hana --- hana_toolset reads monitoring and catalogue views of
+    // on-premise SAP HANA databases, each through its own destination as
+    // that destination's technical database user, and has no other way to
+    // authenticate -- see agents/hana/config.py and model/hanaEntry.ts.
+    {
+        url: "builtin:hana", titleKey: "builtinHana", descriptionKey: "builtinHanaDesc",
+        defaultAuthMode: "destination", authModes: ["destination"]
+    },
     // --- reconcile --- reconcile_toolset holds no credential: it reads the
     // source table through the agent's own ARC-1 server entry, named by URL
     // in `arc1_server`, so the server accepts it on `none` only. Its block

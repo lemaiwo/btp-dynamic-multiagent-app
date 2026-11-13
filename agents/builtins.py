@@ -35,6 +35,7 @@ builtin:bitbucket  --        --        app           --       --
 builtin:confluence --        --        app           --       --
 builtin:ariba      --        --        app           --       --
 builtin:git        --        --        app           --       --
+builtin:hana        --        --        app (tcp)     --       --
 builtin:reconcile  --        --        --            default  --
 ================== ========= ========= ============= ======== ========
 
@@ -92,6 +93,15 @@ switches ``allow_push`` and ``allow_pull_request``. Its factory is the one
 besides ``builtin:odata`` that gets something from ``context``: the agent's
 name, which goes into the trailer of every commit; see :mod:`agents.git_tools`.
 
+``builtin:hana`` reads monitoring views of on-premise SAP HANA databases
+over SQL (``hdbcli`` through the Cloud Connector, ``tcp``) as the technical
+user of one destination per system, and has no per-user mode:
+``user_context`` is refused. Its config block lists the systems (``systems``:
+a slug and a destination each) and holds the one switch ``allow_select``,
+which adds ``run_select``. The driver is imported only when a call connects,
+so building the toolset needs neither ``hdbcli`` nor a binding; see
+:mod:`agents.hana.tools`.
+
 ``builtin:reconcile`` compares a migrated CSV with its source table, row by
 row, and holds no credential (``none`` only). It reads the uploads of the
 current web chat conversation only, and it reaches ECC through a sibling
@@ -117,6 +127,8 @@ from agents.confluence_tools import BUILTIN_CONFLUENCE_URL, confluence_toolset
 from agents.git_config import BUILTIN_GIT_URL
 from agents.git_tools import git_toolset
 from agents.gmail_tools import BUILTIN_GMAIL_URL, gmail_toolset
+from agents.hana import BUILTIN_HANA_URL
+from agents.hana.tools import hana_toolset
 from agents.ina import BUILTIN_INA_URL
 from agents.ina.tools import ina_toolset
 from agents.jira_tools import BUILTIN_JIRA_URL, jira_toolset
@@ -150,6 +162,7 @@ _FACTORIES: dict[str, Callable[..., Any]] = {
     BUILTIN_CONFLUENCE_URL: confluence_toolset,
     BUILTIN_ARIBA_URL: ariba_toolset,
     BUILTIN_GIT_URL: git_toolset,
+    BUILTIN_HANA_URL: hana_toolset,
     BUILTIN_RECONCILE_URL: reconcile_toolset,
 }
 
@@ -218,6 +231,10 @@ def build_builtin_toolset(
     if key == BUILTIN_GIT_URL:
         return factory(oauth or {}, server_key=key, auth_mode=auth_mode,
                        agent_name=(context or {}).get("agent_name") or "")
+    if key == BUILTIN_HANA_URL:
+        # The block as stored, ``None`` included: the entry's own reading
+        # (`agents.hana.config`) refuses a missing block with its own text.
+        return factory(oauth, server_key=key, auth_mode=auth_mode)
     if key == BUILTIN_RECONCILE_URL:
         context = context or {}
         return factory(oauth or {}, server_key=key, auth_mode=auth_mode,

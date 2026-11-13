@@ -13,10 +13,11 @@ demands it as well, the backend has a public CF route of its own):
 
 * ``POST /api/invoke/{slug}``, multipart: ``input`` (text, required) and
   ``files`` (0..n). The agent must exist, be enabled and have
-  ``expose_invoke``; an agent whose ``builtin:bitbucket`` entry approves is
-  never run here. Every one of those cases is the same 404, which names
-  nothing. Answers ``202 {"run_id"}``; ``?wait=<0..30>`` waits that many
-  seconds and answers 200 with the poll answer when the run finished.
+  ``expose_invoke``; an agent whose ``builtin:bitbucket`` entry approves, or
+  whose ``builtin:hana`` entry has ``allow_select``, is never run here.
+  Every one of those cases is the same 404, which names nothing. Answers
+  ``202 {"run_id"}``; ``?wait=<0..30>`` waits that many seconds and answers
+  200 with the poll answer when the run finished.
 * ``GET /api/invoke/runs/{run_id}``: the poll answer, only to the principal
   that started the run (404 for anybody else and for a run of another kind):
   ``{status, result, writes, text, activity, error}``.
@@ -98,6 +99,7 @@ from agents.db import (
     create_job_run,
     get_agent_by_slug,
     get_job_run,
+    has_hana_entry,
 )
 from agents.errors import describe_exception
 from agents.invoke_config import (
@@ -615,7 +617,11 @@ async def invoke_agent(
     async with SessionLocal() as session:
         agent = await get_agent_by_slug(session, slug)
     if (agent is None or not agent.enabled or not agent.expose_invoke
-            or bitbucket_approves(agent.mcp_servers)):
+            or bitbucket_approves(agent.mcp_servers)
+            # A builtin:hana entry (with or without allow_select) reads the
+            # database as a technical user: never from here, refused at
+            # every save as well.
+            or has_hana_entry(agent.mcp_servers)):
         raise HTTPException(status_code=404, detail=NOT_FOUND)
 
     # The slot is taken BEFORE the body is read: a refused caller (a repeat

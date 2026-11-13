@@ -13,6 +13,10 @@ import bitbucketEntry from "../model/bitbucketEntry";
 import gitEntry from "../model/gitEntry";
 import inaEntry from "../model/inaEntry";
 import InaEntryPart from "./agent/InaEntryPart";
+import hanaEntry from "../model/hanaEntry";
+import HanaEntryPart from "./agent/HanaEntryPart";
+import type Table from "sap/m/Table";
+import type { HanaServerRefusal } from "./agent/HanaEntryPart";
 import type { ODataEntryGiven, ODataEntryOpens, ODataEntryRow } from "../model/odataEntry";
 import { AUTH_MODE_TEXT_KEYS, BUILTINS, authModesFor, findBuiltin } from "../model/builtins";
 import formatter from "../model/formatter";
@@ -98,6 +102,10 @@ export default class AgentDetail extends BaseController {
     private saving = false;
     // --- ina --- The dialog's "Analytical queries (InA)" entry.
     private ina!: InaEntryPart;
+    // --- hana --- The dialog's "SAP HANA (monitoring)" entry, and what the
+    // server refused in it at the last save (marked when its row opens).
+    private hana!: HanaEntryPart;
+    private hanaRefusal: HanaServerRefusal | null = null;
 
     public onInit(): void {
         this.setModel(new JSONModel({
@@ -127,6 +135,14 @@ export default class AgentDetail extends BaseController {
             box: () => this.byId("inaEntryQueries") as unknown as { setSelectedKeys(keys: string[]): void } | undefined,
             editingIndex: () => this.editingServerIndex
         });
+        this.hana = new HanaEntryPart({
+            serverModel: () => this.getModel("server") as JSONModel,
+            agentModel: () => this.getModel("agent") as JSONModel,
+            view: () => this.getView()!,
+            service: () => this.getAdminService(),
+            text: (key, args) => this.text(key, args),
+            editingIndex: () => this.editingServerIndex
+        });
 
         this.getRouter().getRoute("agentDetail")?.attachPatternMatched((event: Route$PatternMatchedEvent) => {
             const id = (event.getParameter("arguments") as { agentId: string }).agentId;
@@ -147,6 +163,7 @@ export default class AgentDetail extends BaseController {
             this.storedServers = [];
             this.storedName = undefined;
             this.saving = false;
+            this.hanaRefusal = null;
 
             // Issued together, not one after another: none of the three reads
             // the others' result, so awaiting them in sequence made opening an
@@ -348,20 +365,27 @@ export default class AgentDetail extends BaseController {
         if (opening !== this.odataOpening) {
             return;
         }
+        // --- hana --- Its own state, its canonical spelling.
+        const isHana = hanaEntry.isHanaUrl(server.url);
+        // A refusal belongs to the hana entry at the row it named; another
+        // server at that index never gets it.
+        const hana = this.hana.begin(server, isHana && this.hanaRefusal
+            && this.hanaRefusal.server === this.editingServerIndex ? this.hanaRefusal : null);
         (this.getModel("server") as JSONModel).setData({
             // The fragment shows the services box and "Allow writes" for
             // exactly `builtin:odata`: an entry stored in another spelling
             // (`Builtin:OData`) is held in that one, or OK would write back
             // an `allow_write` the admin never saw.
             url: isOData ? odataEntry.ODATA_URL : isIna ? inaEntry.INA_URL : isBitbucket ? bitbucketEntry.BITBUCKET_URL
-                : isGit ? gitEntry.GIT_URL : server.url,
+                : isGit ? gitEntry.GIT_URL : isHana ? hanaEntry.HANA_URL : server.url,
             auth_mode: server.auth_mode,
             odata: {
                 services: stored.services, allowWrite: stored.allow_write, loaded: isOData, loadError,
                 options: [], rows: [], noData: "", duplicate: "", missing: "", disabled: "", warning: "", writeText: ""
             },
             ina,
-            oauth: isOData || isIna || !server.oauth ? blankOAuth
+            hana,
+            oauth: isOData || isIna || isHana || !server.oauth ? blankOAuth
                 : isBitbucket ? { ...blankOAuth, destination: typeof pins.destination === "string" ? pins.destination : "" }
                     : isGit ? { ...blankOAuth, destination: typeof git.destination === "string" ? git.destination : "" }
                         : server.oauth,
@@ -410,6 +434,7 @@ export default class AgentDetail extends BaseController {
         this.showODataEntry();
         this.ina.showOptions();
         this.ina.show();
+        this.hana.show();
 
         if (!this.serverDialog) {
             this.serverDialog = await Fragment.load({
@@ -434,6 +459,8 @@ export default class AgentDetail extends BaseController {
                 void this.enterODataEntry();
             } else if (inaEntry.isInaUrl(builtin.url)) {
                 void this.ina.enter();
+            } else if (hanaEntry.isHanaUrl(builtin.url)) {
+                this.hana.enter();
             }
         } else if (findBuiltin(serverModel.getProperty("/url") as string)) {
             // Back to a remote server: the built-in's pseudo-url is no
@@ -461,7 +488,31 @@ export default class AgentDetail extends BaseController {
         } else if (inaEntry.isInaUrl(url)) {
             serverModel.setProperty("/url", inaEntry.INA_URL);
             void this.ina.enter();
+        } else if (hanaEntry.isHanaUrl(url)) {
+            serverModel.setProperty("/url", hanaEntry.HANA_URL);
+            this.hana.enter();
         }
+    }
+
+    /** --- hana --- The systems table and the SELECT switch. */
+    public onHanaAddSystem(): void {
+        this.hana.onAdd();
+    }
+
+    public onHanaRemoveSystem(event: Event): void {
+        this.hana.onRemove(event);
+    }
+
+    public onHanaSystemEdited(event: Event): void {
+        this.hana.onEdited(event);
+    }
+
+    public onHanaRowsUpdated(event: Event): void {
+        this.hana.onRowsUpdated(event);
+    }
+
+    public onHanaAllowSelectChange(event: Event): void {
+        this.hana.onAllowSelectChange(event);
     }
 
     /** --- ina --- A tick, a selection or a removed token in the query box. */
@@ -811,6 +862,7 @@ export default class AgentDetail extends BaseController {
     }
 
     public onCancelServer(): void {
+        this.hana.clear();
         this.serverDialog?.close();
     }
 
@@ -835,6 +887,9 @@ export default class AgentDetail extends BaseController {
         delete oauthRaw.branch_prefix;
         delete oauthRaw.allow_push;
         delete oauthRaw.allow_pull_request;
+        // --- hana --- Likewise its own keys.
+        delete oauthRaw.systems;
+        delete oauthRaw.allow_select;
         if (gitEntry.isGitUrl(url)) {
             // Only the entry's own values reach cleanOAuth: the destination
             // name and what the Git fields hold now, as typed.
@@ -882,6 +937,17 @@ export default class AgentDetail extends BaseController {
             }
             Object.keys(oauthRaw).forEach((key) => { delete oauthRaw[key]; });
             oauthRaw.queries = this.ina.block().queries;
+        }
+        if (hanaEntry.isHanaUrl(url)) {
+            // --- hana --- Only the entry's own values reach cleanOAuth: the
+            // systems as typed and the switch as a real boolean.
+            if (!this.hana.confirm(this.byId("hanaSystemsTable") as Table | undefined, () => this.onConfirmServer())) {
+                return;
+            }
+            const block = this.hana.block();
+            Object.keys(oauthRaw).forEach((key) => { delete oauthRaw[key]; });
+            oauthRaw.systems = block.systems;
+            oauthRaw.allow_select = block.allow_select === true;
         }
         if (oauthConfig.supportsMailTheme(url)) {
             const parsedTheme = oauthConfig.parseMailTheme(serverModel.getProperty("/themeJson") as string);
@@ -959,6 +1025,10 @@ export default class AgentDetail extends BaseController {
         }
         agentModel.setProperty("/data/mcp_servers", servers);
         agentModel.setProperty("/errors/servers", "");
+        if (this.hanaRefusal && this.hanaRefusal.server === this.editingServerIndex) {
+            this.hanaRefusal = null;
+        }
+        this.hana.clear();
         this.serverDialog?.close();
     }
 
@@ -970,6 +1040,8 @@ export default class AgentDetail extends BaseController {
         const model = this.getModel("agent") as JSONModel;
         const servers = (model.getProperty("/data/mcp_servers") as McpServer[]).slice();
         servers.splice(index, 1);
+        // --- hana --- Row indexes moved: a kept refusal points nowhere now.
+        this.hanaRefusal = null;
         model.setProperty("/data/mcp_servers", servers);
     }
 
@@ -1098,7 +1170,7 @@ export default class AgentDetail extends BaseController {
             // and the form still holds the form the server answered with;
             // --- ina --- likewise exactly { queries }.
             const sent = {
-                ...data, mcp_servers: inaEntry.explicit(odataEntry.explicit(data.mcp_servers))
+                ...data, mcp_servers: hanaEntry.explicit(inaEntry.explicit(odataEntry.explicit(data.mcp_servers)))
             } as AgentInput & ReloadOutcome;
             // What a save answers about the reload is no field of an agent;
             // it never goes back in a body, whatever the form was filled from.
@@ -1111,6 +1183,7 @@ export default class AgentDetail extends BaseController {
                 MessageToast.show(this.text("agentSaved"));
             }
             this.agentId = saved.id;
+            this.hanaRefusal = null;
             this.getRouter().navTo("agents");
         } catch (error) {
             if (error instanceof AdminError && Object.keys(error.fieldErrors).length > 0) {
@@ -1153,6 +1226,15 @@ export default class AgentDetail extends BaseController {
         if (serverMessages.length > 0) {
             errors.servers = serverMessages.join("; ");
         }
+        // --- hana --- A refusal that names a system of the entry marks that
+        // row and field when the entry's dialog is opened.
+        this.hanaRefusal = null;
+        Object.keys(fieldErrors).forEach((key) => {
+            const at = hanaEntry.refusedAt(key, fieldErrors[key]);
+            if (at && !this.hanaRefusal) {
+                this.hanaRefusal = { ...at, message: fieldErrors[key].replace(/^Value error, /, "") };
+            }
+        });
 
         // --- invoke API --- `result_schema` (the server names the rule, never
         // a value) lands on the schema field. `invoke_limits` is checked as a

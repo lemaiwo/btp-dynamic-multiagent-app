@@ -78,7 +78,7 @@ from agents.db import (
 )
 from agents.deep import DeepConfig, deep_toolset
 from agents.multipart_form import count_pdf_pages
-from agents.registry import _approves
+from agents.registry import _approves, hana_withheld
 from agents.webchat import run, store, uploads, user_agents
 from agents.webchat.docgen import TOOL_NAMES
 
@@ -390,9 +390,12 @@ async def describe(conv: ChatConversation, principal: str,
             enabled = {r.name: r for r in rows if r.enabled and not _approves(r.mcp_servers)}
             tools += [{"kind": "delegate", "name": delegation_tool_name(p), "agent": p}
                       for p in row.peers if p != row.name and p in enabled]
-            # Its own servers, labelled as a personal agent's tool sources are.
+            # Its own servers, labelled as a personal agent's tool sources are;
+            # not a builtin:hana entry the build withholds (`hana_withheld`).
+            withheld = {"builtin:hana"} if hana_withheld(row) else set()
             tools += [{"kind": "connector", "name": label, "agent": row.name}
-                      for label in user_agents.connector_labels(row)]
+                      for label in user_agents.connector_labels(row)
+                      if label not in withheld]
             # The registry attaches the data catalogue's tools when one of the
             # agent's OData services or InA queries exists and is enabled
             # (attached_services, attached_queries).
