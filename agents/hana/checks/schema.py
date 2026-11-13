@@ -56,7 +56,7 @@ _BOTH_BINDS = ("top_plus_one", "schema", "other_schema", "object", "object",
 # is a large join, bounded in rows by `top`, not in work, and one part over
 # the statement timeout fails the check: the optional `object` (one table)
 # narrows parts 2-4 to that table; part 1 always reads the table lists.
-# on-prem: not yet run
+# on-prem: verified 2026-11-13 on SPS07 rev 79
 COMPARE_SCHEMA = Check(
     name="compareSchema",
     category="schema",
@@ -161,7 +161,7 @@ COMPARE_SCHEMA = Check(
 # direction: a reference counts only to the table of that name in `schema`).
 # Only constraints owned by `schema` are listed (one from another schema into
 # this one is not). The PostgreSQL branch is dropped.
-# on-prem: not yet run
+# on-prem: verified 2026-11-13 on SPS07 rev 79
 ERD_DIAGRAM = Check(
     name="erdDiagram",
     category="schema",
@@ -215,7 +215,7 @@ ERD_DIAGRAM = Check(
 # names each workspace with its edge and vertex tables and key columns (the
 # columns SAP lists as not available in HANA Cloud). The workspace-name
 # filter is dropped; the schema filter is optional.
-# on-prem: not yet run
+# on-prem: verified 2026-11-13 on SPS07 rev 79
 GRAPH_WORKSPACES = Check(
     name="graphWorkspaces",
     category="schema",

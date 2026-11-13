@@ -24,7 +24,8 @@ store paths of ``[communication]``). The configuration is read from
 
 The target is on-premise SAP HANA 2.0 (SPS07). Columns are taken from the SAP
 HANA SQL and System Views Reference; a column documented for HANA Cloud only is
-left out. No statement of this module has run on a landscape yet.
+left out. Every statement of this module ran on a landscape on
+2026-11-13 (SPS07 revision 79), in the probe's wrapped form with sample binds.
 """
 
 from __future__ import annotations
@@ -51,7 +52,7 @@ _USER_COLUMNS = (
 # on-prem: hana-cli reads USER_NAME, USERGROUP_NAME, CREATOR, CREATE_TIME
 # with `USER_NAME LIKE ?`; here the validity, deactivation, connect and
 # password-flag columns are added and the filter is an exact name (`object`).
-# on-prem: not yet run
+# on-prem: verified 2026-11-13 on SPS07 rev 79
 USERS = Check(
     name="users",
     category="security",
@@ -76,7 +77,7 @@ USERS = Check(
 # The count is grouped once and joined (a correlated subquery would run once
 # per role before TOP applies); a role's schema may be NULL, so the join
 # compares it NULL-safe.
-# on-prem: not yet run
+# on-prem: verified 2026-11-13 on SPS07 rev 79
 ROLES = Check(
     name="roles",
     category="security",
@@ -103,7 +104,7 @@ ROLES = Check(
 # user header has the named columns of `users`, USER_PARAMETERS is left out
 # (its values are personal data: e-mail, client, locale) and roles and
 # privileges are names only, each part bounded by `top`.
-# on-prem: not yet run
+# on-prem: verified 2026-11-13 on SPS07 rev 79
 INSPECT_USER = Check(
     name="inspectUser",
     category="security",
@@ -145,7 +146,7 @@ INSPECT_USER = Check(
 # distinguished names, serial number, validity, days left and the key and
 # signature algorithms. SUBJECT_ALT_NAME (host names) and FINGERPRINT are left
 # out as well. Expiring first.
-# on-prem: not yet run
+# on-prem: verified 2026-11-13 on SPS07 rev 79
 CERTIFICATES = Check(
     name="certificates",
     category="security",
@@ -168,7 +169,7 @@ CERTIFICATES = Check(
 # effective policy is M_PASSWORD_POLICY (PROPERTY, VALUE: lengths, lifetimes,
 # the invalid connect limit; no password). The user counts are one row of
 # SUM(CASE ...) over SYS.USERS. User group policies are not read.
-# on-prem: not yet run
+# on-prem: verified 2026-11-13 on SPS07 rev 79
 PWD_POLICY = Check(
     name="pwdPolicy",
     category="security",
@@ -217,7 +218,7 @@ _ENCRYPTION_SETTINGS = (
 # M_PERSISTENCE_ENCRYPTION_STATUS per service (status flags only, never
 # USED_ROOT_KEY_HASH or KEY_PAGE_ENTRY_COUNT) and the named settings.
 # M_VOLUMES (a server path) and the backup catalogue (backupStatus) are dropped.
-# on-prem: not yet run
+# on-prem: verified 2026-11-13 on SPS07 rev 79
 ENCRYPTION_STATUS = Check(
     name="encryptionStatus",
     category="security",
@@ -274,7 +275,7 @@ _POWERFUL_PRIVILEGES = (
 _GRANTEE_OR_USERS = (
     "((CAST(? AS NVARCHAR(256)) IS NULL AND GRANTEE_TYPE = 'USER') OR GRANTEE = ?)")
 
-# on-prem: not yet run
+# on-prem: verified 2026-11-13 on SPS07 rev 79
 PRIVILEGE_ANALYSIS = Check(
     name="privilegeAnalysis",
     category="security",
@@ -326,7 +327,7 @@ _DIRECT_ROLES = "(SELECT ROLE_NAME FROM SYS.GRANTED_ROLES WHERE GRANTEE = ?)"
 # grantee's direct privileges and the privileges of its direct roles. A deeper
 # level is another call with a role as `object`. Roles are matched by name
 # (two schema-local roles of one name in different schemas are not told apart).
-# on-prem: not yet run
+# on-prem: verified 2026-11-13 on SPS07 rev 79
 GRANT_CHAINS = Check(
     name="grantChains",
     category="security",
@@ -400,7 +401,7 @@ _USER_FINDINGS = (
 # policies, then scores them; the score is not ported. Here the findings are
 # rows the model reads: users per finding, the SYSTEM user's state, audit
 # policy counts and the three settings by name.
-# on-prem: not yet run
+# on-prem: verified 2026-11-13 on SPS07 rev 79
 SECURITY_SCAN = Check(
     name="securityScan",
     category="security",
@@ -457,7 +458,7 @@ _AUDIT_SETTINGS = (
 # AUDIT_POLICIES. Here the policies' named columns (PRINCIPAL_*, CREATE_TIME
 # and the authentication-method columns are HANA Cloud and left out) and the
 # named settings. The audit trail (AUDIT_LOG and its kin) is never read.
-# on-prem: not yet run
+# on-prem: verified 2026-11-13 on SPS07 rev 79
 AUDIT_LOG = Check(
     name="auditLog",
     category="security",

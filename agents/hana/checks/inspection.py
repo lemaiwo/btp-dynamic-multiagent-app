@@ -34,7 +34,8 @@ What is read and what is not:
 
 The target is on-premise SAP HANA 2.0 (SPS07). Column lists follow hana-cli's
 HANA 2 branch (``utils/dbInspect.js``) and the SAP HANA system view reference;
-none of the statements has run on a landscape yet (``# on-prem: not yet run``).
+every statement ran on a landscape on 2026-11-13 (``# on-prem: verified``),
+in the probe's wrapped form with sample binds.
 :data:`CHECKS` holds them in registration order; its test file
 (``tests/test_hanadb_checks_inspection.py``) pins their names.
 """
@@ -52,15 +53,15 @@ _MEMBER_ROWS = 8
 _MEMBER_CHARS = 4_000
 
 # on-prem: TABLES with hana-cli's HANA 2 columns, plus IS_COLUMN_TABLE; the
-# runtime size (RECORD_COUNT, TABLE_SIZE per host and port) from M_TABLES, a
-# part of its own so a table on several hosts does not repeat the header.
+# runtime size (RECORD_COUNT, TABLE_SIZE) from M_TABLES, a part of its own
+# (M_TABLES has no HOST / PORT on SPS07: SQL code 260 on the landscape).
 # Columns from TABLE_COLUMNS by schema and name (hana-cli: by TABLE_OID after a
 # first read), COMMENTS left out. Constraints: every constraint, not only the
 # primary key (hana-cli filters IS_PRIMARY_KEY); foreign keys from
 # REFERENTIAL_CONSTRAINTS and the indexes with their columns are added, so the
 # model sees keys and indexes in one call. No DDL: GET_OBJECT_DEFINITION is a
 # procedure.
-# on-prem: not yet run
+# on-prem: verified 2026-11-13 on SPS07 rev 79
 INSPECT_TABLE = Check(
     name="inspectTable",
     category="database",
@@ -78,10 +79,9 @@ INSPECT_TABLE = Check(
         ),
         Statement(
             "size",
-            "SELECT HOST, PORT, RECORD_COUNT, TABLE_SIZE, IS_PARTITIONED"
+            "SELECT RECORD_COUNT, TABLE_SIZE, TABLE_TYPE, IS_COLUMN_TABLE, IS_PARTITIONED"
             " FROM SYS.M_TABLES"
-            " WHERE SCHEMA_NAME = ? AND TABLE_NAME = ?"
-            " ORDER BY HOST, PORT",
+            " WHERE SCHEMA_NAME = ? AND TABLE_NAME = ?",
             _ONE,
         ),
         Statement(
@@ -129,7 +129,7 @@ INSPECT_TABLE = Check(
 
 # on-prem: INDEXES and INDEX_COLUMNS as in hana-cli, named columns instead of
 # `*`; `object` is the index name.
-# on-prem: not yet run
+# on-prem: verified 2026-11-13 on SPS07 rev 79
 INSPECT_INDEX = Check(
     name="inspectIndex",
     category="database",
@@ -209,7 +209,7 @@ def _routine(kind: str, label: str) -> tuple[Statement, ...]:
 # PROCEDURE_PARAMETER_COLUMNS by PROCEDURE_OID; the definition from
 # PROCEDURES.DEFINITION (hana-cli: GET_OBJECT_DEFINITION, a CALL). An
 # encrypted procedure has no readable definition (NULL).
-# on-prem: not yet run
+# on-prem: verified 2026-11-13 on SPS07 rev 79
 INSPECT_PROCEDURE = Check(
     name="inspectProcedure",
     category="database",
@@ -224,7 +224,7 @@ INSPECT_PROCEDURE = Check(
 
 # on-prem: FUNCTIONS, FUNCTION_PARAMETERS and FUNCTION_PARAMETER_COLUMNS as in
 # hana-cli; the definition from FUNCTIONS.DEFINITION.
-# on-prem: not yet run
+# on-prem: verified 2026-11-13 on SPS07 rev 79
 INSPECT_FUNCTION = Check(
     name="inspectFunction",
     category="database",
@@ -244,7 +244,7 @@ _VIEW_OID = (" WHERE VIEW_OID IN (SELECT VIEW_OID FROM SYS.VIEWS"
 # left out); the definition from VIEWS.DEFINITION. hana-cli's calculation view
 # branch reads _SYS_BI.BIMC_* (outside the allowed schemas): dropped, such a
 # view is read through SYS.VIEWS like any column view.
-# on-prem: not yet run
+# on-prem: verified 2026-11-13 on SPS07 rev 79
 INSPECT_VIEW = Check(
     name="inspectView",
     category="database",
@@ -289,7 +289,7 @@ INSPECT_VIEW = Check(
 )
 
 # on-prem: TRIGGERS, the documented columns instead of hana-cli's `*`.
-# on-prem: not yet run
+# on-prem: verified 2026-11-13 on SPS07 rev 79
 INSPECT_TRIGGER = Check(
     name="inspectTrigger",
     category="database",
@@ -329,7 +329,7 @@ _LIBRARY_HEADER = Statement(
 
 # on-prem: LIBRARIES and LIBRARY_MEMBERS as in hana-cli; MEMBER_TYPE added; the
 # library's whole definition from LIBRARIES.DEFINITION.
-# on-prem: not yet run
+# on-prem: verified 2026-11-13 on SPS07 rev 79
 INSPECT_LIBRARY = Check(
     name="inspectLibrary",
     category="database",
@@ -371,7 +371,7 @@ INSPECT_LIBRARY = Check(
 # cut (`truncated`, `truncated_columns`), not refused as `result_too_large`.
 # A source made almost wholly of such characters (or of control characters,
 # escaped to six) can still be refused, never cut.
-# on-prem: not yet run
+# on-prem: verified 2026-11-13 on SPS07 rev 79
 INSPECT_LIB_MEMBER = Check(
     name="inspectLibMember",
     category="database",

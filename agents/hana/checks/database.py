@@ -27,8 +27,9 @@ run activity and the chat's stored history like any tool result.
 
 The target is on-premise SAP HANA 2.0 (SPS07); a ``# on-prem:`` comment per
 check says how it differs from hana-cli. The columns are those of the SAP
-HANA 2.0 System Views Reference (SPS08 edition read). No statement of this
-module has run on a landscape yet.
+HANA 2.0 System Views Reference (SPS08 edition read). Every statement of this
+module ran on a landscape on 2026-11-13 (SPS07 revision 79), in the probe's
+wrapped form with sample binds.
 :data:`CHECKS` holds them in registration order; its test file
 (``tests/test_hanadb_checks_database.py``) pins their names.
 """
@@ -63,7 +64,7 @@ _SESSION_KEYS = (
 # (a user name) and without the column of a column privilege. The user
 # part answers the database account name (possibly a person's), which the
 # model sees and the run activity / chat history keep.
-# on-prem: not yet run
+# on-prem: verified 2026-11-13 on SPS07 rev 79
 STATUS = Check(
     name="status",
     category="database",
@@ -107,7 +108,7 @@ STATUS = Check(
 # on-prem: hana-cli's version reports its own, Node's and the CF / btp CLI
 # versions (utils/cf.js, utils/btp.js); only the database part is kept, from
 # M_DATABASE. HOST is left out (a host name of the database).
-# on-prem: not yet run
+# on-prem: verified 2026-11-13 on SPS07 rev 79
 VERSION = Check(
     name="version",
     category="database",
@@ -124,7 +125,7 @@ VERSION = Check(
 # on-prem: hana-cli selects * and by default only schemas with
 # HAS_PRIVILEGES = 'TRUE'; here every schema the user may see, with the flag
 # as a column.
-# on-prem: not yet run
+# on-prem: verified 2026-11-13 on SPS07 rev 79
 SCHEMAS = Check(
     name="schemas",
     category="database",
@@ -144,7 +145,7 @@ SCHEMAS = Check(
 # on-prem: hana-cli (utils/database/hanaDirect.js listTables) selects
 # TABLE_OID and COMMENTS; here the table's type flags and create time,
 # COMMENTS left out. hana-cli shows no record count, so M_TABLES is not read.
-# on-prem: not yet run
+# on-prem: verified 2026-11-13 on SPS07 rev 79
 TABLES = Check(
     name="tables",
     category="database",
@@ -165,7 +166,7 @@ TABLES = Check(
 
 # on-prem: hana-cli selects VIEW_OID and COMMENTS; here type, validity,
 # parameters and create time, COMMENTS and DEFINITION left out.
-# on-prem: not yet run
+# on-prem: verified 2026-11-13 on SPS07 rev 79
 VIEWS = Check(
     name="views",
     category="database",
@@ -184,7 +185,7 @@ VIEWS = Check(
 
 # on-prem: as hana-cli plus type, read-only flag, validity and owner;
 # DEFINITION left out.
-# on-prem: not yet run
+# on-prem: verified 2026-11-13 on SPS07 rev 79
 PROCEDURES = Check(
     name="procedures",
     category="database",
@@ -204,7 +205,7 @@ PROCEDURES = Check(
 
 # on-prem: as hana-cli plus usage type, validity and owner; DEFINITION left
 # out.
-# on-prem: not yet run
+# on-prem: verified 2026-11-13 on SPS07 rev 79
 FUNCTIONS = Check(
     name="functions",
     category="database",
@@ -224,7 +225,7 @@ FUNCTIONS = Check(
 
 # on-prem: as hana-cli; CONSTRAINT is quoted (a reserved word); the object
 # filter is on the index name, as in hana-cli.
-# on-prem: not yet run
+# on-prem: verified 2026-11-13 on SPS07 rev 79
 INDEXES = Check(
     name="indexes",
     category="database",
@@ -244,7 +245,7 @@ INDEXES = Check(
 )
 
 # on-prem: as hana-cli without OBJECT_OID and OBJECT_CATEGORY.
-# on-prem: not yet run
+# on-prem: verified 2026-11-13 on SPS07 rev 79
 OBJECTS = Check(
     name="objects",
     category="database",
@@ -265,7 +266,7 @@ OBJECTS = Check(
 # on-prem: hana-cli reads M_SEQUENCES (cache statistics with CURRENT_VALUE);
 # here the definition from SEQUENCES. RESET_BY_QUERY (a query text) is left
 # out, and so is the current value.
-# on-prem: not yet run
+# on-prem: verified 2026-11-13 on SPS07 rev 79
 SEQUENCES = Check(
     name="sequences",
     category="database",
@@ -286,7 +287,7 @@ SEQUENCES = Check(
 
 # on-prem: as hana-cli plus validity; hana-cli's third filter on the target
 # object name is left out (the object filter is on the synonym's name).
-# on-prem: not yet run
+# on-prem: verified 2026-11-13 on SPS07 rev 79
 SYNONYMS = Check(
     name="synonyms",
     category="database",
@@ -307,7 +308,7 @@ SYNONYMS = Check(
 # on-prem: as hana-cli plus validity, enabled flag and create time;
 # DEFINITION left out. The object filter matches the trigger's name or its
 # table's name (hana-cli filters both, as two arguments).
-# on-prem: not yet run
+# on-prem: verified 2026-11-13 on SPS07 rev 79
 TRIGGERS = Check(
     name="triggers",
     category="database",
@@ -330,7 +331,7 @@ TRIGGERS = Check(
 
 # on-prem: hana-cli selects OWNER_NAME, which LIBRARIES has no column of on
 # HANA 2.0; DEFINITION left out.
-# on-prem: not yet run
+# on-prem: verified 2026-11-13 on SPS07 rev 79
 LIBRARIES = Check(
     name="libraries",
     category="database",
@@ -352,7 +353,7 @@ LIBRARIES = Check(
 # DEPENDENCY_TYPE 1 is direct, 2 indirect (through another object), 5 a
 # foreign key; 3 and 4 are SAP internal. The model can call the check again
 # for a node it wants to follow.
-# on-prem: not yet run
+# on-prem: verified 2026-11-13 on SPS07 rev 79
 DEPENDENCIES = Check(
     name="dependencies",
     category="database",
@@ -386,7 +387,7 @@ DEPENDENCIES = Check(
 # rule (ST_* plus the four plain names); the column filter is left out (the
 # object filter is on the table name). Only the column catalogue is read,
 # never the spatial values.
-# on-prem: not yet run
+# on-prem: verified 2026-11-13 on SPS07 rev 79
 SPATIAL_DATA = Check(
     name="spatialData",
     category="database",
@@ -413,7 +414,7 @@ SPATIAL_DATA = Check(
 # the reserved calendar columns are left out. hana-cli's other subcommands
 # read the series table's rows (time buckets, min / max of a column) or
 # return fixed text; they are dropped: no table row is ever read.
-# on-prem: not yet run
+# on-prem: verified 2026-11-13 on SPS07 rev 79
 TIME_SERIES_TOOLS = Check(
     name="timeSeriesTools",
     category="database",
@@ -447,7 +448,7 @@ TIME_SERIES_TOOLS = Check(
 # per schema (invalid ones, ones with parameters) in place of its metrics.
 # The repository's _SYS_BI tables are not read (the guard allows SYS and
 # _SYS_STATISTICS only).
-# on-prem: not yet run
+# on-prem: verified 2026-11-13 on SPS07 rev 79
 CALC_VIEW_ANALYZER = Check(
     name="calcViewAnalyzer",
     category="database",
@@ -486,7 +487,7 @@ CALC_VIEW_ANALYZER = Check(
 # GROUP_TYPE, SUBTYPE, GROUP_NAME, IS_GROUP_LEAD. The groups part counts the
 # tables per group and names its lead table; the object filter is on the
 # group name.
-# on-prem: not yet run
+# on-prem: verified 2026-11-13 on SPS07 rev 79
 TABLE_GROUPS = Check(
     name="tableGroups",
     category="database",

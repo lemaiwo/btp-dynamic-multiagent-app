@@ -1202,8 +1202,7 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     every registered statement. **68 checks, 139 statements** (the one place
     these counts are kept; Phase 1 = monitoring, performance, system,
     backup; Phases 2 and 3 = database, schema, security, written against the
-    SAP HANA 2.0 documentation and not yet run on a landscape, so a landscape
-    run may rewrite or drop some): monitoring 7 (`alerts`, `blocking`, `deadlocks`, `traces`,
+    SAP HANA 2.0 documentation and run on a landscape on 2026-11-13): monitoring 7 (`alerts`, `blocking`, `deadlocks`, `traces`,
     `traceContents`, `crashDumps`, `replicationStatus`), performance 7
     (`memoryAnalysis`, `memoryLeaks`, `expensiveStatements`,
     `tableHotspots`, `longRunning`, `columnStats` (requires `schema` and
@@ -1344,10 +1343,15 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   filter, LOB values (`read(size)` of hdbcli's LOB object), a multi-line ini
   value, the word-based mapping of -10709, TLS, a Cloud Connector location
   id, the `tcp` destination shape. **The checks of Phases 2 and 3**
-  (categories `database`, `schema`, `security`) are written against the SAP
-  HANA 2.0 documentation and not yet run on a landscape (each statement
-  carries `# on-prem: not yet run`; columns documented for SPS08 only are
-  the first suspects).
+  (categories `database`, `schema`, `security`) ran there on 2026-11-13 (same system and
+  databases, the probe's wrapped form with sample binds, read-only, after
+  `SET SCHEMA SYS`): all 84 statements of the 39 checks on both databases,
+  after one rewrite (`inspectTable.size`: `M_TABLES` has no `HOST` / `PORT`
+  there, SQL code 260). Not shown by that run: real schema and object
+  arguments (the sample binds match nothing, so no row and no LOB came
+  back), the size of real answers, and the runtime of `privilegeAnalysis`,
+  `compareSchema` and `spatialData` on real data; the database user there is
+  wider than `CATALOG READ`, so what a restricted user sees is unverified.
   The seed agent `hana-monitor` and skill `hana-monitoring`: see
   `agents.seed.json`. Tests: `tests/test_hanadb_config.py`,
   `_connection.py`, `_connectivity_config.py`, `_guard.py`, `_masking.py`,
@@ -3887,7 +3891,8 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   security checks of `builtin:hana` (39 checks, 68 in all; `run_check`'s `other_schema`,
   `truncated_columns`): no new resource, environment variable, role, table or column (HANA
   schema generation unchanged, still 11); the catalogue and security checks need
-  `CATALOG READ` for the database user; not yet run on a landscape; the reach rules now
+  `CATALOG READ` for the database user; all 84 statements ran on a landscape with the probe
+  (2026-11-13, a SYSTEMDB and a tenant, sample binds); the reach rules now
   apply to every builtin:hana entry: chat only at tier advanced, never the invoke API,
   never a peer; a stored row that breaks them is built without the HANA tools
 - `scripts/copy_registry_config.py` — copies the registry's configuration
