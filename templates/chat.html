@@ -2,8 +2,8 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/png" href="/static/sap.png" />
-    <link rel="shortcut icon" href="/static/sap.png" />
+    <link rel="icon" type="image/svg+xml" href="/static/agent-icon.svg" />
+    <link rel="shortcut icon" type="image/svg+xml" href="/static/agent-icon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>SAP BTP Multi-Agent</title>
     <script type="module" crossorigin src="https://cdn.jsdelivr.net/npm/@pydantic/ai-chat-ui@1.0.0/dist/assets/index-Dtnbv4I1.js"></script>
@@ -12,7 +12,7 @@
       // The chat UI is a React SPA rendered after load. Rebrand by watching
       // for the title <h1> and swapping its logo + text.
       (function () {
-        const LOGO_URL = "/static/sap.png";
+        const LOGO_URL = "/static/agent-icon.svg";
         const APP_NAME = "SAP BTP Multi-Agent";
         function rebrand() {
           document.querySelectorAll("h1 > span").forEach((span) => {

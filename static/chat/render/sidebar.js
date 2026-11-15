@@ -23,8 +23,8 @@ export function createSidebar(root, handlers) {
   const brand = document.createElement('div');
   brand.className = 'sb-brand';
   const logo = document.createElement('img');
-  logo.src = '/static/sap.png';
-  logo.alt = 'SAP';
+  logo.src = '/static/agent-icon.svg';
+  logo.alt = 'BTP Multi-Agent';
   const brandText = document.createElement('span');
   brandText.textContent = 'BTP Multi-Agent';
   brand.append(logo, brandText);
