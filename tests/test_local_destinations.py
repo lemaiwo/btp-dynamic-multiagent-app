@@ -261,3 +261,28 @@ async def test_plain_http_only_by_explicit_opt_in(stack, key):
         await resolver("S4_USER").resolve(user_token=token, principal="user-1")
     with pytest.raises(DestinationError, match="https://"):
         await resolver("ARC1").resolve(user_token=token, principal="user-1")
+
+
+async def test_tls_server_name_changes_the_checked_name_only(stack, key):
+    import httpx
+    from agents.destination_auth import PLACEHOLDER_BASE
+
+    path, document = stack
+    document["destinations"][0]["TLSServerName"] = "localhost"
+    rewrite(path, document)
+    made = resolver("S4_USER")
+    destination = await made.resolve(user_token=helpers.token(key), principal="user-1")
+    assert destination.tls_server_name == "localhost"
+    flow = DestinationAuth(made, user_context=True, server_key="builtin:odata")
+    request = httpx.Request("GET", f"{PLACEHOLDER_BASE}/sap/x")
+    flow._apply(request, destination)
+    assert request.extensions["sni_hostname"] == "localhost"
+    assert request.url.host == "sap.example.test"  # where it goes is unchanged
+    other = httpx.Request("GET", f"{PLACEHOLDER_BASE}/x")
+    technical = await resolver("S4_TECH").resolve()
+    DestinationAuth(resolver("S4_TECH"), server_key="x")._apply(other, technical)
+    assert "sni_hostname" not in other.extensions
+    document["destinations"][0]["TLSServerName"] = "not a host/name"
+    rewrite(path, document)
+    with pytest.raises(DestinationError, match="TLSServerName"):
+        await resolver("S4_USER").resolve(user_token=helpers.token(key), principal="user-1")

@@ -363,7 +363,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     or no user token mints nothing). `${VAR}` in a value is read from the
     environment; `ProxyType: OnPremise` is refused; `http://` only with
     `AllowPlainHttp` exactly `"true"` (`Destination.plain_http`, the one
-    exception `DestinationAuth._target` makes; never for `SAMLAssertion`). `_as_user` accepts a
+    exception `DestinationAuth._target` makes; never for `SAMLAssertion`);
+    `TLSServerName` is the name the server's certificate is checked against
+    when it is not the URL's host (`Destination.tls_server_name`, sent as
+    httpcore's `sni_hostname`; verification stays on). `_as_user` accepts a
     LOCAL `SAMLAssertion` destination as user-propagating (BTP's is still
     refused there). The OData destination picker lists the file
     (`_list_local`). `tests/test_local_destinations.py`
@@ -374,8 +377,11 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     canonical form and values canonical XML cannot carry are refused.
     `tests/test_saml_bearer.py` re-derives digest and signature with the
     standard library; checked once with xml-crypto. An assertion is minted
-    per resolve (`expires_in` 0, about a second of cache). **Never run
-    against an SAP system.**
+    per resolve (`expires_in` 0, about a second of cache). **Ran against
+    an ABAP Platform 2025 system** (2026-11-15): OData `$metadata` and a
+    one-row read as the signed-in user, on the system's own HTTPS port (the
+    same assertion got 401 through an nginx in front of it). Not run: OData
+    writes, InA, a replayed assertion.
   - `agents/shared.py` — direct providers: a model named `anthropic:<model>`
     (`ANTHROPIC_API_KEY`) or `openai:<model>` (`OPENAI_API_KEY`,
     `OPENAI_BASE_URL`) is served by that API (`_build_model`), any other name

@@ -8,11 +8,14 @@
 # is certifi's list plus the mounted files. Nothing switches verification off.
 set -eu
 
-if [ -d /extra-ca ] && ls /extra-ca/*.crt /extra-ca/*.pem >/dev/null 2>&1; then
+extra=""
+for file in /extra-ca/*.crt /extra-ca/*.pem; do
+    [ -f "$file" ] && extra="$extra $file"
+done
+if [ -n "$extra" ]; then
     bundle="$(mktemp /tmp/ca-bundle.XXXXXX)"
     python -c "import certifi; print(certifi.where())" | xargs cat > "$bundle"
-    for file in /extra-ca/*.crt /extra-ca/*.pem; do
-        [ -f "$file" ] || continue
+    for file in $extra; do
         printf '\n' >> "$bundle"
         cat "$file" >> "$bundle"
     done

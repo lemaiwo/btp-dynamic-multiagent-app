@@ -4,6 +4,9 @@
 # through the proxy, AS THAT USER (destination SAP_USER, SAML bearer assertion).
 #
 #   ./test/pp.sh odata /sap/opu/odata/sap/<SERVICE> [v2|v4]   read $metadata
+#   ./test/pp.sh read /sap/opu/odata/sap/<SERVICE> <EntitySet> <key field> <field,field,...> [v2|v4]
+#                                                              register it as catalogue service "pp-test"
+#                                                              and read one row (the app's OData client)
 #   ./test/pp.sh ina <InA query name, e.g. 2C...> [package]   describe the query
 #
 # Prints statuses, error codes and counts; never a token, a password or a row.
@@ -20,12 +23,18 @@ fi
 
 secret="$(sed -n 's/^OIDC_CLIENT_SECRET=//p' "$HERE/secrets/stack.env")"
 password="$(sed -n 's/^  developer \/ \([^ ]*\).*/\1/p' "$HERE/secrets/logins.txt")"
-otp="$(python3 "$HERE/test/totp.py" "$(sed -n 's/^  developer .*totp-key: \([A-Z2-7]*\).*/\1/p' "$HERE/secrets/logins.txt")")"
-TOKEN="$(curl -s http://localhost:8180/realms/agents/protocol/openid-connect/token \
-    -d grant_type=password -d client_id=agent-app --data-urlencode "client_secret=$secret" \
-    -d username=developer --data-urlencode "password=$password" -d "totp=$otp" \
-    -d 'scope=openid email profile' \
-    | python3 -c "import sys,json; print(json.load(sys.stdin).get('access_token',''))")"
+key="$(sed -n 's/^  developer .*totp-key: \([A-Z2-7]*\).*/\1/p' "$HERE/secrets/logins.txt")"
+# Keycloak accepts a one-time code once: after a recent sign-in, wait for the next code.
+TOKEN=""
+for attempt in 1 2 3 4 5 6 7 8; do
+    TOKEN="$(curl -s http://localhost:8180/realms/agents/protocol/openid-connect/token \
+        -d grant_type=password -d client_id=agent-app --data-urlencode "client_secret=$secret" \
+        -d username=developer --data-urlencode "password=$password" \
+        -d "totp=$(python3 "$HERE/test/totp.py" "$key")" -d 'scope=openid email profile' \
+        | python3 -c "import sys,json; print(json.load(sys.stdin).get('access_token',''))")"
+    [ -n "$TOKEN" ] && break
+    sleep 5
+done
 if [ -z "$TOKEN" ]; then
     echo "FAIL sign-in: Keycloak issued no token" >&2
     exit 1
@@ -63,6 +72,35 @@ print('     first entity sets:', ', '.join(str(s.get('name')) for s in sets[:8])
         exit 1
     fi
     ;;
+read)
+    SET="${3:-}"; KEY="${4:-}"; FIELDS="${5:-}"; VERSION="${6:-v2}"
+    if [ -z "$SET" ] || [ -z "$KEY" ] || [ -z "$FIELDS" ]; then
+        echo "read needs: <service path> <EntitySet> <key field> <field,field,...>" >&2
+        exit 2
+    fi
+    call DELETE /admin/api/odata/services/pp-test >/dev/null || true
+    BODY="$(python3 -c "
+import json,sys
+dest,path,eset,key,fields,version=sys.argv[1:7]
+names=[key]+[f for f in fields.split(',') if f and f!=key]
+print(json.dumps({'name':'pp-test','title':'Principal propagation test','purpose':'Connectivity test of the local stack',
+ 'destination':dest,'user_context':True,'odata_version':version,'service_path':path,'enabled':True,
+ 'definition':{'entity_sets':[{'name':eset,'title':eset,'keys':[{'name':key}],'operations':['list','get'],
+   'fields':[{'name':n,'selectable':True,'filterable':False,'writable':False} for n in names],'navigations':[]}],'operations':[]}}))" "$DEST" "$TARGET" "$SET" "$KEY" "$FIELDS" "$VERSION")"
+    STATUS="$(call POST /admin/api/odata/services "$BODY")"
+    if [ "$STATUS" != 201 ] && [ "$STATUS" != 200 ]; then
+        echo "FAIL register the service: HTTP $STATUS: $(detail)"
+        exit 1
+    fi
+    echo "PASS catalogue service 'pp-test' registered (runs as the signed-in user)"
+    STATUS="$(call POST /admin/api/odata/services/pp-test/test "{\"entity_set\": \"$SET\"}")"
+    python3 -c "
+import sys,json
+d=json.load(open(sys.argv[1]))
+keep={k:d.get(k) for k in ('ok','status','outcome','code','identity','per_user','auth_type','duration_ms','entity_set','rows','fields','message') if k in d}
+print('PASS' if d.get('ok') else 'FAIL', 'one-row read through the OData client:', keep)
+sys.exit(0 if d.get('ok') else 1)" "$OUT" || { echo "     HTTP $STATUS, code '$(code_of OData)'"; exit 1; }
+    ;;
 ina)
     PACKAGE="${3:-}"
     NAME="pp-test"
@@ -95,7 +133,7 @@ print('PASS' if d.get('ok') else 'FAIL', 'test read: ok', d.get('ok'), '| status
     fi
     ;;
 *)
-    echo "unknown check '$KIND' (odata | ina)" >&2
+    echo "unknown check '$KIND' (odata | read | ina)" >&2
     exit 2
     ;;
 esac

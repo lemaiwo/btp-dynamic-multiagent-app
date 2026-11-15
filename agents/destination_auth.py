@@ -534,6 +534,10 @@ class DestinationAuth(httpx.Auth):
             request.url = target
             # httpx set Host when the request was built, from the placeholder.
             request.headers["Host"] = target.netloc.decode("ascii")
+        if destination.local and destination.tls_server_name:
+            # The certificate is checked against this name instead of the
+            # URL's host (httpcore's `sni_hostname`); the check itself stays.
+            request.extensions["sni_hostname"] = destination.tls_server_name
         routed = self._route is not None
         ours: set[str] = request.extensions.get(_FROM_DESTINATION_EXTENSION) or set()
         applied: set[str] = set()

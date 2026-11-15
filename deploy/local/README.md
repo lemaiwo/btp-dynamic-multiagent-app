@@ -13,10 +13,12 @@ with no Cloud Foundry, XSUAA, destination service or Cloud Connector:
 | principal propagation through the Cloud Connector | a SAML 2.0 bearer assertion this app signs per user; the ABAP system trusts the certificate in transaction SAML2 |
 
 **Status: test branch.** Proven here: the stack starts, sign-in works, tokens
-and roles are enforced, assertions verify with an independent XML signature
-library. **Not yet run against an SAP system**: the assertion layout is the
-one ARC-1's `proto/saml-bearer-pp` branch ran against an ABAP Platform 2025
-system, but this implementation has not been in front of one.
+and roles are enforced. **Principal propagation ran against a real system**
+(ABAP Platform 2025, 2026-11-15): `$metadata` of three OData services and a
+one-row read through the app's OData client, as the signed-in user; SAP
+recorded the logon of the user the e-mail maps to. Not run there: OData
+writes (CSRF), InA (its ICF services were not active on that system), ARC-1
+through this stack.
 
 ## Start
 
@@ -93,6 +95,16 @@ the property names are the same. A value may name an environment variable as
 
 `"AllowPlainHttp": "true"` admits an `http://` URL, for a service inside the
 container network only; never for `SAMLAssertion`.
+
+`"TLSServerName": "<name>"` is for a system whose own certificate names
+another host than its URL (a test system with a certificate for `localhost`):
+the certificate is checked against that name, and must still verify, so put
+it into `secrets/extra-ca/`.
+
+Point a `SAMLAssertion` destination at the ABAP system's own HTTPS port. A
+reverse proxy in front of it can break the logon: on the test system the
+same assertion was accepted on the system's port and answered 401 through an
+nginx on 443.
 
 The target is reached directly from the container, over `https`. If its
 certificate is from your own CA, put the CA certificate (PEM, `.crt`) into
@@ -197,11 +209,14 @@ and `secrets/destinations.json` names the system):
 
 ```sh
 ./test/pp.sh odata /sap/opu/odata/sap/<SERVICE> [v2|v4]
+./test/pp.sh read /sap/opu/odata/sap/<SERVICE> <EntitySet> <key field> <field,field,...>
 ./test/pp.sh ina <InA query name> [package]
 ```
 
 Both sign in as `developer` and use the app's own admin checks as that user
-through the `SAP_USER` destination: the OData one reads `$metadata`, the InA
+through the `SAP_USER` destination: `odata` reads `$metadata`, `read`
+registers the entity set as the catalogue service `pp-test` and reads one
+row through the app's OData client, the InA
 one registers the query as `pp-test`, describes it and runs the one-row test
 read. A pass means SAP accepted the assertion for the user whose e-mail the
 identity provider sent; which SAP user that is shows in SAP (SM04 or the

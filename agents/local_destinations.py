@@ -61,7 +61,10 @@ validator nothing is minted. A user is never replaced by a technical one.
 ``ProxyType: OnPremise`` is refused: there is no connectivity proxy here,
 the target is reached directly, over ``https``. ``"AllowPlainHttp": "true"``
 admits an ``http://`` URL for a service on the same private network (an ARC-1
-container next to the app); never for ``SAMLAssertion``.
+container next to the app); never for ``SAMLAssertion``. ``TLSServerName``
+names the host the server's certificate is checked against when that is not
+the URL's host (a system whose own certificate says ``localhost``): the
+certificate must still verify (put it, or its CA, into ``/extra-ca``).
 
 A log line names the destination and, for a minted assertion, the principal;
 never a URL, a credential, a NameID or an assertion.
@@ -95,6 +98,10 @@ USER_AUTH_TYPES = frozenset({SAML_ASSERTION, FORWARD_USER_TOKEN})
 SESSION_HEADER = "x-sap-security-session"
 # ``"AllowPlainHttp": "true"``: the one way an ``http://`` URL is accepted.
 PLAIN_HTTP = "AllowPlainHttp"
+# ``"TLSServerName": "<name>"``: the name the server's certificate is checked
+# against, for a system whose certificate names another host than its URL.
+TLS_SERVER_NAME = "TLSServerName"
+_HOST_NAME = re.compile(r"[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?")
 MAX_FILE_BYTES = 1_000_000
 MAX_DESTINATIONS = 200
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,199}")
@@ -212,6 +219,11 @@ def _properties(name: str, entry: Mapping[str, Any]) -> dict[str, str]:
         logger.warning(
             "local destination %r is plain http: its credential is not protected "
             "on the way (acceptable inside a container network only)", name,
+        )
+    server_name = props.get(TLS_SERVER_NAME, "")
+    if server_name and (scheme != "https" or not _HOST_NAME.fullmatch(server_name)):
+        raise DestinationError(
+            f"local destination {name!r}: {TLS_SERVER_NAME} is a host name, on an https:// URL"
         )
     if props["Authentication"] not in LOCAL_AUTH_TYPES:
         raise DestinationError(
