@@ -134,6 +134,19 @@ try {
     /SAPRead/.test(body));
   await dev.page.screenshot({ path: join(shots, 'chat.png'), fullPage: true });
 
+  // Data from SAP as the signed-in user, when test/odata_agent.py set the agent up.
+  const agents = await api(dev.page, 'GET', '/admin/api/agents');
+  const list = Array.isArray(agents.json) ? agents.json : (agents.json.agents || []);
+  if (list.some((a) => a.name === 'sap-odata-reader' && a.enabled)) {
+    await dev.page.goto(`${BASE}/chat`);
+    await say(dev.page, 'Please ask the sap-odata-reader for products', 'Read from SAP as the signed-in user',
+      'web chat: the OData agent reads rows from SAP as the signed-in user');
+    await dev.page.waitForTimeout(1500);
+    await dev.page.screenshot({ path: join(shots, 'chat-odata.png'), fullPage: true });
+  } else {
+    console.log('SKIP  OData agent (run test/odata_agent.py to set it up)');
+  }
+
   // The two UI5 apps, served by the stack's web server (./build-ui5.sh).
   const failures = [];
   dev.page.on('response', (r) => { if (r.status() >= 400 && /\/ui5(admin|ide)\//.test(r.url())) failures.push(`${r.status()} ${new URL(r.url()).pathname}`); });

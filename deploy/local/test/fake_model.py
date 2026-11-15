@@ -2,7 +2,9 @@
 
 Speaks just enough of the OpenAI chat completions API for the app
 (``OPENAI_BASE_URL``): it answers with fixed text, and when the prompt says
-"ask the <agent>" and a delegation tool is offered, it calls that tool, so
+"ask the <agent>" and a delegation tool is offered, it calls that tool; an
+agent with the OData tools searches the catalogue for the words of the
+question and lists five rows of the first hit. So
 the whole path (sign-in, chat stream, orchestrator, specialist, the
 specialist's MCP session as the signed-in user) runs without a real model.
 It understands nothing: use a real key to judge an answer.
@@ -39,12 +41,71 @@ def _arguments(schema: dict, text: str) -> str:
     })
 
 
+_STOP = {"please", "which", "what", "show", "list", "give", "from", "with", "have", "that",
+         "this", "the", "and", "for", "are", "any", "all", "some", "about", "data", "read",
+         "system", "there", "does", "tell"}
+
+
+def _call_behind(messages: list, tool_message: dict) -> dict:
+    """The tool call (name, arguments) a tool message answers."""
+    wanted = tool_message.get("tool_call_id")
+    for message in reversed(messages):
+        for call in message.get("tool_calls") or []:
+            if call.get("id") == wanted:
+                return call.get("function") or {}
+    return {}
+
+
+def _find_target(node) -> dict | None:
+    """The first ``{service, target}`` of a search result that can be listed."""
+    if isinstance(node, dict):
+        if isinstance(node.get("service"), str) and isinstance(node.get("target"), str):
+            operations = node.get("operations")
+            if not isinstance(operations, list) or "list" in operations:
+                return node
+        node = list(node.values())
+    if isinstance(node, list):
+        for item in node:
+            found = _find_target(item)
+            if found:
+                return found
+    return None
+
+
+def _odata(body: dict, messages: list, last: dict) -> dict:
+    """A scripted read through the OData tools: search, then list five rows."""
+    if last.get("role") != "tool":
+        text = re.sub(r"ask the [\w-]+", " ", _text_of(last), flags=re.IGNORECASE)
+        words = [w for w in re.findall(r"[A-Za-z]{4,}", text) if w.lower() not in _STOP]
+        return {"tool": "search_operations", "arguments": json.dumps({"query": " ".join(words[:2])})}
+    behind = _call_behind(messages, last)
+    content = _text_of(last)
+    if behind.get("name") == "search_operations":
+        try:
+            target = _find_target(json.loads(content))
+        except ValueError:
+            target = None
+        if target:
+            return {"tool": "execute_operation", "arguments": json.dumps({
+                "service": target["service"], "target": target["target"],
+                "operation": "list", "top": 5})}
+        asked = json.loads(behind.get("arguments") or "{}").get("query")
+        if asked:  # nothing under those words: list everything once
+            return {"tool": "search_operations", "arguments": json.dumps({"query": ""})}
+        return {"text": "The catalogue search returned nothing I can list: " + content[:400]}
+    return {"text": "Read from SAP as the signed-in user (stand-in model, first rows): "
+                    + content[:1800]}
+
+
 def decide(body: dict) -> dict:
     """``{"text": ...}`` or ``{"tool": name, "arguments": json}``."""
     messages = body.get("messages") or []
     last = messages[-1] if messages else {}
+    offered = {t["function"]["name"] for t in body.get("tools") or [] if t.get("type") == "function"}
+    if {"search_operations", "execute_operation"} <= offered:
+        return _odata(body, messages, last)
     if last.get("role") == "tool":
-        return {"text": "The specialist answered: " + _text_of(last)[:300]}
+        return {"text": "The specialist answered: " + _text_of(last)[:2000]}
     text = _text_of(last)
     delegates = [
         tool["function"] for tool in body.get("tools") or []
@@ -59,7 +120,7 @@ def decide(body: dict) -> dict:
             delegates[0],
         )
         return {"tool": chosen["name"], "arguments": _arguments(chosen.get("parameters"), text)}
-    tools = sorted(t["function"]["name"] for t in body.get("tools") or [])
+    tools = sorted(offered)
     return {"text": f"Test model reply. I was offered {len(tools)} tools"
                     + (f" ({', '.join(tools[:12])})" if tools else "") + f". You said: {text[:200]}"}
 

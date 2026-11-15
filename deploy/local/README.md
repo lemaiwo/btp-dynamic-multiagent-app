@@ -142,6 +142,18 @@ To map by user name instead: `"nameIdFormat": "unspecified"` and
 `"userIdSource": "preferred_username"` in the destination, and NameID format
 "Unspecified" mapped to the logon ID in step 4.
 
+**An agent on the system's OData services**, to try it in the chat:
+
+```sh
+python3 test/odata_agent.py /sap/opu/odata/sap/<SERVICE> [more service paths]
+```
+
+registers every entity set of each service in the catalogue, read-only and
+as the signed-in user, and creates the chat agent `sap-odata-reader` on
+them. With the stand-in model, "Please ask the sap-odata-reader for
+<word>" searches the catalogue for the word and lists five rows of the
+first hit; a real model answers the question itself.
+
 A rejected assertion: the troubleshooting tab of transaction SAML2, or
 `SEC_DIAG_TOOL`. The app's log names the destination and the principal an
 assertion was issued for, never the assertion.
