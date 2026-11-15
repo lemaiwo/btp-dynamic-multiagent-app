@@ -877,6 +877,19 @@ def get_model(name: str | None = None):
     return model
 
 
+def registered_name(model: Any) -> str | None:
+    """The name ``model`` was built under by ``get_model``, or ``None``.
+
+    A direct provider's model object carries the provider's own name
+    (``claude-opus-5-5``), not the name this app knows it by
+    (``anthropic:claude-opus-5-5``); offered under the bare name it would be
+    looked up as an AI Core deployment."""
+    for name, built in _models.items():
+        if built is model:
+            return name
+    return None
+
+
 def _build_model(name: str):
     """The model for ``name``, by the routing ``get_model`` describes."""
     provider = direct_provider_of(name)

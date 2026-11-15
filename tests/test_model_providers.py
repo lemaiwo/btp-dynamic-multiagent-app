@@ -102,3 +102,12 @@ def test_unprefixed_names_still_go_to_aicore(monkeypatch):
     shared._build_model("anthropic--claude-4.6-opus")
     shared._build_model("gpt-4o")
     assert built == [("bedrock", "anthropic--claude-4.6-opus"), ("openai", "gpt-4o")]
+
+
+def test_registered_name_keeps_the_provider_prefix(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    model = shared._build_model("anthropic:claude-opus-5-5")
+    monkeypatch.setattr(shared, "_models", {"anthropic:claude-opus-5-5": model})
+    assert model.model_name == "claude-opus-5-5"
+    assert shared.registered_name(model) == "anthropic:claude-opus-5-5"
+    assert shared.registered_name(object()) is None

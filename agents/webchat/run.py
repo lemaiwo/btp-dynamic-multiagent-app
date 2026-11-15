@@ -95,7 +95,13 @@ from agents.oauth2 import OAuthAuthorizationRequired
 from agents.progress import ProgressUpdate, current_progress
 from agents.registry import _short_tool_output, registry
 from agents.run_activity import _clip, _detail_for
-from agents.shared import available_models, default_model_name, get_model, run_usage_limits
+from agents.shared import (
+    available_models,
+    default_model_name,
+    get_model,
+    registered_name,
+    run_usage_limits,
+)
 from agents.webchat import store, user_agents
 from agents.webchat.docgen import (
     TOOL_NAMES,
@@ -165,7 +171,10 @@ class ModelCatalog:
 
     def default_name(self) -> str:
         if registry.loaded:
-            name = getattr(registry.orchestrator.model, "model_name", None)
+            model = registry.orchestrator.model
+            # The name the app built it under first: a direct provider's
+            # model object names itself without its prefix.
+            name = registered_name(model) or getattr(model, "model_name", None)
             if isinstance(name, str) and name:
                 return name
         return default_model_name()

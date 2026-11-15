@@ -136,6 +136,39 @@ assertion at all (the signature is verified here only by libraries), whether
 (set `"URL.headers.x-sap-security-session": "none"` in the destination to
 send none), and CSRF-protected writes through OData.
 
+## Testing
+
+**The stack itself, in a browser** (no model key needed):
+
+```sh
+STACK_TEST_MODEL=1 ./stack.sh up     # adds a stand-in model, "openai:test-model"
+node test/e2e.mjs                    # drives the installed Chrome, headless
+```
+
+It signs in through Keycloak as `developer` and as `basic`, opens the web
+chat, the classic chat and the admin, creates an agent on the `ARC1`
+destination, chats, has the orchestrator delegate to that agent, and checks
+that the user without the admin role gets 403. Screenshots land in
+`secrets/e2e/`. The stand-in model (`test/fake_model.py`) answers fixed text
+and calls a delegation tool when asked to "ask the <agent>": it proves the
+plumbing, not an answer. `./stack.sh up` without the variable goes back to
+the real providers.
+
+**Principal propagation to the SAP system** (after the SAML2 trust is set up
+and `secrets/destinations.json` names the system):
+
+```sh
+./test/pp.sh odata /sap/opu/odata/sap/<SERVICE> [v2|v4]
+./test/pp.sh ina <InA query name> [package]
+```
+
+Both sign in as `developer` and use the app's own admin checks as that user
+through the `SAP_USER` destination: the OData one reads `$metadata`, the InA
+one registers the query as `pp-test`, describes it and runs the one-row test
+read. A pass means SAP accepted the assertion for the user whose e-mail the
+identity provider sent; which SAP user that is shows in SAP (SM04 or the
+security audit log).
+
 ## ARC-1 on the same sign-in
 
 The realm is set up like the one of ARC-1's `examples/local-sso`: a token the

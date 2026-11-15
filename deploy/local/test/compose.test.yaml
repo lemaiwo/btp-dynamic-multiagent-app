@@ -1,0 +1,23 @@
+# Test overlay: a stand-in model, so the stack can be exercised end to end
+# (sign-in, chat, delegation to a specialist) without a model API key.
+#   STACK_TEST_MODEL=1 ./stack.sh up
+# The app then offers the single model "openai:test-model". Leave the
+# variable out (and run ./stack.sh up again) to go back to the real providers.
+services:
+  fake-model:
+    image: python:3.13-slim
+    restart: unless-stopped
+    command: ["python", "/srv/fake_model.py"]
+    volumes:
+      - ./test/fake_model.py:/srv/fake_model.py:ro
+
+  app:
+    environment:
+      OPENAI_API_KEY: test-model-needs-no-key
+      OPENAI_BASE_URL: http://fake-model:9000/v1
+      OPENAI_MODELS: test-model
+      DEFAULT_MODEL: openai:test-model
+      AICORE_AVAILABLE_MODELS: openai:test-model
+    depends_on:
+      fake-model:
+        condition: service_started
