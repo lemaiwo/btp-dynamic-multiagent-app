@@ -155,6 +155,18 @@ try {
     .then(() => check('UI5 admin: loads and lists the agents from the backend', true))
     .catch(() => check('UI5 admin: loads and lists the agents from the backend', false));
   await dev.page.screenshot({ path: join(shots, 'ui5admin.png') });
+  // Settings: the model providers panel and its API (no key is typed here).
+  await dev.page.goto(`${BASE}/ui5admin/#/settings`);
+  await dev.page.getByText('Model providers').first().waitFor({ timeout: 60_000 })
+    .then(() => check('UI5 admin: Settings shows the model providers panel', true))
+    .catch(() => check('UI5 admin: Settings shows the model providers panel', false));
+  await dev.page.waitForTimeout(1500);
+  await dev.page.screenshot({ path: join(shots, 'ui5admin-settings.png'), fullPage: true });
+  const providers = await api(dev.page, 'GET', '/ui5admin/backend/model-providers');
+  check('model providers API: both providers, no key in the answer',
+    providers.status === 200 && providers.json.providers.length === 2
+      && !JSON.stringify(providers.json).includes('api_key'));
+
   await dev.page.goto(`${BASE}/ui5ide/`);
   await dev.page.locator('.sapMPage, .sapFDynamicPage, .sapMShell').first().waitFor({ timeout: 60_000 })
     .then(() => check('ABAP Assistant (UI5): loads', true))

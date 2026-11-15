@@ -25,6 +25,7 @@ sap.ui.define(function () {
             "unit/dataCatalog": { title: "Unit: dataCatalog, the data catalogue pages" },
             "unit/graph3d": { title: "Unit: graph3d, the 3D overview of the data catalogue graph" },
             "unit/embeddingsSettings": { title: "Unit: embeddingsSettings, the data catalogue embeddings of the Settings page" },
+            "unit/modelProviders": { title: "Unit: modelProviders, the direct model providers of the Settings page" },
             "unit/inaQueries": { title: "Unit: inaQueries, the analytical queries pages" },
             "unit/odataEntry": { title: "Unit: odataEntry, the agent's OData services entry" },
             "unit/inaEntry": { title: "Unit: inaEntry, the agent's analytical queries entry" },

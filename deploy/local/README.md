@@ -39,7 +39,8 @@ Everything listens on loopback only. `secrets/` is gitignored; `setup.sh`
 never overwrites a file that exists (delete one to have it made again, and
 recreate the Keycloak container after changing `realm.json`).
 
-The UI5 apps: run `./build-ui5.sh` once (and after changing an app); they
+The UI5 apps: run `./build-ui5.sh` once (and after changing an app; it
+restarts the stack's web server); they
 are then at `/ui5admin/` and `/ui5ide/`. The stack's inner web server
 (`web/Caddyfile`) does what the approuter routes and the HTML5 repository do
 on BTP: it serves the built apps, maps `/ui5admin/backend/*` to `/admin/api/*`
@@ -56,6 +57,13 @@ without one is an SAP AI Core deployment, as before.
 | `ANTHROPIC_API_KEY` | `anthropic:<model>` for each name in `ANTHROPIC_MODELS` |
 | `OPENAI_API_KEY` (+ `OPENAI_BASE_URL` for any OpenAI-compatible endpoint) | `openai:<model>` for each name in `OPENAI_MODELS` |
 | `AICORE_AUTH_URL`, `AICORE_CLIENT_ID`, `AICORE_CLIENT_SECRET`, `AICORE_BASE_URL` | the deployments of the resource group |
+
+The same can be set **in the UI5 admin, Settings, "Model providers"**: per
+provider a switch, the API key, an optional base URL and the model list,
+with a Test button. A setting stored there wins over the variables above,
+is kept in the database (the key is never shown again, exported or logged)
+and applies at once: the registry is reloaded. It works on BTP as well, next
+to AI Core.
 
 `DEFAULT_MODEL` names the model a fresh registry starts with; afterwards the
 admin picks it (Settings), and an agent can have its own. The catalogue's

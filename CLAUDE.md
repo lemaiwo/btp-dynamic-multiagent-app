@@ -388,7 +388,22 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     is an AI Core deployment. `available_models()` adds
     `ANTHROPIC_MODELS` / `OPENAI_MODELS`; with no AI Core credentials
     (`aicore_configured()`) only those are offered. `DEFAULT_MODEL` wins over
-    `AICORE_MODEL`. The direct OpenAI model is a `SAPAICoreModel` (same usage
+    `AICORE_MODEL`. **An admin can set a provider from the UI**
+    (`agents/model_providers.py`, table `model_providers`, HANA schema
+    generation 12; routes `agents/model_provider_routes.py`: `GET
+    /admin/api/model-providers`, `PUT .../{provider}` with `{enabled,
+    api_key?, base_url?, models}` where an absent `api_key` keeps the stored
+    one and `null` clears it, `POST .../{provider}/test`, a free "list
+    models" call answering `{ok, status?, error?}`): a stored row wins over
+    the environment (switched off = off even with a key in the environment;
+    a value not stored falls back to its variable), is loaded into
+    `shared._provider_settings` at startup and after a save (which drops the
+    cached direct models and reloads the registry; another instance sees it
+    at its next start or reload). The key is stored like the other stored
+    credentials, never returned (`has_key`, `key_source`), exported or
+    logged; a save is one WARNING naming provider and principal.
+    `tests/test_model_provider_settings.py`; UI5 admin Settings panel
+    "Model providers". The direct OpenAI model is a `SAPAICoreModel` (same usage
     and empty-response handling). Token usage of the direct Anthropic model
     is pydantic-ai's own mapping: not verified with a real key.
     `tests/test_model_providers.py`

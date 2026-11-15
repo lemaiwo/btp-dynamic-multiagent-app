@@ -1673,6 +1673,30 @@ class JobRun(Base):
         }
 
 
+class ModelProvider(Base):
+    """The admin's setting of one direct model provider (``anthropic``,
+    ``openai``): whether it is used, its API key, an optional base URL and the
+    models it offers. Read and written by ``agents/model_providers.py``; the
+    key is never returned by an API, exported or logged.
+
+    ``enabled`` is NOT NULL with a ``server_default`` (HANA adds columns to a
+    table that holds rows only with one); ``models_json`` is a JSON list.
+    The table is HANA schema generation 12.
+    """
+
+    __tablename__ = "model_providers"
+
+    provider: Mapped[str] = mapped_column(String(32), primary_key=True)
+    enabled: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
+    api_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    base_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    models_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    updated_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class AdminNotificationState(Base):
     """Up to when an admin has read the finished-run notifications.
 

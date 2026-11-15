@@ -17,7 +17,6 @@ services:
       OPENAI_BASE_URL: http://fake-model:9000/v1
       OPENAI_MODELS: test-model
       DEFAULT_MODEL: openai:test-model
-      AICORE_AVAILABLE_MODELS: openai:test-model
     depends_on:
       fake-model:
         condition: service_started

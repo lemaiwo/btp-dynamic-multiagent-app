@@ -621,8 +621,9 @@ def _discover_deployed_models(refresh: bool = False) -> list[str] | None:
 # instead of an AI Core deployment: ``anthropic:<model>`` (ANTHROPIC_API_KEY)
 # and ``openai:<model>`` (OPENAI_API_KEY; OPENAI_BASE_URL for any
 # OpenAI-compatible endpoint). A name without a prefix is an AI Core
-# deployment, as before. The keys are read from the environment only, when a
-# model is built; they are never stored, listed or logged.
+# deployment, as before. A key comes from the admin's setting (the table
+# ``model_providers``) or the environment, is read when a model is built, and
+# is never listed or logged.
 DIRECT_PROVIDERS = ("anthropic", "openai")
 _DIRECT_KEY_ENV = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}
 _DIRECT_MODELS_ENV = {"anthropic": "ANTHROPIC_MODELS", "openai": "OPENAI_MODELS"}
@@ -640,20 +641,72 @@ def direct_provider_of(name: str) -> str | None:
     return None
 
 
+# What an admin stored per provider (agents/model_providers.py, the table
+# ``model_providers``): ``{provider: {"enabled", "api_key", "base_url",
+# "models"}}``. A stored setting wins over the environment: switched off, the
+# provider is off even with a key in the environment; switched on, each value
+# that is stored is used and each one that is not falls back to its variable.
+# Kept here, in memory, because the functions below are synchronous; it is
+# loaded at startup and after every save.
+_provider_settings: dict[str, dict[str, Any]] = {}
+
+
+def set_direct_provider_settings(settings: dict[str, dict[str, Any]]) -> None:
+    """Replace the stored provider settings and forget the direct models that
+    were built with the old ones (a changed key must not live on in a cached
+    client). The caller reloads the registry afterwards."""
+    global _provider_settings
+    _provider_settings = {name: dict(value) for name, value in settings.items()}
+    for name in [n for n in _models if direct_provider_of(n) is not None]:
+        del _models[name]
+
+
+def _provider_setting(provider: str) -> dict[str, Any]:
+    return _provider_settings.get(provider) or {}
+
+
+def direct_api_key(provider: str) -> str:
+    """The provider's key: the stored one, else the environment's; ``""``
+    when the provider is switched off or has none."""
+    setting = _provider_setting(provider)
+    if setting and not setting.get("enabled", True):
+        return ""
+    stored = str(setting.get("api_key") or "").strip()
+    return stored or (os.environ.get(_DIRECT_KEY_ENV[provider]) or "").strip()
+
+
+def direct_key_source(provider: str) -> str:
+    """``setting`` | ``env`` | ``none``: where the key in effect comes from."""
+    setting = _provider_setting(provider)
+    if setting and not setting.get("enabled", True):
+        return "none"
+    if str(setting.get("api_key") or "").strip():
+        return "setting"
+    return "env" if (os.environ.get(_DIRECT_KEY_ENV[provider]) or "").strip() else "none"
+
+
+def direct_base_url(provider: str) -> str | None:
+    stored = str(_provider_setting(provider).get("base_url") or "").strip()
+    variable = "OPENAI_BASE_URL" if provider == "openai" else "ANTHROPIC_BASE_URL"
+    return stored or (os.environ.get(variable) or "").strip() or None
+
+
 def _direct_configured(provider: str) -> bool:
-    return bool((os.environ.get(_DIRECT_KEY_ENV[provider]) or "").strip())
+    return bool(direct_api_key(provider))
 
 
 def direct_models() -> list[str]:
-    """The prefixed names of the direct providers that have a key:
-    ``<PROVIDER>_MODELS`` (comma-separated) or a short default list."""
+    """The prefixed names of the direct providers that have a key: the stored
+    list, else ``<PROVIDER>_MODELS`` (comma-separated), else a short default."""
     names: list[str] = []
     for provider in DIRECT_PROVIDERS:
         if not _direct_configured(provider):
             continue
+        stored = _provider_setting(provider).get("models") or []
         raw = (os.environ.get(_DIRECT_MODELS_ENV[provider]) or "").strip()
-        for model in (raw or _DIRECT_DEFAULT_MODELS[provider]).split(","):
-            model = model.strip()
+        listed = stored or (raw or _DIRECT_DEFAULT_MODELS[provider]).split(",")
+        for model in listed:
+            model = str(model).strip()
             if not model:
                 continue
             if direct_provider_of(model) is None:
@@ -821,11 +874,11 @@ class DirectModelError(RuntimeError):
 
 
 def _direct_api_key(provider: str) -> str:
-    key = (os.environ.get(_DIRECT_KEY_ENV[provider]) or "").strip()
+    key = direct_api_key(provider)
     if not key:
         raise DirectModelError(
-            f"{_DIRECT_KEY_ENV[provider]} is not set: the model is served by the "
-            f"{provider} API and needs its key in the environment"
+            f"the {provider} provider has no API key (admin Settings, or "
+            f"{_DIRECT_KEY_ENV[provider]} in the environment) or is switched off"
         )
     return key
 
@@ -839,7 +892,7 @@ def _build_direct_openai_model(model: str) -> SAPAICoreModel:
 
     client = AsyncOpenAI(
         api_key=_direct_api_key("openai"),
-        base_url=(os.environ.get("OPENAI_BASE_URL") or "").strip() or None,
+        base_url=direct_base_url("openai"),
         max_retries=_max_retries(),
     )
     return SAPAICoreModel(model, provider=OpenAIProvider(openai_client=client))
@@ -852,7 +905,7 @@ def _build_direct_anthropic_model(model: str):
 
     client = AsyncAnthropic(
         api_key=_direct_api_key("anthropic"),
-        base_url=(os.environ.get("ANTHROPIC_BASE_URL") or "").strip() or None,
+        base_url=direct_base_url("anthropic"),
         max_retries=_max_retries(),
     )
     return AnthropicModel(model, provider=AnthropicProvider(anthropic_client=client))

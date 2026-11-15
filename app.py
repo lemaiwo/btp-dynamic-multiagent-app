@@ -369,6 +369,10 @@ async def lifespan(app: FastAPI):
         logger.info("Marked %d reconciliation run(s) as interrupted", swept_rc)
     await seed_from_file_if_empty(SEED_FILE)
     await ensure_ide_seed(IDE_SEED_FILE)
+    # The admin's direct model provider settings, before the first build.
+    from agents import model_providers
+
+    await model_providers.refresh()
     await registry.reload()
     dynamic_chat_app.refresh()
     heartbeat: asyncio.Task | None = None

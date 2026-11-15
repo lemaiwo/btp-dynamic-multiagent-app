@@ -30,6 +30,7 @@ import "./RunReportJourney";
 import "./RunAutoRefreshJourney";
 import "./ReloadJourney";
 import "./EmbeddingsJourney";
+import "./ModelProvidersJourney";
 import "./ImportJourney";
 import "./SessionExpiredJourney";
 import "./WorkflowJourney";
