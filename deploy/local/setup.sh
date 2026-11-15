@@ -103,6 +103,30 @@ ENV
     made "secrets/app.env (add a model API key before starting)"
 fi
 
+# --- arc1.env.template: an ARC-1 next to the app (optional) -------------------
+if [ -e "$SECRETS/arc1.env.template" ]; then
+    kept secrets/arc1.env.template
+else
+    cat > "$SECRETS/arc1.env.template" <<'ENV'
+# ARC-1 next to the app, on the same sign-in. Copy this file to arc1.env and
+# fill it in; ./stack.sh up then builds and starts ARC-1 as well.
+SAP_URL=https://REPLACE_ME_SAP_HOST:44300
+SAP_CLIENT=100
+SAP_LANGUAGE=EN
+# The shared startup identity (discovery, feature probes). Calls of a
+# signed-in user never run as this user.
+SAP_USER=REPLACE_ME
+SAP_PASSWORD=REPLACE_ME
+# The ABAP system's SAML2 local provider name (the destination's "audience").
+SAP_PP_SAML_AUDIENCE=REPLACE_ME_SAML2_LOCAL_PROVIDER_NAME
+# Safety ceilings; a propagated user is still limited by their own SAP authorizations.
+SAP_ALLOW_WRITES=false
+SAP_ALLOW_DATA_PREVIEW=false
+SAP_ALLOW_FREE_SQL=false
+ENV
+    made "secrets/arc1.env.template (copy to arc1.env to add ARC-1)"
+fi
+
 # --- destinations.json --------------------------------------------------------
 if [ -e "$SECRETS/destinations.json" ]; then
     kept secrets/destinations.json

@@ -59,7 +59,9 @@ The two user types need a validated user token: the token is validated again
 here (``agents.auth.get_validator``), never merely decoded, and without a
 validator nothing is minted. A user is never replaced by a technical one.
 ``ProxyType: OnPremise`` is refused: there is no connectivity proxy here,
-the target is reached directly.
+the target is reached directly, over ``https``. ``"AllowPlainHttp": "true"``
+admits an ``http://`` URL for a service on the same private network (an ARC-1
+container next to the app); never for ``SAMLAssertion``.
 
 A log line names the destination and, for a minted assertion, the principal;
 never a URL, a credential, a NameID or an assertion.
@@ -91,6 +93,8 @@ LOCAL_AUTH_TYPES = frozenset({
 })
 USER_AUTH_TYPES = frozenset({SAML_ASSERTION, FORWARD_USER_TOKEN})
 SESSION_HEADER = "x-sap-security-session"
+# ``"AllowPlainHttp": "true"``: the one way an ``http://`` URL is accepted.
+PLAIN_HTTP = "AllowPlainHttp"
 MAX_FILE_BYTES = 1_000_000
 MAX_DESTINATIONS = 200
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,199}")
@@ -193,6 +197,21 @@ def _properties(name: str, entry: Mapping[str, Any]) -> dict[str, str]:
         raise DestinationError(
             f"local destination {name!r}: ProxyType must be Internet; a local "
             f"deployment reaches the target directly, not through a Cloud Connector"
+        )
+    scheme = props.get("URL", "").split("://", 1)[0].lower()
+    if props["Type"] == "HTTP" and scheme != "https":
+        if scheme != "http" or props.get(PLAIN_HTTP) != "true":
+            raise DestinationError(
+                f"local destination {name!r}: the URL must be https:// (http:// only "
+                f"with {PLAIN_HTTP} \"true\", for a service on the same private network)"
+            )
+        if props["Authentication"] == SAML_ASSERTION:
+            raise DestinationError(
+                f"local destination {name!r}: a {SAML_ASSERTION} destination must be https://"
+            )
+        logger.warning(
+            "local destination %r is plain http: its credential is not protected "
+            "on the way (acceptable inside a container network only)", name,
         )
     if props["Authentication"] not in LOCAL_AUTH_TYPES:
         raise DestinationError(

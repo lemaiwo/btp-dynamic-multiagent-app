@@ -7,12 +7,30 @@
   "ssoSessionIdleTimeout": 28800,
   "roles": {
     "realm": [
-      {"name": "user", "description": "Chat access (the XSUAA scope 'user')"},
-      {"name": "admin", "description": "Admin UI and API (scope 'admin')"},
-      {"name": "developer", "description": "Advanced access and the ABAP Assistant (scope 'developer')"},
-      {"name": "a2a", "description": "A2A endpoint (scope 'a2a')"},
-      {"name": "invoke", "description": "Invoke API (scope 'invoke')"},
-      {"name": "JOBSCHEDULER", "description": "Scheduler run endpoints (scope 'JOBSCHEDULER')"}
+      {
+        "name": "user",
+        "description": "Chat access (the XSUAA scope 'user')"
+      },
+      {
+        "name": "admin",
+        "description": "Admin UI and API (scope 'admin')"
+      },
+      {
+        "name": "developer",
+        "description": "Advanced access and the ABAP Assistant (scope 'developer')"
+      },
+      {
+        "name": "a2a",
+        "description": "A2A endpoint (scope 'a2a')"
+      },
+      {
+        "name": "invoke",
+        "description": "Invoke API (scope 'invoke')"
+      },
+      {
+        "name": "JOBSCHEDULER",
+        "description": "Scheduler run endpoints (scope 'JOBSCHEDULER')"
+      }
     ]
   },
   "clients": [
@@ -27,9 +45,15 @@
       "directAccessGrantsEnabled": true,
       "implicitFlowEnabled": false,
       "serviceAccountsEnabled": false,
-      "redirectUris": ["http://localhost:4180/oauth2/callback"],
-      "webOrigins": ["http://localhost:4180"],
-      "attributes": {"post.logout.redirect.uris": "http://localhost:4180/*"},
+      "redirectUris": [
+        "http://localhost:4180/oauth2/callback"
+      ],
+      "webOrigins": [
+        "http://localhost:4180"
+      ],
+      "attributes": {
+        "post.logout.redirect.uris": "http://localhost:4180/*"
+      },
       "protocolMappers": [
         {
           "name": "agent-app-audience",
@@ -38,6 +62,52 @@
           "consentRequired": false,
           "config": {
             "included.client.audience": "agent-app",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        },
+        {
+          "name": "arc1-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "arc1-local",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "arc1-local",
+      "name": "ARC-1 MCP clients that sign in themselves (Claude Code, VS Code; curl tests)",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": true,
+      "implicitFlowEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [
+        "http://localhost:56789/*",
+        "http://127.0.0.1:56789/*"
+      ],
+      "webOrigins": [
+        "+"
+      ],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "+"
+      },
+      "protocolMappers": [
+        {
+          "name": "arc1-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "arc1-local",
             "id.token.claim": "false",
             "access.token.claim": "true"
           }
@@ -53,8 +123,18 @@
       "emailVerified": true,
       "firstName": "Dev",
       "lastName": "User",
-      "realmRoles": ["user", "developer", "admin"],
-      "credentials": [{"type": "password", "value": "__USER_PASSWORD__", "temporary": false}]
+      "realmRoles": [
+        "user",
+        "developer",
+        "admin"
+      ],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "__USER_PASSWORD__",
+          "temporary": false
+        }
+      ]
     },
     {
       "username": "basic",
@@ -63,8 +143,16 @@
       "emailVerified": true,
       "firstName": "Basic",
       "lastName": "User",
-      "realmRoles": ["user"],
-      "credentials": [{"type": "password", "value": "__BASIC_PASSWORD__", "temporary": false}]
+      "realmRoles": [
+        "user"
+      ],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "__BASIC_PASSWORD__",
+          "temporary": false
+        }
+      ]
     }
   ]
 }

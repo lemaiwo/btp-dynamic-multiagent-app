@@ -361,7 +361,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     `SAMLAssertion` and `ForwardUserToken` (the last two are the signed-in
     user: the token is validated again, never merely decoded; no validator
     or no user token mints nothing). `${VAR}` in a value is read from the
-    environment; `ProxyType: OnPremise` is refused. `_as_user` accepts a
+    environment; `ProxyType: OnPremise` is refused; `http://` only with
+    `AllowPlainHttp` exactly `"true"` (`Destination.plain_http`, the one
+    exception `DestinationAuth._target` makes; never for `SAMLAssertion`). `_as_user` accepts a
     LOCAL `SAMLAssertion` destination as user-propagating (BTP's is still
     refused there). The OData destination picker lists the file
     (`_list_local`). `tests/test_local_destinations.py`
@@ -387,7 +389,12 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   - `Dockerfile`, `deploy/local/` — `setup.sh` (generates `secrets/`,
     gitignored), `stack.sh`, `compose.yaml`, the Keycloak realm template,
     `entrypoint.sh` (CA certificates in `/extra-ca` are trusted next to the
-    public ones). The UI5 apps are not served there.
+    public ones), `compose.arc1.yaml` (an ARC-1 of the prototype branch on
+    the same realm and SAML key, joined by `stack.sh` when `secrets/arc1.env`
+    exists; reached through the `ARC1` destination). The realm's tokens name
+    `agent-app` and `arc1-local` in `aud` by client mappers: a `clientScopes`
+    block in the realm file makes Keycloak skip its built-in scopes (email,
+    profile, roles). The UI5 apps are not served there.
 - `agents/errors.py` — `describe_exception` / `mask_text` /
   `exception_class`: the one way exception text leaves the log (to the
   model, a tool card, a `job_runs` / `workflow_runs` row). It keeps the

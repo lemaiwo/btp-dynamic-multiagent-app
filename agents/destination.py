@@ -350,6 +350,11 @@ class Destination:
     # (agents.local_destinations), where this app itself mints the user's
     # credential, instead of from the destination service.
     local: bool = False
+    # True only for a local destination whose file says ``AllowPlainHttp``
+    # exactly ``true``: ``http://`` to a service on the same private network
+    # (an ARC-1 container next to the app). Never set for a destination of
+    # the destination service.
+    plain_http: bool = False
 
 
 # Destination property names whose value is a credential. Matched
@@ -702,6 +707,7 @@ class DestinationResolver:
         from agents import local_destinations
 
         local = local_destinations.is_local(self._config)
+        plain_http = local and config.get(local_destinations.PLAIN_HTTP) == "true"
         auth_type = str(config.get("Authentication") or "").strip()
 
         # Static headers set as `URL.headers.<Name>` additional properties.
@@ -758,6 +764,7 @@ class DestinationResolver:
                     proxy_type=proxy_type, location_id=location_id,
                     queries=queries, static_headers=frozenset(static),
                     system_user=system_user, local=local,
+                    plain_http=plain_http,
                 )
             # A destination created with NoAuthentication resolves perfectly
             # well and hands back no credential at all. Saying so here beats
@@ -812,6 +819,7 @@ class DestinationResolver:
             auth_type=auth_type, per_user=per_user,
             proxy_type=proxy_type, location_id=location_id, queries=queries,
             static_headers=frozenset(static), system_user=system_user, local=local,
+            plain_http=plain_http,
         )
 
 

@@ -475,7 +475,10 @@ class DestinationAuth(httpx.Auth):
         """
         dest_url = httpx.URL(destination.url)
         through_proxy = self._through_proxy(destination)
-        if not through_proxy and dest_url.scheme != "https":
+        # The one exception to https on the direct path: a local destination
+        # that says AllowPlainHttp (agents.local_destinations).
+        plain = destination.local and destination.plain_http and dest_url.scheme == "http"
+        if not through_proxy and dest_url.scheme != "https" and not plain:
             raise DestinationError(
                 f"destination {self.destination_name!r} must use https://, "
                 f"not {dest_url.scheme!r}: its credential travels with every request"

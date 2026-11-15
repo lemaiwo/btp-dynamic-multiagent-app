@@ -227,3 +227,37 @@ def test_a_bound_destination_service_wins(stack, monkeypatch):
         {"VCAP_SERVICES": json.dumps(vcap), "LOCAL_DESTINATIONS_FILE": str(stack[0])})
     assert not local_destinations.is_local(config)
     assert config_from_environment({}) is None
+
+
+async def test_plain_http_only_by_explicit_opt_in(stack, key):
+    path, document = stack
+    token = helpers.token(key)
+    document["destinations"][2]["URL"] = "http://arc1:8080"
+    rewrite(path, document)
+    with pytest.raises(DestinationError, match="https://"):
+        await resolver("ARC1").resolve(user_token=token, principal="user-1")
+    document["destinations"][2]["AllowPlainHttp"] = "true"
+    rewrite(path, document)
+    made = resolver("ARC1")
+    destination = await made.resolve(user_token=token, principal="user-1")
+    assert destination.plain_http and destination.url == "http://arc1:8080"
+    import httpx
+    from agents.destination_auth import PLACEHOLDER_BASE
+
+    flow = DestinationAuth(made, user_context=True, server_key="mcp")
+    target = flow._target(httpx.Request("POST", f"{PLACEHOLDER_BASE}/mcp"), destination)
+    assert str(target) == "http://arc1:8080/mcp"
+    # Without the flag on the resolved destination, http stays refused.
+    import dataclasses
+
+    with pytest.raises(DestinationError, match="https://"):
+        flow._target(httpx.Request("POST", f"{PLACEHOLDER_BASE}/mcp"),
+                     dataclasses.replace(destination, plain_http=False))
+    # Never for an assertion, and "True" / true-ish spellings do not count.
+    document["destinations"][0].update({"URL": "http://sap.example.test", "AllowPlainHttp": "true"})
+    document["destinations"][2]["AllowPlainHttp"] = "True"
+    rewrite(path, document)
+    with pytest.raises(DestinationError, match="must be https://"):
+        await resolver("S4_USER").resolve(user_token=token, principal="user-1")
+    with pytest.raises(DestinationError, match="https://"):
+        await resolver("ARC1").resolve(user_token=token, principal="user-1")

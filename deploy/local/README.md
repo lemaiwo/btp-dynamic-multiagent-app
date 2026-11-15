@@ -87,6 +87,9 @@ the property names are the same. A value may name an environment variable as
 | `SAMLAssertion` | **the signed-in user** | `audience` (required), `userIdSource`, `nameIdFormat`, `recipient` |
 | `ForwardUserToken` | **the signed-in user** | their OIDC token as `Bearer`, for a target that validates the same issuer (an ARC-1 MCP server) |
 
+`"AllowPlainHttp": "true"` admits an `http://` URL, for a service inside the
+container network only; never for `SAMLAssertion`.
+
 The target is reached directly from the container, over `https`. If its
 certificate is from your own CA, put the CA certificate (PEM, `.crt`) into
 `secrets/extra-ca/` and restart the app: it is trusted next to the public
@@ -133,14 +136,37 @@ assertion at all (the signature is verified here only by libraries), whether
 (set `"URL.headers.x-sap-security-session": "none"` in the destination to
 send none), and CSRF-protected writes through OData.
 
-## ARC-1 with the same sign-in
+## ARC-1 on the same sign-in
 
-An ARC-1 that validates tokens of the same issuer can be attached to an agent
-in two ways, both as the signed-in user:
+The realm is set up like the one of ARC-1's `examples/local-sso`: a token the
+app's users get also names `arc1-local` in `aud`, so an ARC-1 that validates
+this realm accepts it, and the public client `arc1-local` lets an MCP client
+(Claude Code, VS Code) sign in to that ARC-1 by itself.
 
-- auth mode `jwt` with its URL (add the host to `MCP_URL_ALLOWLIST` in
-  `secrets/app.env`), or
-- auth mode `destination` with a `ForwardUserToken` destination.
+To run ARC-1 in this stack:
 
-ARC-1 then needs this stack's client id among the audiences it accepts
-(`aud` of the token is `agent-app`).
+```sh
+cp secrets/arc1.env.template secrets/arc1.env    # then fill in the SAP system
+./stack.sh up                                    # builds ARC-1's prototype branch too
+```
+
+- ARC-1 validates the realm's tokens (`SAP_OIDC_ISSUER`, audience
+  `arc1-local`) and signs the SAML bearer assertion for the user itself, with
+  the **same key pair** as the app (`secrets/saml`, issuer
+  `agent-local-saml-idp`): the ABAP system needs one trusted provider.
+- The app reaches it through the destination `ARC1` (`ForwardUserToken`: the
+  signed-in user's token is forwarded; `AllowPlainHttp` because it is
+  `http://arc1:8080` inside the container network).
+- Attach it to an agent in the admin: MCP server URL `https://arc1.local/mcp`
+  (only the path is used), auth mode `destination`, destination `ARC1`, user
+  context on. For the ABAP Assistant, name `ARC1` as the destination of the
+  target's conventions.
+- MCP clients on this machine reach it at <http://localhost:8091/mcp>.
+- The tokens carry no ARC-1 scopes (`read`, `write`, ...), which ARC-1 treats
+  as read-only. Wider access needs those scopes as client scopes in the
+  realm, on top of ARC-1's own `SAP_ALLOW_*` ceilings.
+
+An ARC-1 elsewhere works the same way: point a `ForwardUserToken` destination
+(https) at it, or use auth mode `jwt` with its URL and its host in
+`MCP_URL_ALLOWLIST`; it must accept this realm's issuer and `arc1-local`
+(or `agent-app`) as audience.

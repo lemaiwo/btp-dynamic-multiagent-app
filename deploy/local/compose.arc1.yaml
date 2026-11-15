@@ -1,0 +1,57 @@
+# Overlay: an ARC-1 MCP server next to the app, on the same sign-in.
+# stack.sh adds it when secrets/arc1.env exists (copy secrets/arc1.env.template).
+#
+# The user signs in once (Keycloak). The app forwards their token to ARC-1
+# (destination "ARC1", ForwardUserToken); ARC-1 validates it against the same
+# realm and signs a SAML bearer assertion for that user with the SAME key
+# pair the app uses, so the ABAP system needs one trusted provider for both.
+#
+# The image is built from ARC-1's prototype branch (the local SAML issuer is
+# not in a released image).
+services:
+  arc1:
+    build:
+      context: https://github.com/arc-mcp/arc-1.git#proto/saml-bearer-pp
+    image: arc1-saml-proto
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8091:8080"   # for MCP clients that sign in themselves (Claude Code, VS Code)
+    env_file:
+      - ./secrets/arc1.env
+    environment:
+      SAP_TRANSPORT: http-streamable
+      ARC1_SERVER_NAME: arc-1
+      ARC1_PUBLIC_URL: http://localhost:8091
+      NODE_OPTIONS: --max-old-space-size=384
+      # Sign-in: the stack's realm. Inside this container localhost:8180 is
+      # forwarded to Keycloak by the sidecar below, so the issuer URL is the
+      # same one the browser and the tokens use.
+      SAP_OIDC_ISSUER: http://localhost:8180/realms/agents
+      SAP_OIDC_AUDIENCE: arc1-local
+      # Per-user SAP identity: the local SAML bearer issuer.
+      SAP_PP_ENABLED: "true"
+      SAP_PP_STRICT: "false"
+      SAP_PP_SAML_IDP_KEY_FILE: /home/arc1/saml/saml-idp.key
+      SAP_PP_SAML_IDP_CERT_FILE: /home/arc1/saml/saml-idp.crt
+      SAP_PP_SAML_ISSUER: agent-local-saml-idp
+      SAP_PP_SAML_NAMEID_CLAIM: email
+      SAP_PP_SAML_NAMEID_FORMAT: email
+    volumes:
+      - ./secrets/saml:/home/arc1/saml:ro
+    depends_on:
+      keycloak:
+        condition: service_healthy
+
+  # Shares arc1's network namespace: localhost:8180 inside arc1 reaches Keycloak.
+  arc1-idp-forward:
+    image: alpine/socat:1.8.0.0
+    network_mode: "service:arc1"
+    restart: unless-stopped
+    entrypoint: ["sh", "-c"]
+    command:
+      - socat TCP6-LISTEN:8180,fork,reuseaddr,bind=[::1] TCP:keycloak:8180 & exec socat TCP4-LISTEN:8180,fork,reuseaddr,bind=127.0.0.1 TCP:keycloak:8180
+    depends_on:
+      arc1:
+        condition: service_started
+      keycloak:
+        condition: service_healthy
