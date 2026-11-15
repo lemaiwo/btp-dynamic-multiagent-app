@@ -1,0 +1,129 @@
+# The agent app without BTP: PostgreSQL, an OIDC identity provider (Keycloak)
+# and oauth2-proxy as the signing-in reverse proxy (the approuter's part).
+#
+#   ./setup.sh you@example.com        once: secrets, realm, SAML key pair
+#   ./stack.sh up                     build and start
+#   open http://localhost:4180/chat   (admin: /admin)
+#
+# Everything is bound to loopback. Secrets live in ./secrets (gitignored):
+# stack.env feeds the ${...} below, app.env is the app's own environment
+# (model API keys, destination passwords).
+name: agent-local
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: agents
+      POSTGRES_USER: agent
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run ./setup.sh first}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent -d agents"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.4
+    command: ["start-dev", "--import-realm"]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8180:8180"
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?run ./setup.sh first}
+      # The issuer in every token. The browser reaches Keycloak under this
+      # name; the containers reach it as keycloak:8180 (token and key URLs).
+      KC_HOSTNAME: http://localhost:8180
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+      KC_HTTP_ENABLED: "true"
+      KC_HTTP_PORT: "8180"
+      KC_HEALTH_ENABLED: "true"
+    volumes:
+      # Dev mode without a data volume: the realm is imported on every
+      # (re)create. Change secrets/realm.json, not the console.
+      - ./secrets/realm.json:/opt/keycloak/data/import/realm.json:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - exec 3<>/dev/tcp/127.0.0.1/9000; printf 'GET /health/ready HTTP/1.0\r\n\r\n' >&3; grep -q UP <&3
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  app:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: agent-app:local
+    restart: unless-stopped
+    env_file:
+      - ./secrets/app.env
+    environment:
+      DATABASE_URL: postgresql://agent:${POSTGRES_PASSWORD}@postgres:5432/agents
+      # No XSUAA: tokens of the OIDC provider are validated instead, and
+      # oauth2-proxy hands the user's access token over in its own header.
+      OIDC_ISSUER: http://localhost:8180/realms/agents
+      OIDC_AUDIENCE: agent-app
+      OIDC_JWKS_URL: http://keycloak:8180/realms/agents/protocol/openid-connect/certs
+      AUTH_TOKEN_HEADER: X-Forwarded-Access-Token
+      PUBLIC_BASE_URL: http://localhost:4180
+      # No destination service: the file stands in for it.
+      LOCAL_DESTINATIONS_FILE: /config/destinations.json
+    volumes:
+      - ./secrets/destinations.json:/config/destinations.json:ro
+      - ./secrets/saml:/config/saml:ro
+      # Certificates of your own CA (on-premise SAP), trusted next to the public ones.
+      - ./secrets/extra-ca:/extra-ca:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+
+  proxy:
+    image: quay.io/oauth2-proxy/oauth2-proxy:v7.8.1
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:4180:4180"
+    environment:
+      OAUTH2_PROXY_HTTP_ADDRESS: 0.0.0.0:4180
+      OAUTH2_PROXY_UPSTREAMS: http://app:7932
+      OAUTH2_PROXY_UPSTREAM_TIMEOUT: 900s
+      OAUTH2_PROXY_FLUSH_INTERVAL: 100ms
+      OAUTH2_PROXY_PROVIDER: oidc
+      OAUTH2_PROXY_PROVIDER_DISPLAY_NAME: Keycloak
+      OAUTH2_PROXY_CLIENT_ID: agent-app
+      OAUTH2_PROXY_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?run ./setup.sh first}
+      OAUTH2_PROXY_COOKIE_SECRET: ${PROXY_COOKIE_SECRET:?run ./setup.sh first}
+      OAUTH2_PROXY_COOKIE_SECURE: "false"      # http on localhost
+      OAUTH2_PROXY_COOKIE_REFRESH: 10m         # the access token lives 15 min
+      OAUTH2_PROXY_REDIRECT_URL: http://localhost:4180/oauth2/callback
+      OAUTH2_PROXY_EMAIL_DOMAINS: "*"
+      OAUTH2_PROXY_SCOPE: openid email profile
+      OAUTH2_PROXY_CODE_CHALLENGE_METHOD: S256
+      OAUTH2_PROXY_SKIP_PROVIDER_BUTTON: "true"
+      # Discovery is skipped because the provider has two names: the browser
+      # goes to localhost:8180, this container to keycloak:8180.
+      OAUTH2_PROXY_SKIP_OIDC_DISCOVERY: "true"
+      OAUTH2_PROXY_OIDC_ISSUER_URL: http://localhost:8180/realms/agents
+      OAUTH2_PROXY_LOGIN_URL: http://localhost:8180/realms/agents/protocol/openid-connect/auth
+      OAUTH2_PROXY_REDEEM_URL: http://keycloak:8180/realms/agents/protocol/openid-connect/token
+      OAUTH2_PROXY_OIDC_JWKS_URL: http://keycloak:8180/realms/agents/protocol/openid-connect/certs
+      # The app gets the user's access token (X-Forwarded-Access-Token) and
+      # validates it itself; an API caller's own bearer token passes through.
+      OAUTH2_PROXY_PASS_ACCESS_TOKEN: "true"
+      OAUTH2_PROXY_SKIP_JWT_BEARER_TOKENS: "true"
+      OAUTH2_PROXY_SKIP_AUTH_ROUTES: ^/healthz$$,^/\.well-known/
+      # 401 instead of a redirect to the login page, as the UIs expect.
+      OAUTH2_PROXY_API_ROUTES: ^/(admin/api|chat/api|ide/api|api|a2a)
+    depends_on:
+      app:
+        condition: service_healthy
+
+volumes:
+  pgdata:

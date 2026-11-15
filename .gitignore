@@ -61,3 +61,7 @@ CLAUDE.local.md
 
 # Playwright MCP page snapshots and console logs (local browser automation)
 .playwright-mcp/
+
+# The local Docker stack (deploy/local): generated secrets, the realm with
+# its test users, the SAML signing key and the destinations of one landscape.
+deploy/local/secrets/

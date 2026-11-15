@@ -1,0 +1,29 @@
+{
+  "saml": {
+    "issuer": "agent-local-saml-idp",
+    "key_file": "saml/saml-idp.key",
+    "cert_file": "saml/saml-idp.crt",
+    "ttl_seconds": 300
+  },
+  "destinations": [
+    {
+      "Name": "SAP_USER",
+      "Description": "On-premise ABAP system as the signed-in user (SAML bearer assertion)",
+      "URL": "https://REPLACE_ME_SAP_HOST:44300",
+      "Authentication": "SAMLAssertion",
+      "audience": "REPLACE_ME_SAML2_LOCAL_PROVIDER_NAME",
+      "nameIdFormat": "email",
+      "userIdSource": "email",
+      "URL.queries.sap-client": "REPLACE_ME_CLIENT"
+    },
+    {
+      "Name": "SAP_TECH",
+      "Description": "On-premise ABAP system as a technical user",
+      "URL": "https://REPLACE_ME_SAP_HOST:44300",
+      "Authentication": "BasicAuthentication",
+      "User": "REPLACE_ME_TECHNICAL_USER",
+      "Password": "${SAP_TECH_PASSWORD}",
+      "URL.queries.sap-client": "REPLACE_ME_CLIENT"
+    }
+  ]
+}

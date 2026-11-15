@@ -336,6 +336,58 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `require_a2a` (the `a2a` scope, on `/a2a`) and `require_jobscheduler` (the
   `JOBSCHEDULER` scope, on the two scheduler run endpoints), and `run_as`, the
   context manager a "Run now" job uses to run under the agent's principal
+- **Without BTP** (test branch `test/local-docker-sso`; `deploy/local/README.md`
+  is the guide): the app in Docker next to PostgreSQL, an OIDC provider
+  (Keycloak) and oauth2-proxy, reaching on-premise SAP directly.
+  - `agents/oidc.py` — `OidcValidator`, chosen by `auth.get_validator()` when
+    `OIDC_ISSUER` is set and no XSUAA is bound (`auth.oidc_enabled()`): the
+    same `validate` / `has_scope` as `XsuaaValidator`, so every `require_*`
+    works unchanged. `OIDC_AUDIENCE` is required (no switch skips the
+    audience check), keys from `OIDC_JWKS_URL` or discovery, asymmetric
+    algorithms only, roles from `OIDC_ROLES_CLAIM` (default
+    `realm_access.roles,roles,groups`) plus `scope` / `scp`, named like the
+    XSUAA scopes. `AUTH_TOKEN_HEADER` names the proxy's token header (wins
+    over `Authorization`; the token is validated either way).
+    `auth.auth_enforced()` (CF or OIDC) is what the middleware's "token
+    required" rules use, and `create_mcp_server`'s `jwt` mode forwards the
+    user's token under OIDC as on CF. `tests/test_oidc_auth.py`
+  - `agents/local_destinations.py` — `LOCAL_DESTINATIONS_FILE`: a JSON file
+    in place of the destination service (a bound service wins).
+    `config_from_environment` returns a `LocalDestinationConfig` and
+    `DestinationResolver._fetch_payload` answers from `find`, in the
+    service's own "find destination" shape, so caches, `DestinationAuth`
+    and every built-in are unchanged; `Destination.local` marks the result.
+    `Authentication`: `NoAuthentication`, `BasicAuthentication`,
+    `SAMLAssertion` and `ForwardUserToken` (the last two are the signed-in
+    user: the token is validated again, never merely decoded; no validator
+    or no user token mints nothing). `${VAR}` in a value is read from the
+    environment; `ProxyType: OnPremise` is refused. `_as_user` accepts a
+    LOCAL `SAMLAssertion` destination as user-propagating (BTP's is still
+    refused there). The OData destination picker lists the file
+    (`_list_local`). `tests/test_local_destinations.py`
+  - `agents/saml_bearer.py` — the SAML 2.0 bearer assertion of a local
+    `SAMLAssertion` destination (`Authorization: SAML2.0 <base64>`, RSA-SHA256,
+    enveloped, exclusive C14N; ARC-1's `proto/saml-bearer-pp` layout). No XML
+    library signs (signxml needs lxml): the assertion is written directly in
+    canonical form and values canonical XML cannot carry are refused.
+    `tests/test_saml_bearer.py` re-derives digest and signature with the
+    standard library; checked once with xml-crypto. An assertion is minted
+    per resolve (`expires_in` 0, about a second of cache). **Never run
+    against an SAP system.**
+  - `agents/shared.py` — direct providers: a model named `anthropic:<model>`
+    (`ANTHROPIC_API_KEY`) or `openai:<model>` (`OPENAI_API_KEY`,
+    `OPENAI_BASE_URL`) is served by that API (`_build_model`), any other name
+    is an AI Core deployment. `available_models()` adds
+    `ANTHROPIC_MODELS` / `OPENAI_MODELS`; with no AI Core credentials
+    (`aicore_configured()`) only those are offered. `DEFAULT_MODEL` wins over
+    `AICORE_MODEL`. The direct OpenAI model is a `SAPAICoreModel` (same usage
+    and empty-response handling). Token usage of the direct Anthropic model
+    is pydantic-ai's own mapping: not verified with a real key.
+    `tests/test_model_providers.py`
+  - `Dockerfile`, `deploy/local/` — `setup.sh` (generates `secrets/`,
+    gitignored), `stack.sh`, `compose.yaml`, the Keycloak realm template,
+    `entrypoint.sh` (CA certificates in `/extra-ca` are trusted next to the
+    public ones). The UI5 apps are not served there.
 - `agents/errors.py` — `describe_exception` / `mask_text` /
   `exception_class`: the one way exception text leaves the log (to the
   model, a tool card, a `job_runs` / `workflow_runs` row). It keeps the

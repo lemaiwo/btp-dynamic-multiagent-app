@@ -781,11 +781,12 @@ class DestinationAuth(httpx.Auth):
         """
         name = self.destination_name
         auth_type = (destination.auth_type or "").strip()
-        if (
-            not destination.per_user
-            or auth_type not in _SIGNS_IN_AS_USER
-            or destination.system_user
-        ):
+        # A local SAMLAssertion destination is minted by this app for the
+        # validated user (agents.local_destinations): it signs in as them.
+        signs_in = auth_type in _SIGNS_IN_AS_USER or (
+            destination.local and auth_type == "SAMLAssertion"
+        )
+        if not destination.per_user or not signs_in or destination.system_user:
             raise not_user_propagating(self.server_key, name)
         stored = destination.static_headers
         headers = {

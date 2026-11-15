@@ -514,6 +514,27 @@ def _warning(result: _Level) -> dict[str, Any]:
     }
 
 
+async def _list_local(config: Any) -> dict[str, Any]:
+    """The same answer from the local destinations file (a deployment
+    without BTP, ``agents.local_destinations``): one level, nothing shadowed."""
+    from agents import local_destinations
+
+    try:
+        raw = await asyncio.to_thread(local_destinations.listing, config)
+    except DestinationError as exc:
+        logger.warning("odata destinations: local file unusable (%s)", _plain(exc, 200))
+        raise ListError(502, "list_failed", LIST_FAILED_TEXT) from None
+    items, skipped = [], 0
+    for entry in raw:
+        reduced = _reduce(entry, LEVEL_INSTANCE)
+        if reduced is None:
+            skipped += 1
+        else:
+            items.append(reduced[1])
+    items.sort(key=lambda item: (item["name"].casefold(), item["name"]))
+    return {"items": items, "truncated": False, "skipped": skipped, "warnings": []}
+
+
 async def list_destinations() -> dict[str, Any]:
     """The destinations of the instance and the subaccount, for a dropdown.
 
@@ -547,6 +568,10 @@ async def list_destinations() -> dict[str, Any]:
     config = _config()
     if config is None:
         raise ListError(503, "no_destination_service", NO_BINDING_TEXT)
+    from agents import local_destinations
+
+    if local_destinations.is_local(config):
+        return await _list_local(config)
     budget = LIST_BUDGET_SECONDS
     deadline = asyncio.get_running_loop().time() + budget
     token_failure: str | None = None

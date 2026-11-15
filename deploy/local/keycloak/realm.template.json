@@ -1,0 +1,70 @@
+{
+  "realm": "agents",
+  "enabled": true,
+  "displayName": "Agent app (local identity provider)",
+  "sslRequired": "none",
+  "accessTokenLifespan": 900,
+  "ssoSessionIdleTimeout": 28800,
+  "roles": {
+    "realm": [
+      {"name": "user", "description": "Chat access (the XSUAA scope 'user')"},
+      {"name": "admin", "description": "Admin UI and API (scope 'admin')"},
+      {"name": "developer", "description": "Advanced access and the ABAP Assistant (scope 'developer')"},
+      {"name": "a2a", "description": "A2A endpoint (scope 'a2a')"},
+      {"name": "invoke", "description": "Invoke API (scope 'invoke')"},
+      {"name": "JOBSCHEDULER", "description": "Scheduler run endpoints (scope 'JOBSCHEDULER')"}
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "agent-app",
+      "name": "Agent app (oauth2-proxy signs users in with it)",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": "__OIDC_CLIENT_SECRET__",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": true,
+      "implicitFlowEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": ["http://localhost:4180/oauth2/callback"],
+      "webOrigins": ["http://localhost:4180"],
+      "attributes": {"post.logout.redirect.uris": "http://localhost:4180/*"},
+      "protocolMappers": [
+        {
+          "name": "agent-app-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "agent-app",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "developer",
+      "enabled": true,
+      "email": "__USER_EMAIL__",
+      "emailVerified": true,
+      "firstName": "Dev",
+      "lastName": "User",
+      "realmRoles": ["user", "developer", "admin"],
+      "credentials": [{"type": "password", "value": "__USER_PASSWORD__", "temporary": false}]
+    },
+    {
+      "username": "basic",
+      "enabled": true,
+      "email": "basic@example.com",
+      "emailVerified": true,
+      "firstName": "Basic",
+      "lastName": "User",
+      "realmRoles": ["user"],
+      "credentials": [{"type": "password", "value": "__BASIC_PASSWORD__", "temporary": false}]
+    }
+  ]
+}

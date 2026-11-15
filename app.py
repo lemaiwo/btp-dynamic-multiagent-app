@@ -45,6 +45,7 @@ from agents.admin import seed_from_file_if_empty  # noqa: E402
 from agents.api_runs import router as runs_router  # noqa: E402
 from agents.auth import (  # noqa: E402
     InvalidToken,
+    auth_enforced,
     authenticate,
     current_base_url,
     current_claims,
@@ -52,6 +53,7 @@ from agents.auth import (  # noqa: E402
     current_principal,
     get_validator,
     public_base_url,
+    token_header,
 )
 from agents.chat_app import dynamic_chat_app  # noqa: E402
 from agents.data_catalog import embedding_run  # noqa: E402
@@ -463,10 +465,11 @@ class JWTBindingMiddleware:
             await self.app(scope, receive, send)
             return
 
+        extra_header = token_header().encode("latin-1")
         wanted = (
             b"authorization", b"x-forwarded-proto", b"x-forwarded-host", b"host",
             b"origin", b"sec-fetch-site",
-        )
+        ) + ((extra_header,) if extra_header else ())
         hdrs: dict[bytes, bytes] = {}
         for key, value in scope.get("headers", []):
             lk = key.lower()
@@ -479,6 +482,12 @@ class JWTBindingMiddleware:
             parts = auth_header.decode("latin-1").split(None, 1)
             if len(parts) == 2 and parts[0].lower() == "bearer":
                 token = parts[1].strip()
+        if extra_header:
+            # The signing-in proxy's own header (AUTH_TOKEN_HEADER) wins: the
+            # bare access token, validated below like any bearer token.
+            forwarded = hdrs.get(extra_header, b"").decode("latin-1").strip()
+            if forwarded:
+                token = forwarded
 
         # On Cloud Foundry, any API request other than /healthz must come
         # through the approuter (which injects the user JWT). If there is no
@@ -498,7 +507,9 @@ class JWTBindingMiddleware:
         # /admin is left to require_admin for the *missing* token case so its
         # own 401 is what the UI sees; a token that is present but invalid is
         # rejected here like everywhere else.
-        needs_jwt = ON_CF and not is_public and not is_admin
+        # Behind an OIDC proxy (no XSUAA, OIDC_ISSUER set) the same holds.
+        enforced = ON_CF or auth_enforced()
+        needs_jwt = enforced and not is_public and not is_admin
         if needs_jwt and not token:
             logger.warning(
                 "Rejecting %s %s: no JWT — did you hit the approuter URL?",
@@ -589,7 +600,7 @@ class JWTBindingMiddleware:
             # Anonymous paths (agent card, static assets) serve without an
             # identity; a stale token there is dropped, not fatal.
             claims, principal = None, None
-        if ON_CF and not is_public and token and principal is None:
+        if enforced and not is_public and token and principal is None:
             # Validated (or unverifiable in an open deployment) but carries no
             # usable identity: nothing downstream could key a user on it.
             logger.warning("Rejecting %s %s: token yields no principal", method, path)

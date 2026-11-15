@@ -21,6 +21,14 @@ and there is no ``xsuaa`` entry in ``VCAP_SERVICES``, ``get_validator`` raises
 instead of serving every route to everyone with a single warning line. Set
 ``AUTH_REQUIRED=false`` explicitly to run an unbound container open, e.g. a
 throwaway Docker/Kyma deployment behind some other gate.
+
+Without XSUAA: OIDC
+-------------------
+With ``OIDC_ISSUER`` set and no XSUAA binding, tokens are validated by
+``agents.oidc.OidcValidator`` instead (a self-hosted deployment behind an
+OIDC reverse proxy, ``deploy/local``); roles of the token stand in for the
+XSUAA scopes. ``AUTH_TOKEN_HEADER`` names the header that proxy puts the
+access token in.
 """
 
 from __future__ import annotations
@@ -324,8 +332,34 @@ class XsuaaValidator:
         return full in scopes or scope in scopes
 
 
-_validator: XsuaaValidator | None = None
+_validator: Any = None  # XsuaaValidator | agents.oidc.OidcValidator | None
 _validator_checked = False
+
+# A reverse proxy that signs the user in (oauth2-proxy in ``deploy/local``)
+# hands the access token over in a header of its own, e.g.
+# ``X-Forwarded-Access-Token``; ``AUTH_TOKEN_HEADER`` names it. The value is
+# the bare token and is validated like a bearer token, so the header gives
+# nobody an identity the issuer did not sign. It wins over ``Authorization``
+# (which API callers still use, and which the proxy passes through).
+TOKEN_HEADER_ENV = "AUTH_TOKEN_HEADER"
+
+
+def token_header() -> str:
+    """The lower-case name of the extra token header, or ``""``."""
+    return (os.environ.get(TOKEN_HEADER_ENV) or "").strip().lower()
+
+
+def oidc_enabled() -> bool:
+    """Whether tokens are validated against an OIDC issuer (no XSUAA)."""
+    from agents import oidc
+
+    return get_xsuaa_credentials() is None and oidc.enabled()
+
+
+def auth_enforced() -> bool:
+    """Whether every non-public request must carry a user token: on Cloud
+    Foundry (behind the approuter) and behind an OIDC proxy alike."""
+    return "VCAP_APPLICATION" in os.environ or oidc_enabled()
 
 
 class AuthConfigurationError(RuntimeError):
@@ -346,7 +380,7 @@ def auth_required() -> bool:
     return "VCAP_APPLICATION" in os.environ
 
 
-def get_validator() -> XsuaaValidator | None:
+def get_validator() -> Any:
     """The process-wide validator, or None when running open (dev mode).
 
     Raises ``AuthConfigurationError`` instead of returning None when
@@ -357,6 +391,16 @@ def get_validator() -> XsuaaValidator | None:
     if _validator_checked:
         return _validator
     creds = get_xsuaa_credentials()
+    if not creds and oidc_enabled():
+        from agents.oidc import OidcConfigurationError, OidcValidator
+
+        try:
+            _validator = OidcValidator.from_environment()
+        except OidcConfigurationError as exc:
+            raise AuthConfigurationError(str(exc)) from None
+        _validator_checked = True
+        logger.info("Validating tokens against the OIDC issuer (no XSUAA binding)")
+        return _validator
     if not creds and auth_required():
         raise AuthConfigurationError(
             "AUTH_REQUIRED is on (default on Cloud Foundry) but no XSUAA "
@@ -373,6 +417,11 @@ def get_validator() -> XsuaaValidator | None:
 
 
 def _extract_token(request: Request) -> str | None:
+    extra = token_header()
+    if extra:
+        forwarded = (request.headers.get(extra) or "").strip()
+        if forwarded:
+            return forwarded
     auth = request.headers.get("authorization") or request.headers.get("Authorization")
     if not auth:
         return None
@@ -393,7 +442,7 @@ def _extract_token(request: Request) -> str | None:
 # *blocking* urllib call. Declared sync, FastAPI runs them in a threadpool
 # and a slow refresh costs only the request that triggered it.
 # ---------------------------------------------------------------------------
-def _validated_claims(request: Request, validator: XsuaaValidator) -> dict[str, Any]:
+def _validated_claims(request: Request, validator: Any) -> dict[str, Any]:
     claims = current_claims.get()
     if claims is not None:
         return claims
