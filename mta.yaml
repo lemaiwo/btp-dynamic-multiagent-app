@@ -68,6 +68,12 @@ modules:
         - "CLAUDE.local.md"
         - "README.md"
         - "JOULE_A2A.md"
+        # The Docker stack (deploy/local) and its generated secrets, and the
+        # hub's deliverables folder: never part of the app on Cloud Foundry.
+        - "deploy/"
+        - "files/"
+        - "Dockerfile"
+        - ".dockerignore"
         - "SLACK_SETUP.md"
         - "*.mtaext"
         - "ruff.toml"
