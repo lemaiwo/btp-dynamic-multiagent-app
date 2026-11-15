@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 46 40" width="46" height="40" role="img" aria-label="BTP Multi-Agent">
+  <rect x="0" y="0" width="46" height="40" rx="10" ry="10" fill="#546880"/>
+  <rect x="10.12" y="8.8" width="25.76" height="17.6" rx="4.8" ry="4.8" fill="#ffffff"/>
+  <polygon points="15.64,26.4 13.8,32.8 22.08,26.4" fill="#ffffff"/>
+  <circle cx="17.48" cy="17.6" r="1.8" fill="#546880"/>
+  <circle cx="23" cy="17.6" r="1.8" fill="#546880"/>
+  <circle cx="28.52" cy="17.6" r="1.8" fill="#546880"/>
+</svg>

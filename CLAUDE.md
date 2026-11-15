@@ -3322,7 +3322,11 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     file; not added)
 - `static/chat/` + `templates/webchat.html` — the web chat front end: vanilla
   ES modules, no build step, nothing from a CDN (`static/vendor/`: marked,
-  DOMPurify, mermaid, highlight.js 11.12.0 with two GitHub themes). `api.js`
+  DOMPurify, mermaid, highlight.js 11.12.0 with two GitHub themes). The brand
+  icon is our own `static/agent-icon.svg` (sidebar, empty state, the favicon
+  of this page and of `templates/chat.html`, which also swaps the stock
+  chat's header logo for it): the SAP logo must not be used anywhere in the
+  app. `api.js`
   (every call with `X-Requested-With`, a hand-written SSE parser over the
   `fetch` POST body, 401 → "Session expired" banner), `state.js` (parts
   reducer), `render/*` (sidebar grouped Today/Yesterday/Previous 7 days/Older,
@@ -4024,7 +4028,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `CATALOG READ` for the database user; all 84 statements ran on a landscape with the probe
   (2026-11-13, a SYSTEMDB and a tenant, sample binds); the reach rules now
   apply to every builtin:hana entry: chat only at tier advanced, never the invoke API,
-  never a peer; a stored row that breaks them is built without the HANA tools
+  never a peer; a stored row that breaks them is built without the HANA tools;
+  2.42.1 replaces the SAP logo by our own neutral icon (`static/agent-icon.svg`: the web chat's
+  sidebar, empty state and favicon, the stock chat's favicon and header logo; `static/sap.png`
+  is removed): front end only, no new resource, variable, table or column
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets
