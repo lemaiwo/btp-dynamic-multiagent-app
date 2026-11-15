@@ -41,7 +41,7 @@ def issuer():
 
 
 def build(issuer, **overrides):
-    values = {"name_id": "dev@example.test", "audience": "A4H_001",
+    values = {"name_id": "dev@example.test", "audience": "S4H_001",
               "recipient": "https://sap.example.test:44300"}
     values.update(overrides)
     return saml_bearer.build_assertion(issuer, **values)

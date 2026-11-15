@@ -81,12 +81,12 @@ async def test_technical_user_destination(stack):
 
 
 async def test_saml_assertion_for_the_signed_in_user(stack, key):
-    token = helpers.token(key, email="wouter@example.test")
+    token = helpers.token(key, email="someone@example.test")
     destination = await resolver("S4_USER").resolve(user_token=token, principal="user-1")
     scheme, _, value = destination.headers["Authorization"].partition(" ")
     assert scheme == "SAML2.0"
     root = ET.fromstring(base64.b64decode(value))
-    assert root.findtext("saml2:Subject/saml2:NameID", namespaces=NS) == "wouter@example.test"
+    assert root.findtext("saml2:Subject/saml2:NameID", namespaces=NS) == "someone@example.test"
     assert root.findtext(".//saml2:Audience", namespaces=NS) == "S4H_100"
     assert root.findtext("saml2:Issuer", namespaces=NS) == "agent-local-saml-idp"
     data = root.find(".//saml2:SubjectConfirmationData", NS)
