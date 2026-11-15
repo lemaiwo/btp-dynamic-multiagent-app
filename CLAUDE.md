@@ -399,7 +399,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     `test/pp.sh` (OData / InA as the signed-in user). The realm's tokens name
     `agent-app` and `arc1-local` in `aud` by client mappers: a `clientScopes`
     block in the realm file makes Keycloak skip its built-in scopes (email,
-    profile, roles). The UI5 apps are not served there.
+    profile, roles). `web/Caddyfile` (a web server between the proxy and the app) serves
+    the built UI5 apps at `/ui5admin/` and `/ui5ide/` (`build-ui5.sh`) with
+    the approuter's backend routes, SAPUI5 from the CDN.
 - `agents/errors.py` — `describe_exception` / `mask_text` /
   `exception_class`: the one way exception text leaves the log (to the
   model, a tool card, a `job_runs` / `workflow_runs` row). It keeps the

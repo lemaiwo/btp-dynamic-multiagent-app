@@ -92,6 +92,20 @@ services:
       keycloak:
         condition: service_healthy
 
+  # Between the proxy and the app: the UI5 apps and their backend routes
+  # (web/Caddyfile), everything else straight to the app.
+  web:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    volumes:
+      - ./web/Caddyfile:/etc/caddy/Caddyfile:ro
+      # Built by ./build-ui5.sh; empty until then (the two pages answer 404).
+      - ../../ui5-admin/dist:/srv/ui5admin:ro
+      - ../../ui5-ide/dist:/srv/ui5ide:ro
+    depends_on:
+      app:
+        condition: service_healthy
+
   proxy:
     image: quay.io/oauth2-proxy/oauth2-proxy:v7.8.1
     restart: unless-stopped
@@ -99,7 +113,7 @@ services:
       - "127.0.0.1:4180:4180"
     environment:
       OAUTH2_PROXY_HTTP_ADDRESS: 0.0.0.0:4180
-      OAUTH2_PROXY_UPSTREAMS: http://app:7932
+      OAUTH2_PROXY_UPSTREAMS: http://web:8080
       OAUTH2_PROXY_UPSTREAM_TIMEOUT: 900s
       OAUTH2_PROXY_FLUSH_INTERVAL: 100ms
       OAUTH2_PROXY_PROVIDER: oidc
@@ -128,10 +142,10 @@ services:
       OAUTH2_PROXY_SKIP_JWT_BEARER_TOKENS: "true"
       OAUTH2_PROXY_SKIP_AUTH_ROUTES: ^/healthz$$,^/\.well-known/
       # 401 instead of a redirect to the login page, as the UIs expect.
-      OAUTH2_PROXY_API_ROUTES: ^/(admin/api|chat/api|ide/api|api|a2a)
+      OAUTH2_PROXY_API_ROUTES: ^/(admin/api|chat/api|ide/api|api|a2a|ui5admin/backend|ui5ide/backend)
     depends_on:
-      app:
-        condition: service_healthy
+      web:
+        condition: service_started
 
 volumes:
   pgdata:

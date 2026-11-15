@@ -134,6 +134,22 @@ try {
     /SAPRead/.test(body));
   await dev.page.screenshot({ path: join(shots, 'chat.png'), fullPage: true });
 
+  // The two UI5 apps, served by the stack's web server (./build-ui5.sh).
+  const failures = [];
+  dev.page.on('response', (r) => { if (r.status() >= 400 && /\/ui5(admin|ide)\//.test(r.url())) failures.push(`${r.status()} ${new URL(r.url()).pathname}`); });
+  await dev.page.goto(`${BASE}/ui5admin/`);
+  await dev.page.getByText('arc1-reader').first().waitFor({ timeout: 60_000 })
+    .then(() => check('UI5 admin: loads and lists the agents from the backend', true))
+    .catch(() => check('UI5 admin: loads and lists the agents from the backend', false));
+  await dev.page.screenshot({ path: join(shots, 'ui5admin.png') });
+  await dev.page.goto(`${BASE}/ui5ide/`);
+  await dev.page.locator('.sapMPage, .sapFDynamicPage, .sapMShell').first().waitFor({ timeout: 60_000 })
+    .then(() => check('ABAP Assistant (UI5): loads', true))
+    .catch(() => check('ABAP Assistant (UI5): loads', false));
+  await dev.page.waitForTimeout(2500);
+  await dev.page.screenshot({ path: join(shots, 'ui5ide.png') });
+  check('UI5 apps: no failed request', failures.length === 0, failures.slice(0, 4).join('; '));
+
   const classic = await dev.page.goto(`${BASE}/`);
   check('classic chat page loads', classic.status() === 200);
   await dev.context.close();

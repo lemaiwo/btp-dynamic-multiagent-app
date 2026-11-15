@@ -37,8 +37,12 @@ Everything listens on loopback only. `secrets/` is gitignored; `setup.sh`
 never overwrites a file that exists (delete one to have it made again, and
 recreate the Keycloak container after changing `realm.json`).
 
-The UI5 apps (`/ui5admin`, `/ui5ide`) are not part of this stack: on BTP the
-HTML5 repository serves them. The classic admin at `/admin` and both chats are.
+The UI5 apps: run `./build-ui5.sh` once (and after changing an app); they
+are then at `/ui5admin/` and `/ui5ide/`. The stack's inner web server
+(`web/Caddyfile`) does what the approuter routes and the HTML5 repository do
+on BTP: it serves the built apps, maps `/ui5admin/backend/*` to `/admin/api/*`
+and `/ui5ide/backend/*` to `/ide/api/*`, and fetches SAPUI5 from SAP's CDN
+(without the user's cookie or token).
 
 ## Models
 

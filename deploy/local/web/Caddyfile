@@ -1,0 +1,67 @@
+# The stack's inner web server, between oauth2-proxy and the app: it does
+# what the approuter's routes and the HTML5 repository do on BTP for the two
+# UI5 apps. Everything else goes to the app unchanged.
+#
+#   /ui5admin/backend/*    -> app /admin/api/*
+#   /ui5ide/backend/*      -> app /ide/api/*
+#   /ui5*/resources/*      -> SAPUI5 from SAP's CDN (no cookie or token is sent there)
+#   /ui5admin/*, /ui5ide/* -> the built apps (../../ui5-admin/dist, ../../ui5-ide/dist)
+{
+	auto_https off
+	admin off
+}
+
+(sapui5) {
+	rewrite * /1.120.50/resources{uri}
+	reverse_proxy https://ui5.sap.com {
+		header_up Host ui5.sap.com
+		header_up -Cookie
+		header_up -Authorization
+		header_up -X-Forwarded-Access-Token
+		header_up -X-Forwarded-Email
+		header_up -X-Forwarded-User
+		header_up -X-Forwarded-Preferred-Username
+	}
+}
+
+(built_app) {
+	root * {args[0]}
+	# The file names are the same on every build: always revalidate.
+	header Cache-Control "no-cache, must-revalidate"
+	file_server
+}
+
+:8080 {
+	redir /ui5admin /ui5admin/ 308
+	redir /ui5ide /ui5ide/ 308
+
+	handle_path /ui5admin/backend/* {
+		rewrite * /admin/api{uri}
+		reverse_proxy app:7932 {
+			flush_interval -1
+		}
+	}
+	handle_path /ui5ide/backend/* {
+		rewrite * /ide/api{uri}
+		reverse_proxy app:7932 {
+			flush_interval -1
+		}
+	}
+	handle_path /ui5admin/resources/* {
+		import sapui5
+	}
+	handle_path /ui5ide/resources/* {
+		import sapui5
+	}
+	handle_path /ui5admin/* {
+		import built_app /srv/ui5admin
+	}
+	handle_path /ui5ide/* {
+		import built_app /srv/ui5ide
+	}
+	handle {
+		reverse_proxy app:7932 {
+			flush_interval -1
+		}
+	}
+}
