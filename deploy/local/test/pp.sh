@@ -20,9 +20,11 @@ fi
 
 secret="$(sed -n 's/^OIDC_CLIENT_SECRET=//p' "$HERE/secrets/stack.env")"
 password="$(sed -n 's/^  developer \/ \([^ ]*\).*/\1/p' "$HERE/secrets/logins.txt")"
+otp="$(python3 "$HERE/test/totp.py" "$(sed -n 's/^  developer .*totp-key: \([A-Z2-7]*\).*/\1/p' "$HERE/secrets/logins.txt")")"
 TOKEN="$(curl -s http://localhost:8180/realms/agents/protocol/openid-connect/token \
     -d grant_type=password -d client_id=agent-app --data-urlencode "client_secret=$secret" \
-    -d username=developer --data-urlencode "password=$password" -d 'scope=openid email profile' \
+    -d username=developer --data-urlencode "password=$password" -d "totp=$otp" \
+    -d 'scope=openid email profile' \
     | python3 -c "import sys,json; print(json.load(sys.stdin).get('access_token',''))")"
 if [ -z "$TOKEN" ]; then
     echo "FAIL sign-in: Keycloak issued no token" >&2

@@ -5,6 +5,7 @@
 //   node test/e2e.mjs            (Playwright from ../../ui5-ide/node_modules)
 //
 // Passwords are read from secrets/logins.txt and never printed.
+import { createHmac } from 'node:crypto';
 import { readFileSync, mkdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
@@ -14,11 +15,24 @@ const here = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(join(here, '../../../ui5-ide/package.json'));
 const { chromium } = require('@playwright/test');
 
-const BASE = process.env.STACK_URL || 'http://localhost:4180';
+const stackEnv = readFileSync(join(here, '../secrets/stack.env'), 'utf8');
+const BASE = process.env.STACK_URL || (stackEnv.match(/^APP_URL=(.+)$/m) || [])[1] || 'http://localhost:4180';
 const shots = join(here, '../secrets/e2e');
 mkdirSync(shots, { recursive: true });
 const logins = readFileSync(join(here, '../secrets/logins.txt'), 'utf8');
 const password = (user) => logins.match(new RegExp(`^\\s*${user}\\s*/\\s*(\\S+)`, 'm'))[1];
+// The second factor: the TOTP code of the user's key (RFC 6238, SHA-1, 6 digits, 30 s).
+const totp = (user) => {
+  const key = logins.match(new RegExp(`^\\s*${user}\\s.*totp-key:\\s*([A-Z2-7]+)`, 'm'))[1];
+  let bits = '';
+  for (const c of key) bits += 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'.indexOf(c).toString(2).padStart(5, '0');
+  const secret = Buffer.from(bits.match(/.{8}/g).map((b) => parseInt(b, 2)));
+  const counter = Buffer.alloc(8);
+  counter.writeBigUInt64BE(BigInt(Math.floor(Date.now() / 30000)));
+  const digest = createHmac('sha1', secret).update(counter).digest();
+  const offset = digest[digest.length - 1] & 0x0f;
+  return String((digest.readUInt32BE(offset) & 0x7fffffff) % 1_000_000).padStart(6, '0');
+};
 
 const results = [];
 const check = (name, ok, detail = '') => {
@@ -27,12 +41,16 @@ const check = (name, ok, detail = '') => {
 };
 
 async function signIn(browser, user) {
-  const context = await browser.newContext();
+  const context = await browser.newContext({ ignoreHTTPSErrors: localNames });
   const page = await context.newPage();
   await page.goto(`${BASE}/chat`);
-  check(`${user}: unauthenticated /chat goes to Keycloak`, page.url().includes(':8180/realms/agents'));
+  check(`${user}: unauthenticated /chat goes to Keycloak`, page.url().includes('/realms/agents/'));
   await page.fill('#username', user);
   await page.fill('#password', password(user));
+  await page.click('#kc-login');
+  await page.waitForSelector('#otp');
+  check(`${user}: the password alone is not enough (one-time code asked)`, true);
+  await page.fill('#otp', totp(user));
   await page.click('#kc-login');
   await page.waitForURL(`${BASE}/chat`);
   check(`${user}: signed in, back on the web chat`, page.url() === `${BASE}/chat`);
@@ -67,7 +85,13 @@ async function say(page, text, expect, label) {
 }
 
 // The installed Chrome (headless, a temporary profile): no browser download needed.
-const browser = await chromium.launch({ channel: process.env.E2E_CHANNEL || 'chrome' });
+// E2E_LOCAL_NAMES=1: resolve every host name to this machine and accept its
+// certificate, to test public addresses before their DNS records exist.
+const localNames = process.env.E2E_LOCAL_NAMES === '1';
+const browser = await chromium.launch({
+  channel: process.env.E2E_CHANNEL || 'chrome',
+  args: localNames ? ['--host-resolver-rules=MAP * 127.0.0.1', '--ignore-certificate-errors'] : [],
+});
 try {
   // --- developer (roles user, developer, admin) -----------------------------
   const dev = await signIn(browser, 'developer');

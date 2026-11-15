@@ -5,7 +5,10 @@
 #   ./stack.sh up                     build and start
 #   open http://localhost:4180/chat   (admin: /admin)
 #
-# Everything is bound to loopback. Secrets live in ./secrets (gitignored):
+# Everything is bound to loopback. To reach it from outside, a TLS reverse
+# proxy on this machine publishes the proxy (4180) and Keycloak (8180):
+# ./setup.sh <e-mail> <app URL> <idp URL> sets APP_URL / IDP_URL and writes
+# the proxy configuration (README, "Publishing"). Secrets live in ./secrets (gitignored):
 # stack.env feeds the ${...} below, app.env is the app's own environment
 # (model API keys, destination passwords).
 name: agent-local
@@ -37,7 +40,11 @@ services:
       KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?run ./setup.sh first}
       # The issuer in every token. The browser reaches Keycloak under this
       # name; the containers reach it as keycloak:8180 (token and key URLs).
-      KC_HOSTNAME: http://localhost:8180
+      KC_HOSTNAME: ${IDP_URL:-http://localhost:8180}
+      # The admin console stays on this machine, whatever the public name is.
+      KC_HOSTNAME_ADMIN: http://localhost:8180
+      # Behind a TLS reverse proxy (setup.sh with public URLs): trust its X-Forwarded-* headers.
+      KC_PROXY_HEADERS: xforwarded
       KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
       KC_HTTP_ENABLED: "true"
       KC_HTTP_PORT: "8180"
@@ -67,11 +74,11 @@ services:
       DATABASE_URL: postgresql://agent:${POSTGRES_PASSWORD}@postgres:5432/agents
       # No XSUAA: tokens of the OIDC provider are validated instead, and
       # oauth2-proxy hands the user's access token over in its own header.
-      OIDC_ISSUER: http://localhost:8180/realms/agents
+      OIDC_ISSUER: ${IDP_URL:-http://localhost:8180}/realms/agents
       OIDC_AUDIENCE: agent-app
       OIDC_JWKS_URL: http://keycloak:8180/realms/agents/protocol/openid-connect/certs
       AUTH_TOKEN_HEADER: X-Forwarded-Access-Token
-      PUBLIC_BASE_URL: http://localhost:4180
+      PUBLIC_BASE_URL: ${APP_URL:-http://localhost:4180}
       # No destination service: the file stands in for it.
       LOCAL_DESTINATIONS_FILE: /config/destinations.json
     volumes:
@@ -100,9 +107,10 @@ services:
       OAUTH2_PROXY_CLIENT_ID: agent-app
       OAUTH2_PROXY_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?run ./setup.sh first}
       OAUTH2_PROXY_COOKIE_SECRET: ${PROXY_COOKIE_SECRET:?run ./setup.sh first}
-      OAUTH2_PROXY_COOKIE_SECURE: "false"      # http on localhost
+      OAUTH2_PROXY_COOKIE_SECURE: ${COOKIE_SECURE:-false}   # true behind https
+      OAUTH2_PROXY_REVERSE_PROXY: "true"
       OAUTH2_PROXY_COOKIE_REFRESH: 10m         # the access token lives 15 min
-      OAUTH2_PROXY_REDIRECT_URL: http://localhost:4180/oauth2/callback
+      OAUTH2_PROXY_REDIRECT_URL: ${APP_URL:-http://localhost:4180}/oauth2/callback
       OAUTH2_PROXY_EMAIL_DOMAINS: "*"
       OAUTH2_PROXY_SCOPE: openid email profile
       OAUTH2_PROXY_CODE_CHALLENGE_METHOD: S256
@@ -110,8 +118,8 @@ services:
       # Discovery is skipped because the provider has two names: the browser
       # goes to localhost:8180, this container to keycloak:8180.
       OAUTH2_PROXY_SKIP_OIDC_DISCOVERY: "true"
-      OAUTH2_PROXY_OIDC_ISSUER_URL: http://localhost:8180/realms/agents
-      OAUTH2_PROXY_LOGIN_URL: http://localhost:8180/realms/agents/protocol/openid-connect/auth
+      OAUTH2_PROXY_OIDC_ISSUER_URL: ${IDP_URL:-http://localhost:8180}/realms/agents
+      OAUTH2_PROXY_LOGIN_URL: ${IDP_URL:-http://localhost:8180}/realms/agents/protocol/openid-connect/auth
       OAUTH2_PROXY_REDEEM_URL: http://keycloak:8180/realms/agents/protocol/openid-connect/token
       OAUTH2_PROXY_OIDC_JWKS_URL: http://keycloak:8180/realms/agents/protocol/openid-connect/certs
       # The app gets the user's access token (X-Forwarded-Access-Token) and

@@ -3,6 +3,12 @@
 # (gitignored) and never prints one.
 #
 #   ./setup.sh you@example.com
+#   ./setup.sh you@example.com https://agents.example.com:8443 https://idp.example.com:8443
+#
+# With the two URLs (the app's and the identity provider's public addresses,
+# https) the stack is set up to sit behind a TLS reverse proxy on this
+# machine; secrets/Caddyfile.snippet then holds the two site blocks for it.
+# Changing the URLs renders the realm again, with new test passwords.
 #
 # The e-mail address is the test user's: with the default settings it is the
 # SAML NameID, so it must be the e-mail of your user in the SAP system (SU01).
@@ -10,10 +16,19 @@
 set -eu
 
 EMAIL="${1:-}"
-if [ -z "$EMAIL" ]; then
-    echo "usage: ./setup.sh <e-mail address of your SAP user>" >&2
+APP_URL="${2:-}"
+IDP_URL="${3:-}"
+if [ -z "$EMAIL" ] || { [ -n "$APP_URL" ] && [ -z "$IDP_URL" ]; }; then
+    echo "usage: ./setup.sh <e-mail address of your SAP user> [<app URL> <idp URL>]" >&2
     exit 2
 fi
+for url in "$APP_URL" "$IDP_URL"; do
+    case "$url" in
+        ""|https://*[A-Za-z0-9]) ;;
+        *) echo "a public URL is https://host[:port], without a path" >&2; exit 2 ;;
+    esac
+    case "$url" in *[!A-Za-z0-9:/.-]*) echo "a public URL is https://host[:port]" >&2; exit 2 ;; esac
+done
 case "$EMAIL" in
     *[!A-Za-z0-9@._+-]*|*@*@*) echo "that does not look like an e-mail address" >&2; exit 2 ;;
     *@*.*) ;;
@@ -46,22 +61,50 @@ else
 fi
 OIDC_CLIENT_SECRET="$(sed -n 's/^OIDC_CLIENT_SECRET=//p' "$SECRETS/stack.env")"
 
+# --- public addresses (optional) ----------------------------------------------
+setting() { sed -n "s|^$1=||p" "$SECRETS/stack.env"; }
+if [ -n "$APP_URL" ] && { [ "$(setting APP_URL)" != "$APP_URL" ] || [ "$(setting IDP_URL)" != "$IDP_URL" ]; }; then
+    IDP_HOST="${IDP_URL#https://}"; IDP_HOST="${IDP_HOST%%:*}"
+    grep -v '^APP_URL=\|^IDP_URL=\|^IDP_HOST=\|^COOKIE_SECURE=' "$SECRETS/stack.env" > "$SECRETS/stack.env.new"
+    {
+        echo "APP_URL=$APP_URL"
+        echo "IDP_URL=$IDP_URL"
+        echo "IDP_HOST=$IDP_HOST"
+        echo "COOKIE_SECURE=true"
+    } >> "$SECRETS/stack.env.new"
+    mv "$SECRETS/stack.env.new" "$SECRETS/stack.env"
+    # The realm names the app's URL (redirect): render it again.
+    rm -f "$SECRETS/realm.json" "$SECRETS/logins.txt"
+    echo "updated  secrets/stack.env (public addresses)"
+fi
+APP_URL="$(setting APP_URL)"; APP_URL="${APP_URL:-http://localhost:4180}"
+IDP_URL="$(setting IDP_URL)"; IDP_URL="${IDP_URL:-http://localhost:8180}"
+
 # --- realm.json: the Keycloak realm with its client secret and test users -----
 if [ -e "$SECRETS/realm.json" ]; then
     kept secrets/realm.json
 else
     USER_PASSWORD="$(random 10)"
     BASIC_PASSWORD="$(random 10)"
+    # The second factor (TOTP): Keycloak keeps the secret as text, an
+    # authenticator app wants the base32 of it.
+    USER_OTP="$(random 10)"
+    BASIC_OTP="$(random 10)"
+    key() { python3 -c "import base64,sys; print(base64.b32encode(sys.argv[1].encode()).decode().rstrip('='))" "$1"; }
     sed -e "s/__OIDC_CLIENT_SECRET__/$OIDC_CLIENT_SECRET/" \
         -e "s/__USER_EMAIL__/$EMAIL/" \
         -e "s/__USER_PASSWORD__/$USER_PASSWORD/" \
         -e "s/__BASIC_PASSWORD__/$BASIC_PASSWORD/" \
+        -e "s/__USER_OTP__/$USER_OTP/" \
+        -e "s/__BASIC_OTP__/$BASIC_OTP/" \
+        -e "s|__APP_URL__|$APP_URL|g" \
         "$HERE/keycloak/realm.template.json" > "$SECRETS/realm.json"
     {
-        echo "Sign-in at http://localhost:4180 (Keycloak realm 'agents')"
-        echo "  developer / $USER_PASSWORD   roles: user, developer, admin   e-mail: $EMAIL"
-        echo "  basic     / $BASIC_PASSWORD   roles: user"
-        echo "Keycloak admin console http://localhost:8180: user 'admin', password in stack.env"
+        echo "Sign-in at $APP_URL (Keycloak realm 'agents'): password, then a one-time code."
+        echo "Add the key to an authenticator app (TOTP, 6 digits, 30 s, SHA-1)."
+        echo "  developer / $USER_PASSWORD   totp-key: $(key "$USER_OTP")   roles: user, developer, admin   e-mail: $EMAIL"
+        echo "  basic     / $BASIC_PASSWORD   totp-key: $(key "$BASIC_OTP")   roles: user"
+        echo "Keycloak admin console http://localhost:8180 (this machine only): user 'admin', password in stack.env"
     } > "$SECRETS/logins.txt"
     # Keycloak runs as another uid and must be able to read the import file.
     chmod 644 "$SECRETS/realm.json"
@@ -164,6 +207,32 @@ XML
     made "secrets/saml/saml-idp.key, .crt"
     made "secrets/saml/saml-idp-metadata.xml (upload in transaction SAML2)"
 fi
+
+# --- the reverse proxy's site blocks, for public addresses --------------------
+case "$APP_URL" in https://*)
+    cat > "$SECRETS/Caddyfile.snippet" <<CADDY
+# Agent app and its identity provider (deploy/local of the agent app).
+# Append to the Caddyfile once both names resolve to this machine, then
+# reload Caddy. The names share the port with other sites: Caddy routes by name.
+${APP_URL#https://} {
+	request_body {
+		max_size 60MB
+	}
+	reverse_proxy 127.0.0.1:4180 {
+		flush_interval -1
+	}
+}
+
+${IDP_URL#https://} {
+	# Sign-in only: no admin console, no master realm, no health or metrics.
+	@closed path /admin /admin/* /realms/master /realms/master/* /metrics /metrics/* /health /health/*
+	respond @closed 404
+	reverse_proxy 127.0.0.1:8180
+}
+CADDY
+    made "secrets/Caddyfile.snippet (the reverse proxy's two site blocks)"
+    ;;
+esac
 
 echo
 echo "Next: add a model API key to secrets/app.env, the SAP system to"

@@ -136,6 +136,39 @@ assertion at all (the signature is verified here only by libraries), whether
 (set `"URL.headers.x-sap-security-session": "none"` in the destination to
 send none), and CSRF-protected writes through OData.
 
+## Publishing (reaching it from outside)
+
+Nothing listens beyond loopback. To reach the app and the sign-in from
+another device, a TLS reverse proxy on this machine (Caddy here) publishes
+two names, one for the app and one for the identity provider:
+
+```sh
+./setup.sh you@example.com https://agents.example.com:8443 https://idp.example.com:8443
+./stack.sh up --force-recreate
+```
+
+- `setup.sh` stores the two addresses in `secrets/stack.env`, renders the
+  realm again for them (**new test passwords and one-time-code keys**, in
+  `secrets/logins.txt`) and writes `secrets/Caddyfile.snippet`: the two site
+  blocks. Append them to the Caddyfile once both names resolve to this
+  machine (Caddy gets the certificates then), and reload Caddy.
+- Use two names of their own, not paths or ports of another site: cookies
+  ignore ports, and the app has no path prefix.
+- The identity provider's block answers 404 for the admin console, the
+  master realm, health and metrics; the console stays at
+  <http://localhost:8180> on this machine.
+- Sign-in asks for the password and a one-time code (the key is in
+  `secrets/logins.txt`; add it to an authenticator app). Eight wrong
+  attempts lock the account for a while. The password grant is off for the
+  public client; the app's own client keeps it behind its client secret
+  (the test scripts use it).
+- This is still Keycloak in development mode with an import-only realm: a
+  test setup for yourself, not a production identity provider.
+
+`E2E_LOCAL_NAMES=1 node test/e2e.mjs` runs the browser test against the
+public addresses with every name resolved to this machine, which works
+before the DNS records exist (with `tls internal` in the two site blocks).
+
 ## Testing
 
 **The stack itself, in a browser** (no model key needed):
@@ -145,7 +178,8 @@ STACK_TEST_MODEL=1 ./stack.sh up     # adds a stand-in model, "openai:test-model
 node test/e2e.mjs                    # drives the installed Chrome, headless
 ```
 
-It signs in through Keycloak as `developer` and as `basic`, opens the web
+It signs in through Keycloak as `developer` and as `basic` (password and
+one-time code), opens the web
 chat, the classic chat and the admin, creates an agent on the `ARC1`
 destination, chats, has the orchestrator delegate to that agent, and checks
 that the user without the admin role gets 403. Screenshots land in

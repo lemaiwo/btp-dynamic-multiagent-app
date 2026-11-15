@@ -46,13 +46,13 @@
       "implicitFlowEnabled": false,
       "serviceAccountsEnabled": false,
       "redirectUris": [
-        "http://localhost:4180/oauth2/callback"
+        "__APP_URL__/oauth2/callback"
       ],
       "webOrigins": [
-        "http://localhost:4180"
+        "__APP_URL__"
       ],
       "attributes": {
-        "post.logout.redirect.uris": "http://localhost:4180/*"
+        "post.logout.redirect.uris": "__APP_URL__/*"
       },
       "protocolMappers": [
         {
@@ -86,7 +86,7 @@
       "protocol": "openid-connect",
       "publicClient": true,
       "standardFlowEnabled": true,
-      "directAccessGrantsEnabled": true,
+      "directAccessGrantsEnabled": false,
       "implicitFlowEnabled": false,
       "serviceAccountsEnabled": false,
       "redirectUris": [
@@ -133,6 +133,12 @@
           "type": "password",
           "value": "__USER_PASSWORD__",
           "temporary": false
+        },
+        {
+          "type": "otp",
+          "userLabel": "authenticator",
+          "secretData": "{\"value\": \"__USER_OTP__\"}",
+          "credentialData": "{\"subType\": \"totp\", \"digits\": 6, \"counter\": 0, \"period\": 30, \"algorithm\": \"HmacSHA1\"}"
         }
       ]
     },
@@ -151,8 +157,23 @@
           "type": "password",
           "value": "__BASIC_PASSWORD__",
           "temporary": false
+        },
+        {
+          "type": "otp",
+          "userLabel": "authenticator",
+          "secretData": "{\"value\": \"__BASIC_OTP__\"}",
+          "credentialData": "{\"subType\": \"totp\", \"digits\": 6, \"counter\": 0, \"period\": 30, \"algorithm\": \"HmacSHA1\"}"
         }
       ]
     }
-  ]
+  ],
+  "bruteForceProtected": true,
+  "failureFactor": 8,
+  "permanentLockout": false,
+  "maxFailureWaitSeconds": 900,
+  "waitIncrementSeconds": 60,
+  "otpPolicyType": "totp",
+  "otpPolicyAlgorithm": "HmacSHA1",
+  "otpPolicyDigits": 6,
+  "otpPolicyPeriod": 30
 }

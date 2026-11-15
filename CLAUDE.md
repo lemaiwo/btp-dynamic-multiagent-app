@@ -391,7 +391,12 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     `entrypoint.sh` (CA certificates in `/extra-ca` are trusted next to the
     public ones), `compose.arc1.yaml` (an ARC-1 of the prototype branch on
     the same realm and SAML key, joined by `stack.sh` when `secrets/arc1.env`
-    exists; reached through the `ARC1` destination). The realm's tokens name
+    exists; reached through the `ARC1` destination). `setup.sh <e-mail> <app URL>
+    <idp URL>` sets public addresses (`APP_URL`, `IDP_URL` in
+    `secrets/stack.env`, a Caddy snippet with two site blocks); the realm's
+    users have a TOTP credential from the import. Tests: `test/e2e.mjs`
+    (browser, with `STACK_TEST_MODEL=1` and `test/fake_model.py`),
+    `test/pp.sh` (OData / InA as the signed-in user). The realm's tokens name
     `agent-app` and `arc1-local` in `aud` by client mappers: a `clientScopes`
     block in the realm file makes Keycloak skip its built-in scopes (email,
     profile, roles). The UI5 apps are not served there.

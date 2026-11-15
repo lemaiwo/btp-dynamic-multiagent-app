@@ -26,7 +26,7 @@ services:
       # Sign-in: the stack's realm. Inside this container localhost:8180 is
       # forwarded to Keycloak by the sidecar below, so the issuer URL is the
       # same one the browser and the tokens use.
-      SAP_OIDC_ISSUER: http://localhost:8180/realms/agents
+      SAP_OIDC_ISSUER: ${IDP_URL:-http://localhost:8180}/realms/agents
       SAP_OIDC_AUDIENCE: arc1-local
       # Per-user SAP identity: the local SAML bearer issuer.
       SAP_PP_ENABLED: "true"
@@ -36,6 +36,10 @@ services:
       SAP_PP_SAML_ISSUER: agent-local-saml-idp
       SAP_PP_SAML_NAMEID_CLAIM: email
       SAP_PP_SAML_NAMEID_FORMAT: email
+    # With a public IDP_URL the issuer's host must resolve to this machine's
+    # reverse proxy from inside the container (IDP_HOST in stack.env).
+    extra_hosts:
+      - "${IDP_HOST:-idp.invalid}:host-gateway"
     volumes:
       - ./secrets/saml:/home/arc1/saml:ro
     depends_on:
