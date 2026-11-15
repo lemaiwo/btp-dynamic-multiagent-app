@@ -4121,7 +4121,15 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   never a peer; a stored row that breaks them is built without the HANA tools;
   2.42.1 replaces the SAP logo by our own neutral icon (`static/agent-icon.svg`: the web chat's
   sidebar, empty state and favicon, the stock chat's favicon and header logo; `static/sap.png`
-  is removed): front end only, no new resource, variable, table or column
+  is removed): front end only, no new resource, variable, table or column;
+  2.43.0 adds the direct model providers and their admin setting (table
+  `model_providers`, HANA schema generation 12: one new table, nothing
+  undeployed; `anthropic` pinned in `requirements.txt`) and, for a
+  deployment without BTP, OIDC sign-in, local destinations with a SAML
+  bearer assertion, the `Dockerfile` and `deploy/local` (none of it active
+  on Cloud Foundry: XSUAA and a bound destination service win; `deploy/`,
+  `files/` and the `Dockerfile` are not packaged); no new resource,
+  environment variable or role
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets
