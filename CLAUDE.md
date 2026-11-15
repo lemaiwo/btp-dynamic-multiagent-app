@@ -404,8 +404,11 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     logged; a save is one WARNING naming provider and principal.
     `tests/test_model_provider_settings.py`; UI5 admin Settings panel
     "Model providers". The direct OpenAI model is a `SAPAICoreModel` (same usage
-    and empty-response handling). Token usage of the direct Anthropic model
-    is pydantic-ai's own mapping: not verified with a real key.
+    and empty-response handling). The direct Anthropic route ran with a real key
+    (2026-11-15: answers, delegation, OData tools, token counts). It needs
+    `anthropic==0.125.0` (pinned): pydantic-ai 1.72.0 fails every request
+    with anthropic 1.x (`temperature`) and 2.x ("Cannot instantiate
+    typing.Union").
     `tests/test_model_providers.py`
   - `Dockerfile`, `deploy/local/` — `setup.sh` (generates `secrets/`,
     gitignored), `stack.sh`, `compose.yaml`, the Keycloak realm template,
