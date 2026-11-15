@@ -8,7 +8,7 @@ import sys
 import time
 
 
-def code(key: str, at: float | None = None) -> str:
+def code(key, at=None):
     secret = base64.b32decode(key + "=" * (-len(key) % 8))
     counter = struct.pack(">Q", int((time.time() if at is None else at) // 30))
     digest = hmac.new(secret, counter, hashlib.sha1).digest()
