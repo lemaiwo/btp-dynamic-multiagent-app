@@ -12,15 +12,17 @@ import logging
 
 from agents.auth import run_as
 from agents.db import (
+    DEFAULT_RUN_PROMPT,
     AgentConfig,
     SessionLocal,
     active_job_run,
     create_job_run,
     finish_job_run,
+    get_agent_by_name,
     sweep_stale_runs,
 )
-from agents.db import DEFAULT_RUN_PROMPT, get_agent_by_name
 from agents.errors import describe_exception
+from agents.nexus.context import calling_agent, nexus_run
 from agents.registry import _MAX_DELEGATION_DEPTH, _make_progress_handler, registry
 from agents.reports import RunReport
 from agents.run_activity import final_activity, recording
@@ -297,7 +299,7 @@ async def _finalize(run_id: str, **kwargs) -> None:
 async def execute_run(run_id: str, agent_id: int) -> None:
     """Run the agent, recording what it does as it goes (agents.run_activity),
     and record the outcome. See _execute_run."""
-    with recording(run_id):
+    with recording(run_id), nexus_run(run_id):
         await _execute_run(run_id, agent_id)
 
 
@@ -356,17 +358,18 @@ async def _execute_run(run_id: str, agent_id: int) -> None:
             return
 
         async with run_as(agent.run_as_principal):
-            result = await asyncio.wait_for(
-                specialist.run(
-                    agent.run_prompt or DEFAULT_RUN_PROMPT,
-                    output_type=RunReport,
-                    usage_limits=run_usage_limits(),
-                    # The agent's own tool calls; delegations and deep
-                    # sub-agents report theirs through the same sink.
-                    event_stream_handler=_make_progress_handler(agent.name),
-                ),
-                timeout=agent.run_timeout_seconds,
-            )
+            with calling_agent(agent.name):
+                result = await asyncio.wait_for(
+                    specialist.run(
+                        agent.run_prompt or DEFAULT_RUN_PROMPT,
+                        output_type=RunReport,
+                        usage_limits=run_usage_limits(),
+                        # The agent's own tool calls; delegations and deep
+                        # sub-agents report theirs through the same sink.
+                        event_stream_handler=_make_progress_handler(agent.name),
+                    ),
+                    timeout=agent.run_timeout_seconds,
+                )
         report: RunReport = result.output
         marker = signin_prompt_in(report)
         if marker is not None:

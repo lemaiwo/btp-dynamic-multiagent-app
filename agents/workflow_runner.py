@@ -39,6 +39,7 @@ from agents.db import (
     sweep_stale_workflow_runs,
 )
 from agents.errors import describe_exception, mask_text
+from agents.nexus.context import calling_agent, nexus_run
 from agents.registry import registry
 from agents.shared import run_usage_limits
 
@@ -622,10 +623,11 @@ async def _run_step(
         kwargs = {"output_type": output_type} if output_type is not None else {}
         kwargs["usage_limits"] = run_usage_limits()
         async with run_as(effective_principal(agent_row, workflow)):
-            result = await asyncio.wait_for(
-                specialist.run(prompt, **kwargs),
-                timeout=step.step_timeout_seconds,
-            )
+            with calling_agent(step.agent_name):
+                result = await asyncio.wait_for(
+                    specialist.run(prompt, **kwargs),
+                    timeout=step.step_timeout_seconds,
+                )
     except asyncio.TimeoutError:
         message = (
             f"Step {step.position} ({step.agent_name}) exceeded its "
@@ -722,6 +724,13 @@ async def _run_bounded(coro, timeout: float | None):
 
 
 async def execute_workflow_run(run_id: str, workflow_id: int) -> None:
+    """Run the workflow under the run id the agent register logs its model
+    calls with (see ``_execute_workflow_run``)."""
+    with nexus_run(run_id):
+        await _execute_workflow_run(run_id, workflow_id)
+
+
+async def _execute_workflow_run(run_id: str, workflow_id: int) -> None:
     """Run the workflow and record the outcome.
 
     Never raises — the row this writes to IS the overlap lock, so any escaping

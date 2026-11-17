@@ -121,6 +121,7 @@ from agents.multipart_form import (
 )
 from agents.multipart_form import clean_name as _clean_name
 from agents.multipart_form import count_pdf_pages as _count_pdf_pages
+from agents.nexus.context import calling_agent, nexus_run
 from agents.registry import _make_progress_handler, registry
 from agents.run_activity import final_activity, live_activity, recording
 from agents.shared import run_usage_limits
@@ -461,7 +462,7 @@ def _run_done(run_id: str, key: tuple[str, int], state: _RunState,
 async def _run(run_id: str, key: tuple[str, int], agent_id: int, text: str,
                attachments: list[Attachment], state: _RunState) -> None:
     try:
-        with recording(run_id) as activity:
+        with recording(run_id) as activity, nexus_run(run_id):
             await _execute(run_id, activity, agent_id, key[0], text, attachments, state)
     finally:
         if _active.get(key) == run_id:
@@ -537,12 +538,13 @@ async def _attempt(agent_id: int, principal: str, text: str,
         *(BinaryContent(data=a.data, media_type=a.media_type) for a in attachments),
         text,
     ]
-    result = await specialist.run(
-        prompt,
-        output_type=[result_output(box), str],
-        usage_limits=run_usage_limits(),
-        event_stream_handler=_make_progress_handler(agent.name),
-    )
+    with calling_agent(agent.name):
+        result = await specialist.run(
+            prompt,
+            output_type=[result_output(box), str],
+            usage_limits=run_usage_limits(),
+            event_stream_handler=_make_progress_handler(agent.name),
+        )
     text = _final_text(result)
     report = {"text": text, "result": box.result}
     summary = (text or "")[:SUMMARY_CHARS]
