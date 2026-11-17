@@ -2631,6 +2631,126 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   which answers `count` as the total, as the page length or not at all, is
   `tests/aicore_helpers.py`). 693 lines: the credential resolution is the split
   candidate (`agents/aicore_credentials.py`)
+- `agents/nexus/` — the **agent register** integration: an optional side channel that
+  reports every model request of the app to an agent register reached through a BTP
+  destination, and registers the app's agents there so an admin of the register can assign
+  each one a use case. Standard library plus `httpx` (and pydantic-ai in `logged_model.py`);
+  no module imports `agents.registry` or `agents.admin` at module level (deferred imports),
+  so `agents.shared` can import the wrapper factory without a cycle. **Off unless the
+  destination exists**: no destination service bound, or the destination service answers 404
+  (`DestinationNotFound`): no worker, no timer, no HTTP, `get_model` still wraps but the
+  wrapper calls straight through and queues nothing. Settings (`config.py`, every one has a
+  default, an unusable value falls back with one WARNING naming the variable, never the
+  value; none is in `mta.yaml`, set per landscape in an `.mtaext`): `NEXUS_DESTINATION`
+  (default `NEXUS_AI_PLATFORM`; the technical destination, client credentials),
+  `NEXUS_USER_DESTINATION` (default `NEXUS_AI_PLATFORM_USER`; optional, `OAuth2JWTBearer`),
+  `NEXUS_FALLBACK_USE_CASE` (at most 60 characters, sent for an agent the register assigned
+  no use case), `NEXUS_REPUSH_MINUTES` (default 15, 0 = no timer), `NEXUS_SEND_PAYLOAD`
+  (exactly `true` sends prompt and response text, default off), `NEXUS_QUEUE_MAX` (default
+  2000), `NEXUS_TIMEOUT_SECONDS` (default 5, at most 30). The resource group sent is
+  `AICORE_RESOURCE_GROUP` (blank = `default`). One process-wide state per module, like the
+  job runner: with several instances each reports on its own.
+  - `state.py` / `lifecycle.py` — the switch is a plain boolean read on every model call
+    (no I/O) and is decided only by `lifecycle`: `start()` (the lifespan, after
+    `registry.reload()`), `reevaluate()` (admin Reload and Restart), `refresh_switch()` (the
+    timer) and `stop()` (shutdown). The destination exists, or cannot be resolved right now
+    (any other error, a timeout included): on, and the sender treats an unreachable register
+    like any failed send; the destination service's 404: off. The timer's only call per
+    period is that lookup at the destination service, never the register. An evaluation
+    never raises into its caller and is bounded as a whole by `NEXUS_TIMEOUT_SECONDS`;
+    admin Reload / Restart wait for the re-evaluation within that bound, and only when a
+    destination service is bound. An evaluation that itself raises while the integration is
+    on keeps the state (no queue drop, the pusher keeps running) with one WARNING; going
+    off on such a failure happens only when the state was off or at first start-up. `stop()`
+    sets a flag so a Reload racing shutdown cannot restart the worker, flushes for at most 3 s
+    and closes the client (`RegisterClient.aclose()`, harmless twice); while sending is
+    paused after failures nothing is flushed, the queued entries are counted as dropped, one
+    WARNING. The user resolver is built only when `NEXUS_USER_DESTINATION` names a destination
+    that exists, and `state.set_user_forwarding` follows it at start-up and at every Reload
+    (an unverified check cut short by the shared deadline is logged "not verified").
+  - `client.py` — `RegisterClient`, the only code that talks to the register: a JSON `POST`
+    to `<destination URL>/logging/<action>`. Fails closed and never raises: a
+    `SendOutcome` (`ok`, `status`, `failure` = exception CLASS name or `http_<status>`,
+    `sent_as`, `user_fallback`); the body of a status of 300 or more is never read, no
+    redirect is followed, nothing is retried (a 401 drops the cached destination so the NEXT
+    call resolves afresh), one deadline per call (`asyncio.timeout` around resolve, send and
+    read), no cookies kept. Of the destination only URL and headers are used: **query
+    properties are not sent**; a stored `Host`, `Content-Length`, `Content-Type`,
+    `Transfer-Encoding` or `Cookie` header is dropped. httpx's request line is kept out of
+    the log by the contextvar filter of `agents/bitbucket_tools.py`.
+  - `sender.py` — `enqueue(action, body, identity=None)` is synchronous and never raises;
+    the queue is bounded at `NEXUS_QUEUE_MAX` and a full queue drops the OLDEST entry,
+    counted. ONE worker sends in order, nothing retried; after 5 failures in a row
+    (`FAILURES_BEFORE_PAUSE`) it pauses 60 s, then sends ONE probe, so a register that stays
+    down costs one request a minute; failures are logged at most once per 5 minutes as
+    counts plus the last class or status, never a URL, body, header or exception text. A
+    worker whose event loop closed counts as not running.
+  - `logged_model.py` — `NexusLoggedModel`, a pydantic-ai `WrapperModel`; **`agents/shared.get_model`
+    returns it** (the real model is at `.wrapped`; the per-name cache holds the wrapped
+    object; a failure to import or build the wrapper falls back to the unwrapped model with
+    one WARNING per process, class only). Every model request, from every entry point (web
+    chat, classic chat, A2A, jobs, invoke, workflows, IDE, delegation, deep sub-agents),
+    queues one `logRequest` before and one `logResponse` after, with one `correlationId`,
+    `agent` (omitted when blank), `runId`, the model, the resource group and the use case;
+    tokens are that request's own `usage`, never the run's running total, so the register can
+    sum them. Status: `COMPLETED`; `FILTERED` for a RETURNED response whose finish reason is
+    `content_filter` (not an exception at this layer); `FAILED` for a model error or a
+    stream cancelled or left early (`errorCode` the class name, `http_<status>` or
+    `cancelled`, message masked by `agents/errors.describe_exception` and cut to 200
+    characters); the body of a `ModelHTTPError` is never sent. `modelVersion` is sent on
+    neither call (it is known only from the response). A logRequest that could not be built
+    means no logResponse for that call; a build failure is counted (`build_failed`) and
+    logged once per class, the model's answer or exception passes through unchanged. Stream
+    completion is tracked by replacing the private `StreamedResponse._event_iterator` with a
+    pass-through generator: a test pins that attribute on the pinned pydantic-ai, and when it
+    is gone tracking is switched off with one WARNING (`untracked_streams`) and a normal exit
+    is logged `COMPLETED`, never a false `FAILED`.
+  - `context.py` — `current_agent_name` (default `orchestrator`) and `current_nexus_run_id`
+    (cut to 64 characters, an id already bound wins), bound by the synchronous context
+    managers `calling_agent` and `nexus_run` around the call that starts a run (so a task
+    created there inherits them). **A personal agent is reported only as `personal-agent`**,
+    never by its own name; an admin agent run straight, a delegated specialist and a deep
+    sub-agent are reported by the admin agent's name.
+  - **Identity** (`context.capture_identity`, `client.py`, `sender.py`):
+    `registerAgents` always goes as the technical user (the register refuses a user token
+    there). `logRequest` / `logResponse` of a signed-in user go through the user destination
+    (the user's JWT in `X-user-token`) only when user forwarding is on and a token with a
+    principal is bound; the destination counts only when it signs in as that user (the OData
+    rule: resolved for the user, an `Authentication` of `OAuth2JWTBearer`,
+    `OAuth2UserTokenExchange` or `OAuth2SAMLBearerAssertion`, no `SystemUser`, an
+    `Authorization` the destination service minted). Otherwise the call goes as the
+    technical user and is counted `user_fallback`; there is no silent success as a user. A
+    pair is never split: the REQUEST decides, and a response follows the identity its request
+    went out with (decisions kept for at most 10,000 correlation ids). One rare split
+    remains: a user request, then the kept token expired and the re-exchange failed, so the
+    response goes technical, counted `user_fallback`. The JWT is held only in the queued
+    entry (never in a `repr` or a log) and is gone once it was sent.
+  - `register.py` — `build_agent_list`, `push_once`, `start_pusher`, `request_push`,
+    `use_case_for`, `assignment_for`. One entry per admin agent row plus two fixed ones,
+    `orchestrator` (a fixed description; its instructions are prompt text and never pushed)
+    and `personal-agent` (one entry for every chat user's own agents). Names are stripped,
+    the first of two equal names wins, an admin agent wins over a fixed entry of the same
+    name (one WARNING), a blank name or one over 64 characters is left out, a description is
+    cut to 2,000 characters, a model name over 120 is sent blank (the register refuses a
+    whole call for one bad entry). Batches of 500 (`registerAgents`); a push counts only when
+    every batch was accepted, and a failed push changes neither the cache nor the memory of
+    what was pushed. A name pushed before and no longer listed is sent once more as the entry
+    last pushed with `active: false` (a field a call leaves out is cleared there), for as
+    long as the process lives. The answers (use case, resource group, status per agent) are
+    cached in a dict so a model call names its use case without I/O. Pushes happen at
+    start-up, on Reload / Restart, by the re-push timer, and after the commit of an agent
+    create, update, delete or bundle import (`agents/admin.py::_push_agents_to_register`) and
+    at every `Registry.reload` build swap (`_request_register_push`); `request_push()` is
+    synchronous and a no-op while the integration is off.
+  - **Tests** `tests/test_nexus_*.py` (about 215, helpers `tests/nexus_helpers.py`, the
+    entry-point drivers `tests/nexus_entry_drivers.py`) pin every entry point, the off path
+    (nothing sent, nothing queued), the token sum and the lifecycle. **Unit-tested only
+    (`httpx.MockTransport` and scripted models): never run against a real register on a
+    landscape.** Not verified until the smoke test: the register's actual answers (the shape
+    of `registerAgents`' reply and of its use case assignments), that it accepts every field
+    sent, the user-token exchange through the user destination, the stream tracking against
+    a real provider stream, and the cost of the side channel under load. Operator setup
+    notes: `docs/NEXUS_SETUP.md` (local, not in repo)
 - `agents/jira_tools.py` — in-process Jira tools over REST v2
   (`builtin:jira`), reached through a destination. JQL is built server-side
   from pinned `project`/`status` and a `lookback` ceiling; issues this
@@ -4325,7 +4445,12 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   or host kept in an ini file reaches the model and the stored chat history)
   without any admin action. An already seeded landscape keeps its old
   `hana-monitoring` skill text (the seed fills an empty registry only): an
-  admin pastes the new text by hand
+  admin pastes the new text by hand;
+  2.45.0 adds the optional agent register (`agents/nexus/`): no new resource, role, table or
+  column (HANA schema generation unchanged, still 12); the `NEXUS_*` settings are not in the
+  descriptor (set per landscape in an `.mtaext`); the integration is off unless the
+  destination exists, and every model is wrapped (`NexusLoggedModel`) either way. Unit-tested
+  only: not yet run against a real register on a landscape
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets
@@ -4571,6 +4696,12 @@ SAP AI Core's Generative AI Hub is the LLM provider.
    tools -> the SSE stream relays text, tool cards, notes and generated files
    -> the turn is stored (content, parts, `new_messages()`), the title set,
    the lock released
+10. Any model request, from any entry point (`agents/nexus/`, only while the agent register
+   is on): `get_model` hands the run a `NexusLoggedModel` -> `logRequest` is queued before
+   the call (agent, run id, model, use case, as the signed-in user when user forwarding is
+   on) -> the model answers or fails unchanged -> `logResponse` is queued with that
+   request's tokens and status -> one worker sends the queue to the register through its
+   destination, off the request path; off, the wrapper calls straight through
 
 ## Running locally
 ```bash
