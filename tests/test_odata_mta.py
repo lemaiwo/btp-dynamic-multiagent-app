@@ -20,8 +20,8 @@ def _app() -> dict:
     return next(m for m in mta()["modules"] if m["name"] == "pydantic-agent")
 
 
-def test_version_is_2_24_0():
-    assert mta()["version"] == "2.44.0"
+def test_mta_version():
+    assert mta()["version"] == "2.45.0"
 
 
 def test_connectivity_resource_is_lite_and_bound_to_the_app():
