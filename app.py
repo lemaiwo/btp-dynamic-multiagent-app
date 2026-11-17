@@ -86,6 +86,7 @@ from agents.ide.store import (  # noqa: E402
 from agents.invoke import cancel_all_invoke_runs  # noqa: E402
 from agents.invoke import router as invoke_router  # noqa: E402
 from agents.job_runner import cancel_all_runs  # noqa: E402
+from agents.nexus import lifecycle as nexus_lifecycle  # noqa: E402
 from agents.oauth2 import refresh_scheduled_tokens  # noqa: E402
 from agents.oauth_routes import router as oauth_router  # noqa: E402
 from agents.odata import audit as odata_audit  # noqa: E402
@@ -375,6 +376,12 @@ async def lifespan(app: FastAPI):
     await model_providers.refresh()
     await registry.reload()
     dynamic_chat_app.refresh()
+    # The agent register: never raises itself, but an unexpected error must
+    # not keep the app from starting.
+    try:
+        await nexus_lifecycle.start()
+    except Exception as exc:
+        logger.warning("agent register start-up failed (%s)", type(exc).__name__)
     heartbeat: asyncio.Task | None = None
     if DB_HEARTBEAT_SECONDS > 0:
         heartbeat = asyncio.create_task(_db_heartbeat(DB_HEARTBEAT_SECONDS))
@@ -423,7 +430,11 @@ async def lifespan(app: FastAPI):
     # Side by side, not one after the other: Cloud Foundry kills the app 10 s
     # after SIGTERM. An AI Core deploy in flight is waited for, never
     # cancelled (drain_embedding_deploys, bounded, never raises).
-    await asyncio.gather(drain_embedding_deploys(), drain_ide_approvals())
+    await asyncio.gather(
+        drain_embedding_deploys(),
+        drain_ide_approvals(),
+        nexus_lifecycle.stop(flush_seconds=3.0),
+    )
     # A write whose run was cancelled above still has its result to store
     # (its own shielded task). Bounded: `drain` gives up after its timeout
     # and never raises; a row left `intent` is explained in agents.odata.audit.
