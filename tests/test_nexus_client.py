@@ -187,3 +187,51 @@ async def test_register_agents_ignores_an_identity():
     client = RegisterClient(FakeResolver(), user, timeout=5, transport=rec.transport())
     out = await client.post("registerAgents", {"agents": []}, identity=_identity())
     assert out.ok and rec.requests[0]["auth"] == "Bearer tech-token" and user.calls == []
+
+
+async def _user_call(user):
+    rec = Recorder()
+    client = RegisterClient(FakeResolver(), user, timeout=5, transport=rec.transport())
+    out = await client.post("logRequest", {"correlationId": "c"}, identity=_identity())
+    return out, rec.requests[0]["auth"]
+
+
+async def test_basic_user_destination_falls_back():
+    out, auth = await _user_call(FakeResolver("U", token="basic",
+                                              user_auth_type="BasicAuthentication"))
+    assert out.user_fallback and out.sent_as == "technical" and auth == "Bearer tech-token"
+
+
+async def test_client_credentials_user_destination_falls_back():
+    out, auth = await _user_call(FakeResolver("U", token="cc",
+                                              user_auth_type="OAuth2ClientCredentials"))
+    assert out.user_fallback and auth == "Bearer tech-token"
+
+
+async def test_system_user_destination_falls_back():
+    out, auth = await _user_call(FakeResolver("U", token="fixed", system_user=True))
+    assert out.user_fallback and out.sent_as == "technical" and auth == "Bearer tech-token"
+
+
+async def test_destination_not_resolved_for_the_user_falls_back():
+    out, auth = await _user_call(FakeResolver("U", token="app", marks_per_user=False))
+    assert out.user_fallback and auth == "Bearer tech-token"
+
+
+async def test_user_propagating_destination_goes_as_the_user():
+    for kind in ("OAuth2JWTBearer", "OAuth2UserTokenExchange", "OAuth2SAMLBearerAssertion"):
+        out, auth = await _user_call(FakeResolver("U", token="u", user_auth_type=kind))
+        assert out.sent_as == "user" and not out.user_fallback and auth == "Bearer u"
+
+
+async def test_expired_kept_destinations_are_dropped():
+    rec = Recorder()
+    user = FakeResolver("U", token="u", ttl=-1.0)          # already expired when kept
+    client = RegisterClient(FakeResolver(), user, timeout=5, transport=rec.transport())
+    for cid in ("c-1", "c-2"):
+        assert (await client.post("logRequest", {"correlationId": cid},
+                                  identity=_identity())).ok
+    user.ttl = 600.0
+    assert (await client.post("logRequest", {"correlationId": "c-3"},
+                              identity=_identity())).ok
+    assert list(client._pair_destinations) == ["c-3"]

@@ -6,6 +6,7 @@ call: the register is an ``httpx.MockTransport``.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import time
 from dataclasses import dataclass, field
@@ -21,9 +22,13 @@ class FakeResolver:
     """A ``DestinationResolver`` stand-in that records how it was asked."""
 
     def __init__(self, name="NEXUS_AI_PLATFORM", token="tech-token", *, fail=None,
-                 per_user=None, url=REGISTER_URL):
+                 per_user=None, url=REGISTER_URL, user_auth_type="OAuth2JWTBearer",
+                 system_user=False, marks_per_user=True, ttl=600.0):
         self.name, self.token, self.fail, self.per_user = name, token, fail, per_user or {}
         self.url = url
+        # How a resolve WITH a user token answers (a user-propagating destination by default).
+        self.user_auth_type, self.system_user = user_auth_type, system_user
+        self.marks_per_user, self.ttl = marks_per_user, ttl
         self.calls: list[dict] = []
         self.invalidated: list[str | None] = []
 
@@ -32,8 +37,13 @@ class FakeResolver:
         if self.fail is not None:
             raise self.fail
         token = self.per_user.get(user_token, self.token) if user_token else self.token
-        return Destination(url=self.url, headers={"Authorization": f"Bearer {token}"},
-                           expires_at=time.monotonic() + 600)
+        dest = Destination(url=self.url, headers={"Authorization": f"Bearer {token}"},
+                           expires_at=time.monotonic() + self.ttl)
+        if user_token:
+            dest = dataclasses.replace(dest, auth_type=self.user_auth_type,
+                                       per_user=self.marks_per_user,
+                                       system_user=self.system_user)
+        return dest
 
     async def resolve_properties(self, *, force=False):
         if self.fail is not None:
@@ -98,6 +108,7 @@ async def register_on(monkeypatch, recorder, *, queue_max=2000, user=None):
     from agents.nexus import logged_model, register, sender, state
     from agents.nexus.client import RegisterClient
     state.reset_for_tests()
+    state.set_user_forwarding(user is not None)
     sender.reset_for_tests()
     register.reset_for_tests()
     logged_model.reset_for_tests()

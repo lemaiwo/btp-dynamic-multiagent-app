@@ -11,6 +11,10 @@ _NOT_STARTED = "off (not started)"
 
 _enabled = False
 _reason = _NOT_STARTED
+# Whether a user destination is configured: only then is a signed-in user's
+# JWT captured at a model call (else every queue entry would hold one for
+# nothing). Set by the lifecycle when it builds the user resolver.
+_user_forwarding = False
 
 
 def enabled() -> bool:
@@ -31,14 +35,27 @@ def set_on(destination: str) -> None:
 
 
 def set_off(reason: str) -> None:
-    """Switch off for the given reason (shown as given)."""
-    global _enabled, _reason
+    """Switch off for the given reason (shown as given); user forwarding ends too."""
+    global _enabled, _reason, _user_forwarding
     _enabled = False
     _reason = reason
+    _user_forwarding = False
+
+
+def user_forwarding() -> bool:
+    """Whether model calls of a signed-in user are logged through the user destination."""
+    return _user_forwarding
+
+
+def set_user_forwarding(on: bool) -> None:
+    """Set by the lifecycle: ``True`` once a user destination resolver is built."""
+    global _user_forwarding
+    _user_forwarding = bool(on)
 
 
 def reset_for_tests() -> None:
     """Back to the state of a fresh process: off, not started."""
-    global _enabled, _reason
+    global _enabled, _reason, _user_forwarding
     _enabled = False
     _reason = _NOT_STARTED
+    _user_forwarding = False

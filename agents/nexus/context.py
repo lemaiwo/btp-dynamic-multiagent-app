@@ -42,18 +42,24 @@ class Identity:
 def capture_identity() -> Identity | None:
     """The signed-in user of the current model call, or ``None`` (technical).
 
-    A user only when a JWT is bound AND the middleware's validated claims are
-    a user's: not a client-credentials token (the job scheduler's, another
-    application's), and carrying ``user_name`` or ``origin``. The principal
-    comes from those claims, never from ``current_principal``: in a "Run now"
-    job that is the agent's run-as user while the JWT is the trigger's. The
-    claims are the bound JWT's own (the middleware binds both together), so
-    the token is not validated a second time on the model-call path. Never
-    raises: anything unexpected is technical.
+    Nothing is captured unless a user destination is configured
+    (:func:`agents.nexus.state.user_forwarding`). Then a user only when a JWT
+    is bound AND the middleware's validated claims are a user's: not a
+    client-credentials token (the job scheduler's, another application's),
+    and carrying ``user_name`` or ``origin``. The principal is
+    :func:`agents.auth.bound_token_principal`, which answers only when those
+    claims belong to the bound JWT (compared on an unverified decode: no
+    second validation, no key fetch on the model-call path), never
+    ``current_principal``: in a "Run now" job that is the agent's run-as user
+    while the JWT is the trigger's. Never raises: anything unexpected is
+    technical.
     """
     try:
-        from agents.auth import _principal_claim, current_claims, current_jwt
+        from agents.auth import bound_token_principal, current_claims, current_jwt
+        from agents.nexus import state
 
+        if not state.user_forwarding():
+            return None
         token = current_jwt.get()
         claims = current_claims.get()
         if not token or not isinstance(token, str) or not isinstance(claims, dict):
@@ -62,7 +68,10 @@ def capture_identity() -> Identity | None:
             return None
         if not (claims.get("user_name") or claims.get("origin")):
             return None
-        return Identity(jwt=token, principal=_principal_claim(claims))
+        principal = bound_token_principal()
+        if principal is None:
+            return None
+        return Identity(jwt=token, principal=principal)
     except Exception:  # noqa: BLE001 - logging must never break a model call
         return None
 

@@ -33,17 +33,21 @@ Two identities. ``registerAgents`` always goes as the technical user (the
 register refuses a user token there). ``logRequest`` / ``logResponse`` of a
 model call made by a signed-in user carry that user's :class:`Identity`; with
 a user destination configured (``user``), its JWT is exchanged there for a
-token the register sees as the user. When that exchange fails, or the
-destination answers without an ``Authorization`` it minted, the call goes as
-the technical user instead and the outcome says ``user_fallback``; nothing is
-dropped for it. Both calls of one model request go as the same identity: the
-sender drops the identity of a response whose request fell back, and the
+token the register sees as the user. The destination counts only when it signs
+in as that user, the rule the OData callers apply: resolved for the user, an
+``Authentication`` of ``OAuth2JWTBearer``, ``OAuth2UserTokenExchange`` or
+``OAuth2SAMLBearerAssertion``, no ``SystemUser`` property and an
+``Authorization`` the destination service minted (a Basic, client-credentials
+or fixed-user destination would log a technical token as the user). When that
+exchange fails, or the destination does not sign in as the user, the call goes
+as the technical user instead and the outcome says ``user_fallback``; nothing
+is dropped for it. Both calls of one model request go as the same identity:
+the sender drops the identity of a response whose request fell back, and the
 user destination a request was sent with is kept (by ``correlationId``, at
-most :data:`PAIR_MEMO_MAX`, until it expires) for its response, so an
-exchange that fails in between does not split the pair. A 401 under the user
-drops that user's cached destination only. The JWT is never logged, never in
-an outcome and never a key of anything but the resolver's own digest-keyed
-cache.
+most :data:`PAIR_MEMO_MAX`, until it expires) for its response, so an exchange
+that fails in between does not split the pair. A 401 under the user drops that
+user's cached destination only. The JWT is never logged, never in an outcome
+and never a key of anything but the resolver's own digest-keyed cache.
 """
 from __future__ import annotations
 
@@ -59,6 +63,7 @@ import httpx
 
 from agents.bitbucket_tools import _install_once, _sending
 from agents.destination import Destination, DestinationResolver
+from agents.destination_auth import _SIGNS_IN_AS_USER
 from agents.nexus.context import Identity
 from agents.odata.session import NoCookieJar
 
@@ -201,6 +206,9 @@ class RegisterClient:
             if not isinstance(correlation_id, str):
                 correlation_id = None
             user_key = DestinationResolver.user_key(identity.principal, identity.jwt)
+            # Popped for any response with an identity: the entry exists only
+            # when this pair's request went as the user, and correlation ids
+            # are fresh UUIDs, so it is this pair's (and is used at most once).
             if action == "logResponse" and correlation_id is not None:
                 kept = self._pair_destinations.pop(correlation_id, None)
                 if kept is not None and time.monotonic() < kept.expires_at:
@@ -213,18 +221,23 @@ class RegisterClient:
                 logger.debug("agent register: user destination failed (%s); "
                              "technical instead", type(e).__name__)
             else:
-                if _minted_authorization(destination):
+                if _signs_in_as_user(destination):
                     pick.user_key = user_key
                     if action == "logRequest" and correlation_id is not None:
                         self._keep_for_response(correlation_id, destination)
                     return destination
-                logger.debug("agent register: user destination gave no minted "
-                             "Authorization; technical instead")
+                logger.debug("agent register: user destination does not sign in as "
+                             "the user; technical instead")
             pick.fallback = True
         return await self._technical.resolve()
 
     def _keep_for_response(self, correlation_id: str, destination: Destination) -> None:
         memo = self._pair_destinations
+        now = time.monotonic()
+        # Expired entries go first: a response that never comes must not keep
+        # a minted register token alive until the bound pushes it out.
+        while memo and next(iter(memo.values())).expires_at <= now:
+            memo.popitem(last=False)
         memo[correlation_id] = destination
         memo.move_to_end(correlation_id)
         while len(memo) > PAIR_MEMO_MAX:
@@ -270,8 +283,12 @@ class RegisterClient:
                            user_fallback=bool(pick and pick.fallback), sent_as=sent_as)
 
 
-def _minted_authorization(destination: Destination) -> bool:
-    """An ``Authorization`` the destination service minted (not a stored one)."""
+def _signs_in_as_user(destination: Destination) -> bool:
+    """Whether the destination signs in as the user (``destination_auth``'s rule)."""
+    if (not destination.per_user
+            or (destination.auth_type or "").strip() not in _SIGNS_IN_AS_USER
+            or destination.system_user):
+        return False
     if "authorization" in destination.static_headers:
         return False
     return any(name.lower() == "authorization" and value
