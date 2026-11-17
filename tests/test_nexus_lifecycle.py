@@ -255,3 +255,110 @@ async def test_stop_never_raises(env, monkeypatch):
 async def test_stop_without_start_is_harmless():
     await lifecycle.stop()
     assert not state.enabled()
+
+
+# --- review findings of the lifecycle -------------------------------------
+
+
+def _warnings(caplog):
+    return [r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == "agents.nexus.lifecycle"]
+
+
+async def test_a_failing_evaluation_while_on_keeps_the_state(env, monkeypatch, caplog):
+    assert await lifecycle.start() == f"on (destination {TECH})"
+    client = lifecycle.client()
+    pusher = register._state.pusher
+    await register.settle()
+    real = lifecycle._evaluate
+    broken = {"on": True}
+
+    async def evaluate():
+        if broken["on"]:
+            raise ValueError("binding text")
+        return await real()
+    monkeypatch.setattr(lifecycle, "_evaluate", evaluate)
+    with caplog.at_level(logging.WARNING, logger="agents.nexus"):
+        for _ in range(3):
+            assert await lifecycle.refresh_switch() == f"on (destination {TECH})"
+        sender.enqueue("logRequest", {"correlationId": "c-keep"})
+        async with asyncio.timeout(2):                   # the worker still sends
+            while not env.recorder.of("logRequest"):
+                await asyncio.sleep(0.005)
+        assert state.enabled() and sender.running() and lifecycle.client() is client
+        assert not client._http.is_closed and register._state.pusher is pusher
+        assert len(_warnings(caplog)) == 1               # one WARNING per failure streak
+        assert "ValueError" in _warnings(caplog)[0] and "binding text" not in caplog.text
+        broken["on"] = False                             # a good evaluation ends the streak
+        assert await lifecycle.refresh_switch() == f"on (destination {TECH})"
+        broken["on"] = True
+        await lifecycle.refresh_switch()
+    assert len(_warnings(caplog)) == 2
+    await lifecycle.stop()
+
+
+async def test_a_failing_evaluation_at_first_start_is_off(env, monkeypatch):
+    async def broken():
+        raise ValueError("x")
+    monkeypatch.setattr(lifecycle, "_evaluate", broken)
+    assert await lifecycle.start() == "off (check failed)"
+    assert not state.enabled() and not sender.running()
+    await lifecycle.stop()
+
+
+async def test_a_reload_after_stop_does_not_restart(env):
+    await lifecycle.start()
+    await lifecycle.stop()
+    assert await lifecycle.reevaluate() == "off (stopped)"
+    assert not state.enabled() and not sender.running() and lifecycle.client() is None
+    assert not lifecycle.timer_running()
+    assert await lifecycle.refresh_switch() == "off (stopped)"
+    assert not sender.running()
+
+
+async def test_a_reload_racing_shutdown_does_not_restart(env, monkeypatch):
+    await lifecycle.start()
+    gate = asyncio.Event()
+
+    async def held(*, force=False):
+        await gate.wait()                     # the Reload waits at the destination service
+        return {"Name": TECH}
+    monkeypatch.setattr(env.fakes[TECH], "resolve_properties", held)
+    reload = asyncio.ensure_future(lifecycle.reevaluate())
+    await asyncio.sleep(0.02)
+    await lifecycle.stop()
+    gate.set()                                # ... and answers after the shutdown
+    assert await reload == "off (stopped)"
+    assert not state.enabled() and not sender.running() and lifecycle.client() is None
+    assert not lifecycle.timer_running()
+
+
+async def test_reset_and_a_later_start_clear_stopping(env):
+    await lifecycle.start()
+    await lifecycle.stop()
+    assert await lifecycle.start() == f"on (destination {TECH})"   # a later start-up
+    assert sender.running()
+    await lifecycle.stop()
+    lifecycle.reset_for_tests()
+    assert await lifecycle.reevaluate() == f"on (destination {TECH})"
+    await lifecycle.stop()
+
+
+async def test_user_check_cut_short_by_the_deadline_is_not_verified(env, monkeypatch, caplog):
+    monkeypatch.setenv("NEXUS_TIMEOUT_SECONDS", "0.2")
+    env.fakes[USER].hang = True
+    with caplog.at_level(logging.INFO, logger="agents.nexus"):
+        assert await lifecycle.start() == f"on (destination {TECH})"
+    assert (f"agent register integration: user forwarding on (destination {USER}, "
+            "not verified)") in _info(caplog)
+    assert state.user_forwarding() is True
+    await lifecycle.stop()
+
+
+async def test_closing_the_client_twice_is_harmless(env):
+    await lifecycle.start()
+    client = lifecycle.client()
+    await client.aclose()
+    await client.aclose()
+    assert client._http.is_closed
+    await lifecycle.stop()   # closes it a third time

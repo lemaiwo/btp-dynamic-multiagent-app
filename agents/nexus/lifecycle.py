@@ -73,6 +73,10 @@ class _State:
     retired: list[RegisterClient] = field(default_factory=list)
     logged_reason: str | None = None
     logged_forwarding: str | None = None
+    # Set by stop(): a Reload or the timer racing shutdown must not restart anything.
+    stopping: bool = False
+    # An evaluation that raised while on was warned about (once per failure streak).
+    failure_warned: bool = False
 
 
 _state = _State()
@@ -102,16 +106,29 @@ def _resolver(name: str, cfg: DestinationServiceConfig) -> Any:
     return found
 
 
-async def _exists(resolver: Any, deadline: float) -> bool:
-    """``False`` only when the destination service says the destination does not exist."""
+FOUND = "found"
+MISSING = "missing"
+UNVERIFIED = "unverified"  # the shared deadline cut the check short
+
+
+async def _check(resolver: Any, deadline: float) -> str:
+    """``MISSING`` only when the destination service says the destination does not exist.
+
+    Any other failure counts as present; ``UNVERIFIED`` when it was the shared
+    deadline that ended the check (told apart from a callee's own timeout by
+    ``expired()``).
+    """
+    cm = asyncio.timeout_at(deadline)
     try:
-        async with asyncio.timeout_at(deadline):
+        async with cm:
             await resolver.resolve_properties(force=True)
     except DestinationNotFound:
-        return False
+        return MISSING
     except Exception as e:  # noqa: BLE001 - exists, not resolvable now (timeout included)
         logger.debug("agent register: destination check inconclusive (%s)", type(e).__name__)
-    return True
+        if cm.expired():
+            return UNVERIFIED
+    return FOUND
 
 
 def _note_reason(reason: str) -> None:
@@ -145,7 +162,7 @@ async def _evaluate() -> _Result:
     settings = config.settings()
     deadline = asyncio.get_running_loop().time() + settings.timeout_seconds
     technical = _resolver(settings.destination, cfg)
-    if not await _exists(technical, deadline):
+    if await _check(technical, deadline) == MISSING:
         return _Result(False, _off_not_found(settings.destination))
     user = None
     name = settings.user_destination
@@ -154,9 +171,13 @@ async def _evaluate() -> _Result:
                       "calls are logged with the technical token")
     else:
         candidate = _resolver(name, cfg)
-        if await _exists(candidate, deadline):
+        found = await _check(candidate, deadline)
+        if found == FOUND:
             user = candidate
             forwarding = f"user forwarding on (destination {name})"
+        elif found == UNVERIFIED:
+            user = candidate
+            forwarding = f"user forwarding on (destination {name}, not verified)"
         else:
             forwarding = (f"user destination {name} not found; "
                           "calls are logged with the technical token")
@@ -225,11 +246,23 @@ async def refresh_switch() -> str:
     if _state.lock is None:
         _state.lock = asyncio.Lock()
     async with _state.lock:
+        if _state.stopping:
+            return state.reason()
         try:
             result = await _evaluate()
         except Exception as e:  # noqa: BLE001 - never into the lifespan or a Reload
-            logger.warning("agent register: switch check failed (%s)", type(e).__name__)
+            if not _state.failure_warned:
+                _state.failure_warned = True
+                logger.warning("agent register: switch check failed (%s)", type(e).__name__)
+            if state.enabled() and _state.client is not None:
+                # Already on: an evaluation that broke says nothing about the
+                # register. Keep the worker, its queue and the pusher as they are.
+                return state.reason()
             result = _Result(False, OFF_CHECK_FAILED)
+        else:
+            _state.failure_warned = False
+        if _state.stopping:  # shutdown began while the destination service was asked
+            return state.reason()
         try:
             if result.on:
                 await _switch_on(result.destination, result.technical, result.user)
@@ -271,8 +304,18 @@ async def _timer_loop() -> None:
 
 
 async def start() -> str:
-    """At app start-up: decide the switch, start what it needs; the reason. Never raises."""
+    """At app start-up: decide the switch, start what it needs; the reason. Never raises.
+
+    A start after ``stop()`` (a new lifespan) clears the stopping flag.
+    """
+    _state.stopping = False
+    return await _apply()
+
+
+async def _apply() -> str:
     reason = await refresh_switch()
+    if _state.stopping:
+        return reason
     try:
         _ensure_timer()
     except Exception as e:  # noqa: BLE001
@@ -281,15 +324,24 @@ async def start() -> str:
 
 
 async def reevaluate() -> str:
-    """At an admin Reload / Restart: decide again, re-configure, push when on. Never raises."""
-    reason = await start()
-    if state.enabled():
+    """At an admin Reload / Restart: decide again, re-configure, push when on. Never raises.
+
+    After ``stop()`` it changes nothing (a Reload racing shutdown).
+    """
+    reason = await _apply()
+    if state.enabled() and not _state.stopping:
         register.request_push()
     return reason
 
 
 async def stop(flush_seconds: float = DEFAULT_FLUSH_SECONDS) -> None:
-    """At shutdown: timer and pusher stopped, the queue flushed (bounded), the client closed."""
+    """At shutdown: timer and pusher stopped, the queue flushed (bounded), the client closed.
+
+    Sets the stopping flag first, so a Reload or a timer evaluation still in
+    flight applies nothing afterwards (the switching steps do not await, so a
+    check of the flag right before them is enough).
+    """
+    _state.stopping = True
     timer, _state.timer = _state.timer, None
     tasks = [t for t in (timer, *_state.retiring) if t is not None and not t.done()]
     for task in tasks:
