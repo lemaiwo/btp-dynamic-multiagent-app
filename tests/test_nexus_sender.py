@@ -59,10 +59,58 @@ async def test_five_failures_pause_sending(monkeypatch):
     assert len(rec.requests) == 5
     assert len(sender.pending()) == 3                 # entries keep queueing
     clock[0] += 61
+    rec.statuses.pop("logRequest")                    # the register is back
     sender.wake()
     await sender.drain()
     assert len(rec.requests) == 8
     await sender.stop(flush_seconds=0)
+    sender.reset_for_tests()
+
+
+async def test_after_a_pause_one_probe_then_pause_again(monkeypatch):
+    sender.reset_for_tests()
+    rec = Recorder(statuses={"logRequest": 500})
+    clock = [1000.0]
+    monkeypatch.setattr(sender, "_now", lambda: clock[0])
+    sender.start(RegisterClient(FakeResolver(), timeout=5, transport=rec.transport()), queue_max=50)
+    for i in range(8):
+        sender.enqueue("logRequest", {"correlationId": str(i)})
+    await sender.wait_paused()
+    assert len(rec.requests) == 5
+    clock[0] += 61                                    # still down: ONE probe, then pause
+    sender.wake()
+    await sender.wait_paused()
+    assert len(rec.requests) == 6
+    assert len(sender.pending()) == 2
+    await sender.stop(flush_seconds=0)
+    sender.reset_for_tests()
+
+
+def test_worker_of_a_closed_loop_is_not_running():
+    sender.reset_for_tests()
+    first = asyncio.new_event_loop()
+
+    async def start_first():
+        sender.start(RegisterClient(FakeResolver(), timeout=5, transport=Recorder().transport()),
+                     queue_max=5)
+
+    first.run_until_complete(start_first())
+    assert sender.running()
+    first.close()                                     # e.g. a test's loop, or a restarted app
+    assert not sender.running()
+
+    rec = Recorder()
+
+    async def start_second():
+        client = RegisterClient(FakeResolver(), timeout=5, transport=rec.transport())
+        sender.start(client, queue_max=5)
+        sender.enqueue("logRequest", {"correlationId": "a"})
+        await sender.drain()
+        await sender.stop(flush_seconds=0.1)
+        await client.aclose()
+
+    asyncio.run(start_second())
+    assert [r["body"]["correlationId"] for r in rec.requests] == ["a"]
     sender.reset_for_tests()
 
 

@@ -21,7 +21,9 @@ the list is made safe before it leaves:
   configuration, never a model, description or credential).
 
 A name pushed before and no longer listed is sent once more as inactive, so
-the register stops counting it as live. Pushes go in batches of
+the register stops counting it as live. It is sent as the entry last pushed
+for it with ``active: false``: the register clears a field a call leaves
+out, and would lose the agent's description and model. Pushes go in batches of
 :data:`BATCH_SIZE`; a push counts only when every batch is accepted, and a
 failed push changes neither the cache nor the memory of what was pushed.
 """
@@ -62,7 +64,7 @@ class _State:
     def __init__(self) -> None:
         self.client: _Client | None = None
         self.cache: dict[str, Assignment] = {}
-        self.pushed_last: set[str] = set()
+        self.pushed_last: dict[str, dict] = {}
         self.fallback_read = False
         self.fallback: str | None = None
         self.lock: asyncio.Lock | None = None
@@ -146,9 +148,9 @@ async def push_once() -> bool:
         except Exception as e:  # noqa: BLE001 - its text may hold a database URL
             logger.warning("agent register: registration push failed (%s)", type(e).__name__)
             return False
-        listed = {a["name"] for a in agents}
-        removed = sorted(_state.pushed_last - listed)
-        agents += [{"name": n, "type": AGENT_TYPE, "active": False} for n in removed]
+        listed = {a["name"]: a for a in agents}
+        removed = sorted(set(_state.pushed_last) - set(listed))
+        agents += [{**_state.pushed_last[n], "active": False} for n in removed]
         answers: list[dict] = []
         batches = [agents[i:i + BATCH_SIZE] for i in range(0, len(agents), BATCH_SIZE)]
         for number, batch in enumerate(batches, 1):

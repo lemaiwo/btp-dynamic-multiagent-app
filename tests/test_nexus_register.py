@@ -14,6 +14,10 @@ def row(name, enabled=True, description="d", model_name=None):
     return Row(name=name, enabled=enabled, description=description, model_name=model_name)
 
 
+OLD_INACTIVE = {"name": "old", "type": "PYDANTIC", "description": "d", "model": "",
+                "active": False}
+
+
 async def _async(value):
     return value
 
@@ -72,7 +76,7 @@ async def test_push_fills_cache_and_inactivates_removed(monkeypatch):
         "INVOICE_QA", "rg-1", "ASSIGNED")
     assert await register.push_once()
     second = rec.of("registerAgents")[1]["body"]["agents"]
-    assert {"name": "old", "type": "PYDANTIC", "active": False} in second
+    assert OLD_INACTIVE in second
     assert rec.requests[0]["auth"] == "Bearer tech-token"
 
 
@@ -84,8 +88,21 @@ async def test_removed_name_is_sent_inactive_once(monkeypatch):
     for _ in range(3):
         assert await register.push_once()
     calls = [c["body"]["agents"] for c in rec.of("registerAgents")]
-    assert {"name": "old", "type": "PYDANTIC", "active": False} in calls[1]
+    assert OLD_INACTIVE in calls[1]
     assert all(a["name"] != "old" for a in calls[2])
+
+
+async def test_removed_name_keeps_its_description_and_model(monkeypatch):
+    # The register clears a field a call leaves out: the inactive entry repeats the last one.
+    rec = Recorder(answers={"registerAgents": {"value": []}})
+    register.configure(RegisterClient(FakeResolver(), timeout=5, transport=rec.transport()))
+    rows = [[row("old", description="Answers invoice questions.", model_name="gpt-4o")], []]
+    monkeypatch.setattr(register, "_load_rows", lambda: _async(rows.pop(0)))
+    assert await register.push_once()
+    assert await register.push_once()
+    second = rec.of("registerAgents")[1]["body"]["agents"]
+    assert {"name": "old", "type": "PYDANTIC", "description": "Answers invoice questions.",
+            "model": "gpt-4o", "active": False} in second
 
 
 async def test_failed_push_keeps_cache(monkeypatch, caplog):
@@ -103,7 +120,7 @@ async def test_failed_push_keeps_cache(monkeypatch, caplog):
     rec.statuses.pop("registerAgents")
     assert await register.push_once()
     third = rec.of("registerAgents")[2]["body"]["agents"]
-    assert {"name": "old", "type": "PYDANTIC", "active": False} in third
+    assert OLD_INACTIVE in third
     assert "register.example.test" not in caplog.text and "Bearer" not in caplog.text
 
 

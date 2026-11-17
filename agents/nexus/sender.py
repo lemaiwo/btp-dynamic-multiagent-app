@@ -13,8 +13,11 @@ bound. Hence:
   and gone (a second try would double a record the register may have kept).
 * After :data:`FAILURES_BEFORE_PAUSE` failures in a row the worker pauses
   for :data:`PAUSE_SECONDS`; entries keep queueing (and the oldest drop) in
-  the meantime, so a register that is down costs one timeout per pause, not
-  one per model call.
+  the meantime. After a pause ONE entry is sent as a probe: when it fails too
+  the worker pauses again at once, so a register that stays down costs one
+  request (one timeout) a minute, not one per model call.
+* A worker whose event loop was closed (a restarted app, a test's loop) is
+  not running: the next :func:`start` builds a new one on the running loop.
 * Failures are logged at most once per :data:`WARN_INTERVAL_SECONDS`, as
   counts since the previous line and the last failure's class or status.
   Never a URL, a body, a header or an exception's text: an exception from
@@ -155,15 +158,31 @@ def start(client: _Client, *, queue_max: int | None = None) -> None:
     if running():
         _signal()
         return
+    _forget_worker()
     _state.loop = asyncio.get_running_loop()
     _state.wake = asyncio.Event()
     _state.worker = _state.loop.create_task(_work(), name="agent-register-sender")
     _signal()
 
 
+def _loop_closed() -> bool:
+    return _state.loop is not None and _state.loop.is_closed()
+
+
 def running() -> bool:
-    """Whether the worker task is alive."""
-    return _state.worker is not None and not _state.worker.done()
+    """Whether the worker task is alive (a task of a closed loop never runs again)."""
+    return _state.worker is not None and not _state.worker.done() and not _loop_closed()
+
+
+def _forget_worker() -> None:
+    """Drop a worker that cannot run any more; what it held in flight is lost."""
+    if _state.in_flight is not None:
+        _count("dropped")
+    _state.worker = None
+    _state.loop = None
+    _state.wake = None
+    _state.in_flight = None
+    _state.waiting = False
 
 
 def pending() -> list[_Entry]:
@@ -190,7 +209,8 @@ async def _work() -> None:
                 await _wait(remaining)
                 continue
             state.paused_until = None
-            state.failures_in_row = 0
+            # The next entry is a probe: one more failure pauses again.
+            state.failures_in_row = FAILURES_BEFORE_PAUSE - 1
         if not state.queue:
             await _wait(None)
             continue
@@ -273,6 +293,8 @@ async def stop(flush_seconds: float = DEFAULT_FLUSH_SECONDS) -> int:
     Returns how many log calls were dropped (in flight or still queued).
     No flush is attempted while the worker pauses after failures.
     """
+    if not running():
+        _forget_worker()
     worker = _state.worker
     if worker is not None and not worker.done() and flush_seconds > 0 and not _paused():
         try:
@@ -321,9 +343,6 @@ async def wait_paused(timeout: float = 2.0) -> None:
 def reset_for_tests() -> None:
     """Forget everything; a running worker is cancelled without waiting."""
     global _state
-    if _state.worker is not None and not _state.worker.done():
-        try:
-            _state.worker.cancel()
-        except RuntimeError:
-            pass  # its loop is already closed
+    if _state.worker is not None and not _state.worker.done() and not _loop_closed():
+        _state.worker.cancel()
     _state = _State()
