@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 
 from tests.testdb import use_test_database
 
@@ -24,7 +24,12 @@ from agents.db import (  # noqa: E402
     AgentConfig,
     JobRun,
     SessionLocal,
+    Workflow,
+    WorkflowItemRun,
+    WorkflowRun,
+    WorkflowStepRun,
     create_job_run,
+    delete_workflow,
     get_workflow_by_name,
     init_db,
     upsert_agent,
@@ -38,6 +43,42 @@ from tests.test_invoke_api import SCHEMA, bound_app, form, wait_done  # noqa: E4
 
 pytestmark = pytest.mark.usefixtures("real_agents_and_mcp")
 SERVERS = [{"url": "https://mcp.example.test/mcp", "auth_mode": "none"}]
+AGENT_NAMES = ("daily-check", "expense", "first", "second")
+WORKFLOW_PREFIX = "nexus-wf-"
+
+
+async def _forget_rows() -> None:
+    """Remove what these tests wrote: their agents, job runs, workflows and runs.
+
+    A workflow left behind keeps its steps' agent names referenced, so a later
+    test that creates and deletes an agent of one of those names (``second``)
+    would be answered 409.
+    """
+    async with SessionLocal() as s:
+        ids = (await s.execute(select(Workflow.id).where(
+            Workflow.name.like(f"{WORKFLOW_PREFIX}%")))).scalars().all()
+        if ids:
+            runs = (await s.execute(select(WorkflowRun.id).where(
+                WorkflowRun.workflow_id.in_(ids)))).scalars().all()
+            if runs:
+                await s.execute(delete(WorkflowStepRun).where(
+                    WorkflowStepRun.workflow_run_id.in_(runs)))
+                await s.execute(delete(WorkflowItemRun).where(
+                    WorkflowItemRun.workflow_run_id.in_(runs)))
+                await s.execute(delete(WorkflowRun).where(WorkflowRun.id.in_(runs)))
+            for wf_id in ids:
+                await delete_workflow(s, wf_id, commit=False)
+        await s.execute(delete(JobRun).where(JobRun.agent_name.in_(AGENT_NAMES)))
+        await s.execute(delete(AgentConfig).where(AgentConfig.name.in_(AGENT_NAMES)))
+        await s.commit()
+
+
+async def _settle_tasks() -> None:
+    """Let every run task these tests started end (they are module-level sets)."""
+    tasks = [t for group in (job_runner._tasks, workflow_runner._tasks, invoke._tasks)
+             for t in group if not t.done()]
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 @pytest.fixture
@@ -59,6 +100,8 @@ async def rec(monkeypatch):
     await register_on(monkeypatch, r)
     yield r
     await invoke.cancel_all_invoke_runs()
+    await _settle_tasks()
+    await _forget_rows()
     await sender.stop(flush_seconds=0.1)
     state.reset_for_tests()
     sender.reset_for_tests()
@@ -127,7 +170,7 @@ async def test_workflow_run_logs_the_run_id_and_each_steps_agent(rec, monkeypatc
         for n in ("first", "second"):
             await upsert_agent(s, name=n, description=n, instructions=n,
                                mcp_servers=SERVERS, run_as_principal="svc@example.test")
-        name = f"wf-{uuid.uuid4().hex[:8]}"
+        name = f"{WORKFLOW_PREFIX}{uuid.uuid4().hex[:8]}"
         await upsert_workflow(
             s, name=name, description="d", enabled=True, branches=[],
             steps=[{"branch_key": None, "position": p, "agent_name": a,
