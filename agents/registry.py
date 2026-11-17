@@ -1640,6 +1640,19 @@ def _attach_delegation_tool(
 # ---------------------------------------------------------------------------
 # Registry singleton
 # ---------------------------------------------------------------------------
+def _request_register_push() -> None:
+    """The agent list may have changed: ask the agent register for a push.
+
+    Synchronous, a no-op while the integration is off, and never a reason for
+    a reload to fail (deferred import: agents.nexus must not load at import)."""
+    try:
+        from agents.nexus.register import request_push
+
+        request_push()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("agent register: push request failed (%s)", type(e).__name__)
+
+
 class Registry:
     """Holds the current orchestrator and provides atomic reload."""
 
@@ -1686,6 +1699,7 @@ class Registry:
             new = await build_orchestrator()
             self._build = new
             soft_reset_hana_logins()  # builtin:hana: keeps failed credentials
+            _request_register_push()
             logger.info(
                 "Registry reloaded: %d enabled / %d total specialists",
                 len(new.specialists),
