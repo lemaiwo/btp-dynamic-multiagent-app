@@ -31,6 +31,8 @@ class FakeResolver:
         self.marks_per_user, self.ttl = marks_per_user, ttl
         self.calls: list[dict] = []
         self.invalidated: list[str | None] = []
+        self.property_calls: list[bool] = []   # the ``force`` of each resolve_properties
+        self.hang = False                      # resolve_properties never answers
 
     async def resolve(self, *, force=False, user_token=None, principal=None):
         self.calls.append({"user_token": user_token, "principal": principal, "force": force})
@@ -46,6 +48,9 @@ class FakeResolver:
         return dest
 
     async def resolve_properties(self, *, force=False):
+        self.property_calls.append(force)
+        if self.hang:
+            await asyncio.sleep(3600)
         if self.fail is not None:
             raise self.fail
         return {"Name": self.name}
