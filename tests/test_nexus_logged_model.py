@@ -246,3 +246,12 @@ async def test_response_side_failure_keeps_the_result(rec, monkeypatch):
     assert result.output == "ok"
     assert (result.usage().input_tokens, result.usage().output_tokens) == (4, 1)
     assert logged_model.counters()["build_failed"] == 1
+
+
+async def test_empty_agent_name_is_left_out(rec):
+    """An empty agent name is never sent as ``agent: ""`` (review of tasks 7-8)."""
+    with nexus_run("r"), calling_agent("   "):
+        await Agent(wrap(scripted_model([(1, 1)]), "gpt-4o")).run("hi")
+    await sender.drain()
+    for body in (rec.of("logRequest")[0]["body"], rec.of("logResponse")[0]["body"]):
+        assert "agent" not in body and body["runId"] == "r"

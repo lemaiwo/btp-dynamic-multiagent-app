@@ -190,3 +190,55 @@ async def test_run_with_event_handler_and_a_tool_logs_completed_pairs(rec):
     assert [b["body"]["status"] for b in resp] == ["COMPLETED", "COMPLETED"]
     assert sum(b["body"]["outputTokens"] for b in resp) == result.usage().output_tokens
     assert sum(b["body"]["inputTokens"] for b in resp) == result.usage().input_tokens
+
+
+def test_streamed_response_still_has_the_event_iterator():
+    """The tracking relies on a private attribute: a pydantic-ai bump that drops it fails here."""
+    import dataclasses
+
+    from pydantic_ai.models import StreamedResponse
+
+    assert "_event_iterator" in {f.name for f in dataclasses.fields(StreamedResponse)}
+
+
+async def test_tracking_verified_against_aiter(rec, monkeypatch, caplog):
+    """A version whose ``__aiter__`` does not hand out ``_event_iterator``: tracking off,
+    one WARNING per process, counted, and a normal exit is COMPLETED (never a false FAILED)."""
+    from pydantic_ai.messages import ModelRequest
+    from pydantic_ai.models import ModelRequestParameters, StreamedResponse
+
+    original = StreamedResponse.__aiter__
+
+    def detached(self):
+        inner = original(self)
+
+        async def passthrough():
+            async for event in inner:
+                yield event
+        return passthrough()
+
+    monkeypatch.setattr(StreamedResponse, "__aiter__", detached)
+    caplog.set_level("WARNING", logger="agents.nexus.logged_model")
+    for _ in range(2):
+        with nexus_run("r"):
+            async with _streaming("o", "k", "!").request_stream(
+                    [ModelRequest.user_text_prompt("hi")], None,
+                    ModelRequestParameters()) as streamed:
+                async for _ in streamed:
+                    break
+    await sender.drain()
+    assert [b["body"]["status"] for b in rec.of("logResponse")] == ["COMPLETED", "COMPLETED"]
+    assert logged_model.counters()["untracked_streams"] == 2
+    warnings = [r for r in caplog.records if "not tracked" in r.getMessage()]
+    assert len(warnings) == 1
+
+
+def test_stream_without_the_attribute_is_untracked(caplog):
+    from types import SimpleNamespace
+
+    logged_model.reset_for_tests()
+    tracker = logged_model._Tracker()
+    logged_model._track(SimpleNamespace(), tracker)
+    assert tracker.tracking is False
+    assert logged_model.counters()["untracked_streams"] == 1
+    logged_model.reset_for_tests()

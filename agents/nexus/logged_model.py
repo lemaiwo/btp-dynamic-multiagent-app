@@ -77,20 +77,27 @@ CONTENT_FILTER = "content_filter"
 COMPLETED, FAILED, FILTERED, TIMEOUT = "COMPLETED", "FAILED", "FILTERED", "TIMEOUT"
 CANCELLED = "cancelled"
 
-_counters: dict[str, int] = {"build_failed": 0}
+_counters: dict[str, int] = {"build_failed": 0, "untracked_streams": 0}
 _warned_classes: set[str] = set()
 _warned_no_run_id: set[str] = set()
+_warned_untracked: list[bool] = [False]
 
 
 def counters() -> dict[str, int]:
-    """Counts of this module (``build_failed``: log bodies that could not be built)."""
+    """Counts of this module.
+
+    ``build_failed``: log bodies that could not be built; ``untracked_streams``:
+    streams whose end could not be tracked (logged COMPLETED on a normal exit).
+    """
     return dict(_counters)
 
 
 def reset_for_tests() -> None:
-    _counters["build_failed"] = 0
+    for key in _counters:
+        _counters[key] = 0
     _warned_classes.clear()
     _warned_no_run_id.clear()
+    _warned_untracked[0] = False
 
 
 def _swallowed(exc: BaseException) -> None:
@@ -125,8 +132,10 @@ class _Call:
     identity: Identity | None = field(default=None, repr=False, compare=False)
 
     def base(self) -> dict[str, Any]:
-        body: dict[str, Any] = {"correlationId": self.correlation_id,
-                                "agent": self.agent, "runId": self.run_id}
+        body: dict[str, Any] = {"correlationId": self.correlation_id}
+        if self.agent:  # never ``agent: ""``
+            body["agent"] = self.agent
+        body["runId"] = self.run_id
         if self.use_case is not None:
             body["useCase"] = self.use_case
         return body
@@ -314,12 +323,16 @@ def _track(streamed: StreamedResponse, tracker: _Tracker) -> None:
     """Put a pass-through generator around the stream's events that notes their end.
 
     ``__aiter__`` only builds the pipeline (nothing is read); every event goes
-    through unchanged. When this cannot be done (a version whose stream has no
-    ``_event_iterator``), the stream is not tracked and a normal exit counts as
-    read to its end.
+    through unchanged. The replacement is checked: ``__aiter__`` must hand out
+    the tracker afterwards. When it does not (a version whose stream has no
+    ``_event_iterator``, or whose ``__aiter__`` no longer returns it), the
+    original iterator is put back, the stream is not tracked, a normal exit
+    counts as read to its end (never a false FAILED), and it is counted
+    (``untracked_streams``) with one WARNING per process.
     """
     try:
         if not hasattr(streamed, "_event_iterator"):
+            _untracked()
             return
         events = streamed.__aiter__()
 
@@ -334,10 +347,23 @@ def _track(streamed: StreamedResponse, tracker: _Tracker) -> None:
                 raise
             tracker.done = True
 
+        before = streamed._event_iterator
         streamed._event_iterator = tracked()
+        if streamed.__aiter__() is not streamed._event_iterator:
+            streamed._event_iterator = before
+            _untracked()
+            return
         tracker.tracking = True
     except Exception as e:  # noqa: BLE001
         _swallowed(e)
+
+
+def _untracked() -> None:
+    _counters["untracked_streams"] += 1
+    if not _warned_untracked[0]:
+        _warned_untracked[0] = True
+        logger.warning("agent register: the end of a model stream is not tracked on this "
+                       "pydantic-ai version; a stream left early is logged COMPLETED")
 
 
 def _finish_stream(call: _Call | None, streamed: StreamedResponse, tracker: _Tracker) -> None:
