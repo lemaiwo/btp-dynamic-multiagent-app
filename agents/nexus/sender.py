@@ -25,6 +25,16 @@ bound. Hence:
 * :func:`stop` flushes for a bounded time only (Cloud Foundry kills the
   process 10 s after SIGTERM), then drops the rest and says how many.
 
+* **One identity per pair.** A model call's two entries carry the same
+  :class:`Identity` (a signed-in user) or none. The REQUEST decides: when it
+  went out as the technical user (the user exchange failed), the RESPONSE of
+  the same ``correlationId`` is sent without the identity, technical too;
+  when it went as the user, the response goes as the user (the client keeps
+  that destination for it). A response whose request was never sent (dropped)
+  decides on its own. The decisions are kept for at most
+  :data:`PAIR_MEMORY_MAX` correlation ids. An entry, and with it the user's
+  JWT, is gone once it was sent; the JWT is never logged or counted.
+
 The clock (:data:`_now`) is a module attribute so tests move it instead of
 sleeping through the pause and the warning interval.
 """
@@ -33,7 +43,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -45,6 +55,8 @@ FAILURES_BEFORE_PAUSE = 5
 PAUSE_SECONDS = 60.0
 WARN_INTERVAL_SECONDS = 300.0
 DEFAULT_FLUSH_SECONDS = 3.0
+PAIR_MEMORY_MAX = 10_000
+_USER, _TECHNICAL = "user", "technical"
 
 _now = time.monotonic
 
@@ -85,6 +97,8 @@ class _State:
         self.last_warned: float | None = None
         self.failures_in_row = 0
         self.paused_until: float | None = None
+        # correlationId -> "user" | "technical": how the request of a pair went.
+        self.pair_identity: OrderedDict[str, str] = OrderedDict()
 
 
 _state = _State()
@@ -240,13 +254,35 @@ async def _wait(timeout: float | None) -> None:
         wake.clear()
 
 
+def _identity_for(entry: _Entry) -> Identity | None:
+    """The entry's identity, unless its request already went technical."""
+    if entry.identity is None or entry.action != "logResponse" or entry.correlation_id is None:
+        return entry.identity
+    decided = _state.pair_identity.pop(entry.correlation_id, None)
+    return None if decided == _TECHNICAL else entry.identity
+
+
+def _remember_pair(entry: _Entry, outcome: Any) -> None:
+    if entry.identity is None or entry.action != "logRequest" or entry.correlation_id is None:
+        return
+    sent_as = getattr(outcome, "sent_as", None)
+    if sent_as not in (_USER, _TECHNICAL):
+        return  # nothing went out: the response decides on its own
+    memory = _state.pair_identity
+    memory[entry.correlation_id] = sent_as
+    memory.move_to_end(entry.correlation_id)
+    while len(memory) > PAIR_MEMORY_MAX:
+        memory.popitem(last=False)
+
+
 async def _send(entry: _Entry) -> None:
     client = _state.client
     failure: str | None
     try:
         if client is None:
             raise RuntimeError
-        outcome = await client.post(entry.action, entry.body, identity=entry.identity)
+        outcome = await client.post(entry.action, entry.body, identity=_identity_for(entry))
+        _remember_pair(entry, outcome)
         ok = bool(getattr(outcome, "ok", False))
         failure = None if ok else (getattr(outcome, "failure", None) or "unknown")
         if getattr(outcome, "user_fallback", False):
@@ -316,6 +352,7 @@ async def stop(flush_seconds: float = DEFAULT_FLUSH_SECONDS) -> int:
             logger.debug("agent register: sender ended with %s", type(e).__name__)
     left += len(_state.queue)
     _state.queue.clear()
+    _state.pair_identity.clear()
     _state.in_flight = None
     _state.worker = None
     _state.wake = None

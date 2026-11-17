@@ -39,6 +39,34 @@ class Identity:
     principal: str | None = None
 
 
+def capture_identity() -> Identity | None:
+    """The signed-in user of the current model call, or ``None`` (technical).
+
+    A user only when a JWT is bound AND the middleware's validated claims are
+    a user's: not a client-credentials token (the job scheduler's, another
+    application's), and carrying ``user_name`` or ``origin``. The principal
+    comes from those claims, never from ``current_principal``: in a "Run now"
+    job that is the agent's run-as user while the JWT is the trigger's. The
+    claims are the bound JWT's own (the middleware binds both together), so
+    the token is not validated a second time on the model-call path. Never
+    raises: anything unexpected is technical.
+    """
+    try:
+        from agents.auth import _principal_claim, current_claims, current_jwt
+
+        token = current_jwt.get()
+        claims = current_claims.get()
+        if not token or not isinstance(token, str) or not isinstance(claims, dict):
+            return None
+        if claims.get("grant_type") == "client_credentials":
+            return None
+        if not (claims.get("user_name") or claims.get("origin")):
+            return None
+        return Identity(jwt=token, principal=_principal_claim(claims))
+    except Exception:  # noqa: BLE001 - logging must never break a model call
+        return None
+
+
 @contextmanager
 def nexus_run(run_id: str) -> Iterator[str | None]:
     """Bind the run id for the calls made inside, and yield the id in effect.

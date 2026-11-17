@@ -99,3 +99,91 @@ async def test_timeout_is_failure_class():
     out = await RegisterClient(FakeResolver(), timeout=0.05, transport=rec.transport()).post(
         "logRequest", {})
     assert not out.ok and "Timeout" in out.failure
+
+
+# --- Task 9: header filter, no cookie jar, the user destination ------------------------------
+
+class _HeaderResolver(FakeResolver):
+    """A destination whose stored headers try to steer the request."""
+
+    async def resolve(self, *, force=False, user_token=None, principal=None):
+        dest = await super().resolve(force=force, user_token=user_token, principal=principal)
+        dest.headers.update({"Host": "elsewhere.example.test", "content-length": "1",
+                             "Content-Type": "text/plain", "Transfer-Encoding": "chunked",
+                             "COOKIE": "sid=stolen", "X-Tenant": "kept"})
+        return dest
+
+
+async def test_stored_transport_headers_are_not_sent():
+    rec = Recorder()
+    client = RegisterClient(_HeaderResolver(), timeout=5, transport=rec.transport())
+    out = await client.post("logRequest", {"correlationId": "c"})
+    assert out.ok
+    headers = {k.lower(): v for k, v in rec.requests[0]["headers"].items()}
+    assert headers["host"] == "register.example.test"
+    assert headers["content-type"] == "application/json"
+    assert "cookie" not in headers and headers.get("transfer-encoding") != "chunked"
+    assert headers["content-length"] != "1"
+    assert headers["x-tenant"] == "kept" and headers["authorization"] == "Bearer tech-token"
+    assert rec.requests[0]["body"] == {"correlationId": "c"}
+
+
+async def test_set_cookie_is_not_replayed():
+    rec = Recorder(set_cookie="JSESSIONID=abc; Path=/")
+    client = RegisterClient(FakeResolver(), timeout=5, transport=rec.transport())
+    assert (await client.post("logRequest", {})).ok
+    assert (await client.post("logRequest", {})).ok
+    assert "cookie" not in {k.lower() for k in rec.requests[1]["headers"]}
+    await client.aclose()
+
+
+def _identity():
+    from agents.nexus.context import Identity
+    return Identity(jwt="user.jwt.value", principal="alice")
+
+
+async def test_user_destination_without_authorization_falls_back():
+    class NoAuth(FakeResolver):
+        async def resolve(self, **kw):
+            dest = await super().resolve(**kw)
+            dest.headers.clear()
+            return dest
+
+    rec = Recorder()
+    user = NoAuth("NEXUS_AI_PLATFORM_USER")
+    client = RegisterClient(FakeResolver(), user, timeout=5, transport=rec.transport())
+    out = await client.post("logRequest", {"correlationId": "c"}, identity=_identity())
+    assert out.ok and out.user_fallback and out.sent_as == "technical"
+    assert rec.requests[0]["auth"] == "Bearer tech-token"
+
+
+async def test_stored_authorization_of_the_user_destination_falls_back():
+    class Stored(FakeResolver):
+        async def resolve(self, **kw):
+            import dataclasses
+            dest = await super().resolve(**kw)
+            return dataclasses.replace(dest, static_headers=frozenset({"authorization"}))
+
+    rec = Recorder()
+    client = RegisterClient(FakeResolver(), Stored("U", token="stored"), timeout=5,
+                            transport=rec.transport())
+    out = await client.post("logRequest", {"correlationId": "c"}, identity=_identity())
+    assert out.user_fallback and rec.requests[0]["auth"] == "Bearer tech-token"
+
+
+async def test_401_under_the_user_invalidates_that_user_only():
+    rec = Recorder(statuses={"logRequest": 401})
+    tech, user = FakeResolver(), FakeResolver("U", token="user-token")
+    client = RegisterClient(tech, user, timeout=5, transport=rec.transport())
+    out = await client.post("logRequest", {"correlationId": "c"}, identity=_identity())
+    assert not out.ok and out.status == 401 and out.sent_as == "user"
+    assert rec.requests[0]["auth"] == "Bearer user-token"
+    assert user.invalidated == ["alice"] and tech.invalidated == []
+
+
+async def test_register_agents_ignores_an_identity():
+    rec = Recorder()
+    user = FakeResolver("U", token="user-token")
+    client = RegisterClient(FakeResolver(), user, timeout=5, transport=rec.transport())
+    out = await client.post("registerAgents", {"agents": []}, identity=_identity())
+    assert out.ok and rec.requests[0]["auth"] == "Bearer tech-token" and user.calls == []

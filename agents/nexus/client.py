@@ -23,29 +23,59 @@ else's text:
 * httpx's ``HTTP Request: POST <url>`` INFO line is held back by the context
   variable filter of :mod:`agents.bitbucket_tools`, set only in the sending
   task.
+* Of the destination only the URL and the headers are used: destination
+  query properties are not sent. A stored ``Host``, ``Content-Length``,
+  ``Content-Type``, ``Transfer-Encoding`` or ``Cookie`` header is dropped
+  (they would steer or break the request), and the HTTP client keeps no
+  cookies: a ``Set-Cookie`` of one answer is never sent with the next call.
 
-Task scope: the technical identity only. ``identity`` (a signed-in user) is
-accepted by :meth:`RegisterClient.post` and not used yet.
+Two identities. ``registerAgents`` always goes as the technical user (the
+register refuses a user token there). ``logRequest`` / ``logResponse`` of a
+model call made by a signed-in user carry that user's :class:`Identity`; with
+a user destination configured (``user``), its JWT is exchanged there for a
+token the register sees as the user. When that exchange fails, or the
+destination answers without an ``Authorization`` it minted, the call goes as
+the technical user instead and the outcome says ``user_fallback``; nothing is
+dropped for it. Both calls of one model request go as the same identity: the
+sender drops the identity of a response whose request fell back, and the
+user destination a request was sent with is kept (by ``correlationId``, at
+most :data:`PAIR_MEMO_MAX`, until it expires) for its response, so an
+exchange that fails in between does not split the pair. A 401 under the user
+drops that user's cached destination only. The JWT is never logged, never in
+an outcome and never a key of anything but the resolver's own digest-keyed
+cache.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 import httpx
 
 from agents.bitbucket_tools import _install_once, _sending
-from agents.destination import Destination
+from agents.destination import Destination, DestinationResolver
 from agents.nexus.context import Identity
+from agents.odata.session import NoCookieJar
 
 logger = logging.getLogger(__name__)
 
 BASE_PATH = "/logging"
 # The answer of ``registerAgents`` for 500 agents is a few tens of KB.
 MAX_ANSWER_BYTES = 2 * 1024 * 1024
+# How many user destinations are kept for the response of their request.
+PAIR_MEMO_MAX = 10_000
+# The two actions a signed-in user's identity applies to.
+USER_ACTIONS = frozenset({"logRequest", "logResponse"})
+SENT_AS_USER = "user"
+SENT_AS_TECHNICAL = "technical"
+# Stored destination headers that are never sent (lower case).
+DROPPED_HEADERS = frozenset({"host", "content-length", "content-type",
+                             "transfer-encoding", "cookie"})
 
 
 class _Resolver(Protocol):
@@ -63,6 +93,21 @@ class SendOutcome:
     status: int | None
     failure: str | None
     user_fallback: bool = False
+    # ``"user"`` or ``"technical"``: whose token the call went out with;
+    # ``None`` when no destination was obtained (nothing was sent).
+    sent_as: str | None = None
+
+
+@dataclass
+class _Pick:
+    """Which destination one call took; filled in step by step."""
+
+    user_key: str | None = None      # set when the call goes as the user
+    fallback: bool = False
+
+    @property
+    def sent_as(self) -> str:
+        return SENT_AS_USER if self.user_key is not None else SENT_AS_TECHNICAL
 
 
 class _AnswerTooLarge(Exception):
@@ -78,7 +123,7 @@ def action_url(base: str, action: str) -> str:
 
 
 class RegisterClient:
-    """Sends register calls through a destination (technical identity)."""
+    """Sends register calls through a destination, as the technical user or a user."""
 
     def __init__(self, technical: _Resolver, user: _Resolver | None = None, *,
                  timeout: float, transport: httpx.AsyncBaseTransport | None = None) -> None:
@@ -89,15 +134,22 @@ class RegisterClient:
             transport=transport,
             timeout=httpx.Timeout(self._timeout),
             follow_redirects=False,
+            cookies=NoCookieJar(),
         )
+        self._pair_destinations: OrderedDict[str, Destination] = OrderedDict()
 
     async def aclose(self) -> None:
         await self._http.aclose()
 
     async def post(self, action: str, body: dict, *,
                    identity: Identity | None = None) -> SendOutcome:
-        """Send one call; the answer's body is not read."""
-        outcome, _ = await self._exchange(action, body, read_answer=False)
+        """Send one call; the answer's body is not read.
+
+        ``identity`` is used for ``logRequest`` / ``logResponse`` only.
+        """
+        if action not in USER_ACTIONS:
+            identity = None
+        outcome, _ = await self._exchange(action, body, read_answer=False, identity=identity)
         return outcome
 
     async def register(self, agents: list[dict]) -> list[dict] | None:
@@ -117,30 +169,84 @@ class RegisterClient:
             return None
         return value
 
-    async def _exchange(self, action: str, body: dict, *,
-                        read_answer: bool) -> tuple[SendOutcome, Any]:
+    async def _exchange(self, action: str, body: dict, *, read_answer: bool,
+                        identity: Identity | None = None) -> tuple[SendOutcome, Any]:
         answer: Any = None
+        pick = _Pick()
+        sent_as: str | None = None
         try:
             # Ours or a callee's, a ``TimeoutError`` is the same outcome here;
             # httpx's own timeouts are ``httpx.TimeoutException`` subclasses.
             async with asyncio.timeout(self._timeout):
-                destination = await self._technical.resolve()
+                destination = await self._destination(pick, action, body, identity)
+                sent_as = pick.sent_as
                 status, answer = await self._send(destination, action, body, read_answer)
         except TimeoutError:
-            return self._failed(action, "TimeoutError"), None
+            return self._failed(action, "TimeoutError", pick=pick, sent_as=sent_as), None
         except Exception as e:  # noqa: BLE001 - its text is not ours to pass on
-            return self._failed(action, type(e).__name__), None
+            return self._failed(action, type(e).__name__, pick=pick, sent_as=sent_as), None
         if status >= 300:
             if status == 401:
-                self._technical.invalidate()
-            return self._failed(action, f"http_{status}", status), None
-        return SendOutcome(ok=True, status=status, failure=None), answer
+                self._unauthorized(pick, body)
+            return self._failed(action, f"http_{status}", status, pick=pick,
+                                sent_as=sent_as), None
+        return SendOutcome(ok=True, status=status, failure=None,
+                           user_fallback=pick.fallback, sent_as=sent_as), answer
+
+    async def _destination(self, pick: _Pick, action: str, body: dict,
+                           identity: Identity | None) -> Destination:
+        """The user's destination when it can be had, else the technical one."""
+        if identity is not None and self._user is not None:
+            correlation_id = body.get("correlationId") if isinstance(body, dict) else None
+            if not isinstance(correlation_id, str):
+                correlation_id = None
+            user_key = DestinationResolver.user_key(identity.principal, identity.jwt)
+            if action == "logResponse" and correlation_id is not None:
+                kept = self._pair_destinations.pop(correlation_id, None)
+                if kept is not None and time.monotonic() < kept.expires_at:
+                    pick.user_key = user_key
+                    return kept
+            try:
+                destination = await self._user.resolve(user_token=identity.jwt,
+                                                       principal=identity.principal)
+            except Exception as e:  # noqa: BLE001 - its text may carry the token
+                logger.debug("agent register: user destination failed (%s); "
+                             "technical instead", type(e).__name__)
+            else:
+                if _minted_authorization(destination):
+                    pick.user_key = user_key
+                    if action == "logRequest" and correlation_id is not None:
+                        self._keep_for_response(correlation_id, destination)
+                    return destination
+                logger.debug("agent register: user destination gave no minted "
+                             "Authorization; technical instead")
+            pick.fallback = True
+        return await self._technical.resolve()
+
+    def _keep_for_response(self, correlation_id: str, destination: Destination) -> None:
+        memo = self._pair_destinations
+        memo[correlation_id] = destination
+        memo.move_to_end(correlation_id)
+        while len(memo) > PAIR_MEMO_MAX:
+            memo.popitem(last=False)
+
+    def _unauthorized(self, pick: _Pick, body: dict) -> None:
+        """Drop the refused credential so the NEXT call resolves it afresh."""
+        if pick.user_key is None:
+            self._technical.invalidate()
+            return
+        assert self._user is not None
+        self._user.invalidate(pick.user_key)
+        correlation_id = body.get("correlationId") if isinstance(body, dict) else None
+        if isinstance(correlation_id, str):
+            self._pair_destinations.pop(correlation_id, None)
 
     async def _send(self, destination: Destination, action: str, body: dict,
                     read_answer: bool) -> tuple[int, Any]:
+        headers = {name: value for name, value in destination.headers.items()
+                   if name.lower() not in DROPPED_HEADERS}
         request = self._http.build_request(
-            "POST", action_url(destination.url, action),
-            json=body, headers=dict(destination.headers),
+            "POST", action_url(destination.url, action), json=body, headers=headers,
         )
         _install_once()
         quiet = _sending.set(True)
@@ -157,9 +263,19 @@ class RegisterClient:
             _sending.reset(quiet)
 
     @staticmethod
-    def _failed(action: str, failure: str, status: int | None = None) -> SendOutcome:
+    def _failed(action: str, failure: str, status: int | None = None, *,
+                pick: _Pick | None = None, sent_as: str | None = None) -> SendOutcome:
         logger.debug("agent register: %s failed (%s)", action, failure)
-        return SendOutcome(ok=False, status=status, failure=failure)
+        return SendOutcome(ok=False, status=status, failure=failure,
+                           user_fallback=bool(pick and pick.fallback), sent_as=sent_as)
+
+
+def _minted_authorization(destination: Destination) -> bool:
+    """An ``Authorization`` the destination service minted (not a stored one)."""
+    if "authorization" in destination.static_headers:
+        return False
+    return any(name.lower() == "authorization" and value
+               for name, value in destination.headers.items())
 
 
 async def _read_json(response: httpx.Response) -> Any:

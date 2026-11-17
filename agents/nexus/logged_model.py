@@ -37,7 +37,7 @@ import math
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
@@ -59,7 +59,13 @@ if TYPE_CHECKING:
 
 from agents.errors import describe_exception, mask_text
 from agents.nexus import sender, state
-from agents.nexus.context import MAX_ID, current_agent_name, current_nexus_run_id
+from agents.nexus.context import (
+    MAX_ID,
+    Identity,
+    capture_identity,
+    current_agent_name,
+    current_nexus_run_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +120,9 @@ class _Call:
     run_id: str
     use_case: str | None
     payload: bool
+    # The user the pair is logged as (``None``: technical). Captured once, when
+    # the model call is made, and handed to both log calls of the pair.
+    identity: Identity | None = field(default=None, repr=False, compare=False)
 
     def base(self) -> dict[str, Any]:
         body: dict[str, Any] = {"correlationId": self.correlation_id,
@@ -179,7 +188,7 @@ def _begin(deployment: str, model_settings: ModelSettings | None,
                 logger.warning("agent register: a model call of agent %s ran without a run "
                                "id; logged under a fresh id", agent)
         call = _Call(str(uuid.uuid4()), agent, run_id[:MAX_ID],
-                     register.use_case_for(agent), _payload_on())
+                     register.use_case_for(agent), _payload_on(), capture_identity())
         body = call.base()
         body["modelName"] = (deployment or "")[:MAX_MODEL_NAME]
         body["resourceGroup"] = config.resource_group()
@@ -199,7 +208,7 @@ def _begin(deployment: str, model_settings: ModelSettings | None,
             prompt = _prompt(messages)
             if prompt is not None:
                 body["prompt"] = prompt
-        sender.enqueue("logRequest", body)
+        sender.enqueue("logRequest", body, call.identity)
         return call
     except Exception as e:  # noqa: BLE001 - logging must never break a model call
         _swallowed(e)
@@ -220,7 +229,7 @@ def _send_response(call: _Call, status: str, input_tokens: int, output_tokens: i
         body["errorMessage"] = error_message[:MAX_ERROR_MESSAGE]
     if call.payload and text:
         body["response"] = text
-    sender.enqueue("logResponse", body)
+    sender.enqueue("logResponse", body, call.identity)
 
 
 def _finish(call: _Call | None, response: ModelResponse) -> None:
