@@ -920,12 +920,22 @@ def get_model(name: str | None = None):
     routed to AI Core's Bedrock proxy, everything else to its
     OpenAI-compatible proxy. Instances are cached per name for the process
     lifetime.
+
+    Every model is returned behind the agent register's logging wrapper
+    (``agents.nexus.logged_model.wrap``), the one choke point of all model
+    calls; while the register is off the wrapper calls straight through and
+    every attribute (``model_name``, ``client``, ``profile`` ...) is the
+    wrapped model's. The cache holds the wrapped object. The import is
+    deferred: ``agents.nexus`` must not be loaded with this module.
     """
     name = (name or default_model_name()).strip()
     cached = _models.get(name)
     if cached is not None:
         return cached
     model = _build_model(name)
+    from agents.nexus.logged_model import wrap
+
+    model = wrap(model, name)
     _models[name] = model
     return model
 
@@ -953,3 +963,8 @@ def _build_model(name: str):
     if _is_anthropic(name):
         return _build_bedrock_model(name)
     return _build_openai_model(name)
+
+
+# tests/test_agent_model.py replaces ``get_model`` on this module for the whole
+# test session at import; tests that need the real function call this name.
+_get_model_unpatched = get_model
