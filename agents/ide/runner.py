@@ -160,6 +160,7 @@ from agents.ide.store import (
     upsert_findings,
 )
 from agents.ide.workspace import bound_workspace, save_timeout
+from agents.nexus.context import calling_agent, nexus_run
 from agents.progress import ProgressUpdate, current_progress
 from agents.registry import _make_progress_handler, registry
 from agents.run_activity import RunActivity, recording
@@ -1051,7 +1052,8 @@ async def _execute(start: _Start, emit: Emit) -> None:
                 # File revisions record the run that wrote them.
                 run_id=start.run_id,
             ) as scope:
-                with recording(start.run_id) as activity:
+                with recording(start.run_id) as activity, \
+                        nexus_run(start.run_id), calling_agent(name):
                     token = current_progress.set(_EmitSink(activity, emit))
                     diagnose_token = current_diagnose.set(diagnose_run)
                     ide_run_token = current_ide_run.set(IdeRunContext(

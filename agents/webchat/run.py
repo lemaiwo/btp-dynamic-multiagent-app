@@ -91,6 +91,7 @@ from pydantic_ai.messages import (
 from agents.access import BASIC, current_access
 from agents.db import SessionLocal
 from agents.errors import describe_exception, mask_text
+from agents.nexus.context import ORCHESTRATOR, PERSONAL_AGENT, calling_agent, nexus_run
 from agents.oauth2 import OAuthAuthorizationRequired
 from agents.progress import ProgressUpdate, current_progress
 from agents.registry import _short_tool_output, registry
@@ -722,6 +723,9 @@ class Runner:
     model_name: str | None
     note: str | None = None
     counter: Any = None
+    # The name the agent register is told for this run: a personal agent's own
+    # name is user text and never leaves, so it logs as ``PERSONAL_AGENT``.
+    nexus_agent: str = ORCHESTRATOR
 
 
 def _model_id(model: Any) -> str | None:
@@ -760,14 +764,14 @@ async def resolve_runner(data: TurnInput) -> Runner:
         raise AgentUnavailable(target)
     if target.kind == "orchestrator":
         return Runner(registry.orchestrator, ORCHESTRATOR_AGENT, catalog.build(data.model_name),
-                      data.model_name or catalog.default_name())
+                      data.model_name or catalog.default_name(), nexus_agent=ORCHESTRATOR)
     build = registry.build
     if target.kind == "admin":
         specialist = build.specialists.get(target.name)
         if specialist is None:
             raise AgentUnavailable(user_agents.AGENT_UNAVAILABLE)
         return Runner(specialist, target.name, None, _model_id(specialist.model),
-                      counter=getattr(build, "in_flight", None))
+                      counter=getattr(build, "in_flight", None), nexus_agent=target.name)
     model, model_name = await _personal_model(target.user_row.model_name, data.model_name)
     agent, note = await user_agents.build_personal_agent(target.user_row, model=model,
                                                          build=build)
@@ -775,7 +779,7 @@ async def resolve_runner(data: TurnInput) -> Runner:
     # (addendum (g)) use its MCP clients, which a reload must not close
     # mid-turn.
     return Runner(agent, target.name, None, _model_id(model) or model_name, note=note,
-                  counter=getattr(build, "in_flight", None))
+                  counter=getattr(build, "in_flight", None), nexus_agent=PERSONAL_AGENT)
 
 
 async def _save_generated(turn: Turn, name: str, media_type: str, data: bytes) -> dict[str, Any]:
@@ -870,14 +874,19 @@ async def _run(turn: Turn, data: TurnInput) -> None:
             counter = runner.counter
             if counter is not None:
                 counter.value += 1
-            result = await runner.agent.run(
-                data.prompt,
-                message_history=data.history or None,
-                model=runner.model,
-                toolsets=[docgen_toolset()],
-                usage_limits=run_usage_limits(),
-                event_stream_handler=rec.handler,
-            )
+            # The register's run id: every model call of the turn, delegated
+            # agents and sub-agents included, shares it (sync managers, so
+            # they bind and reset in this task).
+            with nexus_run(f"chat-{data.assistant_message_id}"), \
+                    calling_agent(runner.nexus_agent):
+                result = await runner.agent.run(
+                    data.prompt,
+                    message_history=data.history or None,
+                    model=runner.model,
+                    toolsets=[docgen_toolset()],
+                    usage_limits=run_usage_limits(),
+                    event_stream_handler=rec.handler,
+                )
             output = result.output
             content = output if isinstance(output, str) else str(output)
             model_json = ModelMessagesTypeAdapter.dump_json(
