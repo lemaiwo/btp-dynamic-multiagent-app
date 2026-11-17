@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass, field
 from typing import Iterator
 
 ORCHESTRATOR = "orchestrator"
@@ -23,6 +24,19 @@ MAX_ID = 64
 
 current_agent_name: ContextVar[str] = ContextVar("nexus_agent_name", default=ORCHESTRATOR)
 current_nexus_run_id: ContextVar[str | None] = ContextVar("nexus_run_id", default=None)
+
+
+@dataclass(frozen=True)
+class Identity:
+    """The signed-in user a register call may be sent as.
+
+    Captured when the model call is made and carried to the sender, which
+    runs in another task. The token is left out of the ``repr`` so that a
+    log line or a traceback that prints the object does not print it.
+    """
+
+    jwt: str = field(repr=False)
+    principal: str | None = None
 
 
 @contextmanager
