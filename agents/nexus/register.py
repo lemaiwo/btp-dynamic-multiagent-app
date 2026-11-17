@@ -240,7 +240,9 @@ async def stop_pusher() -> None:
         try:
             await task
         except asyncio.CancelledError:
-            pass
+            current = asyncio.current_task()
+            if current is not None and current.cancelling() > 0:
+                raise  # the caller itself was cancelled: not ours to hide
 
 
 async def settle(timeout: float = 2.0) -> None:

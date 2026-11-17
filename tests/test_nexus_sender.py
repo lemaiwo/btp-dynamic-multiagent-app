@@ -182,3 +182,73 @@ async def test_worker_survives_a_raising_client():
     assert sender.running()
     await sender.stop(flush_seconds=0)
     sender.reset_for_tests()
+
+
+async def test_user_fallback_alone_reaches_the_warning(caplog, monkeypatch):
+    """Every send succeeds but goes technical instead of as the user: still warned."""
+    from types import SimpleNamespace
+    caplog.set_level(logging.WARNING, logger="agents.nexus.sender")
+    clock = [1000.0]
+    monkeypatch.setattr(sender, "_now", lambda: clock[0])
+
+    class Fallback:
+        async def post(self, action, body, *, identity=None):
+            return SimpleNamespace(ok=True, status=200, failure=None, user_fallback=True,
+                                   sent_as="technical")
+
+    sender.reset_for_tests()
+    sender.start(Fallback(), queue_max=50)
+    for cid in ("a", "b"):
+        sender.enqueue("logRequest", {"correlationId": cid})
+    await sender.drain()
+    lines = [r.getMessage() for r in caplog.records if r.name == "agents.nexus.sender"]
+    assert len(lines) == 1                           # rate limited: one line, not two
+    assert "failed=0" in lines[0] and "user_fallback=1" in lines[0]
+    clock[0] += 301
+    sender.enqueue("logRequest", {"correlationId": "c"})
+    await sender.drain()
+    lines = [r.getMessage() for r in caplog.records if r.name == "agents.nexus.sender"]
+    assert len(lines) == 2 and "user_fallback=2" in lines[1]
+    await sender.stop(flush_seconds=0)
+    sender.reset_for_tests()
+
+
+async def test_a_missing_destination_pauses_and_asks_once(monkeypatch):
+    from agents.destination import DestinationNotFound
+    sender.reset_for_tests()
+    clock = [1000.0]
+    monkeypatch.setattr(sender, "_now", lambda: clock[0])
+    tech = FakeResolver(fail=DestinationNotFound("404"))
+    asked: list[int] = []
+    sender.start(RegisterClient(tech, timeout=5, transport=Recorder().transport()),
+                 queue_max=50, on_destination_missing=lambda: asked.append(1))
+    for i in range(4):
+        sender.enqueue("logRequest", {"correlationId": str(i)})
+    await sender.wait_paused()
+    assert asked == [1]                              # once, not once per entry
+    assert len(tech.calls) == 1                      # no destination-service call per entry
+    assert len(sender.pending()) == 3
+    await sender.stop(flush_seconds=0)
+    sender.reset_for_tests()
+
+
+async def test_stop_does_not_hide_a_cancellation_of_its_caller():
+    class SlowToCancel:
+        async def post(self, action, body, *, identity=None):
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                await asyncio.sleep(0.2)             # the worker takes a while to end
+                raise
+
+    sender.reset_for_tests()
+    sender.start(SlowToCancel(), queue_max=5)
+    sender.enqueue("logRequest", {"correlationId": "a"})
+    await asyncio.sleep(0.01)
+
+    stopping = asyncio.ensure_future(sender.stop(flush_seconds=0))
+    await asyncio.sleep(0.01)                        # stop() awaits the cancelled worker
+    stopping.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await stopping
+    sender.reset_for_tests()

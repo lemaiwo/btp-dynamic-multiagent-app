@@ -214,3 +214,23 @@ async def test_load_rows_reads_the_registry():
             found = await get_agent_by_name(s, "register-probe-agent")
             if found is not None:
                 await delete_agent(s, found.id)
+
+
+async def test_stop_pusher_does_not_hide_a_cancellation_of_its_caller(monkeypatch):
+    class SlowToCancel:
+        async def register(self, agents):
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                await asyncio.sleep(0.2)              # the push takes a while to end
+                raise
+
+    monkeypatch.setattr(register, "_load_rows", lambda: _async([row("invoice-assistant")]))
+    register.start_pusher(SlowToCancel())
+    register.request_push()
+    await asyncio.sleep(0.02)                         # the push is in flight
+    stopping = asyncio.ensure_future(register.stop_pusher())
+    await asyncio.sleep(0.01)                         # stop_pusher awaits the cancelled task
+    stopping.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await stopping

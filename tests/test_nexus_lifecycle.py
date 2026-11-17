@@ -362,3 +362,40 @@ async def test_closing_the_client_twice_is_harmless(env):
     await client.aclose()
     assert client._http.is_closed
     await lifecycle.stop()   # closes it a third time
+
+
+async def test_a_destination_a_send_finds_missing_switches_off_once(env, monkeypatch, caplog):
+    """On with an unverified destination; the first send gets the 404: off, queue cleared."""
+    monkeypatch.setenv("NEXUS_REPUSH_MINUTES", "0")        # no timer to save the day
+    env.fakes[TECH].fail = DestinationError("down")        # inconclusive check: on
+    with caplog.at_level(logging.INFO, logger="agents.nexus"):
+        assert await lifecycle.start() == f"on (destination {TECH})"
+        await register.settle()
+        env.fakes[TECH].fail = DestinationNotFound("404")
+        resolves = len(env.fakes[TECH].calls)
+        checks = len(env.fakes[TECH].property_calls)
+        for i in range(5):
+            sender.enqueue("logRequest", {"correlationId": str(i)})
+        async with asyncio.timeout(2):
+            while state.enabled():
+                await asyncio.sleep(0.005)
+        await asyncio.sleep(0.05)
+    assert state.reason() == f"off (destination {TECH} not found)"
+    assert sender.pending() == [] and not sender.running() and lifecycle.client() is None
+    assert len(env.fakes[TECH].calls) == resolves + 1          # one send, not one per entry
+    assert len(env.fakes[TECH].property_calls) == checks + 1   # one re-check
+    assert f"agent register integration: off (destination {TECH} not found)" in _info(caplog)
+    assert env.recorder.of("logRequest") == []
+    await lifecycle.stop()
+
+
+async def test_send_payload_is_read_at_switch_on_and_at_reload(env, monkeypatch):
+    monkeypatch.setenv("NEXUS_SEND_PAYLOAD", "true")
+    await lifecycle.start()
+    assert state.send_payload() is True
+    monkeypatch.delenv("NEXUS_SEND_PAYLOAD")
+    assert state.send_payload() is True                    # cached until a re-evaluation
+    await lifecycle.reevaluate()
+    assert state.send_payload() is False
+    await lifecycle.stop()
+    assert state.send_payload() is False

@@ -21,7 +21,12 @@ The register is a side channel, so the wrapper is built to never be noticed:
   cut to 200 characters; the body of a ``ModelHTTPError`` (and the dumped
   response of an ``UnexpectedModelBehavior``) is never sent: a provider may
   echo the prompt there;
-* prompt and response text are sent only with ``NEXUS_SEND_PAYLOAD=true``;
+* prompt and response text are sent only with ``NEXUS_SEND_PAYLOAD=true``,
+  as the lifecycle read it at switch-on or the last Reload
+  (``state.send_payload()``): no setting is parsed per model call;
+* ``temperature`` / ``topP`` fit the register's Decimal(5,4): rounded to 4
+  places, left out when not a finite number or 10 or more in size;
+  ``modelName`` and ``resourceGroup`` are cut to 120 characters;
 * ``modelVersion`` is not sent: it is a field of ``logRequest`` only and
   known only once the response is there.
 
@@ -70,6 +75,10 @@ from agents.nexus.context import (
 logger = logging.getLogger(__name__)
 
 MAX_MODEL_NAME = 120
+MAX_RESOURCE_GROUP = 120
+# ``temperature`` / ``topP`` are Decimal(5,4) in the register: 4 places, |v| < 10.
+DECIMAL_PLACES = 4
+DECIMAL_LIMIT = 10
 MAX_ERROR_CODE = 40
 MAX_ERROR_MESSAGE = 200
 CONTENT_FILTER = "content_filter"
@@ -114,8 +123,9 @@ def _now() -> str:
 
 
 def _payload_on() -> bool:
-    from agents.nexus import config
-    return config.settings().send_payload
+    # The flag the lifecycle read at switch-on / Reload: no settings parsing
+    # (and no warning about a bad setting) per model call.
+    return state.send_payload()
 
 
 @dataclass(frozen=True)
@@ -147,6 +157,15 @@ def _number(value: Any) -> int | float | None:
     if isinstance(value, float) and not math.isfinite(value):
         return None
     return value
+
+
+def _decimal_5_4(value: Any) -> float | None:
+    """``value`` as the register's Decimal(5,4) holds it; ``None`` when it cannot."""
+    number = _number(value)
+    if number is None:
+        return None
+    rounded = round(float(number), DECIMAL_PLACES)
+    return rounded if abs(rounded) < DECIMAL_LIMIT else None
 
 
 def _part_text(content: Any) -> str:
@@ -200,10 +219,10 @@ def _begin(deployment: str, model_settings: ModelSettings | None,
                      register.use_case_for(agent), _payload_on(), capture_identity())
         body = call.base()
         body["modelName"] = (deployment or "")[:MAX_MODEL_NAME]
-        body["resourceGroup"] = config.resource_group()
+        body["resourceGroup"] = config.resource_group()[:MAX_RESOURCE_GROUP]
         settings = model_settings or {}
         for key, field in (("temperature", "temperature"), ("top_p", "topP")):
-            value = _number(settings.get(key))
+            value = _decimal_5_4(settings.get(key))
             if value is not None:
                 body[field] = value
         max_tokens = settings.get("max_tokens")

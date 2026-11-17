@@ -62,7 +62,7 @@ async def test_streamed_run_logs_one_pair_with_final_usage(rec):
 
 
 async def test_streamed_payload_only_with_switch(rec, monkeypatch):
-    monkeypatch.setenv("NEXUS_SEND_PAYLOAD", "true")
+    state.set_send_payload(True)          # as the lifecycle sets it from NEXUS_SEND_PAYLOAD
     with nexus_run("r"):
         async with Agent(_streaming("o", "k")).run_stream("hello") as run:
             await run.get_output()

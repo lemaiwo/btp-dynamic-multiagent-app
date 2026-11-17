@@ -20,6 +20,7 @@ import os
 from collections.abc import Mapping
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
+from types import ModuleType
 
 from dotenv import load_dotenv
 
@@ -86,7 +87,6 @@ from agents.ide.store import (  # noqa: E402
 from agents.invoke import cancel_all_invoke_runs  # noqa: E402
 from agents.invoke import router as invoke_router  # noqa: E402
 from agents.job_runner import cancel_all_runs  # noqa: E402
-from agents.nexus import lifecycle as nexus_lifecycle  # noqa: E402
 from agents.oauth2 import refresh_scheduled_tokens  # noqa: E402
 from agents.oauth_routes import router as oauth_router  # noqa: E402
 from agents.odata import audit as odata_audit  # noqa: E402
@@ -308,6 +308,26 @@ def serve_address(environ: Mapping[str, str] | None = None) -> tuple[str, int]:
     return host, int(env.get("PORT") or 7932)
 
 
+def _nexus_lifecycle() -> ModuleType:
+    """The agent register's lifecycle module, imported only when it is used.
+
+    Never at module level: its import pulls in the register client and the
+    destination code, and a failure there must stay inside the lifespan's
+    guards instead of keeping the app from starting.
+    """
+    from agents.nexus import lifecycle
+
+    return lifecycle
+
+
+async def _stop_nexus(flush_seconds: float) -> None:
+    """Shutdown of the agent register; a raise must not cut the shutdown gather short."""
+    try:
+        await _nexus_lifecycle().stop(flush_seconds=flush_seconds)
+    except Exception as exc:
+        logger.warning("agent register shutdown failed (%s)", type(exc).__name__)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Fail closed before anything is served: with AUTH_REQUIRED on (the
@@ -379,7 +399,7 @@ async def lifespan(app: FastAPI):
     # The agent register: never raises itself, but an unexpected error must
     # not keep the app from starting.
     try:
-        await nexus_lifecycle.start()
+        await _nexus_lifecycle().start()
     except Exception as exc:
         logger.warning("agent register start-up failed (%s)", type(exc).__name__)
     heartbeat: asyncio.Task | None = None
@@ -433,7 +453,7 @@ async def lifespan(app: FastAPI):
     await asyncio.gather(
         drain_embedding_deploys(),
         drain_ide_approvals(),
-        nexus_lifecycle.stop(flush_seconds=3.0),
+        _stop_nexus(3.0),
     )
     # A write whose run was cancelled above still has its result to store
     # (its own shielded task). Bounded: `drain` gives up after its timeout

@@ -15,6 +15,10 @@ _reason = _NOT_STARTED
 # JWT captured at a model call (else every queue entry would hold one for
 # nothing). Set by the lifecycle when it builds the user resolver.
 _user_forwarding = False
+# ``NEXUS_SEND_PAYLOAD`` as read when the integration was switched on or
+# re-evaluated (a Reload): the model wrapper reads this flag on every call
+# instead of parsing the settings (and warning about a bad one) each time.
+_send_payload = False
 
 
 def enabled() -> bool:
@@ -36,10 +40,11 @@ def set_on(destination: str) -> None:
 
 def set_off(reason: str) -> None:
     """Switch off for the given reason (shown as given); user forwarding ends too."""
-    global _enabled, _reason, _user_forwarding
+    global _enabled, _reason, _user_forwarding, _send_payload
     _enabled = False
     _reason = reason
     _user_forwarding = False
+    _send_payload = False
 
 
 def user_forwarding() -> bool:
@@ -53,9 +58,21 @@ def set_user_forwarding(on: bool) -> None:
     _user_forwarding = bool(on)
 
 
+def send_payload() -> bool:
+    """Whether prompt and answer text are sent (``NEXUS_SEND_PAYLOAD``, as last read)."""
+    return _send_payload
+
+
+def set_send_payload(on: bool) -> None:
+    """Set by the lifecycle at switch-on and at every re-evaluation."""
+    global _send_payload
+    _send_payload = bool(on)
+
+
 def reset_for_tests() -> None:
     """Back to the state of a fresh process: off, not started."""
-    global _enabled, _reason, _user_forwarding
+    global _enabled, _reason, _user_forwarding, _send_payload
     _enabled = False
     _reason = _NOT_STARTED
     _user_forwarding = False
+    _send_payload = False

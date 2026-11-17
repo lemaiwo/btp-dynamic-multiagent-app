@@ -112,7 +112,7 @@ async def test_settings_absent_or_not_numbers_are_left_out(rec):
 
 
 async def test_payload_only_with_switch(rec, monkeypatch):
-    monkeypatch.setenv("NEXUS_SEND_PAYLOAD", "true")
+    state.set_send_payload(True)          # as the lifecycle sets it from NEXUS_SEND_PAYLOAD
     with nexus_run("r"):
         await Agent(wrap(scripted_model(), "gpt-4o"), system_prompt="be brief").run("hello there")
     await sender.drain()
@@ -255,3 +255,66 @@ async def test_empty_agent_name_is_left_out(rec):
     await sender.drain()
     for body in (rec.of("logRequest")[0]["body"], rec.of("logResponse")[0]["body"]):
         assert "agent" not in body and body["runId"] == "r"
+
+
+async def test_settings_are_not_parsed_per_model_call(rec, monkeypatch, caplog):
+    """``send_payload`` is the flag the lifecycle cached: no settings read, no warning per call."""
+    from agents.nexus import config
+    calls = []
+    real = config.settings
+    monkeypatch.setattr(config, "settings", lambda *a, **k: calls.append(1) or real(*a, **k))
+    monkeypatch.setenv("NEXUS_QUEUE_MAX", "not-a-number")      # would warn on every read
+    caplog.set_level(logging.WARNING, logger="agents.nexus")
+    with nexus_run("r"):
+        # The first call may read the fallback use case once (the register caches it).
+        await Agent(wrap(scripted_model(), "gpt-4o")).run("hi")
+        first = len(calls)
+        assert first <= 1
+        for _ in range(5):
+            await Agent(wrap(scripted_model(), "gpt-4o")).run("hi")
+    await sender.drain()
+    assert len(rec.of("logRequest")) == 6
+    assert len(calls) == first                                  # none per model call
+    warned = [r for r in caplog.records if "NEXUS_QUEUE_MAX" in r.getMessage()]
+    assert len(warned) == first
+
+
+async def test_register_on_sets_the_payload_flag_from_the_settings(monkeypatch):
+    monkeypatch.setenv("NEXUS_SEND_PAYLOAD", "true")
+    await register_on(monkeypatch, Recorder())
+    assert state.send_payload() is True
+    await sender.stop(flush_seconds=0)
+    state.reset_for_tests()
+    assert state.send_payload() is False
+
+
+async def test_resource_group_is_cut_to_120(rec, monkeypatch):
+    monkeypatch.setenv("AICORE_RESOURCE_GROUP", "g" * 200)
+    with nexus_run("r"):
+        await Agent(wrap(scripted_model(), "gpt-4o")).run("hi")
+    await sender.drain()
+    assert rec.of("logRequest")[0]["body"]["resourceGroup"] == "g" * 120
+
+
+@pytest.mark.parametrize("given, sent", [
+    (0.123456, 0.1235), (1.0, 1.0), (0, 0), (9.9999, 9.9999), (-9.9999, -9.9999),
+    (-0.00004, -0.0),
+])
+async def test_temperature_and_top_p_fit_decimal_5_4(rec, given, sent):
+    with nexus_run("r"):
+        await Agent(wrap(scripted_model(), "gpt-4o"),
+                    model_settings={"temperature": given, "top_p": given}).run("hi")
+    await sender.drain()
+    body = rec.of("logRequest")[0]["body"]
+    assert body["temperature"] == sent and body["topP"] == sent
+
+
+# 9.99996 rounds to 10.0, which Decimal(5,4) cannot hold either.
+@pytest.mark.parametrize("given", [10, 10.0, -10.5, 9.99996, 1e9, float("nan"), float("inf")])
+async def test_temperature_and_top_p_out_of_decimal_5_4_are_left_out(rec, given):
+    with nexus_run("r"):
+        await Agent(wrap(scripted_model(), "gpt-4o"),
+                    model_settings={"temperature": given, "top_p": given}).run("hi")
+    await sender.drain()
+    body = rec.of("logRequest")[0]["body"]
+    assert "temperature" not in body and "topP" not in body

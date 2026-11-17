@@ -2,6 +2,7 @@
 import logging
 
 import httpx
+import pytest
 
 from agents.destination import DestinationError
 from agents.nexus.client import RegisterClient
@@ -235,3 +236,97 @@ async def test_expired_kept_destinations_are_dropped():
     assert (await client.post("logRequest", {"correlationId": "c-3"},
                               identity=_identity())).ok
     assert list(client._pair_destinations) == ["c-3"]
+
+
+# --- a failed user exchange is not repeated per log entry ---------------------
+
+def _jwt_with_exp(exp):
+    import jwt as pyjwt
+    return pyjwt.encode({"user_name": "alice", "exp": exp}, key="k" * 32, algorithm="HS256")
+
+
+async def test_an_expired_jwt_is_not_exchanged(monkeypatch):
+    from agents.nexus import client as client_mod
+    from agents.nexus.context import Identity
+    monkeypatch.setattr(client_mod, "_wall", lambda: 2_000_000_000.0)
+    rec, user = Recorder(), FakeResolver("U", token="u")
+    client = RegisterClient(FakeResolver(), user, timeout=5, transport=rec.transport())
+    identity = Identity(jwt=_jwt_with_exp(2_000_000_000 - 1), principal="alice")
+    out = await client.post("logRequest", {"correlationId": "c"}, identity=identity)
+    assert out.ok and out.user_fallback and out.sent_as == "technical"
+    assert user.calls == []                                   # never asked
+    assert rec.requests[0]["auth"] == "Bearer tech-token"
+    # A JWT that is still valid is exchanged.
+    fresh = Identity(jwt=_jwt_with_exp(2_000_000_000 + 600), principal="bob")
+    out = await client.post("logRequest", {"correlationId": "d"}, identity=fresh)
+    assert out.sent_as == "user" and len(user.calls) == 1
+    await client.aclose()
+
+
+async def test_a_failed_exchange_is_remembered_for_60_seconds(monkeypatch):
+    from agents.nexus import client as client_mod
+    clock = [100.0]
+    monkeypatch.setattr(client_mod, "_now", lambda: clock[0])
+    rec, user = Recorder(), FakeResolver("U", token="u", fail=DestinationError("x"))
+    client = RegisterClient(FakeResolver(), user, timeout=5, transport=rec.transport())
+    for i in range(5):
+        out = await client.post("logRequest", {"correlationId": f"c{i}"}, identity=_identity())
+        assert out.ok and out.user_fallback and out.sent_as == "technical"
+    assert len(user.calls) == 1                               # one failing exchange, not five
+    user.fail = None
+    clock[0] += 59.0
+    await client.post("logRequest", {"correlationId": "e"}, identity=_identity())
+    assert len(user.calls) == 1
+    clock[0] += 2.0                                           # 61 s after the failure
+    out = await client.post("logRequest", {"correlationId": "f"}, identity=_identity())
+    assert out.sent_as == "user" and len(user.calls) == 2
+    await client.aclose()
+
+
+async def test_a_non_propagating_user_destination_is_remembered(monkeypatch):
+    from agents.nexus import client as client_mod
+    monkeypatch.setattr(client_mod, "_now", lambda: 100.0)
+    user = FakeResolver("U", token="basic", user_auth_type="BasicAuthentication")
+    client = RegisterClient(FakeResolver(), user, timeout=5, transport=Recorder().transport())
+    for i in range(3):
+        out = await client.post("logRequest", {"correlationId": f"c{i}"}, identity=_identity())
+        assert out.user_fallback
+    assert len(user.calls) == 1
+    await client.aclose()
+
+
+async def test_the_memo_ends_at_the_jwt_expiry_when_that_is_sooner(monkeypatch):
+    from agents.nexus import client as client_mod
+    from agents.nexus.context import Identity
+    clock, wall = [100.0], [2_000_000_000.0]
+    monkeypatch.setattr(client_mod, "_now", lambda: clock[0])
+    monkeypatch.setattr(client_mod, "_wall", lambda: wall[0])
+    user = FakeResolver("U", token="u", fail=DestinationError("x"))
+    client = RegisterClient(FakeResolver(), user, timeout=5, transport=Recorder().transport())
+    identity = Identity(jwt=_jwt_with_exp(2_000_000_000 + 10), principal="alice")
+    await client.post("logRequest", {"correlationId": "a"}, identity=identity)
+    assert client_mod._memo_until(client, "alice") == pytest.approx(110.0)
+    await client.aclose()
+
+
+async def test_the_memo_holds_no_token(monkeypatch):
+    from agents.nexus import client as client_mod
+    user = FakeResolver("U", fail=DestinationError("x"))
+    client = RegisterClient(FakeResolver(), user, timeout=5, transport=Recorder().transport())
+    from agents.nexus.context import Identity
+    await client.post("logRequest", {"correlationId": "a"},
+                      identity=Identity(jwt="secret.jwt.value", principal=None))
+    assert "secret.jwt.value" not in repr(client_mod._memo_keys(client))
+    await client.aclose()
+
+
+async def test_a_missing_technical_destination_has_its_own_failure():
+    from agents.destination import DestinationNotFound
+    from agents.nexus.client import FAILURE_DESTINATION_MISSING
+    out = await RegisterClient(FakeResolver(fail=DestinationNotFound("404")), timeout=5,
+                               transport=Recorder().transport()).post("logRequest", {})
+    assert not out.ok and out.failure == FAILURE_DESTINATION_MISSING
+    # Any other destination error keeps its class name.
+    out = await RegisterClient(FakeResolver(fail=DestinationError("x")), timeout=5,
+                               transport=Recorder().transport()).post("logRequest", {})
+    assert out.failure == "DestinationError"

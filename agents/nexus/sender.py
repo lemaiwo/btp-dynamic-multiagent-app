@@ -18,8 +18,15 @@ bound. Hence:
   request (one timeout) a minute, not one per model call.
 * A worker whose event loop was closed (a restarted app, a test's loop) is
   not running: the next :func:`start` builds a new one on the running loop.
-* Failures are logged at most once per :data:`WARN_INTERVAL_SECONDS`, as
-  counts since the previous line and the last failure's class or status.
+* A call whose technical destination does not exist (the client's
+  ``destination_missing``) pauses the worker at once and calls the
+  ``on_destination_missing`` callback given to :func:`start` ONCE per pause:
+  the lifecycle then decides the switch again (and switches off, clearing the
+  queue, when the destination service says so). No further entry costs a
+  destination-service call meanwhile.
+* Failures, drops and calls that went technical instead of as the user
+  (``user_fallback``) are logged at most once per :data:`WARN_INTERVAL_SECONDS`,
+  as counts since the previous line and the last failure's class or status.
   Never a URL, a body, a header or an exception's text: an exception from
   the HTTP layer can carry the URL and the body can carry a prompt.
 * :func:`stop` flushes for a bounded time only (Cloud Foundry kills the
@@ -45,7 +52,7 @@ import logging
 import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from agents.nexus.context import Identity
 
@@ -99,6 +106,8 @@ class _State:
         self.paused_until: float | None = None
         # correlationId -> "user" | "technical": how the request of a pair went.
         self.pair_identity: OrderedDict[str, str] = OrderedDict()
+        # Called once per pause when the technical destination is missing.
+        self.on_destination_missing: Callable[[], None] | None = None
 
 
 _state = _State()
@@ -164,11 +173,17 @@ def wake() -> None:
     _signal()
 
 
-def start(client: _Client, *, queue_max: int | None = None) -> None:
-    """Start the worker on the running loop; a running one gets the new client."""
+def start(client: _Client, *, queue_max: int | None = None,
+          on_destination_missing: Callable[[], None] | None = None) -> None:
+    """Start the worker on the running loop; a running one gets the new client.
+
+    ``on_destination_missing`` (the lifecycle's re-check) replaces the one of
+    an earlier start.
+    """
     if queue_max is not None:
         configure(queue_max=queue_max)
     _state.client = client
+    _state.on_destination_missing = on_destination_missing
     if running():
         _signal()
         return
@@ -278,6 +293,7 @@ def _remember_pair(entry: _Entry, outcome: Any) -> None:
 async def _send(entry: _Entry) -> None:
     client = _state.client
     failure: str | None
+    missing = False
     try:
         if client is None:
             raise RuntimeError
@@ -287,6 +303,9 @@ async def _send(entry: _Entry) -> None:
         failure = None if ok else (getattr(outcome, "failure", None) or "unknown")
         if getattr(outcome, "user_fallback", False):
             _count("user_fallback")
+            if ok:
+                _maybe_warn()
+        missing = getattr(outcome, "destination_missing", False) is True
     except asyncio.CancelledError:
         raise
     except Exception as e:  # noqa: BLE001 - only the class is kept, never the text
@@ -299,8 +318,21 @@ async def _send(entry: _Entry) -> None:
     _state.last_failure = failure
     _state.failures_in_row += 1
     _maybe_warn()
-    if _state.failures_in_row >= FAILURES_BEFORE_PAUSE:
+    if missing or _state.failures_in_row >= FAILURES_BEFORE_PAUSE:
         _state.paused_until = _now() + PAUSE_SECONDS
+    if missing:
+        _report_missing()
+
+
+def _report_missing() -> None:
+    """Ask the lifecycle once to decide the switch again (it never raises into us)."""
+    callback = _state.on_destination_missing
+    if callback is None:
+        return
+    try:
+        callback()
+    except Exception as e:  # noqa: BLE001 - the worker must outlive its callback
+        logger.debug("agent register: re-check request failed (%s)", type(e).__name__)
 
 
 def _maybe_warn() -> None:
@@ -308,7 +340,7 @@ def _maybe_warn() -> None:
     if _state.last_warned is not None and now - _state.last_warned < WARN_INTERVAL_SECONDS:
         return
     since = _state.since
-    if not since["failed"] and not since["dropped"]:
+    if not since["failed"] and not since["dropped"] and not since["user_fallback"]:
         return
     logger.warning(
         "agent register: sent=%d failed=%d dropped=%d user_fallback=%d last=%s",
@@ -347,7 +379,8 @@ async def stop(flush_seconds: float = DEFAULT_FLUSH_SECONDS) -> int:
         try:
             await worker
         except asyncio.CancelledError:
-            pass
+            if _caller_cancelled():
+                raise  # the caller itself was cancelled: not ours to hide
         except Exception as e:  # noqa: BLE001 - the worker's end must not stop the app's
             logger.debug("agent register: sender ended with %s", type(e).__name__)
     left += len(_state.queue)
@@ -361,6 +394,11 @@ async def stop(flush_seconds: float = DEFAULT_FLUSH_SECONDS) -> int:
         _state.totals["dropped"] += left
         logger.warning("agent register: %d log call(s) dropped at shutdown", left)
     return left
+
+
+def _caller_cancelled() -> bool:
+    task = asyncio.current_task()
+    return task is not None and task.cancelling() > 0
 
 
 async def drain(timeout: float = 2.0) -> None:

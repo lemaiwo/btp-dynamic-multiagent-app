@@ -48,10 +48,24 @@ most :data:`PAIR_MEMO_MAX`, until it expires) for its response, so an exchange
 that fails in between does not split the pair. A 401 under the user drops that
 user's cached destination only. The JWT is never logged, never in an outcome
 and never a key of anything but the resolver's own digest-keyed cache.
+
+A failed exchange is not repeated for every log entry of a long run: a JWT
+whose (unverified) ``exp`` has passed is not sent to the destination service
+at all, and a user whose exchange failed, or whose destination did not sign in
+as the user, goes technical straight away for :data:`USER_FAILURE_SECONDS`
+(or until the JWT expires, if sooner). That memo is keyed by
+``DestinationResolver.user_key`` (the principal, or a digest of the token) and
+holds no token; it has at most :data:`USER_FAILURE_MEMO_MAX` entries. Each call
+it sends technical is counted as ``user_fallback``.
+
+A technical destination the destination service says does not exist (its
+404) is the failure :data:`FAILURE_DESTINATION_MISSING`, so the sender can ask
+for the switch to be decided again.
 """
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import time
@@ -62,7 +76,7 @@ from typing import Any, Protocol
 import httpx
 
 from agents.bitbucket_tools import install_request_log_filter, request_log_quiet
-from agents.destination import Destination, DestinationResolver
+from agents.destination import Destination, DestinationNotFound, DestinationResolver
 from agents.destination_auth import signs_in_as_user
 from agents.nexus.context import Identity
 from agents.odata.session import NoCookieJar
@@ -78,6 +92,15 @@ PAIR_MEMO_MAX = 10_000
 USER_ACTIONS = frozenset({"logRequest", "logResponse"})
 SENT_AS_USER = "user"
 SENT_AS_TECHNICAL = "technical"
+# How long a user whose exchange failed goes technical without asking again.
+USER_FAILURE_SECONDS = 60.0
+USER_FAILURE_MEMO_MAX = 1_000
+# The failure of a call whose technical destination does not exist (a 404 of
+# the destination service), told apart from every exception class name.
+FAILURE_DESTINATION_MISSING = "destination_not_found"
+# Clocks (test seams): monotonic for the memos, wall time for a JWT's ``exp``.
+_now = time.monotonic
+_wall = time.time
 # Stored destination headers that are never sent (lower case).
 DROPPED_HEADERS = frozenset({"host", "content-length", "content-type",
                              "transfer-encoding", "cookie"})
@@ -101,6 +124,11 @@ class SendOutcome:
     # ``"user"`` or ``"technical"``: whose token the call went out with;
     # ``None`` when no destination was obtained (nothing was sent).
     sent_as: str | None = None
+
+    @property
+    def destination_missing(self) -> bool:
+        """The technical destination does not exist (the destination service's 404)."""
+        return self.failure == FAILURE_DESTINATION_MISSING
 
 
 @dataclass
@@ -142,6 +170,8 @@ class RegisterClient:
             cookies=NoCookieJar(),
         )
         self._pair_destinations: OrderedDict[str, Destination] = OrderedDict()
+        # user_key -> monotonic deadline: go technical without asking until then.
+        self._user_failures: OrderedDict[str, float] = OrderedDict()
 
     async def aclose(self) -> None:
         await self._http.aclose()
@@ -188,6 +218,10 @@ class RegisterClient:
                 status, answer = await self._send(destination, action, body, read_answer)
         except TimeoutError:
             return self._failed(action, "TimeoutError", pick=pick, sent_as=sent_as), None
+        except DestinationNotFound:
+            # Only the technical resolve can raise it here: a user's is caught below.
+            return self._failed(action, FAILURE_DESTINATION_MISSING, pick=pick,
+                                sent_as=sent_as), None
         except Exception as e:  # noqa: BLE001 - its text is not ours to pass on
             return self._failed(action, type(e).__name__, pick=pick, sent_as=sent_as), None
         if status >= 300:
@@ -214,22 +248,50 @@ class RegisterClient:
                 if kept is not None and time.monotonic() < kept.expires_at:
                     pick.user_key = user_key
                     return kept
-            try:
-                destination = await self._user.resolve(user_token=identity.jwt,
-                                                       principal=identity.principal)
-            except Exception as e:  # noqa: BLE001 - its text may carry the token
-                logger.debug("agent register: user destination failed (%s); "
-                             "technical instead", type(e).__name__)
+            expires = _unverified_exp(identity.jwt)
+            if expires is not None and expires <= _wall():
+                logger.debug("agent register: user token expired; technical instead")
+            elif self._recently_failed(user_key):
+                pass  # the memo holds: no exchange, technical
             else:
-                if _signs_in_as_user(destination):
-                    pick.user_key = user_key
-                    if action == "logRequest" and correlation_id is not None:
-                        self._keep_for_response(correlation_id, destination)
-                    return destination
-                logger.debug("agent register: user destination does not sign in as "
-                             "the user; technical instead")
+                try:
+                    destination = await self._user.resolve(user_token=identity.jwt,
+                                                           principal=identity.principal)
+                except Exception as e:  # noqa: BLE001 - its text may carry the token
+                    logger.debug("agent register: user destination failed (%s); "
+                                 "technical instead", type(e).__name__)
+                else:
+                    if _signs_in_as_user(destination):
+                        pick.user_key = user_key
+                        if action == "logRequest" and correlation_id is not None:
+                            self._keep_for_response(correlation_id, destination)
+                        return destination
+                    logger.debug("agent register: user destination does not sign in as "
+                                 "the user; technical instead")
+                self._remember_failure(user_key, expires)
             pick.fallback = True
         return await self._technical.resolve()
+
+    def _recently_failed(self, user_key: str) -> bool:
+        until = self._user_failures.get(user_key)
+        if until is None:
+            return False
+        if _now() < until:
+            return True
+        del self._user_failures[user_key]
+        return False
+
+    def _remember_failure(self, user_key: str, expires: float | None) -> None:
+        """Go technical for this user for a while: 60 s, or until the JWT expires."""
+        now = _now()
+        seconds = USER_FAILURE_SECONDS
+        if expires is not None:
+            seconds = min(seconds, max(0.0, expires - _wall()))
+        memo = self._user_failures
+        memo[user_key] = now + seconds
+        memo.move_to_end(user_key)
+        while len(memo) > USER_FAILURE_MEMO_MAX:
+            memo.popitem(last=False)
 
     def _keep_for_response(self, correlation_id: str, destination: Destination) -> None:
         memo = self._pair_destinations
@@ -295,6 +357,30 @@ def _signs_in_as_user(destination: Destination) -> bool:
         return False
     return any(name.lower() == "authorization" and value
                for name, value in destination.headers.items())
+
+
+def _unverified_exp(jwt: str) -> float | None:
+    """The ``exp`` claim of a JWT, NOT verified (only to skip a hopeless
+    exchange); ``None`` when it cannot be read."""
+    try:
+        payload = jwt.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        exp = claims.get("exp") if isinstance(claims, dict) else None
+    except Exception:  # noqa: BLE001 - not a JWT we can read: exchange as before
+        return None
+    if isinstance(exp, bool) or not isinstance(exp, (int, float)):
+        return None
+    return float(exp)
+
+
+def _memo_until(client: RegisterClient, user_key: str) -> float | None:
+    """Test helper: until when a user goes technical without asking."""
+    return client._user_failures.get(user_key)
+
+
+def _memo_keys(client: RegisterClient) -> list[str]:
+    """Test helper: the keys of the failure memo."""
+    return list(client._user_failures)
 
 
 async def _read_json(response: httpx.Response) -> Any:

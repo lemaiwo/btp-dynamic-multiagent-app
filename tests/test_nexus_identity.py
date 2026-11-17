@@ -165,7 +165,10 @@ async def test_registration_is_always_technical(on, monkeypatch):
         assert user.calls == []
 
 
-async def test_jwt_never_logged(on, caplog):
+async def test_jwt_never_logged(on, caplog, monkeypatch):
+    from agents.nexus import client as client_mod
+    clock = [100.0]
+    monkeypatch.setattr(client_mod, "_now", lambda: clock[0])
     caplog.set_level(logging.DEBUG)
     # The exchange fails with the token in its text; the register refuses; then a 401.
     user = user_resolver(fail=DestinationError(f"exchange of {USER_JWT} refused"))
@@ -174,6 +177,7 @@ async def test_jwt_never_logged(on, caplog):
         rec.statuses["logRequest"] = 500
         await _one_model_call()
         user.fail = None
+        clock[0] += 61.0          # past the memo of the failed exchange
         rec.statuses["logRequest"] = 401
         await _one_model_call()
         assert len(rec.requests) == 4

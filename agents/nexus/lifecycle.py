@@ -8,7 +8,10 @@ The switch (``agents.nexus.state``) is decided here and nowhere else:
   same lookup at the destination service, never the register;
 * the destination exists, or cannot be resolved right now (any other error,
   a timeout included): on. The sender treats an unreachable register like any
-  failed send.
+  failed send. When a send then finds the technical destination missing (the
+  destination service's 404 at the resolve), the sender asks ONCE for the
+  switch to be decided again (``_recheck_soon``), which switches off with the
+  usual INFO line and clears the queue.
 
 While on, the sender worker and the registration pusher run on one
 ``RegisterClient``: the technical destination, plus the user destination when
@@ -77,6 +80,8 @@ class _State:
     stopping: bool = False
     # An evaluation that raised while on was warned about (once per failure streak).
     failure_warned: bool = False
+    # A re-check the sender asked for (a send found the destination missing).
+    recheck: asyncio.Task | None = None
 
 
 _state = _State()
@@ -187,11 +192,12 @@ async def _evaluate() -> _Result:
 
 async def _switch_on(destination: str, technical: Any, user: Any) -> None:
     was_on = state.enabled() and _state.client is not None
+    settings = config.settings()
     key = (technical, user)
     if _state.client is None or _state.client_key != key:
         old = _state.client
         _state.client = RegisterClient(technical, user,
-                                       timeout=config.settings().timeout_seconds,
+                                       timeout=settings.timeout_seconds,
                                        transport=_transport)
         _state.client_key = key
         if old is not None:
@@ -199,11 +205,25 @@ async def _switch_on(destination: str, technical: Any, user: Any) -> None:
     new = _state.client
     state.set_on(destination)
     state.set_user_forwarding(user is not None)
-    sender.start(new, queue_max=config.settings().queue_max)
+    state.set_send_payload(settings.send_payload)
+    sender.start(new, queue_max=settings.queue_max, on_destination_missing=_recheck_soon)
     register.configure(new)  # also re-reads the fallback use case (Reload)
     register.start_pusher(new)
     if not was_on:
         register.request_push()
+
+
+def _recheck_soon() -> None:
+    """The sender found the technical destination missing: decide the switch again.
+
+    Synchronous (called from the sender's worker); the evaluation runs in a
+    task of its own, since switching off stops that very worker. At most one
+    at a time; nothing after ``stop()``.
+    """
+    if _state.stopping or (_state.recheck is not None and not _state.recheck.done()):
+        return
+    _state.recheck = asyncio.get_running_loop().create_task(
+        refresh_switch(), name="agent-register-recheck")
 
 
 def _retire(old: RegisterClient) -> None:
@@ -343,7 +363,9 @@ async def stop(flush_seconds: float = DEFAULT_FLUSH_SECONDS) -> None:
     """
     _state.stopping = True
     timer, _state.timer = _state.timer, None
-    tasks = [t for t in (timer, *_state.retiring) if t is not None and not t.done()]
+    recheck, _state.recheck = _state.recheck, None
+    tasks = [t for t in (timer, recheck, *_state.retiring)
+             if t is not None and not t.done()]
     for task in tasks:
         task.cancel()
     if tasks:
@@ -364,7 +386,7 @@ async def stop(flush_seconds: float = DEFAULT_FLUSH_SECONDS) -> None:
 def reset_for_tests() -> None:
     """Forget everything; a running timer is cancelled without waiting."""
     global _state
-    for task in (_state.timer, *_state.retiring):
+    for task in (_state.timer, _state.recheck, *_state.retiring):
         if task is not None and not task.done():
             try:
                 task.cancel()

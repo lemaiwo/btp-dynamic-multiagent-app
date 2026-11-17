@@ -117,10 +117,11 @@ async def register_on(monkeypatch, recorder, *, queue_max=2000, user=None, timeo
     ``user`` is the resolver of the user destination (``None``: none configured);
     ``timeout`` is the client's deadline per call.
     """
-    from agents.nexus import logged_model, register, sender, state
+    from agents.nexus import config, logged_model, register, sender, state
     from agents.nexus.client import RegisterClient
     state.reset_for_tests()
     state.set_user_forwarding(user is not None)
+    state.set_send_payload(config.settings().send_payload)   # as the lifecycle does
     sender.reset_for_tests()
     register.reset_for_tests()
     logged_model.reset_for_tests()
