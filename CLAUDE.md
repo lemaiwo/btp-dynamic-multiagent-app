@@ -2655,11 +2655,21 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     `registry.reload()`), `reevaluate()` (admin Reload and Restart), `refresh_switch()` (the
     timer) and `stop()` (shutdown). The destination exists, or cannot be resolved right now
     (any other error, a timeout included): on, and the sender treats an unreachable register
-    like any failed send; the destination service's 404: off. The timer's only call per
-    period is that lookup at the destination service, never the register. An evaluation
-    never raises into its caller and is bounded as a whole by `NEXUS_TIMEOUT_SECONDS`;
-    admin Reload / Restart wait for the re-evaluation within that bound, and only when a
-    destination service is bound. An evaluation that itself raises while the integration is
+    like any failed send; the destination service's 404: off. While off, the timer's only
+    call per period is that lookup at the destination service, never the register; while on,
+    the timer also pushes `registerAgents`. A transient destination-service error at the
+    check counts as "present": when the first send then finds the technical destination
+    missing (the 404 at its resolve, `SendOutcome.failure` = `destination_not_found`), the
+    sender pauses at once and asks the lifecycle ONCE to decide again (a callback given at
+    switch-on, run in a task of its own), which switches off with the usual INFO line and
+    clears the queue; no further entry costs a destination-service call meanwhile, also with
+    `NEXUS_REPUSH_MINUTES=0`. An evaluation never raises into its caller and is bounded as a
+    whole by `NEXUS_TIMEOUT_SECONDS`; admin Reload / Restart wait for the re-evaluation, only
+    when a destination service is bound, for up to twice that bound when a timer evaluation
+    holds the lifecycle lock. `NEXUS_SEND_PAYLOAD` is read at switch-on and at every
+    re-evaluation (`state.send_payload()`), never per model call. `app.py` imports the
+    lifecycle only inside the lifespan's guards (`_nexus_lifecycle()`), and a raise of its
+    `stop()` cannot cut the other shutdown drains short. An evaluation that itself raises while the integration is
     on keeps the state (no queue drop, the pusher keeps running) with one WARNING; going
     off on such a failure happens only when the state was off or at first start-up. `stop()`
     sets a flag so a Reload racing shutdown cannot restart the worker, flushes for at most 3 s
@@ -2682,9 +2692,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     the queue is bounded at `NEXUS_QUEUE_MAX` and a full queue drops the OLDEST entry,
     counted. ONE worker sends in order, nothing retried; after 5 failures in a row
     (`FAILURES_BEFORE_PAUSE`) it pauses 60 s, then sends ONE probe, so a register that stays
-    down costs one request a minute; failures are logged at most once per 5 minutes as
-    counts plus the last class or status, never a URL, body, header or exception text. A
-    worker whose event loop closed counts as not running.
+    down costs one request a minute; failures, drops and calls that went technical instead
+    of as the user (`user_fallback`) are logged at most once per 5 minutes as counts plus the
+    last class or status, never a URL, body, header or exception text. A worker whose event
+    loop closed counts as not running.
   - `logged_model.py` — `NexusLoggedModel`, a pydantic-ai `WrapperModel`; **`agents/shared.get_model`
     returns it** (the real model is at `.wrapped`; the per-name cache holds the wrapped
     object; a failure to import or build the wrapper falls back to the unwrapped model with
@@ -2698,7 +2709,12 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     stream cancelled or left early (`errorCode` the class name, `http_<status>` or
     `cancelled`, message masked by `agents/errors.describe_exception` and cut to 200
     characters); the body of a `ModelHTTPError` is never sent. `modelVersion` is sent on
-    neither call (it is known only from the response). A logRequest that could not be built
+    neither call (it is known only from the response). `temperature` / `topP` are rounded to
+    4 places and left out when not a finite number or 10 or more in size (the register's
+    Decimal(5,4)); `modelName` and `resourceGroup` are cut to 120. A model call without a
+    bound run id is logged under a fresh id with one WARNING per agent name. With
+    `NEXUS_SEND_PAYLOAD` the whole system prompt is sent, a personal agent's own
+    instructions included. A logRequest that could not be built
     means no logResponse for that call; a build failure is counted (`build_failed`) and
     logged once per class, the model's answer or exception passes through unchanged. Stream
     completion is tracked by replacing the private `StreamedResponse._event_iterator` with a
@@ -2714,16 +2730,27 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   - **Identity** (`context.capture_identity`, `client.py`, `sender.py`):
     `registerAgents` always goes as the technical user (the register refuses a user token
     there). `logRequest` / `logResponse` of a signed-in user go through the user destination
-    (the user's JWT in `X-user-token`) only when user forwarding is on and a token with a
-    principal is bound; the destination counts only when it signs in as that user (the OData
+    only when user forwarding is on and a token with a principal is bound: the user's JWT
+    goes only to the destination service (as `X-user-token`), and the register receives the
+    token the destination service minted for that user. Invoke API and A2A calls made with a
+    user's token are logged as that user; the destination counts only when it signs in as that user (the OData
     rule: resolved for the user, an `Authentication` of `OAuth2JWTBearer`,
     `OAuth2UserTokenExchange` or `OAuth2SAMLBearerAssertion`, no `SystemUser`, an
-    `Authorization` the destination service minted). Otherwise the call goes as the
-    technical user and is counted `user_fallback`; there is no silent success as a user. A
+    `Authorization` the destination service minted; one rule,
+    `agents/destination_auth.signs_in_as_user`, plus the minted `Authorization`). Otherwise
+    the call goes as the technical user and is counted `user_fallback`; there is no silent
+    success as a user. A failed exchange is not repeated per log entry: a JWT whose
+    (unverified) `exp` has passed is not exchanged, and a user whose exchange failed, or whose
+    destination does not sign in as the user, goes technical without asking for 60 s (or
+    until the JWT expires, if sooner), each such call counted `user_fallback`; that memo is
+    per client, keyed by `DestinationResolver.user_key` (the principal or a digest), holds no
+    token and at most 1,000 users. A
     pair is never split: the REQUEST decides, and a response follows the identity its request
-    went out with (decisions kept for at most 10,000 correlation ids). One rare split
-    remains: a user request, then the kept token expired and the re-exchange failed, so the
-    response goes technical, counted `user_fallback`. The JWT is held only in the queued
+    went out with (decisions kept for at most 10,000 correlation ids). Rare splits remain:
+    a user request, then the kept token expired and the re-exchange failed, or a Reload
+    replaced the client between request and response (its per-correlation memo is lost) and
+    the re-exchange failed: the response goes technical, counted `user_fallback`; and a full
+    queue that dropped the request leaves the response to decide on its own. The JWT is held only in the queued
     entry (never in a `repr` or a log) and is gone once it was sent.
   - `register.py` — `build_agent_list`, `push_once`, `start_pusher`, `request_push`,
     `use_case_for`, `assignment_for`. One entry per admin agent row plus two fixed ones,
@@ -2742,7 +2769,7 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     create, update, delete or bundle import (`agents/admin.py::_push_agents_to_register`) and
     at every `Registry.reload` build swap (`_request_register_push`); `request_push()` is
     synchronous and a no-op while the integration is off.
-  - **Tests** `tests/test_nexus_*.py` (about 215, helpers `tests/nexus_helpers.py`, the
+  - **Tests** `tests/test_nexus_*.py` (about 300, helpers `tests/nexus_helpers.py`, the
     entry-point drivers `tests/nexus_entry_drivers.py`) pin every entry point, the off path
     (nothing sent, nothing queued), the token sum and the lifecycle. **Unit-tested only
     (`httpx.MockTransport` and scripted models): never run against a real register on a
