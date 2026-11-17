@@ -67,6 +67,9 @@ class Recorder:
     answers: dict[str, object] = field(default_factory=dict)  # action -> JSON
     hang: bool = False
     set_cookie: str | None = None                           # answered on every call
+    refuse: bool = False                    # every call: connection refused
+    refuse_text: str = "connection refused"  # the text of that ConnectError
+    status: int | None = None               # every action answers this status
     requests: list[dict] = field(default_factory=list)
 
     def transport(self) -> httpx.MockTransport:
@@ -76,10 +79,13 @@ class Recorder:
                                   "auth": request.headers.get("Authorization"),
                                   "headers": dict(request.headers),
                                   "body": json.loads(request.content or b"{}")})
+            if self.refuse:
+                raise httpx.ConnectError(self.refuse_text, request=request)
             if self.hang:
                 await asyncio.sleep(3600)
             headers = {"Set-Cookie": self.set_cookie} if self.set_cookie else None
-            return httpx.Response(self.statuses.get(action, 200), headers=headers,
+            status = self.status if self.status is not None else self.statuses.get(action, 200)
+            return httpx.Response(status, headers=headers,
                                   json=self.answers.get(action, {"accepted": True}))
         return httpx.MockTransport(handler)
 
@@ -105,10 +111,11 @@ def scripted_model(usages=((10, 2),), *, name="scripted", finish_reason=None, fa
     return FunctionModel(answer, model_name=name)
 
 
-async def register_on(monkeypatch, recorder, *, queue_max=2000, user=None):
+async def register_on(monkeypatch, recorder, *, queue_max=2000, user=None, timeout=5):
     """Switch the register on with a recording transport (no lifecycle).
 
-    ``user`` is the resolver of the user destination (``None``: none configured).
+    ``user`` is the resolver of the user destination (``None``: none configured);
+    ``timeout`` is the client's deadline per call.
     """
     from agents.nexus import logged_model, register, sender, state
     from agents.nexus.client import RegisterClient
@@ -117,7 +124,8 @@ async def register_on(monkeypatch, recorder, *, queue_max=2000, user=None):
     sender.reset_for_tests()
     register.reset_for_tests()
     logged_model.reset_for_tests()
-    client = RegisterClient(FakeResolver(), user, timeout=5, transport=recorder.transport())
+    client = RegisterClient(FakeResolver(), user, timeout=timeout,
+                            transport=recorder.transport())
     register.configure(client)
     sender.start(client, queue_max=queue_max)
     state.set_on("NEXUS_AI_PLATFORM")
