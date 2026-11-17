@@ -10,12 +10,14 @@ fixture the outcome would depend on the file order.
 """
 import inspect
 
-import pytest
 from pydantic_ai import Agent
 from pydantic_ai.messages import ModelResponse, TextPart
+from pydantic_ai.models import ModelRequestParameters
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.usage import RequestUsage
+
+from agents.nexus.logged_model import NexusLoggedModel
 
 
 def test_wrapper_signatures():
@@ -35,7 +37,8 @@ async def test_agent_runs_on_a_wrapper_and_keeps_usage(real_agents_and_mcp):
     inner = FunctionModel(_answer, model_name="scripted")
     wrapped = WrapperModel(inner)
     assert wrapped.model_name == "scripted"
-    assert wrapped.profile is inner.profile or wrapped.profile == inner.profile
+    assert wrapped.profile is inner.profile
+    assert wrapped.settings is inner.settings
     result = await Agent(wrapped).run("hi")
     assert result.output == "ok"
     assert (result.usage().input_tokens, result.usage().output_tokens) == (7, 3)
@@ -65,11 +68,13 @@ def test_profile_of_the_app_models_passes_through():
     assert wrapped.profile.openai_supports_strict_tool_definition is False
     assert wrapped.model_name == "gpt-4o"
     assert wrapped.system == inner.system
+    assert wrapped.client is inner.client
+    assert NexusLoggedModel(inner, "gpt-4o").client is inner.client
 
 
 def test_bedrock_model_passes_through():
     """Built on a botocore client without credentials: nothing is sent."""
-    boto3 = pytest.importorskip("boto3")
+    import boto3
     from pydantic_ai.models.bedrock import BedrockConverseModel
     from pydantic_ai.providers.bedrock import BedrockProvider
 
@@ -80,3 +85,32 @@ def test_bedrock_model_passes_through():
     assert wrapped.model_name == "anthropic--claude-4-sonnet"
     assert wrapped.system == inner.system == "bedrock"
     assert wrapped.profile is inner.profile
+
+
+async def test_settings_and_parameters_reach_the_inner_model_unchanged(
+        real_agents_and_mcp, monkeypatch):
+    """Through the logging wrapper, on and off, the inner model sees the same objects."""
+    from agents.nexus import sender, state
+    from tests.nexus_helpers import Recorder, register_on
+
+    seen = []
+
+    class Recording(FunctionModel):
+        async def request(self, messages, model_settings, model_request_parameters):
+            seen.append((model_settings, model_request_parameters))
+            return await super().request(messages, model_settings, model_request_parameters)
+
+    inner = Recording(_answer, model_name="scripted")
+    settings = {"temperature": 0.3, "max_tokens": 20}
+    params = ModelRequestParameters()
+    try:
+        for on in (False, True):
+            if on:
+                await register_on(monkeypatch, Recorder())
+            seen.clear()
+            await NexusLoggedModel(inner, "gpt-4o").request([], settings, params)
+            assert seen[0][0] is settings and seen[0][1] is params
+    finally:
+        await sender.stop(flush_seconds=0.1)
+        state.reset_for_tests()
+        sender.reset_for_tests()

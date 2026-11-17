@@ -68,3 +68,36 @@ class Recorder:
 
     def of(self, action):
         return [r for r in self.requests if r["action"] == action]
+
+
+def scripted_model(usages=((10, 2),), *, name="scripted", finish_reason=None, fail=None):
+    """FunctionModel answering text with the given (input, output) tokens per call, in turn."""
+    from pydantic_ai.messages import ModelResponse, TextPart
+    from pydantic_ai.models.function import FunctionModel
+    from pydantic_ai.usage import RequestUsage
+
+    seq = list(usages)
+
+    def answer(messages, info):
+        if fail is not None:
+            raise fail
+        i, o = seq.pop(0) if len(seq) > 1 else seq[0]
+        return ModelResponse(parts=[TextPart("ok")],
+                             usage=RequestUsage(input_tokens=i, output_tokens=o),
+                             model_name=name, finish_reason=finish_reason)
+    return FunctionModel(answer, model_name=name)
+
+
+async def register_on(monkeypatch, recorder, *, queue_max=2000):
+    """Switch the register on with a recording transport (no lifecycle)."""
+    from agents.nexus import logged_model, register, sender, state
+    from agents.nexus.client import RegisterClient
+    state.reset_for_tests()
+    sender.reset_for_tests()
+    register.reset_for_tests()
+    logged_model.reset_for_tests()
+    client = RegisterClient(FakeResolver(), timeout=5, transport=recorder.transport())
+    register.configure(client)
+    sender.start(client, queue_max=queue_max)
+    state.set_on("NEXUS_AI_PLATFORM")
+    return client
