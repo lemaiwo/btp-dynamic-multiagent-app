@@ -164,21 +164,47 @@ async def test_a_failing_request_push_never_fails_the_save(monkeypatch, client, 
     assert "RuntimeError" in caplog.text and "secret-detail" not in caplog.text
 
 
+def _row_committed(name: str) -> bool:
+    """Whether a FRESH session, on a connection of its own, sees the agent row.
+
+    ``request_push`` is synchronous, so the look runs to its end in a thread
+    with its own event loop and engine (no pooled connection of the request's
+    loop): what it sees is what was committed at that moment, never the
+    request's own uncommitted write.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    async def look() -> bool:
+        engine = create_async_engine(os.environ["DATABASE_URL"], poolclass=NullPool)
+        try:
+            async with async_sessionmaker(engine)() as fresh:
+                found = await fresh.execute(
+                    select(AgentConfig.id).where(AgentConfig.name == name))
+                return found.first() is not None
+        finally:
+            await engine.dispose()
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, look()).result(timeout=10)
+
+
 async def test_push_comes_after_the_commit(monkeypatch, client):
     seen = []
 
-    async def rows():
-        return []
-
     def spy():
-        # A fresh session sees the committed row only after the commit.
-        seen.append(1)
+        # At the push a fresh session must see the committed state: the row
+        # there after a create, gone after a delete.
+        seen.append(_row_committed("invoice-assistant"))
 
     monkeypatch.setattr(register, "request_push", spy)
     aid = (await client.post(AGENTS, json=body())).json()["id"]
-    assert seen == [1]
+    assert seen == [True]
     assert (await client.delete(f"{AGENTS}/{aid}")).status_code == 204
-    assert seen == [1, 1]
+    assert seen == [True, False]
 
 
 async def test_admin_reload_and_restart_reevaluate_once(monkeypatch, client, world):
