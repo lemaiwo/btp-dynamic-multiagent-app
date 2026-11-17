@@ -349,6 +349,7 @@ def _track(streamed: StreamedResponse, tracker: _Tracker) -> None:
 
         before = streamed._event_iterator
         streamed._event_iterator = tracked()
+        # __aiter__ is idempotent on pydantic-ai 1.72.0: it only returns _event_iterator.
         if streamed.__aiter__() is not streamed._event_iterator:
             streamed._event_iterator = before
             _untracked()

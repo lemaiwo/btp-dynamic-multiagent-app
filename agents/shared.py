@@ -933,9 +933,7 @@ def get_model(name: str | None = None):
     if cached is not None:
         return cached
     model = _build_model(name)
-    from agents.nexus.logged_model import wrap
-
-    model = wrap(model, name)
+    model = _logged(model, name)
     _models[name] = model
     return model
 
@@ -963,6 +961,33 @@ def _build_model(name: str):
     if _is_anthropic(name):
         return _build_bedrock_model(name)
     return _build_openai_model(name)
+
+
+# One WARNING per process when the logging wrapper cannot be applied.
+_wrap_failure_warned = False
+
+
+def _logged(model, name: str):
+    """Put ``model`` behind the register's logging wrapper, or hand it back as is.
+
+    Logging is a side concern: a wrapper that cannot be imported or built must
+    never fail a model build, so the plain model is used instead, with one
+    WARNING per process that names the exception class only (its text could
+    carry anything).
+    """
+    global _wrap_failure_warned
+    try:
+        from agents.nexus.logged_model import wrap
+
+        return wrap(model, name)
+    except Exception as e:  # noqa: BLE001
+        if not _wrap_failure_warned:
+            _wrap_failure_warned = True
+            logger.warning(
+                "agent register logging wrapper unavailable (%s); models are used unwrapped",
+                type(e).__name__,
+            )
+        return model
 
 
 # tests/test_agent_model.py replaces ``get_model`` on this module for the whole

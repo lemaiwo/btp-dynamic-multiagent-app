@@ -107,3 +107,35 @@ async def test_off_path_keeps_the_model_exception(monkeypatch):
 def test_unpatched_is_the_real_function():
     assert shared._get_model_unpatched.__module__ == "agents.shared"
     assert shared._get_model_unpatched.__name__ == "get_model"
+
+
+def test_a_failing_wrapper_never_fails_a_model_build(monkeypatch, caplog):
+    """A broken logging wrapper falls back to the plain model, one WARNING per process."""
+    from agents.nexus import logged_model
+
+    def broken(model, deployment):
+        raise ValueError("secret-ish text that must not be logged")
+    monkeypatch.setattr(logged_model, "wrap", broken)
+    monkeypatch.setattr(shared, "_build_openai_model", lambda n: scripted_model(name=n))
+    monkeypatch.setattr(shared, "_models", {})
+    monkeypatch.setattr(shared, "_wrap_failure_warned", False)
+    with caplog.at_level("WARNING", logger="agents.shared"):
+        first = shared._get_model_unpatched("gpt-4o")
+        second = shared._get_model_unpatched("gpt-4.1")
+    assert not isinstance(first, NexusLoggedModel) and first.model_name == "gpt-4o"
+    assert not isinstance(second, NexusLoggedModel)
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1 and "ValueError" in warnings[0].getMessage()
+    assert "secret-ish" not in caplog.text
+
+
+def test_a_failing_wrapper_import_never_fails_a_model_build(monkeypatch, caplog):
+    import sys
+    monkeypatch.setitem(sys.modules, "agents.nexus.logged_model", None)
+    monkeypatch.setattr(shared, "_build_openai_model", lambda n: scripted_model(name=n))
+    monkeypatch.setattr(shared, "_models", {})
+    monkeypatch.setattr(shared, "_wrap_failure_warned", False)
+    with caplog.at_level("WARNING", logger="agents.shared"):
+        model = shared._get_model_unpatched("gpt-4o")
+    assert model.model_name == "gpt-4o" and not isinstance(model, NexusLoggedModel)
+    assert "ImportError" in caplog.text or "ModuleNotFoundError" in caplog.text
