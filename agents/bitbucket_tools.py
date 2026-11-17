@@ -336,6 +336,11 @@ def _install_once() -> None:
 
 _install_once()
 
+# Public names of the filter for other clients that send to a destination
+# (the agent register): the same objects, so one filter covers them all.
+install_request_log_filter = _install_once
+request_log_quiet = _sending
+
 
 class Refused(Exception):
     """A refused call: ``code`` is stable, ``message`` a fixed text."""

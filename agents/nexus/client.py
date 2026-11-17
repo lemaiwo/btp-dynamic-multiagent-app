@@ -61,9 +61,9 @@ from typing import Any, Protocol
 
 import httpx
 
-from agents.bitbucket_tools import _install_once, _sending
+from agents.bitbucket_tools import install_request_log_filter, request_log_quiet
 from agents.destination import Destination, DestinationResolver
-from agents.destination_auth import _SIGNS_IN_AS_USER
+from agents.destination_auth import signs_in_as_user
 from agents.nexus.context import Identity
 from agents.odata.session import NoCookieJar
 
@@ -261,8 +261,8 @@ class RegisterClient:
         request = self._http.build_request(
             "POST", action_url(destination.url, action), json=body, headers=headers,
         )
-        _install_once()
-        quiet = _sending.set(True)
+        install_request_log_filter()
+        quiet = request_log_quiet.set(True)
         try:
             response = await self._http.send(request, stream=True)
             try:
@@ -273,7 +273,7 @@ class RegisterClient:
             finally:
                 await response.aclose()
         finally:
-            _sending.reset(quiet)
+            request_log_quiet.reset(quiet)
 
     @staticmethod
     def _failed(action: str, failure: str, status: int | None = None, *,
@@ -284,10 +284,12 @@ class RegisterClient:
 
 
 def _signs_in_as_user(destination: Destination) -> bool:
-    """Whether the destination signs in as the user (``destination_auth``'s rule)."""
-    if (not destination.per_user
-            or (destination.auth_type or "").strip() not in _SIGNS_IN_AS_USER
-            or destination.system_user):
+    """``destination_auth.signs_in_as_user`` plus a minted ``Authorization``.
+
+    The register gets only the header the destination service minted for
+    the user: a stored ``Authorization`` would be somebody else's.
+    """
+    if not signs_in_as_user(destination):
         return False
     if "authorization" in destination.static_headers:
         return False
