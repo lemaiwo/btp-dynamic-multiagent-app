@@ -78,6 +78,7 @@ STEP_AGENTS = ("first", "second")
 AGENT_NAMES = (ADMIN_AGENT, JOB_AGENT, INVOKE_AGENT, *STEP_AGENTS)
 WORKFLOW_PREFIX = "nexus-entry-wf-"
 PERSONAL_NAME = "Zorblax Personal Helper"
+IDE_TARGET = "NEXUSDIAG"
 SUB_TASK = "check the sub-task"
 INVOKE_SCHEMA = {
     "type": "object",
@@ -186,7 +187,14 @@ class Ctx:
 
 async def forget_rows() -> None:
     """Remove every row a driver wrote (they share the session database)."""
-    from agents.ide.models import IdeArtifact, IdeMessage, IdeSession, IdeWorkspaceFile
+    from agents.ide.models import (
+        IdeArtifact,
+        IdeConventions,
+        IdeFinding,
+        IdeMessage,
+        IdeSession,
+        IdeWorkspaceFile,
+    )
     async with SessionLocal() as s:
         for model in (ChatFile, ChatMessage, ChatConversation):
             await s.execute(delete(model))
@@ -204,8 +212,9 @@ async def forget_rows() -> None:
                 await delete_workflow(s, wf_id, commit=False)
         await s.execute(delete(JobRun).where(JobRun.agent_name.in_(AGENT_NAMES)))
         await s.execute(delete(AgentConfig).where(AgentConfig.name.in_(AGENT_NAMES)))
-        for model in (IdeWorkspaceFile, IdeArtifact, IdeMessage, IdeSession):
+        for model in (IdeWorkspaceFile, IdeArtifact, IdeMessage, IdeFinding, IdeSession):
             await s.execute(model.__table__.delete())
+        await s.execute(delete(IdeConventions).where(IdeConventions.target == IDE_TARGET))
         await s.commit()
 
 
@@ -521,25 +530,46 @@ async def drive_a2a_stream(ctx: Ctx) -> Outcome:
 # --- IDE ------------------------------------------------------------------------------------
 
 
-async def drive_ide(ctx: Ctx) -> Outcome:
-    from agents.ide import runner
-    from agents.ide.store import create_session
-    script = Script()
-    name = runner._agent_name("change")
-    ctx.monkeypatch.setattr(registry, "_build", _build(**{name: ctx.agent(script)}))
-    async with SessionLocal() as db:
-        s = await create_session(db, owner=ALICE, title="t", target="T1")
-        s.stage = "chat"
-        await db.commit()
-        sid = s.id
-    events: list[tuple[str, dict]] = []
-    await runner.run_stage(sid, ALICE, "go", request_changes=None,
-                           emit=lambda k, d: events.append((k, d)))
-    run_id = next(d["run_id"] for k, d in events if k == "run")
-    text = "".join(d.get("text", d.get("delta", "")) for k, d in events if k == "text")
-    kinds = sorted({k for k, _ in events} - {"usage"})
-    return Outcome({"kinds": kinds, "text": text, "errors": [d for k, d in events if k == "error"]},
-                   Counter({name: script.calls}), run_id)
+def _ide_driver(session_type: str, *, report: bool = False
+                ) -> Callable[[Ctx], Awaitable[Outcome]]:
+    """A change message, a diagnose message or a diagnose report turn of the IDE.
+
+    A diagnose session runs on a target flagged ``non_production`` (written
+    straight to the table, as ``forget_rows`` removes it again); its agent is
+    the diagnose agent, whose name the pairs must carry.
+    """
+    async def drive(ctx: Ctx) -> Outcome:
+        from agents.ide import runner
+        from agents.ide.models import IdeConventions
+        from agents.ide.store import create_session
+        script = Script()
+        name = runner._agent_name(session_type)
+        ctx.monkeypatch.setattr(registry, "_build", _build(**{name: ctx.agent(script)}))
+        async with SessionLocal() as db:
+            if session_type != "change":
+                await db.merge(IdeConventions(target=IDE_TARGET, destination="ARC1_TEST",
+                                              non_production=True))
+            s = await create_session(db, owner=ALICE, title="t", target=IDE_TARGET,
+                                     session_type=session_type)
+            if session_type == "change":
+                s.stage = "chat"
+            await db.commit()
+            sid = s.id
+        events: list[tuple[str, dict]] = []
+        await runner.run_stage(sid, ALICE, None if report else "go", request_changes=None,
+                               emit=lambda k, d: events.append((k, d)), report=report)
+        run_id = next(d["run_id"] for k, d in events if k == "run")
+        text = "".join(d.get("text", d.get("delta", "")) for k, d in events if k == "text")
+        kinds = sorted({k for k, _ in events} - {"usage"})
+        return Outcome({"kinds": kinds, "text": text,
+                        "errors": [d for k, d in events if k == "error"]},
+                       Counter({name: script.calls}), run_id)
+    return drive
+
+
+drive_ide = _ide_driver("change")
+drive_ide_diagnose = _ide_driver("diagnose")
+drive_ide_report = _ide_driver("diagnose", report=True)
 
 
 DRIVERS: dict[str, Callable[[Ctx], Awaitable[Outcome]]] = {
@@ -555,4 +585,6 @@ DRIVERS: dict[str, Callable[[Ctx], Awaitable[Outcome]]] = {
     "a2a_send": drive_a2a_send,
     "a2a_stream": drive_a2a_stream,
     "ide": drive_ide,
+    "ide_diagnose": drive_ide_diagnose,
+    "ide_report": drive_ide_report,
 }

@@ -50,7 +50,7 @@ def _wrapped(model):
 
 async def _run(monkeypatch, rec, name: str, *, payload: bool = False):
     if payload:
-        monkeypatch.setenv("NEXUS_SEND_PAYLOAD", "true")
+        state.set_send_payload(True)      # as the lifecycle sets it from NEXUS_SEND_PAYLOAD
     outcome = await DRIVERS[name](Ctx(monkeypatch, _wrapped))
     await sender.drain()
     return outcome
@@ -92,3 +92,16 @@ async def test_a_personal_agents_name_is_in_no_request_body(monkeypatch, rec, pa
     for r in rec.requests:
         text = str(r["body"])
         assert PERSONAL_NAME not in text and PERSONAL_NAME.casefold() not in text.casefold()
+
+
+@pytest.mark.parametrize("name", ["ide_diagnose", "ide_report"])
+async def test_ide_diagnose_and_report_turns_are_logged_as_the_diagnose_agent(
+        monkeypatch, rec, name):
+    from agents.ide import runner
+    outcome = await _run(monkeypatch, rec, name)
+    requests = _check_pairs(rec, outcome)
+    diagnose_agent = runner.diagnose_agent_name()
+    assert diagnose_agent != runner._agent_name("change")
+    assert {b["agent"] for b in requests} == {diagnose_agent}
+    assert {b["runId"] for b in requests} == {outcome.run_id}
+    assert [e for e in outcome.output["errors"] if e.get("code") != "no_diagnose_server"] == []
