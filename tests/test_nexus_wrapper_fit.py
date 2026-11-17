@@ -48,9 +48,17 @@ async def test_streamed_run_on_a_wrapper(real_agents_and_mcp):
     async def stream(messages, info):
         yield "o"
         yield "k"
-    wrapped = WrapperModel(FunctionModel(stream_function=stream, model_name="scripted"))
-    async with Agent(wrapped).run_stream("hi") as run:
-        assert await run.get_output() == "ok"
+    inner = FunctionModel(stream_function=stream, model_name="scripted")
+    async with Agent(inner).run_stream("hi") as run:
+        await run.get_output()
+        plain = run.usage()
+    assert plain.output_tokens > 0
+    for wrapped in (WrapperModel(inner), NexusLoggedModel(inner, "gpt-4o")):
+        async with Agent(wrapped).run_stream("hi") as run:
+            assert await run.get_output() == "ok"
+            usage = run.usage()
+        assert (usage.input_tokens, usage.output_tokens, usage.requests) == (
+            plain.input_tokens, plain.output_tokens, plain.requests)
 
 
 def test_profile_of_the_app_models_passes_through():

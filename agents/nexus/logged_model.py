@@ -35,9 +35,11 @@ import asyncio
 import logging
 import math
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior
 from pydantic_ai.messages import (
@@ -51,6 +53,9 @@ from pydantic_ai.messages import (
 from pydantic_ai.models import Model, ModelRequestParameters, StreamedResponse
 from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.settings import ModelSettings
+
+if TYPE_CHECKING:
+    from pydantic_ai import RunContext
 
 from agents.errors import describe_exception, mask_text
 from agents.nexus import sender, state
@@ -285,6 +290,78 @@ def _finish_failed(call: _Call | None, exc: BaseException, *,
         _swallowed(e)
 
 
+class _Tracker:
+    """Whether a stream was read to its end (``StreamedResponse`` has no such flag)."""
+
+    def __init__(self) -> None:
+        self.done = False
+        self.tracking = False
+        # An error the provider's stream raised while it was read: it reaches the
+        # consumer, which may then leave the context in any way.
+        self.error: BaseException | None = None
+
+
+def _track(streamed: StreamedResponse, tracker: _Tracker) -> None:
+    """Put a pass-through generator around the stream's events that notes their end.
+
+    ``__aiter__`` only builds the pipeline (nothing is read); every event goes
+    through unchanged. When this cannot be done (a version whose stream has no
+    ``_event_iterator``), the stream is not tracked and a normal exit counts as
+    read to its end.
+    """
+    try:
+        if not hasattr(streamed, "_event_iterator"):
+            return
+        events = streamed.__aiter__()
+
+        async def tracked() -> AsyncIterator[Any]:
+            try:
+                async for event in events:
+                    yield event
+            except (asyncio.CancelledError, GeneratorExit):
+                raise
+            except BaseException as exc:
+                tracker.error = exc
+                raise
+            tracker.done = True
+
+        streamed._event_iterator = tracked()
+        tracker.tracking = True
+    except Exception as e:  # noqa: BLE001
+        _swallowed(e)
+
+
+def _finish_stream(call: _Call | None, streamed: StreamedResponse, tracker: _Tracker) -> None:
+    """Queue the ``logResponse`` of a stream whose context exited normally."""
+    if call is None:
+        return
+    if tracker.error is not None:
+        _finish_failed(call, tracker.error, streamed=streamed)
+        return
+    try:
+        if tracker.tracking and not tracker.done:
+            _finish_partial(call, streamed)
+            return
+        _finish(call, streamed.get())
+    except Exception as e:  # noqa: BLE001
+        _swallowed(e)
+
+
+def _finish_partial(call: _Call | None, streamed: StreamedResponse | None) -> None:
+    """A stream cancelled or left before its end: FAILED, ``cancelled``, tokens so far."""
+    if call is None:
+        return
+    try:
+        input_tokens = output_tokens = 0
+        if streamed is not None:
+            usage = streamed.usage()
+            input_tokens, output_tokens = usage.input_tokens, usage.output_tokens
+        _send_response(call, FAILED, input_tokens, output_tokens, error_code=CANCELLED,
+                       error_message="the stream was cancelled or not read to its end")
+    except Exception as e:  # noqa: BLE001
+        _swallowed(e)
+
+
 class NexusLoggedModel(WrapperModel):
     """A model whose every request is logged to the agent register (see the module)."""
 
@@ -305,6 +382,39 @@ class NexusLoggedModel(WrapperModel):
             raise
         _finish(call, response)
         return response
+
+    @asynccontextmanager
+    async def request_stream(
+        self, messages: list[ModelMessage], model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+        run_context: RunContext[Any] | None = None,
+    ) -> AsyncIterator[StreamedResponse]:
+        if not state.enabled():
+            async with self.wrapped.request_stream(messages, model_settings,
+                                                   model_request_parameters,
+                                                   run_context) as streamed:
+                yield streamed
+            return
+        call = _begin(self._deployment, model_settings, messages)
+        tracker = _Tracker()
+        streamed: StreamedResponse | None = None
+        try:
+            async with self.wrapped.request_stream(messages, model_settings,
+                                                   model_request_parameters,
+                                                   run_context) as streamed:
+                if call is not None:
+                    _track(streamed, tracker)
+                yield streamed
+        except (asyncio.CancelledError, GeneratorExit):
+            if tracker.error is not None:
+                _finish_failed(call, tracker.error, streamed=streamed)
+            else:
+                _finish_partial(call, streamed)
+            raise
+        except BaseException as exc:
+            _finish_failed(call, exc, streamed=streamed)
+            raise
+        _finish_stream(call, streamed, tracker)
 
 
 def wrap(model: Model, deployment: str) -> Model:
