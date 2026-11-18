@@ -122,6 +122,7 @@ async def register_on(monkeypatch, recorder, *, queue_max=2000, user=None, timeo
     state.reset_for_tests()
     state.set_user_forwarding(user is not None)
     state.set_send_payload(config.settings().send_payload)   # as the lifecycle does
+    state.set_landscape(config.settings().landscape)
     sender.reset_for_tests()
     register.reset_for_tests()
     logged_model.reset_for_tests()

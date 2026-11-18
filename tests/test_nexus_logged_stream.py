@@ -11,6 +11,7 @@ import pytest
 from pydantic_ai import Agent
 from pydantic_ai.models.function import FunctionModel
 
+from agents.model_call_headers import current_call_headers
 from agents.nexus import logged_model, register, sender, state
 from agents.nexus.context import nexus_run
 from agents.nexus.logged_model import wrap
@@ -242,3 +243,20 @@ def test_stream_without_the_attribute_is_untracked(caplog):
     assert tracker.tracking is False
     assert logged_model.counters()["untracked_streams"] == 1
     logged_model.reset_for_tests()
+
+
+async def test_stream_call_headers_carry_the_logged_id_and_are_cleared(rec):
+    seen = []
+
+    async def stream(messages, info):
+        seen.append(current_call_headers.get())
+        yield "ok"
+    model = wrap(FunctionModel(stream_function=stream, model_name="scripted"), "gpt-4o")
+    with nexus_run("r"):
+        async with Agent(model).run_stream("hi") as run:
+            await run.get_output()
+    assert current_call_headers.get() is None
+    await sender.drain()
+    cid = rec.of("logResponse")[0]["body"]["correlationId"]
+    assert cid == rec.of("logRequest")[0]["body"]["correlationId"]
+    assert f"ext.ai.sap.com/correlation={cid}" in seen[0]["ai-inference-observability-labels"]

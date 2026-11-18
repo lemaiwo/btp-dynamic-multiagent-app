@@ -13,6 +13,8 @@ import os
 from dataclasses import dataclass
 from typing import Mapping
 
+from agents.nexus.observability import label_value
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_DESTINATION = "NEXUS_AI_PLATFORM"
@@ -42,6 +44,8 @@ class NexusSettings:
     send_payload: bool
     queue_max: int
     timeout_seconds: float
+    # A label for AI Core's observability record (``NEXUS_LANDSCAPE``); None: no label.
+    landscape: str | None = None
 
 
 def _text(environ: Mapping[str, str], name: str) -> str:
@@ -78,6 +82,16 @@ def _timeout(environ: Mapping[str, str], name: str) -> float:
     return value
 
 
+def _landscape(environ: Mapping[str, str]) -> str | None:
+    raw = _text(environ, "NEXUS_LANDSCAPE")
+    if not raw:
+        return None
+    if label_value(raw) is None:
+        logger.warning("NEXUS_LANDSCAPE is not a valid label value; ignored")
+        return None
+    return raw
+
+
 def settings(environ: Mapping[str, str] = os.environ) -> NexusSettings:
     """The settings as the given environment states them, defaults filled in."""
     fallback = _text(environ, "NEXUS_FALLBACK_USE_CASE") or None
@@ -98,6 +112,7 @@ def settings(environ: Mapping[str, str] = os.environ) -> NexusSettings:
         send_payload=environ.get("NEXUS_SEND_PAYLOAD") == "true",
         queue_max=_int(environ, "NEXUS_QUEUE_MAX", DEFAULT_QUEUE_MAX, 1),
         timeout_seconds=_timeout(environ, "NEXUS_TIMEOUT_SECONDS"),
+        landscape=_landscape(environ),
     )
 
 

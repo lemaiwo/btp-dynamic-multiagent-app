@@ -206,6 +206,7 @@ async def _switch_on(destination: str, technical: Any, user: Any) -> None:
     state.set_on(destination)
     state.set_user_forwarding(user is not None)
     state.set_send_payload(settings.send_payload)
+    state.set_landscape(settings.landscape)
     sender.start(new, queue_max=settings.queue_max, on_destination_missing=_recheck_soon)
     register.configure(new)  # also re-reads the fallback use case (Reload)
     register.start_pusher(new)

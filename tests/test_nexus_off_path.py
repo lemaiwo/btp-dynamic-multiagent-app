@@ -23,6 +23,7 @@ from tests.testdb import use_test_database
 use_test_database()
 
 from agents.destination import DestinationNotFound, DestinationServiceConfig  # noqa: E402
+from agents.model_call_headers import current_call_headers  # noqa: E402
 from agents.nexus import client as nexus_client  # noqa: E402
 from agents.nexus import lifecycle, logged_model, register, sender, state  # noqa: E402
 from agents.nexus.logged_model import wrap  # noqa: E402
@@ -76,7 +77,18 @@ async def off(request, monkeypatch, entry_env, caplog):  # noqa: F811
 @pytest.mark.parametrize("name", sorted(DRIVERS))
 async def test_off_sends_nothing_and_changes_nothing(monkeypatch, off, caplog, name):
     without = await DRIVERS[name](Ctx(monkeypatch, lambda model: model))
+    # Off: no correlation id is made and no call headers are published.
+    monkeypatch.setattr(logged_model, "uuid", SimpleNamespace(
+        uuid4=lambda: pytest.fail("a correlation id was made while off")))
+    published = []
+    real_sending = logged_model.sending
+
+    def recording(headers):
+        published.append(headers)
+        return real_sending(headers)
+    monkeypatch.setattr(logged_model, "sending", recording)
     wrapped = await DRIVERS[name](Ctx(monkeypatch, lambda model: wrap(model, "gpt-4o")))
+    assert published == [] and current_call_headers.get() is None
     assert wrapped.output == without.output
     assert wrapped.agents == without.agents and wrapped.calls > 0
     assert not state.enabled() and lifecycle.client() is None and not sender.running()

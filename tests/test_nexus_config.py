@@ -54,6 +54,29 @@ def test_timeout_outside_range_is_default(raw, caplog):
     assert "NEXUS_TIMEOUT_SECONDS" in caplog.text
 
 
+def test_landscape_default_none_and_stripped():
+    assert config.settings({}).landscape is None
+    assert config.settings({"NEXUS_LANDSCAPE": "  "}).landscape is None
+    assert config.settings({"NEXUS_LANDSCAPE": " acc-eu10 "}).landscape == "acc-eu10"
+
+
+@pytest.mark.parametrize("raw", ["has space", "a_b", "x" * 65, "café"])
+def test_landscape_not_a_label_value_is_none_with_a_warning(raw, caplog):
+    assert config.settings({"NEXUS_LANDSCAPE": raw}).landscape is None
+    assert "NEXUS_LANDSCAPE" in caplog.text and raw not in caplog.text
+
+
+def test_landscape_kept_in_state_and_reset():
+    state.reset_for_tests()
+    state.set_landscape("acc")
+    assert state.landscape() == "acc"
+    state.set_off("off (test)")
+    assert state.landscape() is None
+    state.set_landscape("acc")
+    state.reset_for_tests()
+    assert state.landscape() is None
+
+
 def test_resource_group_default_and_stripped():
     assert config.resource_group({}) == "default"
     assert config.resource_group({"AICORE_RESOURCE_GROUP": "  "}) == "default"
