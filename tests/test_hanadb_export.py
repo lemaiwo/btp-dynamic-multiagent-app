@@ -24,6 +24,7 @@ from agents.hana.checks import base
 from agents.hana.checks.base import Check, Statement, register
 from agents.hana.connection import LOB_CUT_MARKER, HanaSystem
 from agents.hana.errors import ERROR_CODES, MESSAGES
+from agents.hana.export import EXPORT_ROW_CHARS_BUDGET
 from agents.webchat import docgen
 from tests import hanadb_helpers as h
 
@@ -226,7 +227,8 @@ async def test_export_binds_export_top(monkeypatch: pytest.MonkeyPatch, chat) ->
     answer = await export(system="erp_tenant", check="topped", filename="t")
     assert answer["row_count"] == 1
     assert seen == [("SELECT TOP ? A, B FROM SYS.M_Y", (10_001,), 10_000,
-                     {"lob_chars": 4096, "lob_budget": 5_000_000})]
+                     {"lob_chars": 4096, "lob_budget": 5_000_000,
+                      "row_chars_budget": 20_000_000})]
     seen.clear()
     await export(system="erp_tenant", check="topped", filename="t", top=200)
     assert seen[0][1:3] == ((201,), 200)
@@ -234,7 +236,8 @@ async def test_export_binds_export_top(monkeypatch: pytest.MonkeyPatch, chat) ->
     await export(system="erp_tenant", check="longRunning", filename="t", schema="SYS")
     assert seen[0][1:] == (("SYS", "SYS", 24), 10_000,
                            {"lob_chars": tools.EXPORT_LOB_CHARS,
-                            "lob_budget": tools.EXPORT_LOB_BUDGET})
+                            "lob_budget": tools.EXPORT_LOB_BUDGET,
+                            "row_chars_budget": EXPORT_ROW_CHARS_BUDGET})
 
 
 async def test_export_composite_check_writes_one_sheet_per_part(db: h.FakeDbapi,

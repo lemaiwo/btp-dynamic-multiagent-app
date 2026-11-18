@@ -40,8 +40,10 @@ The rules, in the order they are checked:
     ``M_INIFILE_CONTENT_HISTORY``, ``M_INIFILES``,
     ``M_CONFIGURATION_PARAMETER_VALUES``, ...) or to a
     ``SYS.P_*`` or ``_SYS_STATISTICS.P_*`` object is refused too. The registered checks pass
-    ``fixed=True``, which skips the deny-list and nothing else: ``iniContents``,
-    ``iniFiles`` and ``backupStatus`` read the ini contents for named keys.
+    ``fixed=True``, which skips the deny-list and nothing else: ``iniContents``
+    reads every value of the ini views, narrowed only by its file, section and
+    key filters; ``iniFiles`` counts parameters per file; ``backupStatus`` reads
+    named keys.
 
     ``any_schema=True`` (``run_select`` of an entry that may read business
     schemas) accepts a two-part name ``<schema>.<name>`` or

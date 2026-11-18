@@ -1051,10 +1051,18 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     TRANSACTION READ ONLY` (last, so no session statement can end or change
     that transaction after it), `setquerytimeout(20)`, execute,
     `fetchmany(top + 1)`, the LOB values of the kept rows read, then
-    `rollback()` and `close()` on every path: nothing ever commits. **LOB
+    `rollback()` and `close()` on every path: nothing ever commits. **The
+    row-character budget** (`run_query(..., row_chars_budget=)`, default
+    `None`: one `fetchmany(top + 1)` as above; only the export passes one):
+    the rows are fetched in chunks of `ROW_FETCH_CHUNK` (500) and the length
+    of every `str` and `bytes` value is summed as they arrive (a LOB object,
+    a number or a date does not count); once the sum passes the budget
+    nothing more is fetched and the call is `result_too_large`, rollback and
+    close as always (`fetch_rows` in `agents/hana/reading.py`, which also
+    holds the LOB reader; one WARNING naming the system only). **LOB
     values** (`STATEMENT_STRING` of `M_EXPENSIVE_STATEMENTS` /
     `M_ACTIVE_STATEMENTS` is `NCLOB`): every value with a callable `read` is
-    read in the worker thread before the rollback (`_LobReader`), each up to
+    read in the worker thread before the rollback (`LobReader`), each up to
     a cap per value (`run_query(..., lob_chars=)`, default `LOB_MAX_CHARS`
     65,536; `run_check` passes `CHECK_LOB_CHARS` 4,096, the masking keeps
     300) and a longer text cut with ` …[cut]`, bytes likewise (the answer
@@ -1282,7 +1290,11 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     apply), written as ONE Excel file of the web chat conversation through
     `agents/webchat/docgen.py` (`store_file`, `build_xlsx`: one sheet per part
     of a composite check, `Result` for a SELECT; LOB values read at
-    `EXPORT_LOB_CHARS` 4,096 each within `EXPORT_LOB_BUDGET` 5,000,000; masked
+    `EXPORT_LOB_CHARS` 4,096 each within `EXPORT_LOB_BUDGET` 5,000,000, and
+    the text and binary values of the rows within `EXPORT_ROW_CHARS_BUDGET`
+    20,000,000 characters, counted while they are fetched (`row_chars_budget`
+    of `run_query`), so a wide table stops before 10,001 rows of it are held,
+    copied and written; masked
     columns stay masked; a finite number stays a number, a `Decimal` only when
     the float says exactly the same, else text; rows cut to the workbook's
     500,000 cells, the part then `truncated`). The answer is the file's
@@ -1293,9 +1305,13 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     previews are emptied (`preview_omitted: true`), and if it still does not
     fit only the counts (`row_count`, `truncated`, `column_count`). Refusals
     of its own: `no_chat` (no web chat run bound: a scheduled run, A2A, the
-    classic chat), `export_too_large` (over 100 columns, or the store's
-    `too_large`), `export_failed`, `export_busy` (ONE export at a time per
-    toolset, an `asyncio.Lock`; a second call is refused, not queued); order:
+    classic chat), `export_too_large` (over 100 columns, a read over the LOB
+    or the row-character budget, or the store's `too_large`; nothing is
+    stored; hint `select fewer columns or rows`, `EXPORT_HINT`),
+    `export_failed`, `export_busy` (ONE export at a time per toolset, an
+    `asyncio.Lock`; a second call is refused, not queued; the registry shares
+    one toolset across all users of an agent, so a second user's export of
+    the same agent answers `export_busy` while the first runs); order:
     refuse first, then read, then store. **What Allow SELECT
     exposes**: the whole `SYS` catalogue and every monitoring view the
     database user can read, among them statement texts WITH their literal
@@ -4268,7 +4284,13 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   values as stored, `offset` paging for `run_check` / `run_select` and the
   tool `export_result` (an Excel file in the web chat conversation); a file a
   tool stores gets a file card in the web chat; no new resource, environment
-  variable, role, table or column (HANA schema generation unchanged, still 12)
+  variable, role, table or column (HANA schema generation unchanged, still 12).
+  With this deploy EVERY existing `builtin:hana` agent, with or without Allow
+  SELECT, returns ini values unmasked from `iniContents` (a credential, path
+  or host kept in an ini file reaches the model and the stored chat history)
+  without any admin action. An already seeded landscape keeps its old
+  `hana-monitoring` skill text (the seed fills an empty registry only): an
+  admin pastes the new text by hand
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets

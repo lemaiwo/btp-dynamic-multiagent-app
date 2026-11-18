@@ -101,6 +101,8 @@ OFFSET_MAX = 100_000
 OFFSET_RULE = f"must be a whole number from 0 to {OFFSET_MAX}"
 #: The fixed hint of a ``result_too_large`` refusal: a smaller page fits.
 PAGE_HINT = "lower top"
+#: The fixed hint of an ``export_too_large`` refusal.
+EXPORT_HINT = "select fewer columns or rows"
 #: What a registered check reads of each LOB value (a statement text) unless
 #: the check sets its own ``lob_chars``: the masking keeps 300 characters of
 #: it, so more is never needed.
@@ -122,6 +124,8 @@ def _error(exc: HanaError) -> dict[str, Any]:
     error = exc.to_dict()
     if error.get("code") == "result_too_large":
         error["hint"] = PAGE_HINT
+    elif error.get("code") == "export_too_large":
+        error["hint"] = EXPORT_HINT
     return {"error": error}
 
 
@@ -176,7 +180,8 @@ and the arguments each one takes. Categories: {categories}.
 
 Leave an argument out unless the check lists it: an argument the check does
 not take is refused. Defaults when left out: `top` {top.default}, `hours`
-{hours.default}, `schema`, `object`, `host` and `other_schema` none (no filter).
+{hours.default}, `schema`, `object`, `host`, `other_schema`, `section` and `key`
+none (no filter).
 `truncated: true` means more rows exist than were returned; every answer (each
 part of a several-part check) also says its `offset` and `next_offset`, the
 `offset` to pass for the next page (`null` when nothing more is there). A long

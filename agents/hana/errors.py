@@ -34,7 +34,7 @@ MESSAGES: dict[str, str] = {
     "unknown_system": "No system of that name is configured for this agent.",
     "unknown_check": "No check of that name exists.",
     "invalid_argument": "An argument of the call is not valid.",
-    "select_refused": "The statement is not a read of the allowed monitoring views.",
+    "select_refused": "The statement is not a read the guard allows.",
     "result_too_large": "The result is too large to return; narrow the query.",
     "sql_error": "The database refused the statement.",
     "call_failed": "The call could not be completed. Tell the user instead of retrying.",
