@@ -361,11 +361,12 @@ opaTest("a second entry is refused in the dialog; a stored entry in another spel
     });
     iSwitchAllowSelect(When, false);
     iSwitchAllowSelect(When, true);
+    iAnswer(When, "Allow SELECT");
     iPressInTheDialog(When, "serverConfirm");
     iSeeTheForm(Then, "the entry in its canonical spelling", function (data) {
         Opa5.assert.deepEqual(data.mcp_servers[2], {
             url: HANA, auth_mode: "destination", oauth: { systems: [TENANT, SYSTEMDB], allow_select: true }
-        }, "no question for a switch the entry already had; OK writes the canonical url");
+        }, "switched off and on again, it was asked about; OK writes the canonical url");
     }, (data) => data.mcp_servers[2]?.url === HANA);
     Then.iStopTheApp();
 });
@@ -683,6 +684,52 @@ opaTest("a stored allow_select_all switched off and on again is asked about; Can
         Opa5.assert.deepEqual(data.mcp_servers[2].oauth, { systems: [TENANT], allow_select: true },
             "OK asks nothing and allow_select_all is gone");
     }, (data) => !(data.mcp_servers[2].oauth as Record<string, unknown>).allow_select_all);
+    Then.iStopTheApp();
+});
+
+opaTest("a stored allow_select switched off and on again is asked about; Cancel leaves it off and OK asks nothing more", function (Given: Common, When: Common, Then: Common) {
+    const ONE = "(SYS, _SYS_STATISTICS, M_*) of \"erp_tenant\" (hana-erp-tenant). ";
+    iOpenAgent(Given, When, 101, () => storeEntry(101, { systems: [TENANT], allow_select: true }));
+    iSeeTheServers(When, 3);
+    iEditServer(When, 2);
+    iSeeTheEntry(Then, "the stored entry", (entry) => entry.rows.length === 1 && entry.allowSelect, function () {
+        Opa5.assert.ok(true, "Allow SELECT is on as stored");
+    });
+    iSwitchAllowSelect(When, false);
+    iSeeTheEntry(Then, "Allow SELECT off", (entry) => !entry.allowSelect, function () {
+        Opa5.assert.ok(true, "switched off without a question");
+    });
+    iSeeNoMessage(Then, "switching off asks nothing");
+    iSwitchAllowSelect(When, true);
+    iSeeAMessage(Then, "the question again", function (dialog) {
+        Opa5.assert.ok(messageOf(dialog).indexOf(ONE) > -1, "switching it off forgot what the stored entry said");
+        const focus = Element.getElementById((dialog as Dialog).getInitialFocus()) as Button | undefined;
+        Opa5.assert.strictEqual(focus?.getText(), "Cancel", "Cancel has the initial focus");
+    });
+    iAnswer(When, "Cancel");
+    iSeeTheEntry(Then, "Allow SELECT back off", (entry) => !entry.allowSelect, function () {
+        Opa5.assert.ok(true, "Cancel leaves it off");
+    });
+    iSeeNoMessage(Then, "the question is closed");
+    iSwitchAllowSelect(When, true);
+    iSeeAMessage(Then, "the question once more", function (dialog) {
+        Opa5.assert.ok(messageOf(dialog).indexOf(ONE) > -1, "asked again after Cancel");
+    });
+    iAnswer(When, "Allow SELECT");
+    iSeeTheEntry(Then, "Allow SELECT on", (entry) => entry.allowSelect, function () {
+        Opa5.assert.ok(true, "the answer switched it on");
+    });
+    iSeeNoMessage(Then, "the answered question is closed");
+    iPressInTheDialog(When, "serverConfirm");
+    iSeeTheForm(Then, "the entry with Allow SELECT", function (data) {
+        Opa5.assert.deepEqual(data.mcp_servers[2].oauth, { systems: [TENANT], allow_select: true },
+            "OK asks nothing more for the systems just confirmed (no dialog is open)");
+    }, (data) => !!data.mcp_servers[2]);
+    iPressSave(When);
+    iSeeTheSavedAgent(Then, "the saved agent", function () {
+        Opa5.assert.deepEqual(sentServers()[2].oauth, { systems: [TENANT], allow_select: true },
+            "saved with allow_select: true");
+    });
     Then.iStopTheApp();
 });
 

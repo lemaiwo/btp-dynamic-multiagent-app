@@ -212,14 +212,17 @@ export default class HanaEntryPart {
     /**
      * The switch. Switched on where the entry did not already allow it, it
      * asks first, naming the systems; Cancel is the default and puts it
-     * back off. Switched off, it takes the second switch with it and
-     * forgets every answer about that one.
+     * back off. Switched off, it forgets what the stored entry said and
+     * every answer about it, and takes the second switch with it (its
+     * stored value and answers too): switching it on again asks.
      */
     public onAllowSelectChange(event: Event): void {
         const model = this.host.serverModel();
         const on = (event.getSource() as unknown as { getState(): boolean }).getState() === true;
         model.setProperty("/hana/allowSelect", on);
         if (!on) {
+            model.setProperty("/hana/storedAllowSelect", false);
+            model.setProperty("/hana/confirmed", []);
             model.setProperty("/hana/allowSelectAll", false);
             model.setProperty("/hana/storedAllowSelectAll", false);
             model.setProperty("/hana/confirmedAll", []);
