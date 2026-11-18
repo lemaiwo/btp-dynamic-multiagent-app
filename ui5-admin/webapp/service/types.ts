@@ -260,6 +260,12 @@ export type OAuthClient =
            * monitoring views; stored only as `true`.
            */
           allow_select?: boolean;
+          /**
+           * `builtin:hana` only. Lets that SELECT read every schema the
+           * database user can read; stored only as `true`, and only
+           * together with `allow_select: true`.
+           */
+          allow_select_all?: boolean;
       };
 
 export interface McpServer {

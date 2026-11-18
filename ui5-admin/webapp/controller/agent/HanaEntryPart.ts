@@ -50,8 +50,34 @@ export interface HanaEntryState {
      *  the admin answered the question in this dialog. OK asks again for
      *  any other. */
     confirmed: HanaSystem[];
+    /** "Allow SELECT on all schemas": only ever with Allow SELECT on. */
+    allowSelectAll: boolean;
+    /** What the entry said about it when the dialog opened; forgotten when
+     *  Allow SELECT is switched off, so switching it on again asks. */
+    storedAllowSelectAll: boolean;
+    /** The systems the second switch was agreed for, its own track: an
+     *  answer to the Allow SELECT question never counts for it. */
+    confirmedAll: HanaSystem[];
     duplicate: string;
 }
+
+/** The texts of one of the two questions and where its answer is kept. */
+interface Question {
+    confirm: string;
+    title: string;
+    yes: string;
+    /** The path under `server>` of the systems the answer covers. */
+    confirmed: string;
+}
+
+const SELECT: Question = {
+    confirm: "hanaAllowSelectConfirm", title: "hanaAllowSelectTitle", yes: "hanaAllowSelectYes",
+    confirmed: "/hana/confirmed"
+};
+const SELECT_ALL: Question = {
+    confirm: "hanaAllowSelectAllConfirm", title: "hanaAllowSelectAllTitle", yes: "hanaAllowSelectAllYes",
+    confirmed: "/hana/confirmedAll"
+};
 
 /** A refusal of the server, with its text, kept for the server row it names. */
 export interface HanaServerRefusal extends HanaRefusal {
@@ -65,7 +91,9 @@ const DEST_MODEL = "hanaDest";
  * The server dialog's "SAP HANA (monitoring)" entry: a table of systems (a
  * name the model sees and the destination of that one database), Add and
  * Remove, the switch "Allow SELECT on monitoring views" (asked before it is
- * switched on), and a second entry refused. Kept apart from
+ * switched on), the switch "Allow SELECT on all schemas" (only with the
+ * first, asked about on its own, with its own record of the systems it was
+ * agreed for), and a second entry refused. Kept apart from
  * `AgentDetail.controller.ts`, which only hands its events over; the rules
  * are `model/hanaEntry.ts`, which mirrors `agents/hana/config.py`.
  *
@@ -109,8 +137,12 @@ export default class HanaEntryPart {
             void this.destinations.load();
         }
         const allow = stored.allow_select === true;
+        // `clean` keeps allow_select_all only together with allow_select.
+        const all = stored.allow_select_all === true;
         return { rows, allowSelect: allow, storedAllowSelect: allow,
-            confirmed: allow ? stored.systems.slice() : [], duplicate: "" };
+            confirmed: allow ? stored.systems.slice() : [],
+            allowSelectAll: all, storedAllowSelectAll: all,
+            confirmedAll: all ? stored.systems.slice() : [], duplicate: "" };
     }
 
     /** "SAP HANA (monitoring)" was picked in a dialog opened for something else. */
@@ -158,36 +190,67 @@ export default class HanaEntryPart {
     /**
      * The switch. Switched on where the entry did not already allow it, it
      * asks first, naming the systems; Cancel is the default and puts it
-     * back off.
+     * back off. Switched off, it takes the second switch with it and
+     * forgets every answer about that one.
      */
     public onAllowSelectChange(event: Event): void {
         const model = this.host.serverModel();
         const on = (event.getSource() as unknown as { getState(): boolean }).getState() === true;
         model.setProperty("/hana/allowSelect", on);
-        if (!on || !hanaEntry.selectNewlyAllowed(
+        if (!on) {
+            model.setProperty("/hana/allowSelectAll", false);
+            model.setProperty("/hana/storedAllowSelectAll", false);
+            model.setProperty("/hana/confirmedAll", []);
+            return;
+        }
+        if (!hanaEntry.selectNewlyAllowed(
             { allow_select: model.getProperty("/hana/storedAllowSelect") === true }, { allow_select: true })) {
             return;
         }
-        this.ask(() => {
+        this.ask(SELECT, () => {
             model.setProperty("/hana/allowSelect", false);
         });
     }
 
     /**
-     * The question about Allow SELECT, naming every system of the entry now.
-     * "Allow SELECT" records them as confirmed and calls `allowed`; Cancel
-     * (the default) calls `cancelled`.
+     * The second switch. Enabled only while Allow SELECT is on (the
+     * fragment); switched on where the entry did not already allow it, it
+     * asks its own question; Cancel is the default and puts it back off.
      */
-    private ask(cancelled: () => void, allowed?: () => void): void {
+    public onAllowSelectAllChange(event: Event): void {
+        const model = this.host.serverModel();
+        const on = (event.getSource() as unknown as { getState(): boolean }).getState() === true;
+        if (on && model.getProperty("/hana/allowSelect") !== true) {
+            // Never on its own: the server refuses it without Allow SELECT.
+            model.setProperty("/hana/allowSelectAll", false);
+            return;
+        }
+        model.setProperty("/hana/allowSelectAll", on);
+        if (!on || !hanaEntry.selectAllNewlyAllowed(
+            { allow_select: true, allow_select_all: model.getProperty("/hana/storedAllowSelectAll") === true },
+            { allow_select: true, allow_select_all: true })) {
+            return;
+        }
+        this.ask(SELECT_ALL, () => {
+            model.setProperty("/hana/allowSelectAll", false);
+        });
+    }
+
+    /**
+     * One of the two questions, naming every system of the entry now. Its
+     * answer records them as confirmed for that question only and calls
+     * `allowed`; Cancel (the default) calls `cancelled`.
+     */
+    private ask(question: Question, cancelled: () => void, allowed?: () => void): void {
         const model = this.host.serverModel();
         // Each system with its destination: a changed destination is what the
         // admin is asked about again, so the question shows it.
         const named = this.rows().filter((row) => row.name !== "");
         const which = named.length > 0 ? named.map((row) => hanaEntry.shownSystem(row)).join(", ")
             : this.host.text("hanaAllowSelectTheseSystems");
-        const allow = this.host.text("hanaAllowSelectYes");
-        MessageBox.warning(this.host.text("hanaAllowSelectConfirm", [which]), {
-            title: this.host.text("hanaAllowSelectTitle"),
+        const allow = this.host.text(question.yes);
+        MessageBox.warning(this.host.text(question.confirm, [which]), {
+            title: this.host.text(question.title),
             actions: [allow, MessageBox.Action.CANCEL],
             emphasizedAction: allow,
             initialFocus: MessageBox.Action.CANCEL,
@@ -196,7 +259,7 @@ export default class HanaEntryPart {
                     cancelled();
                     return;
                 }
-                model.setProperty("/hana/confirmed", this.block().systems);
+                model.setProperty(question.confirmed, this.block().systems);
                 allowed?.();
             }
         });
@@ -243,7 +306,9 @@ export default class HanaEntryPart {
      * a block the server would refuse (the row and field it names are
      * marked), or Allow SELECT on while a system was not confirmed for it
      * (asked with the whole list; the answer "Allow SELECT" calls `again`,
-     * which is OK once more; Cancel, the default, changes nothing).
+     * which is OK once more; Cancel, the default, changes nothing), or
+     * likewise Allow SELECT on all schemas, asked after Allow SELECT with its
+     * own question and its own record.
      */
     public confirm(table: Table | undefined, again: () => void): boolean {
         const model = this.host.serverModel();
@@ -274,17 +339,25 @@ export default class HanaEntryPart {
         const block = this.block();
         if (block.allow_select === true && hanaEntry.unconfirmed(
             model.getProperty("/hana/confirmed") as HanaSystem[] | undefined, block.systems).length > 0) {
-            this.ask(() => undefined, again);
+            this.ask(SELECT, () => undefined, again);
+            return false;
+        }
+        if (block.allow_select_all === true && hanaEntry.unconfirmed(
+            model.getProperty("/hana/confirmedAll") as HanaSystem[] | undefined, block.systems).length > 0) {
+            this.ask(SELECT_ALL, () => undefined, again);
             return false;
         }
         return true;
     }
 
-    /** The block OK puts into the form: exactly `{systems, allow_select?}`. */
+    /** The block OK puts into the form: exactly `{systems, allow_select?,
+     *  allow_select_all?}`; `clean` keeps the second only with the first. */
     public block(): HanaEntry {
+        const model = this.host.serverModel();
         return hanaEntry.clean({
             systems: this.rows().map((row) => ({ name: row.name, destination: row.destination })),
-            allow_select: this.host.serverModel().getProperty("/hana/allowSelect") === true
+            allow_select: model.getProperty("/hana/allowSelect") === true,
+            allow_select_all: model.getProperty("/hana/allowSelectAll") === true
         });
     }
 

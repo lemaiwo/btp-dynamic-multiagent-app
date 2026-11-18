@@ -292,7 +292,8 @@ export default {
         }
         if (key === hanaEntry.HANA_URL) {
             // --- hana --- As for InA, first and whatever the mode: exactly
-            // the systems and `allow_select` only as true; no top-level
+            // the systems, `allow_select` and `allow_select_all` only as true
+            // (the second only with the first); no top-level
             // destination, no user_context.
             return hanaEntry.clean(raw) as McpServer["oauth"];
         }
