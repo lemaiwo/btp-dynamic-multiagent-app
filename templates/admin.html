@@ -870,9 +870,18 @@ function addMcpServerRow(server) {
     // Ticking "Allow SELECT" (builtin:hana) asks first; Cancel leaves it
     // unticked, OK covers the systems listed at that moment.
     row.querySelector('.dest-allow_select').addEventListener('change', e => {
+        if (e.target.checked) {
+            if (!confirm(HANA_ALLOW_SELECT_CONFIRM)) e.target.checked = false;
+            else hanaCoverCurrent(row);
+        }
+        hanaSyncAllBox(row);
+    });
+    // "Allow SELECT on all schemas" needs Allow SELECT (it is disabled and
+    // unticked without it) and asks its own question; Cancel leaves it unticked.
+    row.querySelector('.dest-allow_select_all').addEventListener('change', e => {
         if (!e.target.checked) return;
-        if (!confirm(HANA_ALLOW_SELECT_CONFIRM)) e.target.checked = false;
-        else hanaCoverCurrent(row);
+        if (!confirm(HANA_ALLOW_SELECT_ALL_CONFIRM)) e.target.checked = false;
+        else hanaCoverCurrentAll(row);
     });
     const modeSelect = row.querySelector('.mcp-auth-mode');
     const storedMode = server.auth_mode || 'jwt';
@@ -2703,7 +2712,7 @@ const DESTINATION_FIELDS = {
     // On-premise SAP HANA monitoring views, as the database user of each
     // system's destination: no destination of its own and no user_context
     // (agents/hana/config.py refuses both). Collected by `collectHanaConfig`.
-    'builtin:hana':          ['systems', 'allow_select'],
+    'builtin:hana':          ['systems', 'allow_select', 'allow_select_all'],
     // No destination name and no user_context: both belong to each catalogue
     // service (`_validate_odata_entry` in agents/admin.py refuses any key but
     // these two). Collected by `collectODataConfig`, not the generic branch.
@@ -2742,6 +2751,16 @@ const HANA_ALLOW_SELECT_CONFIRM = 'This lets the agent run its own SELECT statem
 // with allow_select; replaced by the row's systems at every OK; emptied when
 // the row's URL turns into another toolset.
 const HANA_COVERED = new WeakMap();
+// The question of "Allow SELECT on all schemas" (allow_select_all), at the
+// toggle and at the save; fixed text, it names no system, schema or destination.
+const HANA_ALLOW_SELECT_ALL_CONFIRM = 'This lets the agent run its own SELECT statements on every schema the '
+    + 'database user of the listed systems can read, including business tables. Rows of business '
+    + 'and personal data reach the AI model and stay in the stored conversation and in exported '
+    + 'files. On a system database it also reaches the monitoring views of all tenant databases. '
+    + 'The statements stay read-only. Continue?';
+// Per hana row: the systems an answer to that second question covers, kept
+// like HANA_COVERED; emptied whenever the box is unticked by the page.
+const HANA_COVERED_ALL = new WeakMap();
 // --- builtin:reconcile ---
 const RECONCILE_BUILTIN = 'builtin:reconcile';
 const RECONCILE_KEYS = ['arc1_server', 'target', 'batch_size', 'mismatch_cap'];
@@ -2925,6 +2944,9 @@ function destinationFieldsHtml() {
                 <label class="full dest-field-allow_select">
                     <input type="checkbox" class="dest-allow_select"> Allow SELECT on monitoring views
                 </label>
+                <label class="full dest-field-allow_select_all">
+                    <input type="checkbox" class="dest-allow_select_all" disabled> Allow SELECT on all schemas (read-only)
+                </label>
                 <label class="dest-field-provider">Provider
                     <select class="dest-provider">
                         <option value="github">GitHub</option>
@@ -3003,6 +3025,14 @@ function fillDestinationFields(row, oauth) {
         ? storedSystems.filter(sys => sys && typeof sys.name === 'string' && typeof sys.destination === 'string')
             .map(sys => hanaSystemKey(sys.name, sys.destination))
         : []));
+    // allow_select_all only with allow_select, each as the JSON boolean true.
+    const storedAll = isHana && oauth.allow_select === true && oauth.allow_select_all === true;
+    row.querySelector('.dest-allow_select_all').checked = storedAll;
+    HANA_COVERED_ALL.set(row, new Set(storedAll
+        ? storedSystems.filter(sys => sys && typeof sys.name === 'string' && typeof sys.destination === 'string')
+            .map(sys => hanaSystemKey(sys.name, sys.destination))
+        : []));
+    hanaSyncAllBox(row);
     row.querySelector('.dest-require_green_builds').checked = !(isBitbucket && oauth.require_green_builds === false);
     // builtin:odata. What a stored block of ANOTHER type holds under these
     // two keys is never loaded: making such a row an odata row later must not
@@ -3083,6 +3113,7 @@ function syncDestinationFields(row) {
     if (builtin !== HANA_BUILTIN && destinationFieldsFor(builtin) !== null) {
         row.querySelector('.dest-allow_select').checked = false;
         HANA_COVERED.set(row, new Set());
+        hanaSyncAllBox(row);
     }
     row.dataset.destBuiltin = builtin;
     // One repositories field for two toolsets with two shapes.
@@ -3484,6 +3515,31 @@ function hanaCoverCurrent(row) {
         .map(parts => hanaSystemKey(parts[0], parts[1]))));
 }
 
+/** OK to the all-schemas question: it covers the systems the row lists now. */
+function hanaCoverCurrentAll(row) {
+    HANA_COVERED_ALL.set(row, new Set(hanaSystemLines(row).filter(parts => parts.length === 2)
+        .map(parts => hanaSystemKey(parts[0], parts[1]))));
+}
+
+/**
+ * "Allow SELECT on all schemas" follows Allow SELECT: enabled only while it
+ * is ticked, otherwise unticked and its coverage forgotten.
+ */
+function hanaSyncAllBox(row) {
+    const allBox = row.querySelector('.dest-allow_select_all');
+    allBox.disabled = !row.querySelector('.dest-allow_select').checked;
+    if (allBox.disabled) {
+        allBox.checked = false;
+        HANA_COVERED_ALL.set(row, new Set());
+    }
+}
+
+/** True when the row lists a system the given coverage does not hold. */
+function hanaUncovered(row, covered) {
+    return hanaSystemLines(row).filter(parts => parts.length === 2)
+        .some(parts => !(covered || new Set()).has(hanaSystemKey(parts[0], parts[1])));
+}
+
 /**
  * At save: Allow SELECT applies to every system of the entry, so a ticked
  * row that lists a system no answer covered asks again, once. Cancel: false
@@ -3494,12 +3550,15 @@ function confirmHanaCoverage() {
     for (const row of rows) {
         if (destinationBuiltinOf(row) !== HANA_BUILTIN) continue;
         if (!row.querySelector('.dest-allow_select').checked) continue;
-        const covered = HANA_COVERED.get(row) || new Set();
-        const uncovered = hanaSystemLines(row).filter(parts => parts.length === 2)
-            .some(parts => !covered.has(hanaSystemKey(parts[0], parts[1])));
-        if (!uncovered) continue;
-        if (!confirm(HANA_ALLOW_SELECT_CONFIRM)) return false;
-        hanaCoverCurrent(row);
+        if (hanaUncovered(row, HANA_COVERED.get(row))) {
+            if (!confirm(HANA_ALLOW_SELECT_CONFIRM)) return false;
+            hanaCoverCurrent(row);
+        }
+        // Allow SELECT on all schemas likewise, with its own question.
+        if (!row.querySelector('.dest-allow_select_all').checked) continue;
+        if (!hanaUncovered(row, HANA_COVERED_ALL.get(row))) continue;
+        if (!confirm(HANA_ALLOW_SELECT_ALL_CONFIRM)) return false;
+        hanaCoverCurrentAll(row);
     }
     return true;
 }
@@ -3523,7 +3582,10 @@ function collectHanaConfig(row) {
     });
     if (!systems.length) throw new Error('SAP HANA: list at least one system.');
     const oauth = {systems};
-    if (row.querySelector('.dest-allow_select').checked) oauth.allow_select = true;
+    const allowSelect = row.querySelector('.dest-allow_select').checked;
+    if (allowSelect) oauth.allow_select = true;
+    // Only together with allow_select, as the server requires.
+    if (allowSelect && row.querySelector('.dest-allow_select_all').checked) oauth.allow_select_all = true;
     return oauth;
 }
 
