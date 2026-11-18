@@ -51,6 +51,11 @@ EXPORT_LOB_BUDGET = 5_000_000
 #: counted while they are fetched (``row_chars_budget`` of ``run_query``): a
 #: wide table stops before 10,001 rows of it are held, copied and written.
 EXPORT_ROW_CHARS_BUDGET = 20_000_000
+#: The workbook's column cap (``MAX_COLUMNS`` of :mod:`agents.webchat.docgen`,
+#: not imported here so this module does not load the web chat at import),
+#: checked by ``run_query`` (``max_columns``) before anything is fetched; the
+#: check in :meth:`HanaExport.write` stays as the second line.
+EXPORT_MAX_COLUMNS = 100
 EXPORT_TOP_RULE = f"must be a whole number from 1 to {EXPORT_MAX_ROWS}"
 EXPORT_ONE_OF_RULE = "give exactly one of check and sql"
 EXPORT_NO_SQL_RULE = "free SQL is not allowed for this agent"
@@ -58,9 +63,9 @@ EXPORT_CHECK_ONLY_RULE = "only with check"
 EXPORT_FILENAME_RULE = "must be a file name with at least one usable character"
 
 __all__ = ["EXPORT_CHECK_ONLY_RULE", "EXPORT_FILENAME_RULE", "EXPORT_LOB_BUDGET",
-           "EXPORT_LOB_CHARS", "EXPORT_MAX_ROWS", "EXPORT_NO_SQL_RULE", "EXPORT_ONE_OF_RULE",
-           "EXPORT_PREVIEW_ROWS", "EXPORT_ROW_CHARS_BUDGET", "EXPORT_TOP_RULE", "HanaExport",
-           "export_top"]
+           "EXPORT_LOB_CHARS", "EXPORT_MAX_COLUMNS", "EXPORT_MAX_ROWS", "EXPORT_NO_SQL_RULE",
+           "EXPORT_ONE_OF_RULE", "EXPORT_PREVIEW_ROWS", "EXPORT_ROW_CHARS_BUDGET",
+           "EXPORT_TOP_RULE", "HanaExport", "export_top"]
 
 Run = Callable[..., Awaitable[tuple[Any, Any, Any]]]
 Read = tuple[dict[str, Any], list[dict[str, Any]], list[tuple[str, list[str]]]]
@@ -68,14 +73,15 @@ Read = tuple[dict[str, Any], list[dict[str, Any]], list[tuple[str, list[str]]]]
 
 async def _read(run: Run, target: HanaSystem, sql: str, binds: Any,
                 top_rows: int) -> tuple[Any, Any, Any]:
-    """One read of an export, with its LOB and row-character budgets. A read
-    over either budget is ``export_too_large`` here, not ``result_too_large``:
-    the file, not an answer, is what would be too large, and nothing is
-    stored."""
+    """One read of an export, with its LOB and row-character budgets and its
+    column cap (checked before the fetch). A read over any of them is
+    ``export_too_large`` here, not ``result_too_large``: the file, not an
+    answer, is what would be too large, and nothing is stored."""
     try:
         return await run(target, sql, binds, top_rows, lob_chars=EXPORT_LOB_CHARS,
                          lob_budget=EXPORT_LOB_BUDGET,
-                         row_chars_budget=EXPORT_ROW_CHARS_BUDGET)
+                         row_chars_budget=EXPORT_ROW_CHARS_BUDGET,
+                         max_columns=EXPORT_MAX_COLUMNS)
     except HanaError as refused:
         if refused.code == "result_too_large":
             raise HanaError("export_too_large") from None

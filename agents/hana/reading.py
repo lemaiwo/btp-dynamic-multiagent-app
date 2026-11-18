@@ -18,8 +18,8 @@ ROW_FETCH_CHUNK = 500
 """Rows per ``fetchmany`` when the caller names a ``row_chars_budget``: the
 budget is checked after each chunk, so at most one chunk is fetched past it."""
 
-__all__ = ["LOB_CUT_MARKER", "LOB_UNREADABLE", "ROW_FETCH_CHUNK", "LobBudget", "LobReader",
-           "RowBudget", "fetch_rows", "row_chars"]
+__all__ = ["LOB_CUT_MARKER", "LOB_UNREADABLE", "ROW_FETCH_CHUNK", "ColumnCap", "LobBudget",
+           "LobReader", "RowBudget", "check_columns", "fetch_rows", "row_chars"]
 
 
 class LobBudget(Exception):
@@ -69,6 +69,20 @@ class LobReader:
         if isinstance(content, str):
             return kept + LOB_CUT_MARKER if len(content) > self.per_value else kept
         return bytes(kept)
+
+
+class ColumnCap(Exception):
+    """The result has more columns than the call's ``max_columns`` (no text)."""
+
+
+def check_columns(columns: list[str], max_columns: int | None) -> None:
+    """Right after ``execute``, before any fetch: a result wider than
+    ``max_columns`` raises :class:`ColumnCap` (the caller answers
+    ``result_too_large``). ``None`` checks nothing. Why before the fetch: an
+    export of ``SELECT *`` on a very wide table would otherwise hold its first
+    chunk of wide rows before the file's column cap could refuse it."""
+    if max_columns is not None and len(columns) > max_columns:
+        raise ColumnCap()
 
 
 class RowBudget(Exception):

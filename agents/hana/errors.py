@@ -43,7 +43,7 @@ MESSAGES: dict[str, str] = {
         "page through it with offset."),
     "export_too_large": (
         "The export is over the file's caps (10,000 rows, 100 columns, "
-        "500,000 cells, 10 MiB); narrow the query."),
+        "500,000 cells, 10 MiB) or holds too much text; narrow the query."),
     "export_failed": "The file could not be stored. Tell the user instead of retrying.",
     "export_busy": "Another export of this agent is running; wait for it to finish.",
 }

@@ -94,9 +94,11 @@ from typing import Any, NamedTuple
 from agents.hana import BUILTIN_HANA_URL
 from agents.hana.errors import HanaError
 from agents.hana.reading import LOB_CUT_MARKER, LOB_UNREADABLE, ROW_FETCH_CHUNK
+from agents.hana.reading import ColumnCap as _ColumnCap
 from agents.hana.reading import LobBudget as _LobBudget
 from agents.hana.reading import LobReader as _LobReader
 from agents.hana.reading import RowBudget as _RowBudget
+from agents.hana.reading import check_columns as _check_columns
 from agents.hana.reading import fetch_rows as _fetch
 
 logger = logging.getLogger(__name__)
@@ -669,7 +671,7 @@ def _quiet(system: str, step: str, action: Any) -> None:
 
 def _execute(system: str, kwargs: dict[str, Any], sql: str, binds: tuple,
              max_rows: int, lob: tuple[int, int] = (LOB_MAX_CHARS, LOB_BUDGET_CHARS),
-             row_budget: int | None = None
+             row_budget: int | None = None, max_columns: int | None = None
              ) -> tuple[list[str], list[tuple], bool]:
     """The blocking part, in a worker thread. Rollback and close always."""
     from hdbcli import dbapi
@@ -697,6 +699,8 @@ def _execute(system: str, kwargs: dict[str, Any], sql: str, binds: tuple,
         else:
             cursor.execute(sql)
         columns = [str(d[0]) for d in (cursor.description or ())]
+        step = "columns"
+        _check_columns(columns, max_columns)
         step = "fetch"
         fetched = _fetch(cursor, max_rows, row_budget)
         truncated = len(fetched) > max_rows
@@ -727,7 +731,7 @@ def _spawn(coro: Any) -> asyncio.Future:
 
 async def _in_slot(system: str, account: str, digest: str, kwargs: dict[str, Any],
                    sql: str, binds: tuple, max_rows: int, lob: tuple[int, int],
-                   row_budget: int | None = None
+                   row_budget: int | None = None, max_columns: int | None = None
                    ) -> tuple[list[str], list[tuple], bool]:
     """Wait for the login turn and a free slot, then run in a worker thread.
 
@@ -757,7 +761,7 @@ async def _in_slot(system: str, account: str, digest: str, kwargs: dict[str, Any
         if _gate_closed(account, digest):
             raise HanaError("login_failed")  # recorded since the slot check
         return await asyncio.to_thread(_execute, system, kwargs, sql, binds, max_rows, lob,
-                                       row_budget)
+                                       row_budget, max_columns)
 
     def _start(holds_lock: bool) -> asyncio.Future:
         def _done(fut: asyncio.Future) -> None:
@@ -838,7 +842,8 @@ async def _in_slot(system: str, account: str, digest: str, kwargs: dict[str, Any
 async def run_query(system: HanaSystem, sql: str, binds: Sequence[Any],
                     max_rows: int, *, lob_chars: int = LOB_MAX_CHARS,
                     lob_budget: int = LOB_BUDGET_CHARS,
-                    row_chars_budget: int | None = None
+                    row_chars_budget: int | None = None,
+                    max_columns: int | None = None
                     ) -> tuple[list[str], list[tuple], bool]:
     """Run one read on ``system``: ``(columns, rows, truncated)``.
 
@@ -850,11 +855,13 @@ async def run_query(system: HanaSystem, sql: str, binds: Sequence[Any],
     (``None``: one ``fetchmany``, as always) bounds the text and binary
     values of the fetched rows together, counted while they are fetched in
     chunks (:func:`_fetch`); a call over it is ``result_too_large`` too.
+    ``max_columns`` (``None``: no check) refuses a wider result right after
+    ``execute``, before anything is fetched, as ``result_too_large``.
     """
-    if row_chars_budget is not None and not (
-            isinstance(row_chars_budget, int) and not isinstance(row_chars_budget, bool)
-            and row_chars_budget >= 0):
-        raise HanaError("invalid_argument")
+    for limit in (row_chars_budget, max_columns):
+        if limit is not None and not (
+                isinstance(limit, int) and not isinstance(limit, bool) and limit >= 0):
+            raise HanaError("invalid_argument")
     if not (isinstance(max_rows, int) and not isinstance(max_rows, bool)
             and max_rows >= 1):
         raise HanaError("invalid_argument")
@@ -905,12 +912,16 @@ async def run_query(system: HanaSystem, sql: str, binds: Sequence[Any],
     try:
         return await _in_slot(system.name, account, digest, kwargs, sql,
                               tuple(binds), max_rows, (lob_chars, lob_budget),
-                              row_chars_budget)
+                              row_chars_budget, max_columns)
     except _Failed as failed:
         caught: _Failed | None = failed
     if isinstance(caught.cause, _LobBudget):
         logger.warning("hana: LOB values of system %s passed the call's budget; "
                        "reading stopped (result_too_large)", system.name)
+        raise HanaError("result_too_large")
+    if isinstance(caught.cause, _ColumnCap):
+        logger.warning("hana: result of system %s has more columns than the call's cap; "
+                       "nothing fetched (result_too_large)", system.name)
         raise HanaError("result_too_large")
     if isinstance(caught.cause, _RowBudget):
         logger.warning("hana: rows of system %s passed the call's character budget; "

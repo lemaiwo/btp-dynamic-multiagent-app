@@ -228,7 +228,7 @@ async def test_export_binds_export_top(monkeypatch: pytest.MonkeyPatch, chat) ->
     assert answer["row_count"] == 1
     assert seen == [("SELECT TOP ? A, B FROM SYS.M_Y", (10_001,), 10_000,
                      {"lob_chars": 4096, "lob_budget": 5_000_000,
-                      "row_chars_budget": 20_000_000})]
+                      "row_chars_budget": 20_000_000, "max_columns": 100})]
     seen.clear()
     await export(system="erp_tenant", check="topped", filename="t", top=200)
     assert seen[0][1:3] == ((201,), 200)
@@ -237,7 +237,8 @@ async def test_export_binds_export_top(monkeypatch: pytest.MonkeyPatch, chat) ->
     assert seen[0][1:] == (("SYS", "SYS", 24), 10_000,
                            {"lob_chars": tools.EXPORT_LOB_CHARS,
                             "lob_budget": tools.EXPORT_LOB_BUDGET,
-                            "row_chars_budget": EXPORT_ROW_CHARS_BUDGET})
+                            "row_chars_budget": EXPORT_ROW_CHARS_BUDGET,
+                            "max_columns": 100})
 
 
 async def test_export_composite_check_writes_one_sheet_per_part(db: h.FakeDbapi,

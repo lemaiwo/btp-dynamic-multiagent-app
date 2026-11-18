@@ -198,3 +198,101 @@ async def test_the_export_passes_the_budget_and_run_check_and_run_select_do_not(
 def test_select_refused_does_not_claim_monitoring_views_only() -> None:
     # An entry with allow_select_all reads every schema: the text must hold there too.
     assert MESSAGES["select_refused"] == "The statement is not a read the guard allows."
+
+
+# ---- fix re-review Minor A: the column cap before the read ----------------------------
+
+
+def _wide(count: int) -> tuple:
+    return tuple((f"C{i}",) for i in range(count))
+
+
+async def test_max_columns_refuses_before_any_fetch(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = h.install(monkeypatch, h.FakeDbapi(rows=[(1, 2, 3)]))
+    db.description = _wide(3)
+    with pytest.raises(HanaError) as info:
+        await run_query(_system(), "SELECT * FROM SYS.M_X", [], 5, max_columns=2)
+    assert info.value.code == "result_too_large"
+    assert _fetches(db) == []  # nothing fetched: the description alone decided
+    _ends_clean(db)
+    # The login worked: the call is recorded as any call past connect.
+    state = connection._logins[connection._accounts["hana-test"]]
+    assert state.confirmed is not None
+
+
+async def test_max_columns_at_the_cap_reads_as_before(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = h.install(monkeypatch, h.FakeDbapi(rows=[(1, 2, 3)]))
+    db.description = _wide(3)
+    columns, rows, _ = await run_query(_system(), "SELECT * FROM SYS.M_X", [], 5,
+                                       max_columns=3)
+    assert columns == ["C0", "C1", "C2"] and rows == [(1, 2, 3)]
+    assert _fetches(db) == [6]
+
+
+@pytest.mark.parametrize("bad", [-1, True, 1.5, "100"])
+async def test_max_columns_must_be_a_whole_number(monkeypatch: pytest.MonkeyPatch,
+                                                  bad: Any) -> None:
+    db = h.install(monkeypatch, h.FakeDbapi(rows=[(1, 2)]))
+    with pytest.raises(HanaError) as info:
+        await run_query(_system(), "SELECT A, B FROM SYS.M_X", [], 5, max_columns=bad)
+    assert info.value.code == "invalid_argument"
+    assert db.calls == []
+
+
+async def test_an_export_of_101_columns_is_refused_before_it_reads(
+        monkeypatch: pytest.MonkeyPatch, saved: _Saved) -> None:
+    db = h.install(monkeypatch, h.FakeDbapi(rows=[tuple(range(101))] * 3))
+    db.description = _wide(101)
+    answer = await _export(system="erp_tenant", sql="SELECT * FROM SYS.M_ALERTS",
+                           filename="wide")
+    assert answer == {"error": {"code": "export_too_large",
+                                "message": MESSAGES["export_too_large"],
+                                "hint": "select fewer columns or rows"}}
+    assert saved.files == []
+    assert _fetches(db) == []
+    _ends_clean(db)
+
+
+async def test_the_export_passes_max_columns_and_run_check_and_run_select_do_not(
+        monkeypatch: pytest.MonkeyPatch, saved: _Saved) -> None:
+    seen: list[dict[str, Any]] = []
+
+    async def recorder(system, sql, binds, max_rows, **kw):
+        seen.append(kw)
+        return ["A", "B"], [(1, 2)], False
+
+    monkeypatch.setattr(tools, "run_query", recorder)
+    toolset = _toolset(OAUTH_SELECT)
+    await toolset.tools["export_result"].function(
+        system="erp_tenant", sql="SELECT A, B FROM SYS.M_ALERTS", filename="t")
+    assert seen[-1]["max_columns"] == docgen.MAX_COLUMNS == 100
+    seen.clear()
+    await toolset.tools["run_select"].function(system="erp_tenant",
+                                               sql="SELECT A, B FROM SYS.M_ALERTS")
+    await toolset.tools["run_check"].function(system="erp_tenant", check="alerts")
+    assert len(seen) >= 2 and all("max_columns" not in kw for kw in seen)
+
+
+# ---- fix re-review Minor B: the export's LOB budget -----------------------------------
+
+
+async def test_an_export_over_the_lob_budget_is_export_too_large_and_stores_nothing(
+        monkeypatch: pytest.MonkeyPatch, saved: _Saved) -> None:
+    monkeypatch.setattr(export, "EXPORT_LOB_BUDGET", 50)
+    db = h.install(monkeypatch, h.FakeDbapi())
+    db.rows = [(i, h.FakeLob("t" * 30, db=db)) for i in range(5)]
+    answer = await _export(system="erp_tenant", sql="SELECT A, B FROM SYS.M_ALERTS",
+                           filename="lobs")
+    assert answer["error"]["code"] == "export_too_large"
+    assert answer["error"]["code"] != "result_too_large"
+    assert saved.files == []
+    # 30 + 30 passes 50: the second value stops the reading, no third read.
+    assert db.steps().count("lob_read") == 2
+    _ends_clean(db)
+
+
+# ---- Nit C: the message names the read budget -----------------------------------------
+
+
+def test_export_too_large_names_the_text_budget() -> None:
+    assert "too much text" in MESSAGES["export_too_large"]

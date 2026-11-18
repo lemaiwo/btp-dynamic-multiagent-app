@@ -1059,7 +1059,12 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     a number or a date does not count); once the sum passes the budget
     nothing more is fetched and the call is `result_too_large`, rollback and
     close as always (`fetch_rows` in `agents/hana/reading.py`, which also
-    holds the LOB reader; one WARNING naming the system only). **LOB
+    holds the LOB reader; one WARNING naming the system only). **The column
+    cap** (`run_query(..., max_columns=)`, default `None`: no check; only the
+    export passes one, `EXPORT_MAX_COLUMNS` 100): right after `execute` and
+    before any fetch, a result with more columns is `result_too_large`,
+    rollback and close as always, the login counted as worked
+    (`check_columns` in `reading.py`). **LOB
     values** (`STATEMENT_STRING` of `M_EXPENSIVE_STATEMENTS` /
     `M_ACTIVE_STATEMENTS` is `NCLOB`): every value with a callable `read` is
     read in the worker thread before the rollback (`LobReader`), each up to
@@ -1294,7 +1299,8 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     the text and binary values of the rows within `EXPORT_ROW_CHARS_BUDGET`
     20,000,000 characters, counted while they are fetched (`row_chars_budget`
     of `run_query`), so a wide table stops before 10,001 rows of it are held,
-    copied and written; masked
+    copied and written, and a result of more than 100 columns refused before
+    its first row is fetched (`max_columns`); masked
     columns stay masked; a finite number stays a number, a `Decimal` only when
     the float says exactly the same, else text; rows cut to the workbook's
     500,000 cells, the part then `truncated`). The answer is the file's
@@ -1305,7 +1311,7 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     previews are emptied (`preview_omitted: true`), and if it still does not
     fit only the counts (`row_count`, `truncated`, `column_count`). Refusals
     of its own: `no_chat` (no web chat run bound: a scheduled run, A2A, the
-    classic chat), `export_too_large` (over 100 columns, a read over the LOB
+    classic chat), `export_too_large` (over 100 columns, before or after the read, a read over the LOB
     or the row-character budget, or the store's `too_large`; nothing is
     stored; hint `select fewer columns or rows`, `EXPORT_HINT`),
     `export_failed`, `export_busy` (ONE export at a time per toolset, an
