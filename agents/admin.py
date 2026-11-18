@@ -401,6 +401,9 @@ class OAuthClientPayload(BaseModel):
     # (a list of objects the gate reads key by key), never trimmed.
     systems: list[Any] | None = None
     allow_select: StrictBool = False
+    # builtin:hana only: free SELECT beyond the monitoring views (only
+    # together with allow_select; agents/hana/config.py refuses it alone).
+    allow_select_all: StrictBool = False
     # builtin:reconcile only (auth_mode=none). `arc1_server` names the
     # agent's own ARC-1 server entry by URL; the rest are the run's knobs.
     # Strings like `min_score`; agents/reconcile/config.py is the gate.
@@ -412,7 +415,8 @@ class OAuthClientPayload(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     @field_validator("services", "allow_write", "allow_approve", "allow_push",
-                     "allow_pull_request", "systems", "allow_select", mode="before")
+                     "allow_pull_request", "systems", "allow_select",
+                     "allow_select_all", mode="before")
     @classmethod
     def _null_is_absent(cls, v: Any, info: Any) -> Any:
         """A client that serialises an unset field as ``null`` means "not
@@ -606,6 +610,8 @@ class OAuthClientPayload(BaseModel):
             config["systems"] = copy.deepcopy(self.systems)
         if self.allow_select:
             config["allow_select"] = True
+        if self.allow_select_all:
+            config["allow_select_all"] = True
         return config
 
 
@@ -859,10 +865,11 @@ class McpServerPayload(BaseModel):
                 raise ValueError(_HANA_MODE_TEXT)
             check_hana_entry(self.oauth.to_config() if self.oauth else None)
             return self
-        if self.oauth is not None and (self.oauth.systems or self.oauth.allow_select):
+        if self.oauth is not None and (self.oauth.systems or self.oauth.allow_select
+                                       or self.oauth.allow_select_all):
             raise ValueError(
-                f"oauth.systems and oauth.allow_select belong to a {BUILTIN_HANA_URL} "
-                "entry only; no other server reads them"
+                "oauth.systems, oauth.allow_select and oauth.allow_select_all belong "
+                f"to a {BUILTIN_HANA_URL} entry only; no other server reads them"
             )
         is_reconcile = _server_key(self.url) == BUILTIN_RECONCILE_URL
         if is_reconcile and self.auth_mode != AUTH_MODE_NONE:
@@ -1737,8 +1744,9 @@ def _entry_signature(servers: Any, enabled: Any = True) -> list[Any]:
             stored = {"refused": [server.get("auth_mode"), block]}
         git.append((BUILTIN_GIT_URL, json.dumps(stored, sort_keys=True, default=str)))
     # A ``builtin:hana`` entry the same way, read as the toolset reads it
-    # (`agents.hana.config.pins_of`): the systems and Allow SELECT come from
-    # the build, so an unticked "Allow SELECT", a system taken out or a
+    # (`agents.hana.config.pins_of`): the systems, Allow SELECT and
+    # ``allow_select_all`` come from the build, so an unticked "Allow SELECT"
+    # or a free SELECT switched off, a system taken out or a
     # changed destination must not wait for a manual reload. Systems sorted
     # by name: an edit that only reorders them is no change.
     hana = []
@@ -1751,7 +1759,8 @@ def _entry_signature(servers: Any, enabled: Any = True) -> list[Any]:
                 raise ValueError("not a destination entry")
             pins = hana_pins_of(block)
             stored: Any = {"systems": sorted(pins.systems),
-                           "allow_select": pins.allow_select}
+                           "allow_select": pins.allow_select,
+                           "allow_select_all": pins.allow_select_all}
         except ValueError:
             stored = {"refused": [server.get("auth_mode"), block]}
         hana.append((BUILTIN_HANA_URL, json.dumps(stored, sort_keys=True, default=str)))

@@ -52,6 +52,9 @@ URL = "builtin:hana"
 DEST = "HANA_PRD_SECRET_DEST"
 READING = {"systems": [{"name": "prd", "destination": DEST}]}
 SELECTING = {**READING, "allow_select": True}
+# The reach rules do not depend on the switches: every rule holds alike.
+WIDE = {**SELECTING, "allow_select_all": True}
+BLOCKS = [READING, SELECTING, WIDE]
 NOTES = {"url": "builtin:sapnotes", "auth_mode": "none"}
 AGENTS = "/admin/api/agents"
 READ_TOOLS = {"list_systems", "list_checks", "run_check"}
@@ -121,7 +124,7 @@ def test_the_messages_name_the_entry_not_allow_select():
 
 # --- the payload gate --------------------------------------------------------------
 
-@pytest.mark.parametrize("block", [READING, SELECTING])
+@pytest.mark.parametrize("block", BLOCKS)
 @pytest.mark.parametrize("url", [URL, "Builtin:HANA", " builtin:hana/ "])
 def test_r1_the_gate_refuses_sharing_for_any_hana_entry(block, url):
     from agents.admin import AgentPayload
@@ -133,7 +136,7 @@ def test_r1_the_gate_refuses_sharing_for_any_hana_entry(block, url):
     assert SHARE_RULE in said and '"share_tools"' in said and DEST not in said
 
 
-@pytest.mark.parametrize("block", [READING, SELECTING])
+@pytest.mark.parametrize("block", BLOCKS)
 def test_r2a_the_gate_refuses_the_invoke_api_for_any_hana_entry(block):
     from agents.admin import AgentPayload
 
@@ -144,7 +147,7 @@ def test_r2a_the_gate_refuses_the_invoke_api_for_any_hana_entry(block):
     assert INVOKE_RULE in said and DEST not in said
 
 
-@pytest.mark.parametrize("block", [READING, SELECTING, {**READING, "allow_select": False}])
+@pytest.mark.parametrize("block", [*BLOCKS, {**READING, "allow_select": False}])
 @pytest.mark.parametrize("patch", [
     {}, {"expose_chat": True}, {"tier": "basic"}, {"expose_chat": True, "tier": "basic"},
 ])
@@ -159,7 +162,7 @@ def test_r2b_the_gate_refuses_basic_chat_for_any_hana_entry(block, patch):
     assert CHAT_RULE in said and DEST not in said
 
 
-@pytest.mark.parametrize("block", [READING, SELECTING])
+@pytest.mark.parametrize("block", BLOCKS)
 @pytest.mark.parametrize("patch", [
     {"expose_chat": False},
     {"expose_chat": False, "tier": "basic"},
@@ -212,7 +215,7 @@ async def test_r1_the_api_refuses_sharing_on_create_and_update(client):
     assert len(listed["lender"]["mcp_servers"]) == 1
 
 
-@pytest.mark.parametrize("block", [READING, SELECTING])
+@pytest.mark.parametrize("block", BLOCKS)
 async def test_r2a_the_api_refuses_invoke_both_ways(client, block):
     r = await client.post(AGENTS, json=body("dba", entry(block), expose_chat=False,
                                             expose_invoke=True, api_slug="dba"))
@@ -234,7 +237,7 @@ async def test_r2a_the_api_refuses_invoke_both_ways(client, block):
     assert r.status_code == 422 and INVOKE_RULE in r.text
 
 
-@pytest.mark.parametrize("block", [READING, SELECTING])
+@pytest.mark.parametrize("block", BLOCKS)
 async def test_r2b_the_api_refuses_basic_chat_both_ways(client, block):
     r = await client.post(AGENTS, json=body("dba", entry(block), tier="basic"))
     assert r.status_code == 422 and CHAT_RULE in r.text and DEST not in r.text
@@ -261,7 +264,7 @@ async def test_r2b_the_api_refuses_basic_chat_both_ways(client, block):
     assert r.status_code == 422 and CHAT_RULE in r.text
 
 
-@pytest.mark.parametrize("block", [READING, SELECTING])
+@pytest.mark.parametrize("block", BLOCKS)
 async def test_scheduled_and_advanced_chat_hana_agents_are_stored(client, block):
     r = await client.post(AGENTS, json=body(
         "dba", entry(block), expose_chat=False, expose_api=True, api_slug="dba",
@@ -271,7 +274,7 @@ async def test_scheduled_and_advanced_chat_hana_agents_are_stored(client, block)
     assert r.status_code == 201, r.text
 
 
-@pytest.mark.parametrize("block", [READING, SELECTING])
+@pytest.mark.parametrize("block", BLOCKS)
 async def test_r2c_no_agent_may_name_a_hana_agent_as_a_peer(client, block):
     r = await client.post(AGENTS, json=body("dba", entry(block), expose_chat=False))
     assert r.status_code == 201, r.text
@@ -289,7 +292,7 @@ async def test_r2c_no_agent_may_name_a_hana_agent_as_a_peer(client, block):
 
 
 @pytest.mark.parametrize("helper_enabled", [True, False])
-@pytest.mark.parametrize("block", [READING, SELECTING])
+@pytest.mark.parametrize("block", BLOCKS)
 async def test_r2c_an_agent_that_is_a_peer_cannot_be_given_a_hana_entry(
         client, helper_enabled, block):
     r = await client.post(AGENTS, json=body("dba", NOTES, expose_chat=False))
@@ -312,7 +315,7 @@ async def test_r2c_an_agent_that_is_a_peer_cannot_be_given_a_hana_entry(
     assert r.status_code == 200, r.text
 
 
-@pytest.mark.parametrize("block", [READING, SELECTING])
+@pytest.mark.parametrize("block", BLOCKS)
 async def test_r2c_a_hana_agent_may_have_peers_of_its_own(client, block):
     r = await client.post(AGENTS, json=body("helper", NOTES))
     assert r.status_code == 201, r.text
@@ -346,7 +349,7 @@ async def test_a_phase_1_row_that_breaks_the_rules_still_loads_and_must_be_fixed
 
 # --- the import ----------------------------------------------------------------
 
-@pytest.mark.parametrize("block", [READING, SELECTING])
+@pytest.mark.parametrize("block", BLOCKS)
 async def test_an_import_is_held_to_the_rules_whatever_the_order(client, block):
     dba = body("dba", entry(block), expose_chat=False)
     helper = body("helper", NOTES, peers=["dba"])
@@ -383,7 +386,7 @@ async def test_an_import_may_drop_the_peer_and_add_the_entry_in_one_bundle(clien
 
 # --- storage, reached without the payload ---------------------------------------
 
-@pytest.mark.parametrize("block", [READING, SELECTING])
+@pytest.mark.parametrize("block", BLOCKS)
 async def test_a_direct_upsert_is_held_to_every_rule(block):
     from agents.db import SessionLocal, upsert_agent
 
@@ -580,7 +583,7 @@ async def test_a_build_attaches_no_delegation_tool_to_any_hana_agent(caplog):
 
 # --- the invoke API: the last line ---------------------------------------------
 
-@pytest.mark.parametrize("block", [READING, SELECTING])
+@pytest.mark.parametrize("block", BLOCKS)
 async def test_a_hand_written_hana_row_is_404_at_the_invoke_route(block):
     from fastapi import FastAPI
 
@@ -611,3 +614,28 @@ async def test_a_hand_written_hana_row_is_404_at_the_invoke_route(block):
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         r = await c.post("/api/invoke/dba", files={"input": (None, "hello")})
     assert r.status_code == 404 and r.json() == {"detail": "No such agent"}
+
+
+async def test_the_reach_rules_hold_with_allow_select_all(client):
+    """The switch that opens free SELECT changes no reach rule: invoke, basic
+    chat, a peer and sharing are refused exactly as for an entry without it,
+    and the entry that is accepted is stored with the switch."""
+    from agents.admin import AgentPayload
+
+    for patch, rule in (({"expose_invoke": True, "api_slug": "dba", "expose_chat": False},
+                         INVOKE_RULE),
+                        ({"tier": "basic"}, CHAT_RULE),
+                        ({"expose_chat": False, "share_tools": True}, SHARE_RULE)):
+        refusals = []
+        for block in (SELECTING, WIDE):
+            with pytest.raises(ValidationError) as refused:
+                AgentPayload.model_validate(body("dba", entry(block), **patch))
+            refusals.append(_said(refused.value))
+        assert rule in refusals[0] and refusals[0] == refusals[1]
+    r = await client.post(AGENTS, json=body("dba", entry(WIDE), expose_chat=False))
+    assert r.status_code == 201, r.text
+    listed = {a["name"]: a for a in (await client.get(AGENTS)).json()}
+    (hana,) = [s for s in listed["dba"]["mcp_servers"] if s["url"] == URL]
+    assert hana["oauth"]["allow_select_all"] is True
+    r = await client.post(AGENTS, json=body("helper", NOTES, peers=["dba"]))
+    assert r.status_code == 422 and PEER_RULE in r.text and DEST not in r.text

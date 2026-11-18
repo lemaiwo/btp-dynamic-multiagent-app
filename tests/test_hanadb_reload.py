@@ -146,3 +146,16 @@ async def test_another_admin_save_that_reloads_keeps_the_failed_credential(monke
     await admin.registry.reload()  # what a model change or an agent save does
     state = connection._logins["acct"]
     assert state.failed and state.blocked_until is None
+
+
+def test_allow_select_all_changes_the_signature():
+    """Adding or removing the switch reloads the registry: the build decides
+    whether run_select may read outside the monitoring views. Spelling out
+    the default changes nothing."""
+    base = _entry_signature(entry(BLOCK))
+    wide = _entry_signature(entry({**BLOCK, "allow_select_all": True}))
+    assert wide != base
+    assert _entry_signature(entry({**BLOCK, "allow_select_all": False})) == base
+    # A refused block (the switch without allow_select) differs from both.
+    narrow = {"systems": [PRD, SYS], "allow_select_all": True}
+    assert _entry_signature(entry(narrow)) not in (base, wide)
