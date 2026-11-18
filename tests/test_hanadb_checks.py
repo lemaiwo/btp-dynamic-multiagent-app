@@ -291,6 +291,21 @@ def test_every_statement_passes_the_select_guard(check: Check, statement: Statem
     _assert_guard(check, statement, GUARD_EXCEPTIONS)
 
 
+@pytest.mark.parametrize(
+    "check, statement",
+    [(c, s) for c in EVERY_CHECK for s in c.statements],
+    ids=lambda v: getattr(v, "name", None) or getattr(v, "label", None) or "single",
+)
+def test_every_statement_passes_the_guard_when_paged(check: Check, statement: Statement) -> None:
+    """``run_check`` with an ``offset`` sends the statement inside
+    :func:`agents.hana.tools.page_sql`; that form must be a read the guard
+    accepts too."""
+    from agents.hana.tools import page_sql
+
+    _assert_guard(check, Statement(statement.label, page_sql(statement.sql),
+                                   statement.binds), GUARD_EXCEPTIONS)
+
+
 BUSINESS_READ = _variant(
     name="dummyBusiness", source="bin/dummyBusiness.js",
     statements=(Statement("", "SELECT TOP ? VBELN FROM SAPABAP1.VBAK", ("top",)),))
