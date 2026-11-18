@@ -2747,9 +2747,12 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     process, exception class only). `agents/shared.py` imports only
     `agents.model_call_headers` for this, never `agents.nexus`. Embeddings and the AI Core
     admin calls (`agents/aicore_deployments.py`) send no such headers.
-    `tests/test_nexus_observability.py`, `tests/test_model_call_headers.py`. **Not yet run on
-    a landscape**: whether AI Core records streamed calls with their token counts, and
-    whether a retried request leaves two records, are unverified.
+    `tests/test_nexus_observability.py`, `tests/test_model_call_headers.py`. **Ran on a
+    landscape** (2026-11-18, the Bedrock route only): one streamed web chat turn on a Claude
+    deployment left one record per model request (8, all `streaming` true, HTTP 200, input and
+    output token counts present, the three labels as sent), read back by the correlation
+    label. Not verified there: the OpenAI-style route (unit tests only), whether a retried
+    request leaves two records, a non-streamed call.
   - `context.py` — `current_agent_name` (default `orchestrator`) and `current_nexus_run_id`
     (cut to 64 characters, an id already bound wins), bound by the synchronous context
     managers `calling_agent` and `nexus_run` around the call that starts a run (so a task
@@ -4516,7 +4519,8 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   register's `correlationId`, sent only while the agent register is on) and moves the
   local-dev browser OAuth of `agents/shared.py` to `agents/local_oauth.py` unchanged: no new
   resource, role, table or column (HANA schema generation unchanged, still 12);
-  `NEXUS_LANDSCAPE` is not in the descriptor. Not yet run on a landscape
+  `NEXUS_LANDSCAPE` is not in the descriptor. Ran on a landscape for the Bedrock route
+  (streamed calls are recorded with token counts); the OpenAI-style route is unit-tested only
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets
