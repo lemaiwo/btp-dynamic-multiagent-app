@@ -98,8 +98,8 @@ MAX_SQL_CHARS = 4000
 ALLOWED_SCHEMAS = frozenset({"SYS", "_SYS_STATISTICS"})
 
 #: Monitoring views ``run_select`` may not read although the allow rule would
-#: let them through: they hold the ini and configuration values the fixed
-#: ``iniContents`` check deliberately hides. Matched unqualified and in every
+#: let them through: they hold the ini and configuration values that only the
+#: fixed ``iniContents`` check reads. Matched unqualified and in every
 #: allowed schema (``SYS.``, ``_SYS_STATISTICS.``), after the allow rule's
 #: upper-casing (a quoted name verbatim); with ``any_schema`` in every schema,
 #: case-folded (a quoted name too).

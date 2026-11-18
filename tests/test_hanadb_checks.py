@@ -963,7 +963,7 @@ def test_column_and_table_rules_across_modules(check: Check, statement: Statemen
 
 def test_the_shared_rules_run_over_the_whole_registry() -> None:
     """The parametrized test above skips silently on an empty registry: the
-    registry of Phases 1 to 3 holds 139 statements."""
+    registry of Phases 1 to 3 holds 140 statements."""
     assert len(_registered_statements()) > 100
 
 

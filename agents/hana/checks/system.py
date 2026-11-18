@@ -26,50 +26,6 @@ from __future__ import annotations
 
 from agents.hana.checks.base import Check, Statement, register
 
-HIDDEN = "<hidden>"
-"""What ``iniContents`` answers instead of a value it does not show."""
-
-# iniContents is DEFAULT-DENY BY SHAPE. A value is shown only when (a) neither
-# its key nor its section names anything secret-like and the key does not end
-# in "key", and (b) the value itself has a harmless shape: at most SHAPE_MAX
-# characters of letters, digits, space and _ . , + - % (numbers, booleans,
-# sizes, simple names). Anything with / \ : @ = ; ' " (paths, hosts, URLs,
-# connection strings, credentials) or longer is hidden whatever its key says.
-# Fixed SQL: the words and the pattern are literals of this repository, never
-# arguments. LOCATE / RIGHT instead of LIKE '%...%', and LENGTH instead of a
-# {0,64} quantifier: the registry refuses "%s" and braces in a statement.
-# A line feed, carriage return or tab hides the value outright: if ^ and $ were
-# line anchors in HANA's LIKE_REGEXPR, one harmless line would otherwise show
-# a multi-line value with a secret on another line.
-# on-prem: verified 2026-11-10 on SPS07 rev 79 (LIKE_REGEXPR and the CASE are
-# accepted); unverified: the anchors on a multi-line ini value (the line
-# feed rule above hides such a value whatever they do)
-DENY_WORDS: tuple[str, ...] = (
-    "password", "passwd", "pwd", "pass", "secret", "credential", "passphrase", "token",
-    "auth", "cert", "salt", "saml", "jwt", "proxy", "keystore", "private", "ssl", "ldap")
-SHAPE_MAX = 64
-SHAPE_PATTERN = "^[A-Za-z0-9_ .,+%-]*$"
-
-_DENIED = " OR ".join(
-    [f"LOCATE(LOWER(\"KEY\"), '{w}') > 0" for w in DENY_WORDS]
-    + ["RIGHT(LOWER(\"KEY\"), 3) = 'key'"]
-    + [f"LOCATE(LOWER(SECTION), '{w}') > 0" for w in DENY_WORDS]
-)
-_EMPTY = "\"VALUE\" IS NULL OR \"VALUE\" = ''"
-_SHOWN = (
-    f"NOT ({_DENIED}) AND LENGTH(\"VALUE\") <= {SHAPE_MAX}"
-    f" AND \"VALUE\" LIKE_REGEXPR '{SHAPE_PATTERN}'"
-    " AND LOCATE(\"VALUE\", CHAR(10)) = 0 AND LOCATE(\"VALUE\", CHAR(13)) = 0"
-    " AND LOCATE(\"VALUE\", CHAR(9)) = 0"
-)
-# A NULL anywhere in the conditions makes them unknown, which falls to ELSE:
-# hidden. The raw VALUE column is reachable only through the first CASE.
-INI_VALUE_SQL = (
-    f"CASE WHEN {_EMPTY} THEN \"VALUE\" WHEN {_SHOWN} THEN \"VALUE\""
-    f" ELSE '{HIDDEN}' END AS \"VALUE\","
-    f" CASE WHEN {_EMPTY} THEN 0 WHEN {_SHOWN} THEN 0 ELSE 1 END AS VALUE_HIDDEN"
-)
-
 HOST_INFORMATION_KEYS: tuple[str, ...] = (
     "sid", "sapsystem", "build_version", "build_branch", "os_name", "os_kernel_version",
     "os_cpe_name", "hw_manufacturer", "hw_model", "cpu_model", "cpu_summary", "cpu_cores",
@@ -84,6 +40,14 @@ rev 79; unverified: which of these keys exist (an absent key is no row)."""
 # explicitly. Accepted on SPS07 rev 79 with a non-NULL bind (2026-11-10); the
 # NULL bind is unverified.
 _OPTIONAL_FILE = "(CAST(? AS NVARCHAR(256)) IS NULL OR FILE_NAME = ?)"
+# iniContents filters: the section exactly and the key by a part, both
+# case-insensitive (SAP writes section and key names in lower case, a person
+# may not). LOCATE instead of LIKE: a bound value is matched as it is, so a
+# ``%`` or ``_`` in it is no wildcard. Values are bound, never part of the SQL.
+_OPTIONAL_SECTION = "(CAST(? AS NVARCHAR(128)) IS NULL OR LOWER(SECTION) = LOWER(?))"
+_OPTIONAL_KEY = "(CAST(? AS NVARCHAR(128)) IS NULL OR LOCATE(LOWER(\"KEY\"), LOWER(?)) > 0)"
+_INI_FILTERS = _OPTIONAL_FILE + " AND " + _OPTIONAL_SECTION + " AND " + _OPTIONAL_KEY
+_INI_FILTER_BINDS = ("top_plus_one", "object", "object", "section", "section", "key", "key")
 
 
 # ---- single views (task 13a) ----------------------------------------------------------
@@ -267,26 +231,37 @@ register(
             ),
         ),
     ),
-    Check(  # on-prem: verified 2026-11-10 on SPS07 rev 79
+    # Values are returned as stored, in every layer (DEFAULT, SYSTEM, HOST,
+    # DATABASE): nothing is hidden. The SELECT guard keeps these views out of
+    # model-written SQL; this fixed check is the one reader of the values.
+    # on-prem: verified 2026-11-18 on SPS07 rev 79 (SYSTEMDB and a tenant):
+    # M_INIFILE_CONTENTS lists the DEFAULT layer, M_CONFIGURATION_PARAMETER_VALUES
+    # exists (no DEFAULT_VALUE column), and the section and key filters ran with
+    # mixed-case values; unverified: the two statements as a whole.
+    Check(
         name="iniContents",
         category="system",
-        purpose=(
-            "Configuration parameters of one file (object) or all; values that could hold"
-            " secrets, paths, hosts or URLs hidden."
-        ),
+        purpose=("Configuration parameters of every layer and in effect, by file (object),"
+                 " section (exact) and key (contains)."),
         source="bin/iniContents.js",
         statements=(
             Statement(
-                "",
-                "SELECT TOP ? FILE_NAME, LAYER_NAME, TENANT_NAME, HOST, SECTION, \"KEY\", "
-                + INI_VALUE_SQL
-                + " FROM SYS.M_INIFILE_CONTENTS WHERE "
-                + _OPTIONAL_FILE
+                "files",
+                "SELECT TOP ? FILE_NAME, LAYER_NAME, TENANT_NAME, HOST, SECTION, \"KEY\","
+                " \"VALUE\" FROM SYS.M_INIFILE_CONTENTS WHERE " + _INI_FILTERS
                 + " ORDER BY FILE_NAME, SECTION, \"KEY\", LAYER_NAME",
-                ("top_plus_one", "object", "object"),
+                _INI_FILTER_BINDS,
+            ),
+            # on-prem: the value each service uses, per host and port.
+            Statement(
+                "effective",
+                "SELECT TOP ? HOST, PORT, FILE_NAME, SECTION, \"KEY\", LAYER_NAME, \"VALUE\","
+                " RESTART_REQUIRED FROM SYS.M_CONFIGURATION_PARAMETER_VALUES WHERE "
+                + _INI_FILTERS + " ORDER BY FILE_NAME, SECTION, \"KEY\", HOST, PORT",
+                _INI_FILTER_BINDS,
             ),
         ),
-        args=frozenset({"top", "object"}),
+        args=frozenset({"top", "object", "section", "key"}),
     ),
 )
 
