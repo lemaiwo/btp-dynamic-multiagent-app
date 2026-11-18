@@ -1086,7 +1086,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     `bytearray` longer than the cap per value is now cut to it (text with
     ` …[cut]`, bytes without) and counted against the budget with the same
     `result_too_large` rule; a plain value up to the cap is unchanged and not
-    counted. `read(size)` of a LOB object is still unverified on the real
+    counted. After that fix the same export ran there (2026-11-18): 50 rows,
+    48 of its statement cells cut at 4,096 characters plus the marker, which
+    fits the inference (the cap now applies) without proving the value's type.
+    `read(size)` of a LOB object is still unverified on the real
     driver. **The login protection**: every call is
     one login and HANA locks a user after a few invalid attempts (default 6,
     reset only by a successful login; the user may be a person's). The state
@@ -1574,15 +1577,16 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `iniContents` with a key filter and NULL file / section binds (both parts),
   `export_result` of a check (200 rows) and of a SELECT (50 rows), and the
   refusal of `PUBLIC.M_INIFILE_CONTENTS`; an export of a SELECT with a
-  131,072-character `NCLOB` failed before the plain-text LOB fix and has not
-  been rerun yet.
+  131,072-character `NCLOB` failed before the plain-text LOB fix and ran
+  after it (the model went from `result_too_large` of `run_select` to
+  `export_result` by itself; the file opened in the web chat's viewer).
   **Not verified there**: the app's own client end to end beyond the calls
   of 2026-11-18 above, the order `SET SCHEMA SYS` then `SET TRANSACTION READ ONLY`
   in the app's own client (the probe sends it as `schema_pin`), the login
   breaker and the one-login gate, the LOB budget,
   `communicationTimeout`, the run_select deny-list against the real views,
   `traceContents` with a real host and file, a NULL bind of an optional
-  filter, a LOB object's `read(size)` (on the landscape an `NCLOB` arrived
+  filter other than `iniContents`' file and section, a LOB object's `read(size)` (on the landscape an `NCLOB` arrived
   as plain text, inferred above), a multi-line ini
   value, the word-based mapping of -10709, TLS, a Cloud Connector location
   id, the `tcp` destination shape. **The checks of Phases 2 and 3**
