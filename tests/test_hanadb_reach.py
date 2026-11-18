@@ -57,7 +57,8 @@ WIDE = {**SELECTING, "allow_select_all": True}
 BLOCKS = [READING, SELECTING, WIDE]
 NOTES = {"url": "builtin:sapnotes", "auth_mode": "none"}
 AGENTS = "/admin/api/agents"
-READ_TOOLS = {"list_systems", "list_checks", "run_check"}
+# export_result is registered for every entry, like the three reading tools.
+READ_TOOLS = {"list_systems", "list_checks", "run_check", "export_result"}
 
 SHARE_RULE = "share_tools: an agent with a builtin:hana entry cannot share its tools"
 INVOKE_RULE = "expose_invoke: must be false for an agent with a builtin:hana entry"

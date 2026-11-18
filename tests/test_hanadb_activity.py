@@ -192,3 +192,116 @@ def test_run_select_preview_shows_system_sql_length_and_top_only():
     assert _detail_for("hana_run_select", {"sql": SQL, "other": "x"}) == "sql=<57 chars>"
     said = _detail_for("hana_0_run_select", args)
     assert said == "system=erp, sql=<57 chars>, top=5"
+
+
+# --- export_result ------------------------------------------------------------
+
+@pytest.mark.parametrize("name", ["export_result", "hana_export_result",
+                                  "hana_0_export_result"])
+def test_export_result_line(name: str) -> None:
+    result = {"system": "erp", "check": "alerts", "file_id": "f-" + LEAK,
+              "filename": LEAK + ".xlsx", "download_url": "/chat/api/files/" + LEAK,
+              "row_count": 200, "truncated": False, "columns": [LEAK],
+              "preview": _rows(20)}
+    said = activity_summary(name, result)
+    assert said == "export_result: 200 rows"
+    assert LEAK not in said
+    said = activity_summary(name, {**result, "row_count": 10000, "truncated": True})
+    assert said == "export_result: 10000 rows, truncated"
+    assert activity_summary(name, {"error": {"code": "no_chat", "message": LEAK}}) == \
+        "error: no_chat"
+
+
+def test_export_result_line_of_an_odd_count() -> None:
+    for count in (None, True, "12", LEAK, 1.5):
+        said = activity_summary("export_result", {"row_count": count, "preview": _rows(3)})
+        assert said == "export_result: ? rows"
+
+
+def test_export_result_line_of_a_composite_check() -> None:
+    result = {"check": "alerts", "file_id": LEAK, "parts": [
+        {"label": "a", "row_count": 2, "truncated": False, "preview": _rows(2)},
+        {"label": "b", "row_count": 3, "truncated": True, "preview": _rows(3)}]}
+    assert activity_summary("export_result", result) == "export_result: 5 rows, truncated"
+
+
+EXPORT_DROPPED = ("filename", "schema", "object", "section", "key", "host",
+                  "other_schema", "hours", "note")
+
+
+@pytest.mark.parametrize("name", ["export_result", "hana_export_result",
+                                  "hana_0_export_result"])
+def test_the_argument_preview_of_export_result_keeps_the_length_of_the_sql(name):
+    import json
+
+    from agents.run_activity import _detail_for, redact_args
+
+    args = {key: LEAK for key in EXPORT_DROPPED}
+    args.update({"top": 500, "sql": SQL, "check": "alerts", "system": "erp"})
+    shown = redact_args(name, args)
+    assert shown == {"system": "erp", "check": "alerts", "sql": "<57 chars>", "top": 500}
+    assert list(shown) == ["system", "check", "sql", "top"]
+    assert args["sql"] == SQL and args["filename"] == LEAK  # the caller's object stays
+    said = _detail_for(name, args)
+    assert said == "system=erp, check=alerts, sql=<57 chars>, top=500"
+    assert LEAK not in said and "M_SERVICES" not in said
+    assert _detail_for(name, json.dumps(args)) == said
+
+
+def test_export_result_of_a_check_keeps_no_sql_key():
+    from agents.run_activity import redact_args
+
+    args = {"system": "erp", "check": "alerts", "filename": LEAK, "schema": LEAK,
+            "top": 10}
+    assert redact_args("export_result", args) == {"system": "erp", "check": "alerts",
+                                                  "top": 10}
+
+
+def test_export_result_drops_a_check_that_is_no_check_name():
+    from agents.run_activity import redact_args
+
+    for check in (LEAK + " ' OR 1=1", "a.b", "", 7, None, ["alerts"]):
+        shown = redact_args("export_result", {"system": "erp", "check": check,
+                                              "filename": LEAK})
+        assert shown == {"system": "erp"}
+
+
+@pytest.mark.parametrize("args", [
+    ["SELECT", SQL], (SQL,), 42, {"sql": ["SELECT", SQL]}, {"system": "erp", "sql": None},
+    {"system": "erp", "sql": 5, "check": "alerts"}, b"SELECT HOST FROM SYS.M_SERVICES",
+    f"not json {SQL}", '["SELECT HOST FROM SYS.M_SERVICES"]'])
+def test_export_result_of_any_other_shape_is_shown_as_its_length_only(args):
+    from agents.run_activity import _detail_for, redact_args
+
+    said = _detail_for("hana_export_result", args)
+    assert "M_SERVICES" not in said and said.startswith("<") and said.endswith(" chars>")
+    shown = redact_args("export_result", args)
+    assert isinstance(shown, str) and "M_SERVICES" not in shown
+
+
+def test_run_select_preview_keeps_offset():
+    from agents.run_activity import _detail_for, redact_args
+
+    args = {"offset": 200, "top": 100, "sql": SQL, "system": "erp", "filename": LEAK}
+    shown = redact_args("run_select", args)
+    assert shown == {"system": "erp", "sql": "<57 chars>", "top": 100, "offset": 200}
+    assert list(shown) == ["system", "sql", "top", "offset"]
+    assert _detail_for("hana_0_run_select", args) == \
+        "system=erp, sql=<57 chars>, top=100, offset=200"
+
+
+def test_a_run_records_export_result_without_its_file_name():
+    from agents.chat_app import _tool_card_input
+    from agents.progress import ProgressUpdate
+    from agents.run_activity import RunActivity
+    from agents.webchat.run import _preview_args
+
+    args = {"system": "erp", "filename": LEAK, "sql": SQL, "top": 100}
+    activity = RunActivity()
+    activity.record(ProgressUpdate(kind="tool_start", agent="dba",
+                                   tool_name="hana_export_result", tool_call_id="c1",
+                                   args=args))
+    assert activity.events[0]["detail"] == "system=erp, sql=<57 chars>, top=100"
+    assert _preview_args("export_result", args) == "system=erp, sql=<57 chars>, top=100"
+    assert _tool_card_input("hana_export_result", args) == {
+        "system": "erp", "sql": "<57 chars>", "top": 100}

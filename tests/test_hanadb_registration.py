@@ -312,7 +312,8 @@ def test_an_update_that_leaves_allow_select_out_stores_none_over_a_row_that_had_
 
 # --- factory ------------------------------------------------------------------
 
-TOOLS = {"list_systems", "list_checks", "run_check"}
+# export_result is registered for every entry, like the three reading tools.
+TOOLS = {"list_systems", "list_checks", "run_check", "export_result"}
 
 
 def test_hana_is_a_known_builtin():

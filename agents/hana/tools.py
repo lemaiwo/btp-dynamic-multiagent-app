@@ -691,6 +691,24 @@ def _rows_and_truncated(result: dict[str, Any]) -> tuple[Any, bool]:
     return (len(rows) if isinstance(rows, list) else "?"), result.get("truncated") is True
 
 
+def _count(value: Any) -> int | None:
+    """A row count as the line may say it: a real int, never a bool."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _export_rows_and_truncated(result: dict[str, Any]) -> tuple[Any, bool]:
+    """``export_result`` answers ``row_count`` (its rows are in the file, its
+    ``preview`` holds only the first few), per part for a composite check."""
+    parts = result.get("parts")
+    if isinstance(parts, list):
+        counts = [_count(p.get("row_count")) if isinstance(p, dict) else None for p in parts]
+        if not counts or any(c is None for c in counts):
+            return "?", False
+        return sum(counts), any(p.get("truncated") is True for p in parts)
+    count = _count(result.get("row_count"))
+    return ("?" if count is None else count), result.get("truncated") is True
+
+
 def activity_summary(tool_name: Any, result: Any) -> str | None:
     """What a run's activity keeps of a result of this toolset, else ``None``.
 
@@ -714,6 +732,10 @@ def activity_summary(tool_name: Any, result: Any) -> str | None:
     if tool == "list_checks":
         checks = result.get("checks")
         return f"{tool}: {len(checks) if isinstance(checks, list) else '?'} checks"
+    if tool == "export_result":
+        # Never the file name, the file id or a preview cell: counts only.
+        count, truncated = _export_rows_and_truncated(result)
+        return f"{tool}: {count} rows" + (", truncated" if truncated else "")
     count, truncated = _rows_and_truncated(result)
     said = f"{count} rows" + (", truncated" if truncated else "")
     if tool == "run_check":

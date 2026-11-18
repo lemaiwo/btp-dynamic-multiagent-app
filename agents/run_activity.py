@@ -59,10 +59,17 @@ def _detail(args: Any) -> str:
     return _clip(str(args), _DETAIL_CHARS)
 
 
-# ``builtin:hana``'s run_select, plain or prefixed (`hana_`, `hana_0_`): its
-# ``sql`` is model-written text that can quote values out of the database it
-# reads, so the preview keeps its length only.
-_SQL_LENGTH_ONLY = re.compile(r"(?:hana_(?:\d+_)?)?run_select")
+# ``builtin:hana``'s run_select and export_result, plain or prefixed (`hana_`,
+# `hana_0_`): their ``sql`` is model-written text that can quote values out of
+# the database it reads, so the preview keeps its length only.
+_SQL_LENGTH_ONLY = re.compile(r"(?:hana_(?:\d+_)?)?(run_select|export_result)")
+
+# What a preview keeps of each, in this order; every other key (a file name the
+# model chose, a check filter, a note) is dropped.
+_KEPT_KEYS = {
+    "run_select": ("system", "sql", "top", "offset"),
+    "export_result": ("system", "check", "sql", "top"),
+}
 
 
 def _size(value: Any) -> int:
@@ -72,19 +79,30 @@ def _size(value: Any) -> int:
     return len(json.dumps(value, default=str))
 
 
+def _is_check_name(value: Any) -> bool:
+    # Imported here: the package import registers every HANA check, which
+    # this module (imported by every runner) should not pay for up front.
+    from agents.hana.checks.base import CHECK_NAME_RE
+
+    return isinstance(value, str) and CHECK_NAME_RE.fullmatch(value) is not None
+
+
 def redact_args(tool_name: Any, args: Any) -> Any:
     """The arguments of one tool call as every preview may show them: the
     run activity (:func:`_detail_for`), the web chat's tool card and the
     classic chat's tool card (``agents/chat_app.py``).
 
     For a HANA ``run_select`` (plain or prefixed) a new object holds only
-    ``system``, ``sql`` as ``"<n chars>"`` and ``top``, those present, in
-    that order; any other key is dropped (the caller's object is not
-    changed). It fails
-    closed: arguments handed over as JSON text are read as such, and any
-    shape other than an object with a string ``sql`` is shown as the length
-    of the whole, ``"<n chars>"``. Every other tool's arguments are returned
-    as they are (the same object).
+    ``system``, ``sql`` as ``"<n chars>"``, ``top`` and ``offset``; for an
+    ``export_result`` only ``system``, ``check`` (only when it has the form
+    of a check name, else dropped), ``sql`` as ``"<n chars>"`` (absent for
+    an export of a check) and ``top``: those present, in that order. Every
+    other key is dropped, ``filename`` among them (the caller's object is
+    not changed). It fails closed: arguments handed over as JSON text are
+    read as such, and any shape other than an object whose ``sql`` is a
+    string (or, for ``export_result``, absent) is shown as the length of the
+    whole, ``"<n chars>"``. Every other tool's arguments are returned as
+    they are (the same object).
 
     Known limit: the web chat also stores pydantic-ai's ``new_messages()`` of
     each turn (``chat_messages.model_json``, the conversation history the next
@@ -94,8 +112,10 @@ def redact_args(tool_name: Any, args: Any) -> Any:
     RETURN of that agent: for ``builtin:hana`` session user names, client
     hosts, statement texts and the rows of ``run_select``. That history is not
     redacted here; it is the model's own context, not a preview."""
-    if not (isinstance(tool_name, str) and _SQL_LENGTH_ONLY.fullmatch(tool_name)):
+    match = _SQL_LENGTH_ONLY.fullmatch(tool_name) if isinstance(tool_name, str) else None
+    if match is None:
         return args
+    tool = match.group(1)
     if args is None:
         return None
     shown = args
@@ -104,21 +124,31 @@ def redact_args(tool_name: Any, args: Any) -> Any:
             shown = json.loads(shown)
         except ValueError:
             return f"<{len(args)} chars>"
-    if isinstance(shown, dict) and isinstance(shown.get("sql"), str):
-        kept: dict[str, Any] = {}
-        if "system" in shown:
-            kept["system"] = shown["system"]
-        kept["sql"] = f"<{len(shown['sql'])} chars>"
-        if "top" in shown:
-            kept["top"] = shown["top"]
-        return kept
-    return f"<{_size(args)} chars>"
+    if not isinstance(shown, dict):
+        return f"<{_size(args)} chars>"
+    sql_ok = isinstance(shown.get("sql"), str) or (
+        tool == "export_result" and "sql" not in shown)
+    if not sql_ok:
+        return f"<{_size(args)} chars>"
+    kept: dict[str, Any] = {}
+    for key in _KEPT_KEYS[tool]:
+        if key not in shown:
+            continue
+        if key == "sql":
+            kept[key] = f"<{len(shown[key])} chars>"
+        elif key == "check":
+            if _is_check_name(shown[key]):
+                kept[key] = shown[key]
+        else:
+            kept[key] = shown[key]
+    return kept
 
 
 def _detail_for(tool_name: Any, args: Any) -> str:
     """:func:`_detail` of the arguments :func:`redact_args` lets a preview
-    show: the same line, except that a HANA ``run_select`` call shows
-    ``sql=<n chars>`` (or only the length of the whole) instead of its SQL."""
+    show: the same line, except that a HANA ``run_select`` or
+    ``export_result`` call shows ``sql=<n chars>`` (or only the length of the
+    whole) instead of its SQL."""
     return _detail(redact_args(tool_name, args))
 
 
