@@ -9,7 +9,7 @@ not know. Never imports ``agents.db`` (storage imports this module).
 The entry::
 
     {"systems": [{"name": "<slug>", "destination": "<name>"}, ...],
-     "allow_select": true}
+     "allow_select": true, "allow_select_all": true}
 
 Each system is one HANA database (a tenant or SYSTEMDB) behind its own BTP
 destination, which holds the host and the credential; the agent names a
@@ -17,6 +17,13 @@ system only by its slug, never a destination or a host. There is therefore
 no top-level ``destination``: one would say nothing about which system it is.
 The connection is the destination's technical user, so ``user_context:
 true`` is refused. ``allow_select`` is stored only as ``true``.
+
+``allow_select_all`` (stored only as ``true``, and only together with
+``allow_select: true``) opens ``run_select`` (and ``export_result``'s ``sql``)
+to every schema the database user can read, not only the ``SYS`` catalogue
+and the monitoring views. It is a switch of its own because it reaches
+business data: Allow SELECT alone never does, so an entry that had it keeps
+exactly what it had.
 """
 
 from __future__ import annotations
@@ -27,7 +34,7 @@ from typing import Any
 
 from agents.hana import BUILTIN_HANA_URL
 
-ENTRY_KEYS = ("systems", "allow_select")
+ENTRY_KEYS = ("systems", "allow_select", "allow_select_all")
 SYSTEM_KEYS = ("name", "destination")
 MAX_SYSTEMS = 10
 
@@ -57,6 +64,7 @@ class Pins:
 
     systems: tuple[tuple[str, str], ...]
     allow_select: bool
+    allow_select_all: bool = False
 
 
 def _is(pattern: re.Pattern[str], value: Any) -> bool:
@@ -123,27 +131,42 @@ def check_entry(cfg: Any) -> None:
         raise HanaConfigError(
             "oauth.allow_select: must be the JSON boolean true or false; a string "
             "or a number does not set it")
+    wide = cfg.get("allow_select_all")
+    if wide is not None and not isinstance(wide, bool):
+        raise HanaConfigError(
+            "oauth.allow_select_all: must be the JSON boolean true or false; a string "
+            "or a number does not set it")
+    if wide is True and allow is not True:
+        # A free SELECT without the guarded one would be the wider switch on its
+        # own; it is only ever an extension of Allow SELECT.
+        raise HanaConfigError(
+            "oauth.allow_select_all: needs oauth.allow_select true; free SELECT on "
+            "every schema extends Allow SELECT")
 
 
 def clean_entry(cfg: Any) -> dict[str, Any]:
     """The block as it is stored: checked, its own keys only, fixed order, a
-    new object. ``allow_select`` only as ``true``."""
+    new object. ``allow_select`` and ``allow_select_all`` only as ``true``."""
     check_entry(cfg)
     cleaned: dict[str, Any] = {
         "systems": [{"name": s["name"], "destination": s["destination"]}
                     for s in cfg["systems"]]}
     if cfg.get("allow_select") is True:
         cleaned["allow_select"] = True
+    if cfg.get("allow_select_all") is True:
+        cleaned["allow_select_all"] = True
     return cleaned
 
 
 def pins_of(cfg: Any) -> Pins:
     """The checked block as the toolset reads it. ``allow_select`` is true
     only for exactly ``true`` and decides whether ``run_select`` is
-    registered; the reach rules hold for every ``builtin:hana`` entry,
+    registered; ``allow_select_all`` likewise decides whether it may read
+    every schema. The reach rules hold for every ``builtin:hana`` entry,
     whatever it says (`agents.db.check_hana_reach`)."""
     cleaned = clean_entry(cfg)
     return Pins(
         systems=tuple((s["name"], s["destination"]) for s in cleaned["systems"]),
         allow_select=cleaned.get("allow_select") is True,
+        allow_select_all=cleaned.get("allow_select_all") is True,
     )
