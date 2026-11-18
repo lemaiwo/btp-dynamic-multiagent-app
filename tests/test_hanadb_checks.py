@@ -748,7 +748,8 @@ DUMMY_INI_OPTIONAL = Check(
         ("top_plus_one", "section", "section", "key", "key")),),
     args=frozenset({"top", "section", "key"}),
 )
-TEXT_RULE = "must be one line of 1 to 128 characters without control or format characters"
+TEXT_RULE = ("must be one line of 1 to 128 characters, not empty, without control or format"
+             " characters")
 
 
 def test_section_and_key_are_text_arguments() -> None:

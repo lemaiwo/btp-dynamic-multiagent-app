@@ -92,8 +92,8 @@ class Arg:
         if self.kind == "int":
             return f"must be a whole number from {self.low} to {self.high}"
         if self.kind == "text":
-            return (f"must be one line of 1 to {TEXT_ARG_MAX} characters without control"
-                    " or format characters")
+            return (f"must be one line of 1 to {TEXT_ARG_MAX} characters, not empty,"
+                    " without control or format characters")
         if self.kind == "host":
             return ("must be a host name: a letter or digit then letters, digits, . _ -,"
                     " at most 255")
@@ -338,6 +338,7 @@ def _check_value(arg: Arg, value: Any) -> Any:
         return value
     if arg.kind == "text":
         if (not isinstance(value, str) or not 1 <= len(value) <= TEXT_ARG_MAX
+                or not value.strip()
                 or any(unicodedata.category(ch) in _UNSAFE_TEXT for ch in value)):
             raise InvalidArgument(arg.name, arg.rule)
         return value

@@ -785,3 +785,35 @@ async def test_credential_health_ignores_allow_select_all(monkeypatch):
         seen.append(await admin._destination_health())
     assert seen[0] == seen[1] and len(seen[0]) == 2
     assert "allow_select_all" not in json.dumps(seen[1])
+
+
+@pytest.mark.usefixtures("real_agents_and_mcp")
+async def test_a_save_without_allow_select_all_drops_it_and_reloads(monkeypatch):
+    """An older client does not know ``allow_select_all`` and leaves it out of
+    its PUT: the key is gone from the stored block (never kept silently) and
+    the registry reloads, as for any change of what the entry allows."""
+    from pydantic_ai.models.test import TestModel
+
+    import agents.registry as registry_module
+    from agents.chat_app import dynamic_chat_app
+    from agents.odata import admin_routes
+
+    monkeypatch.setattr(registry_module, "get_model", lambda *a, **k: TestModel())
+    monkeypatch.setattr(admin_routes, "_live_registry", REAL_LIVE_REGISTRY)
+    monkeypatch.setattr(registry_module.registry, "_build", None)
+    monkeypatch.setattr(dynamic_chat_app, "refresh", lambda: None)
+
+    def agent(block: dict[str, Any]) -> dict[str, Any]:
+        return {"name": "dba", "description": "d", "instructions": "i",
+                "expose_chat": False, "mcp_servers": [_server(_copy(block))]}
+
+    async with await _api_client() as client:
+        r = await client.post("/admin/api/agents", json=agent(WIDE))
+        assert r.status_code == 201, r.text
+        await registry_module.registry.reload()
+        assert await _stored_block("dba") == WIDE
+        r = await client.put(f"/admin/api/agents/{r.json()['id']}", json=agent(FULL))
+        assert r.status_code == 200, r.text
+        assert r.json()["reloaded"] is True
+        assert "allow_select_all" not in await _stored_block("dba")
+    await _wipe()

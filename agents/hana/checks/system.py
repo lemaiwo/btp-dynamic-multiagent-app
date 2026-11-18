@@ -40,13 +40,16 @@ rev 79; unverified: which of these keys exist (an absent key is no row)."""
 # explicitly. Accepted on SPS07 rev 79 with a non-NULL bind (2026-11-10); the
 # NULL bind is unverified.
 _OPTIONAL_FILE = "(CAST(? AS NVARCHAR(256)) IS NULL OR FILE_NAME = ?)"
+# iniContents only: the file name compared without regard to case, like the
+# section and the key below (a model may send ``Global.ini`` for ``global.ini``).
+_OPTIONAL_FILE_CI = "(CAST(? AS NVARCHAR(256)) IS NULL OR LOWER(FILE_NAME) = LOWER(?))"
 # iniContents filters: the section exactly and the key by a part, both
 # case-insensitive (SAP writes section and key names in lower case, a person
 # may not). LOCATE instead of LIKE: a bound value is matched as it is, so a
 # ``%`` or ``_`` in it is no wildcard. Values are bound, never part of the SQL.
 _OPTIONAL_SECTION = "(CAST(? AS NVARCHAR(128)) IS NULL OR LOWER(SECTION) = LOWER(?))"
 _OPTIONAL_KEY = "(CAST(? AS NVARCHAR(128)) IS NULL OR LOCATE(LOWER(\"KEY\"), LOWER(?)) > 0)"
-_INI_FILTERS = _OPTIONAL_FILE + " AND " + _OPTIONAL_SECTION + " AND " + _OPTIONAL_KEY
+_INI_FILTERS = _OPTIONAL_FILE_CI + " AND " + _OPTIONAL_SECTION + " AND " + _OPTIONAL_KEY
 _INI_FILTER_BINDS = ("top_plus_one", "object", "object", "section", "section", "key", "key")
 
 

@@ -138,8 +138,20 @@ async def test_ini_contents_binds_file_section_and_key(db: h.FakeDbapi) -> None:
             "global_allocation", "global_allocation")
         assert "LOWER(SECTION) = LOWER(?)" in statement.sql
         assert 'LOCATE(LOWER("KEY"), LOWER(?)) > 0' in statement.sql
-        assert "CAST(? AS NVARCHAR(256)) IS NULL OR FILE_NAME = ?" in statement.sql
+        assert "CAST(? AS NVARCHAR(256)) IS NULL OR LOWER(FILE_NAME) = LOWER(?)" in statement.sql
         assert "LIKE" not in _words(statement.sql)
+
+
+def test_only_ini_contents_filters_the_file_case_insensitively() -> None:
+    ci = "LOWER(FILE_NAME) = LOWER(?)"
+    for statement in get_check("iniContents").statements:
+        assert ci in statement.sql and statement.sql.count("FILE_NAME = ?") == 0
+        assert statement.binds == _INI_FILTER_BINDS
+    for check in all_checks():
+        if check.name == "iniContents":
+            continue
+        for statement in check.statements:
+            assert ci not in statement.sql, check.name
 
 
 def test_ini_contents_returns_values_as_stored() -> None:
