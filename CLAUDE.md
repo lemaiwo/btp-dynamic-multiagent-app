@@ -1016,10 +1016,16 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   nor a binding). **Destination mode only**, `user_context: true` refused.
   The entry is exactly `{"url": "builtin:hana", "auth_mode": "destination",
   "oauth": {"systems": [{"name": ..., "destination": ...}], "allow_select":
-  true}}`: 1 to 10 systems, `name` `[a-z][a-z0-9_]{0,31}` and distinct,
-  `destination` the OData gate's name pattern, no top-level `destination`,
-  `allow_select` stored only as `true`, an unknown key refused without being
-  named. `config.py` (standard library only) is the one reading: the gate
+  true, "allow_select_all": true}}`: 1 to 10 systems, `name`
+  `[a-z][a-z0-9_]{0,31}` and distinct, `destination` the OData gate's name
+  pattern, no top-level `destination`, `allow_select` stored only as `true`,
+  `allow_select_all` (Allow SELECT on all schemas: `run_select` and
+  `export_result`'s `sql` read any schema, below) a JSON boolean, stored only
+  as `true` and refused unless `allow_select` is `true` too (it only ever
+  extends Allow SELECT, so an entry that had Allow SELECT keeps exactly what it
+  had), an unknown key refused without being named. The admin payload carries
+  `oauth.allow_select_all` (`StrictBool`); `oauth.systems`, `allow_select` and
+  `allow_select_all` on any other server are a 422. `config.py` (standard library only) is the one reading: the gate
   (`_validate_raw_hana_entry` in `agents/admin.py`), storage
   (`_clean_hana_entry` in `agents/db.py`) and the build (`pins_of`); a second
   entry per agent is refused at the gate and in storage
@@ -1178,26 +1184,42 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     body, and `(SELECT ...)`; after `FROM` / `JOIN` / `APPLY` / a `,` of a
     FROM list a table function, `LATERAL`, `JSON_TABLE`, `AS OF`,
     `TABLESAMPLE` or a parenthesised join is refused, and so is a
-    schema-qualified call outside those two schemas or a quoted one. **The
+    schema-qualified call outside those two schemas or a quoted one.
+    **`any_schema=True`** (`run_select` and `export_result`'s `sql` of an
+    entry with `allow_select_all`) also accepts a two-part name
+    `<schema>.<name>` or `"<schema>"."<name>"` in EVERY schema, nothing more:
+    a three-part name (another database) is still refused, an unqualified
+    name must still be an `M_*` name or a CTE (the session is pinned to
+    `SYS`), table functions and schema-qualified calls outside the two schemas
+    stay refused, every other rule is unchanged. **The
     deny-list**, applied to a reference AFTER the allow rule and only to
     model-written SQL: every name, unqualified or in either allowed schema
-    (`SYS.`, `_SYS_STATISTICS.`), that holds
+    (`SYS.`, `_SYS_STATISTICS.`; with `any_schema` in every schema and
+    compared case-folded, a quoted lower-case name included, since a `PUBLIC`
+    synonym of `M_INIFILE_CONTENTS` reads the same values), that holds
     `INIFILE` or `CONFIGURATION_PARAMETER` (`DENIED_NAME_PARTS`: the whole
     ini and configuration-parameter family, `M_INIFILE_CONTENTS`,
     `M_INIFILE_CONTENT_HISTORY` with its current and earlier KEY / VALUE,
     `M_INIFILES`, `M_CONFIGURATION_PARAMETER_VALUES`, and any such view the
     list does not name, and the statistics server's copies) and
     every `SYS.P_*` or `_SYS_STATISTICS.P_*` object (internal persistence
-    tables; no registered check reads one) are
+    tables; no registered check reads one; this rule stays on those two
+    schemas, also with `any_schema`) are
     `table_not_allowed` in every position a reference can stand (a CTE of
-    such a name is still a CTE); quoted names compared verbatim after the
-    allow rule's upper-casing of words (`DENIED_VIEWS`, `DENIED_NAME_PARTS`,
-    `DENIED_SYS_PREFIX`).
-    `check_select(sql, *, fixed=False)`: `fixed=True` skips the deny-list and
-    nothing else, for the registered checks only (`iniContents`, `iniFiles`
-    and `backupStatus` read the ini contents for named keys;
+    such a name is still a CTE); without `any_schema` quoted names compared
+    verbatim after the allow rule's upper-casing of words (`DENIED_VIEWS`,
+    `DENIED_NAME_PARTS`, `DENIED_SYS_PREFIX`). **Accepted gaps** (decided):
+    the guard reads names and looks nothing up, so a synonym or view of
+    ANOTHER name in a business schema that points at an ini view or a `P_*`
+    table passes with `any_schema`; so does `SYS_DATABASES.<view>` on a
+    system database, i.e. the monitoring views of all its tenants.
+    `check_select(sql, *, fixed=False, any_schema=False)`: `fixed=True` skips
+    the deny-list and nothing else, for the registered checks only
+    (`iniContents` reads the ini values, `iniFiles` counts them, `backupStatus`
+    and the `security` checks read named keys;
     `tests/test_hanadb_checks.py` validates every registered statement with
-    it); `run_select` keeps the strict default. One walk
+    it); the two switches are independent; `run_select` keeps the strict
+    default unless the entry has `allow_select_all`. One walk
     with a frame per parenthesis level: **only reserved words end a FROM
     list** (`WHERE` and `HAVING` followed by a condition, `GROUP BY`, `ORDER
     BY`, `LIMIT <n>`, a set operator followed by `ALL`, `DISTINCT`, `SELECT`
@@ -1225,63 +1247,122 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     arguments: [{name, default, rule}]}]}`; a `required` argument carries
     `required: true` instead of a default), `run_check(system, check,
     schema=None, object=None, top=None, hours=None, host=None,
-    other_schema=None)` (defaults
+    other_schema=None, section=None, key=None, offset=None)` (defaults
     applied by the registry: `top` 50, at most the check's cap; `hours` 24;
     no filter; an argument the check does not take is refused, a `required`
     one left out too; answers `{system, check, columns, rows, row_count,
-    truncated}`, for a check of several statements `{system, check, parts:
-    [{label, columns, rows, row_count, truncated}]}`; an answer or part whose
+    truncated, offset, next_offset}`, for a check of several statements
+    `{system, check, parts: [{label, columns, rows, row_count, truncated,
+    offset, next_offset}]}`; an answer or part whose
     LOB values came back cut (ending in ` …[cut]`, judged before masking)
     adds `truncated_columns`, the sorted column names, only when not empty;
     the LOB cap per value is the check's `lob_chars`, else `CHECK_LOB_CHARS`
     4,096) and, ONLY with
-    `allow_select`, `run_select(system, sql, top=100)` (`top` 1..500; the
-    guard first, nothing sent on a refusal; what it selected comes back
-    unmasked, which is what the switch is for). **What Allow SELECT
+    `allow_select`, `run_select(system, sql, top=100, offset=None)` (`top`
+    1..500; the guard first, with `any_schema` exactly when the entry has
+    `allow_select_all`, on the model's statement as written, nothing sent on a
+    refusal; what it selected comes back unmasked, which is what the switch is
+    for). **Paging** (`page_sql`): `offset` is 0..`OFFSET_MAX` (100,000;
+    anything else, a bool included, `invalid_argument` naming the rule). At
+    offset 0 the statement and its binds are sent exactly as registered or
+    written; above it the statement is sent as `SELECT * FROM (<statement>)
+    LIMIT ? OFFSET ?` with `top + 1` and the offset bound, and a check's inner
+    `TOP ?` binds `offset + top + 1` so the page lies inside what the
+    statement reads. Every answer and part says its `offset` and
+    `next_offset` (`offset + row_count` when `truncated`, else `null`); each
+    page is a new read of live views, so rows can shift between pages. A
+    `result_too_large` refusal of any tool of the toolset carries the hint
+    `lower top` (`PAGE_HINT`). **`export_result(system, filename, check=None, sql=None, schema,
+    object, hours, host, other_schema, section, key, top=None)`**
+    (`export.py`), registered for every entry: the FULL result of one
+    registered check, or (only with `allow_select`, else `invalid_argument`
+    `sql`; the same guard call as `run_select`) of one SELECT, exactly one of
+    the two (`check`), the check's arguments only with `check`, `top` 1 to
+    `EXPORT_MAX_ROWS` (10,000, the default; a check's `max_rows_cap` does not
+    apply), written as ONE Excel file of the web chat conversation through
+    `agents/webchat/docgen.py` (`store_file`, `build_xlsx`: one sheet per part
+    of a composite check, `Result` for a SELECT; LOB values read at
+    `EXPORT_LOB_CHARS` 4,096 each within `EXPORT_LOB_BUDGET` 5,000,000; masked
+    columns stay masked; a finite number stays a number, a `Decimal` only when
+    the float says exactly the same, else text; rows cut to the workbook's
+    500,000 cells, the part then `truncated`). The answer is the file's
+    metadata and `EXPORT_PREVIEW_ROWS` (20) rows: `{system, check, file_id,
+    filename, download_url, row_count, truncated, columns, preview,
+    truncated_columns?}` (a composite check: `parts: [{label, ...}]`); once
+    the file is stored the call always answers it: over the 60,000 cap the
+    previews are emptied (`preview_omitted: true`), and if it still does not
+    fit only the counts (`row_count`, `truncated`, `column_count`). Refusals
+    of its own: `no_chat` (no web chat run bound: a scheduled run, A2A, the
+    classic chat), `export_too_large` (over 100 columns, or the store's
+    `too_large`), `export_failed`, `export_busy` (ONE export at a time per
+    toolset, an `asyncio.Lock`; a second call is refused, not queued); order:
+    refuse first, then read, then store. **What Allow SELECT
     exposes**: the whole `SYS` catalogue and every monitoring view the
     database user can read, among them statement texts WITH their literal
     values (`M_SQL_PLAN_CACHE`, `M_EXPENSIVE_STATEMENTS`, ...), bind values
     (the `PARAMETERS` columns), session and user names, client hosts and
     trace contents; the deny-list keeps out only the ini / configuration
     views (every name holding `INIFILE` or `CONFIGURATION_PARAMETER`) and the
-    `P_*` tables of `SYS` and `_SYS_STATISTICS`. Without the switch
-    `run_select` is not registered, and a `requires_select` check is neither
-    listed nor runnable (`unknown_check`, as if it did not exist).
+    `P_*` tables of `SYS` and `_SYS_STATISTICS`. **What Allow SELECT on all
+    schemas exposes** (`allow_select_all`): every row of every table and view
+    the database user can read, business and personal data included; it
+    reaches the model, the stored web chat history and, through
+    `export_result`, an Excel file of the conversation; on a system database
+    also the monitoring views of every tenant (`SYS_DATABASES`). Statements
+    stay read-only. Without `allow_select`
+    `run_select` is not registered, `export_result` takes no `sql`, and a
+    `requires_select` check is neither listed nor runnable (`unknown_check`,
+    as if it did not exist).
     **Nothing the model sent is echoed**: a refusal is `{"error": {code,
     message}}` from the closed `ERROR_CODES` (`errors.py`:
     `destination_error`, `proxy_refused`, `unreachable`, `login_failed`,
     `not_authorized`, `timeout`, `unknown_system`, `unknown_check`,
     `invalid_argument` plus `argument` and `rule`, `select_refused` plus
     `rule`, `result_too_large`, `sql_error` plus the integer `sql_code`,
-    `call_failed`), never a driver's, the destination service's or the
+    `call_failed`, `no_chat`, `export_too_large`, `export_failed`,
+    `export_busy`), never a driver's, the destination service's or the
     database's text; anything unexpected is `call_failed`, logged by class.
-    Every cell is made JSON safe (`json_value`: bytes as their size, temporal
-    values ISO, decimals as text, anything else its type name, never its
-    `repr`); a column name is cut to 128 characters, control and format
-    characters as `?` (`run_select`'s aliases are the model's). An answer
+    Every cell is made JSON safe (`values.py` `json_value`: bytes as their
+    size, temporal values ISO, decimals as text, a non-finite float as text,
+    anything else its type name, never its `repr`); a column name is cut to
+    128 characters, control and format characters as `?` (`run_select`'s
+    aliases are the model's). An answer
     over `MAX_RESULT_CHARS` (60,000, measured by `agents/tool_results.py`
     `result_chars`) is `result_too_large`, never cut. **What is stored**:
     `activity_summary` gives the fixed lines `list_systems: n systems`,
     `list_checks: n checks`, `run_check: <registered check>, n rows[,
-    truncated]`, `run_select: n rows[, truncated]`, `error: <code>`, plain
+    truncated]`, `run_select: n rows[, truncated]`, `export_result: n rows[,
+    truncated]` (the file's row count, summed over parts; never the file name,
+    id or a preview cell), `error: <code>` (a code outside `ERROR_CODES` is
+    shown as `call_failed`), plain
     or prefixed (`hana_`, `hana_0_`), hooked into
     `registry._short_tool_output`; `agents/run_activity.redact_args` keeps of
-    a `run_select` call only `system`, the SQL's length (`"<n chars>"`) and
-    `top`, for the run activity, the web chat's tool card and the classic
+    a `run_select` call only `system`, the SQL's length (`"<n chars>"`), `top`
+    and `offset`, of an `export_result` call only `system`, `check`, the
+    SQL's length and `top` (`filename` and the filters dropped), each kept
+    only in its own form (`system` a system slug, `check` a check name, `top`
+    / `offset` a real integer, else left out; arguments that are not an
+    object with a string `sql`, or for `export_result` without `sql`, are
+    shown as the length of the whole), for the run activity, the web chat's
+    tool card and the classic
     chat's tool card (`agents/chat_app.py`). Known limit: the web chat's
     stored history (`chat_messages.model_json`, the next turn's
     `message_history`, kept for `CHAT_RETENTION_DAYS`) holds the real
     tool-call arguments, SQL included, and, in a conversation that runs an
     admin agent straight (`agent_ref` `admin:<name>`), every tool RETURN of
-    that agent as well: session user names, client hosts, statement texts
-    and the rows of `run_select`
+    that agent as well: session user names, client hosts, statement texts,
+    ini values and the rows of `run_select` and of an export's preview
   - `checks/` — the closed check registry (`base.py`): a check is data, a
     hana-cli command name, a category, a one-line purpose,
     `source="bin/<name>.js"` and fixed statements whose only variable parts
     are `?` binds of the closed arguments `schema`, `object` and
     `other_schema` (identifiers, bound as given: the catalogue's case,
     usually upper; compared with `=`, never `LIKE`: a filter is an exact
-    name, no wildcard),
+    name, no wildcard), `section` and `key` (argument kind `text`: one line
+    of 1 to `TEXT_ARG_MAX` (128) characters, not blank, without a control,
+    format, line or paragraph separator character or lone surrogate; bound,
+    never part of the SQL, so a quote or `%` changes nothing; only
+    `iniContents` takes them),
     `top` (1..500, default 50, a `max_rows_cap` per check), `hours` (1..720,
     default 24) and `host` (a host name), plus the derived `top_plus_one`
     for a row limit in the SQL; `required`, `masked_columns`,
@@ -1289,7 +1370,7 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     `MAX_LOB_CHARS`; none = 4,096) per check. `register` refuses a statement that is not
     one read (first word `SELECT` / `WITH`; no comment, `;`, forbidden word,
     `INTO` or format placeholder), and a test runs the SELECT guard over
-    every registered statement. **68 checks, 139 statements** (the one place
+    every registered statement. **68 checks, 140 statements** (the one place
     these counts are kept; Phase 1 = monitoring, performance, system,
     backup; Phases 2 and 3 = database, schema, security, written against the
     SAP HANA 2.0 documentation and run on a landscape on 2026-11-13): monitoring 7 (`alerts`, `blocking`, `deadlocks`, `traces`,
@@ -1359,12 +1440,20 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     attribution is the docstring of `checks/__init__.py`, each check names
     its `bin/<command>.js`), mostly rewritten for the on-premise views:
     named columns, never `*`; HANA Cloud views replaced; a `# on-prem:`
-    comment per check says how and what ran where. **`iniContents` hides
-    values by default**: a value is shown only when neither its key nor its
-    section holds a word of `DENY_WORDS` (and the key does not end in `key`)
-    AND the value has a harmless shape (at most 64 characters of
-    `[A-Za-z0-9_ .,+%-]`, no line feed, carriage return or tab); otherwise
-    it reads `<hidden>` with `VALUE_HIDDEN` 1. `traceContents` needs `host`
+    comment per check says how and what ran where. **`iniContents` returns
+    ini values as stored**, nothing hidden, for EVERY `builtin:hana` agent
+    (with or without Allow SELECT): a credential, host or path kept in an ini
+    file reaches the model and the stored chat history. Filters, each
+    optional and bound: `object` the file (`LOWER(FILE_NAME) = LOWER(?)`),
+    `section` exact and `key` contains (`LOCATE`, so `%` and `_` are no
+    wildcards), all three case-insensitive. Two parts: `files`
+    (`SYS.M_INIFILE_CONTENTS`, one row per file, section, key and layer,
+    DEFAULT included) and `effective` (`SYS.M_CONFIGURATION_PARAMETER_VALUES`:
+    host, port, file, section, key, layer, value and `RESTART_REQUIRED`, the
+    value each service uses). The SELECT guard keeps both views out of
+    model-written SQL, so this fixed check is the one reader of every value
+    (`backupStatus` and the `security` checks read named keys only, `iniFiles`
+    counts). `traceContents` needs `host`
     and `object` (the file, as `traces` lists them: `M_TRACEFILE_CONTENTS`
     refuses a read without both equality predicates), exists only with
     `allow_select` (trace text is unmasked) and returns at most 200 rows.
@@ -1384,8 +1473,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   cannot be `expose_invoke` (`HANA_INVOKE_MESSAGE`), may be chat-exposed
   only at tier `advanced` (`HANA_CHAT_MESSAGE`), and may not be named in
   any agent's `peers` (any other row, enabled or not; `_HANA_PEER_RULE`);
-  `allow_select` decides only whether `run_select` is registered (exactly
-  `true`, `pins_of`). A stored row that breaks the rules (written by hand, or a
+  `allow_select` decides only whether `run_select` is registered and
+  `export_result` takes `sql`, `allow_select_all` only whether that SQL may
+  read any schema (each exactly `true`, `pins_of`; the reach rules are the
+  same for both). A stored row that breaks the rules (written by hand, or a
   Phase 1 row saved as basic chat or invoke without `allow_select`, which
   was valid before 2.42.0) still loads and the app starts, but it is built
   WITHOUT the HANA tools (its other servers stay), and no delegation tool is
@@ -1400,7 +1491,7 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `check_hana_reach` takes no row lock (the build closes what it misses).
   **Registry and admin.** `agents/builtins.py` builds it from the stored
   block; an agent save or bundle import that changes the entry (systems,
-  Allow SELECT, the entry itself) or enables or disables such an agent
+  Allow SELECT, `allow_select_all`, the entry itself) or enables or disables such an agent
   reloads the registry (`_entry_signature`). `GET
   /admin/api/credential-health` lists a `builtin:hana` entry once per system
   (`system`, `destination`, `state`, `auth_type`): the destination's
@@ -1421,12 +1512,27 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `SELECT TOP 1 * FROM (<statement>)` with the sample binds of `--dump`,
   not as the exact statement the app sends. "Read-only verified" means only
   that the statement was accepted: that a write is refused is what the
-  probe's `--write-test` step (`write_refused`, `WRITE_REFUSED`) proves, and
-  it has not run yet (it needs the customer's agreement; its read-only
-  refusal code, `READ_ONLY_REFUSAL_CODES`, is a candidate to confirm then).
+  probe's `--write-test` step (`write_refused`, `WRITE_REFUSED`) proves. It
+  ran there on 2026-11-18 (same system, a SYSTEMDB and a tenant, after the
+  schema pin): a DDL and a DML in the read-only transaction were both refused
+  with SQL code 129 and a driver text naming a read-only transaction
+  (`WRITE_REFUSED yes`); code 7, the probe's one candidate in
+  `READ_ONLY_REFUSAL_CODES` (still `{7}`), did not occur, the refusal passed
+  on its text. The same run (`--admin-sql-facts`, every key `yes` on both
+  databases) showed: `M_INIFILE_CONTENTS` lists the DEFAULT layer;
+  `SYS.M_CONFIGURATION_PARAMETER_VALUES` exists with the columns HOST, PORT,
+  SECTION, KEY, HAS_KEY_INDEX, FILE_NAME, LAYER_NAME, VALUE, HAS_PROPERTIES,
+  RAW_VALUE, VIOLATED_RESTRICTIONS, RESTART_REQUIRED (no default-value
+  column); the section and key filter with mixed-case values; the paging
+  wrapper `SELECT * FROM (...) LIMIT ? OFFSET ?` takes binds, keeps the inner
+  order, and accepts a `WITH` and two columns of one name inside it. Not
+  shown by that run: the app's own client for any of 2.44.0's features
+  (`allow_select_all`, paging, `export_result`), the two `iniContents`
+  statements as a whole (NULL binds with `LOWER(?)`), the runtime of a large
+  export.
   **Not verified there**: the app's own client end to end (nothing is
   deployed yet), the order `SET SCHEMA SYS` then `SET TRANSACTION READ ONLY`
-  (the probe now sends it as `schema_pin`), a refused write, the login
+  in the app's own client (the probe sends it as `schema_pin`), the login
   breaker and the one-login gate, the LOB budget,
   `communicationTimeout`, the run_select deny-list against the real views,
   `traceContents` with a real host and file, a NULL bind of an optional
@@ -1448,7 +1554,7 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `_checks.py`, `_checks_monitoring.py`, `_checks_performance.py`,
   `_checks_system.py`, `_checks_backup.py`, `_checks_database.py`,
   `_checks_inspection.py`, `_checks_schema.py`, `_checks_security.py`,
-  `_tools.py`, `_activity.py`,
+  `_text_args.py`, `_tools.py`, `_export.py`, `_activity.py`,
   `_registration.py`, `_reload.py`, `_reach.py`, `_readonly.py`,
   `_seed.py`; setup in `docs/HANA_SETUP.md` (local, not in repo)
 - `agents/tool_results.py` — `result_chars(result)`: the size of a tool
@@ -3196,7 +3302,15 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     added**: it depends on lxml, and with lxml installed openpyxl stops using
     defusedxml (`tests/test_sharepoint_requirements.py`). Files go to
     `chat_files` through the `ChatRunContext` contextvar, never an argument;
-    caps 10 MiB, 10 per run, 500,000 cells; every refusal is `{"error": ...}`
+    caps 10 MiB, 10 per run, 500,000 cells; every refusal is `{"error": ...}`.
+    **Every file a tool stores during a turn gets exactly one file card**:
+    the document tools emit theirs from the event stream; a file another tool
+    stored through `docgen.store_file` (a specialist's or an admin agent's own
+    tool, e.g. `builtin:hana`'s `export_result`) is only in the run context's
+    list, so `TurnRecorder.files_from(ctx.files)` adds a `file` part for each
+    file without one at the end of a turn, on success, cancel and failure
+    alike (`TurnRecorder.file` skips a `file_id` it has carded), so it reaches
+    the viewer (`tests/test_webchat_tool_files.py`)
   - `store.py` — owner-scoped persistence, `CHAT_RETENTION_DAYS` (180, `0`
     keeps) purge in the app's daily retention pass, `MAX_MESSAGES` 500
   - **Usage and agent detail** (no table or column: parts and events only).
@@ -3663,8 +3777,13 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   (blank lines dropped, the names sent as typed for the server to judge, a
   line without exactly two names refused by its line number, never its
   text) and an "Allow SELECT" checkbox whose ticking asks first (Cancel
-  leaves it unticked; the question names no system); two such rows are
-  refused before the save
+  leaves it unticked; the question names no system); below it "Allow SELECT
+  on all schemas (read-only)" (`allow_select_all`), enabled only while Allow
+  SELECT is ticked (unticking that one unticks and disables it, a URL edit to
+  another toolset unticks both), with a fixed question of its own at the
+  tick and again at the save when the row lists a system its answer did not
+  cover, and sent only as `true` next to `allow_select: true`; two such rows
+  are refused before the save
 - `ui5-admin/` — SAPUI5 (TypeScript) rebuild of the admin UI, deployed to the
   BTP HTML5 Application Repository and served at `/ui5admin`. Runs **alongside**
   `templates/admin.html`, which is still the supported admin at `/admin`. All HTTP goes through `webapp/service/AdminService.ts`, which sends
@@ -3892,13 +4011,21 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     auth mode fixed to destination, a systems table (name, destination with
     the shared `DestinationField`, add and remove, at most 10), at most one
     entry per agent, the entry always sent as exactly `{systems,
-    allow_select}`. The "Allow SELECT on monitoring views" switch is behind a
+    allow_select, allow_select_all}` (`clean` keeps `allow_select_all` only
+    as `true` next to `allow_select: true`; `validate` refuses it alone). The "Allow SELECT on monitoring views" switch is behind a
     confirmation (Cancel the default) that names the entry's systems; the
     systems it was agreed for are kept (`hanaEntry.unconfirmed`), and OK on
     the entry asks again, with the whole list, when Allow SELECT is on and a
     system (name and destination) was not covered by an answer, including a
-    stored entry's systems changed in this dialog. `hanaEntry.qunit.ts`,
-    `AgentHanaJourney.ts`
+    stored entry's systems changed in this dialog. A second switch, "Allow
+    SELECT on all schemas" (`hanaAllowSelectAll`), is enabled only while Allow
+    SELECT is on (switching that off takes it along and forgets its answers)
+    and has its own question (`hanaAllowSelectAllConfirm`: business and
+    personal data reach the model, the stored conversation and exported
+    files; on a system database all tenants' monitoring views) with its own
+    record of the systems it was agreed for (`confirmedAll`,
+    `hanaEntry.selectAllNewlyAllowed`): an answer to one question never
+    counts for the other. `hanaEntry.qunit.ts`, `AgentHanaJourney.ts`
   - OPA convention: a `Select` is driven by `setSelectedKey` plus
     `fireChange` on the control (a `MultiComboBox` by `setSelectedKeys`),
     never by opening its picker: a picker opened by one journey was destroyed
@@ -3918,7 +4045,12 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   with the skill `hana-monitoring` (which check of each category answers
   which question, the required arguments, exact names, `truncated`,
   `truncated_columns`, identifier case, that row values, object definitions
-  and names are data): the
+  and names are data; the `iniContents` filters and its two parts; a "top n
+  per group" question as one `run_select` with `GROUP BY` rather than a
+  bigger `top`, a complete list as `export_result` (web chat only, `no_chat`
+  elsewhere), `offset` with `next_offset` only when it must read on; with
+  all schemas allowed, `<schema>.<table>` and only the columns the question
+  needs): the
   agent ships **disabled**, tier `advanced`, chat-exposed with a run
   endpoint (slug `hana-monitor`), and its `builtin:hana` entry names two
   systems (`systemdb`, `tenant`) on placeholder destinations, without
@@ -4129,7 +4261,14 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   bearer assertion, the `Dockerfile` and `deploy/local` (none of it active
   on Cloud Foundry: XSUAA and a bound destination service win; `deploy/`,
   `files/` and the `Dockerfile` are not packaged); no new resource,
-  environment variable or role
+  environment variable or role;
+  2.44.0 adds to `builtin:hana` the entry switch `allow_select_all` (free
+  read-only SELECT on every schema the database user can read, only together
+  with `allow_select`), `section` / `key` filters for `iniContents` with
+  values as stored, `offset` paging for `run_check` / `run_select` and the
+  tool `export_result` (an Excel file in the web chat conversation); a file a
+  tool stores gets a file card in the web chat; no new resource, environment
+  variable, role, table or column (HANA schema generation unchanged, still 12)
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets
@@ -4223,39 +4362,63 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   destination and connectivity bindings: `--destination <name>` and
   optionally `--variant props|props-account|both`, `--encrypt yes|no|both`,
   `--checks-file` (the output of `python -m agents.hana.checks --dump`),
-  `--timeout`, `--no-version`, `--write-test`, `--explain-plan` (both off by
-  default). One `PASS` / `FAIL` / `SKIP` line per step:
+  `--timeout`, `--no-version`, `--write-test`, `--explain-plan`,
+  `--admin-sql-facts` (the last three off by default). One `PASS` / `FAIL` / `SKIP` line per step:
   S1 bindings, S2 destination (`http` or `tcp` shape), S3 connectivity token
   (lifetime), S4 TCP connect to the SOCKS5 port, S5 raw SOCKS5 handshake, S6
   `hdbcli` login per variant and TLS, S7 `M_DATABASE` (rows, version), S8
   `SET SCHEMA SYS` (`schema_pin`) then `SET TRANSACTION READ ONLY`, S8b
   (`--write-test` only, the customer agrees first) two writes in the
   read-only transaction, each on its own line with its SQL code, which must
-  both be refused: DDL `CREATE LOCAL TEMPORARY TABLE #AGENT_PROBE_RO`
-  (`write_refused_ddl`) and DML `INSERT INTO "<current schema>".#AGENT_PROBE_RW
-  VALUES (1)` (`write_refused_dml`) into a session-local table made before
+  both be refused: DDL `CREATE LOCAL TEMPORARY TABLE "<current
+  schema>".#AGENT_PROBE_RO` (`write_refused_ddl`; schema-qualified like the
+  DML target, since after `SET SCHEMA SYS` an unqualified name was refused
+  for a missing privilege on SYS, which proves nothing about read-only) and
+  DML `INSERT INTO "<current schema>".#AGENT_PROBE_RW VALUES (1)`
+  (`write_refused_dml`) into a session-local table made before
   the transaction is reset (S8a `write_setup`: `SELECT CURRENT_SCHEMA`, then
-  the `CREATE`; the schema is never printed) and dropped after the last step
-  (`write_cleanup`). An attempt PASSes only for a code in
-  `READ_ONLY_REFUSAL_CODES` (one unconfirmed candidate, 7: confirm or correct
-  it from the first run), any other refusal is `INCONCLUSIVE <step>:
-  sql_code=<n>`; `WRITE_REFUSED yes` only when both pass, `no` when either is
-  accepted (the RO table dropped or the row rolled back, every later SQL
-  step `SKIP <step>: write was accepted`), `inconclusive` otherwise (a failed
-  setup included); `no` and `inconclusive` exit 1; a refused schema pin skips S8b and
-  S12 (`SKIP <step>: schema pin failed`, exit code 1), and `FAIL read_only:
+  the `CREATE`; the schema is never printed; without it both attempts are
+  `SKIP ...: setup failed`). A refused attempt prints `sql_code=<n>
+  read_only_text=yes|no` (`yes` when the driver's text, lower-cased, holds
+  `read only` or `read-only`; the text itself never leaves the function) and
+  PASSes for a code in `READ_ONLY_REFUSAL_CODES` (still the one unconfirmed
+  candidate, 7, which the landscape runs never saw: they saw 129, and 258
+  for the unqualified DDL of the earlier form) OR
+  `read_only_text=yes`; any other refusal is `INCONCLUSIVE <step>:
+  sql_code=<n> read_only_text=no`; `WRITE_REFUSED yes` only when both pass,
+  `no` when either is accepted (the RO table dropped or the row rolled back,
+  every later SQL step `SKIP <step>: write was accepted`), `inconclusive`
+  otherwise (a failed setup included); `no` and `inconclusive` exit 1. The
+  cleanup (`write_cleanup`, after the last step) first leaves the read-only
+  transaction (a rollback, then `SET TRANSACTION READ WRITE` in its own try)
+  and then drops the RW table and an RO table an accepted DDL left behind;
+  a refused schema pin skips S8b, S12 and S13
+  (`SKIP <step>: schema pin failed`, exit code 1), and `FAIL read_only:
   sql_code=<n>` right after `PASS schema_pin` would say HANA refused READ
   ONLY once the pin had opened the transaction; S9 the query timeout, S10 the effective
   privileges of the user (`ok`, `review`, `too_wide` or `unknown`; counts
   and schema names, never an object, grantor or user name), S11 `EXPLAIN
   PLAN` (`--explain-plan` only: it writes plan rows), S12 each statement of
   the checks file (run as `SELECT TOP 1 * FROM
-  (...)` with the sample binds, in the read-only transaction). A final block
+  (...)` with the sample binds, in the read-only transaction), S13
+  (`--admin-sql-facts` only, after S12 in the same read-only transaction and
+  skipped for the same reasons) the read-only facts of `ADMIN_SQL_FACTS` for
+  `iniContents` and paging, counts and column names only, never a row:
+  `ini_default_layer: rows=<n>`, `ini_layers: <LAYER>=<n> ...` (a layer name
+  of another form `<unprintable>`), `ini_key_filter: rows=<n>` (mixed-case
+  section and key matched case-insensitively), `config_parameter_values:
+  rows=<n> columns=<NAME>,...`, `page_inner` / `page_wrap` (an ordered read
+  and its page `LIMIT 10 OFFSET 10` around it, compared in memory),
+  `page_wrap_with` (a `WITH` inside the wrap) and `page_wrap_duplicate` (two
+  columns of one name inside it); a failure is its SQL code, and the facts
+  do not change the exit code. A final block
   with one value per key: `DEST_SHAPE`, `PROXY_VARIANT`, `TLS`,
   `TOKEN_SECONDS`, `READ_ONLY`, `QUERY_TIMEOUT`, `EXPLAIN_PLAN`
   (`yes|no|untested`), `PRIVILEGES`, `WRITE_REFUSED` (`yes`: both writes
-  refused with a read-only code; `no` only for an accepted write;
-  `inconclusive`; `untested`), `SCHEMA_PIN` (`yes|no`,
+  refused as read-only; `no` only for an accepted write;
+  `inconclusive`; `untested`), `INI_DEFAULT_LAYER`,
+  `CONFIG_PARAMETER_VALUES`, `PAGE_WRAP`, `PAGE_ORDER`, `PAGE_WRAP_WITH`,
+  `PAGE_WRAP_DUPLICATE` (`yes|no|untested` each, S13), `SCHEMA_PIN` (`yes|no`,
   the last key). Prints property names, SOCKS5 reply codes, SQL error codes
   and counts, never a credential, a token, a host from a binding or a
   destination, a row or a driver's error text
