@@ -18,7 +18,7 @@ Usage (inside the app container, with the app's Python):
     python probe_hana_connectivity.py --destination <name> \
         [--variant props|props-account|both] [--encrypt yes|no|both] \
         [--checks-file f.json] [--timeout 15] [--no-version] [--write-test]
-        [--explain-plan]
+        [--explain-plan] [--admin-sql-facts]
 
 The database password is read from the resolved destination (``User`` /
 ``Password``), never from a prompt or an argument. Two destination shapes are
@@ -45,6 +45,8 @@ Steps, one line each, ``PASS|FAIL|SKIP <step>: <fixed words>``:
                                     S10 EFFECTIVE_PRIVILEGES of CURRENT_USER
                                     S11 with --explain-plan only: EXPLAIN PLAN
                                     S12 the statements of --checks-file
+                                    S13 with --admin-sql-facts only: facts for
+                                        the ini check and result paging
 
 S8b proves what S8's ``accepted`` cannot: that the database refuses a write
 inside the read-only transaction, with two attempts, each on its own line
@@ -54,22 +56,29 @@ CURRENT_SCHEMA`` and ``CREATE LOCAL TEMPORARY TABLE "<schema>".#AGENT_PROBE_RW
 HANA does not commit that DDL by itself, the rollback that follows takes it
 back and the insert below is refused as an unknown table: inconclusive, the
 safe direction). Then, right after ``SET TRANSACTION READ ONLY``: (1) DDL,
-``CREATE LOCAL TEMPORARY TABLE #AGENT_PROBE_RO (I INTEGER)``
-(``write_refused_ddl``); (2) DML, ``INSERT INTO "<schema>".#AGENT_PROBE_RW
-VALUES (1)`` (``write_refused_dml``; ``SKIP ...: setup failed`` without the
-table). An attempt PASSes on a refusal whose SQL code is in
-``READ_ONLY_REFUSAL_CODES`` (``sql_code=<n>``; the set starts as one
-unconfirmed candidate, 7, to be confirmed or corrected from the first run);
-any other refusal is ``INCONCLUSIVE <step>: sql_code=<n>`` (a syntax error or
-a missing privilege proves nothing about the read-only transaction).
-``WRITE_REFUSED yes`` only when BOTH are refused with such a code. An
+``CREATE LOCAL TEMPORARY TABLE "<schema>".#AGENT_PROBE_RO (I INTEGER)``
+(``write_refused_ddl``; qualified like the DML target: after ``SET SCHEMA
+SYS`` an unqualified name was refused for a missing privilege on SYS, which
+says nothing about read-only); (2) DML, ``INSERT INTO "<schema>".#AGENT_PROBE_RW
+VALUES (1)`` (``write_refused_dml``). Without the schema both are ``SKIP ...:
+setup failed``, without the RW table the DML attempt. A refused attempt prints
+``sql_code=<n> read_only_text=yes|no``: ``yes`` when the driver's error text,
+lower-cased, holds ``read only`` or ``read-only`` (the text itself never leaves
+the function). It PASSes when its code is in ``READ_ONLY_REFUSAL_CODES`` (one
+unconfirmed candidate, 7; the first run saw 258 and 129, and 7 never) OR
+``read_only_text`` is ``yes``; any other refusal is ``INCONCLUSIVE <step>:
+sql_code=<n> read_only_text=no`` (a syntax error or a missing privilege proves
+nothing about the read-only transaction).
+``WRITE_REFUSED yes`` only when BOTH are refused that way. An
 accepted attempt is a FAIL: the RO table is dropped or the row rolled back,
 the DML attempt after an accepted DDL is ``SKIP ...: write was accepted``,
 ``READ_ONLY`` becomes ``no``, and every later SQL step (S9-S12) is ``SKIP
-<step>: write was accepted``. When the steps are done the transaction is
-rolled back and the RW table dropped (``PASS|FAIL write_cleanup``; it would
-go with the session anyway). Everything the test makes is session-local. S8b and S12 also need a
-passing schema pin (the app never runs a statement without it): when
+<step>: write was accepted``. When the steps are done the cleanup leaves the
+read-only transaction (a rollback, then ``SET TRANSACTION READ WRITE``) and
+drops the RW table and an RO table an accepted DDL left behind (``PASS|FAIL
+write_cleanup``; they would go with the session anyway). Everything the
+test makes is session-local. S8b, S12 and S13 also need a passing schema
+pin (the app never runs a statement without it): when
 ``SET SCHEMA SYS`` is refused they are ``SKIP <step>: schema pin failed`` and the
 probe exits non-zero. A ``FAIL read_only: sql_code=<n>`` right after ``PASS
 schema_pin`` would say that the pin opened the transaction and HANA refused to
@@ -80,6 +89,19 @@ once the customer agreed.
 S11 is off by default too (``--explain-plan``): ``EXPLAIN PLAN`` writes plan
 rows for the session, and it failed on the first landscape (the check that
 needed it was dropped).
+
+S13 is off by default too (``--admin-sql-facts``): read-only facts for the
+``iniContents`` check and for paging a result, in the same read-only
+transaction after S12 and skipped for the same reasons as the checks. It runs
+the statements of ``ADMIN_SQL_FACTS`` and prints counts and column names,
+never a row: ``ini_default_layer: rows=<n>``, ``ini_layers: <LAYER>=<n> ...``
+(a layer name of another form is ``<unprintable>``), ``ini_key_filter:
+rows=<n>`` (section and key matched case-insensitively), ``config_parameter_values:
+rows=<n> columns=<NAME>,...``, ``page_inner`` / ``page_wrap`` (an ordered read
+and its page ``LIMIT 10 OFFSET 10`` around it; ``PAGE_ORDER`` compares the two
+in memory), ``page_wrap_with`` (a ``WITH`` inside the wrap) and
+``page_wrap_duplicate`` (two columns of one name inside the wrap). A failure is
+its SQL code. The facts are information: they do not change the exit code.
 
 Variants (``hdbcli`` connection properties, SAP HANA Client SQLDBC properties):
 ``props`` = ``proxyHostname``, ``proxyPort``, ``proxyUserName`` (the
@@ -101,6 +123,9 @@ The final block holds one fixed value per key: ``DEST_SHAPE``,
 refused with a read-only code; ``no``: a write was ACCEPTED, only ever that;
 ``inconclusive``: otherwise, a refusal with another code or a failed setup;
 ``untested``: S8b did not run),
+``INI_DEFAULT_LAYER``, ``CONFIG_PARAMETER_VALUES``, ``PAGE_WRAP``,
+``PAGE_ORDER``, ``PAGE_WRAP_WITH``, ``PAGE_WRAP_DUPLICATE`` (``yes`` | ``no`` |
+``untested``: S13),
 ``SCHEMA_PIN`` (``yes`` | ``no``, the last key). ``no``, ``inconclusive`` and
 ``SCHEMA_PIN no`` each exit non-zero.
 ``QUERY_TIMEOUT yes`` says the driver accepted the timeout and ran a statement
@@ -169,8 +194,10 @@ MAX_SCHEMA_LINES = 10
 BROAD_SYSTEM_PRIVILEGES = frozenset({"DATA ADMIN"})
 SCHEMA_STATEMENT = "SET SCHEMA SYS"
 READ_ONLY_STATEMENT = "SET TRANSACTION READ ONLY"
+# The DDL attempt's table, qualified with the user's current schema like the
+# DML target (an unqualified name lands in SYS after the schema pin).
 WRITE_TEST_TABLE = "#AGENT_PROBE_RO"
-WRITE_TEST_STATEMENT = f"CREATE LOCAL TEMPORARY TABLE {WRITE_TEST_TABLE} (I INTEGER)"
+READ_WRITE_STATEMENT = "SET TRANSACTION READ WRITE"
 # The DML attempt's target, made before the read-only transaction in the
 # user's current schema (qualified: the schema pin moves the session to SYS).
 WRITE_DML_TABLE = "#AGENT_PROBE_RW"
@@ -180,7 +207,43 @@ WRITE_DML_TABLE = "#AGENT_PROBE_RW"
 # read-only transaction refused the write. 7 ("feature not supported") is the
 # single best-known candidate and is NOT confirmed for HANA 2.0: confirm on
 # the first run (the line prints the code either way), then correct this set.
+# The first run (2026-11-18) saw 258 for the DDL (an unqualified name in SYS)
+# and 129 for the DML, never 7: those codes are NOT added from one run; a
+# refusal whose text says read-only passes instead (``read_only_text``).
 READ_ONLY_REFUSAL_CODES = frozenset({7})
+READ_ONLY_WORDS = ("read only", "read-only")
+
+# S13, --admin-sql-facts: name -> (statement, binds). Read-only; the probe
+# prints counts and column names of their answers, never a row.
+ADMIN_SQL_FACTS: dict[str, tuple[str, tuple]] = {
+    "ini_default_layer": (
+        "SELECT COUNT(*) FROM SYS.M_INIFILE_CONTENTS WHERE LAYER_NAME = 'DEFAULT'", ()),
+    "ini_layers": (
+        "SELECT LAYER_NAME, COUNT(*) FROM SYS.M_INIFILE_CONTENTS GROUP BY LAYER_NAME "
+        "ORDER BY LAYER_NAME", ()),
+    # mixed case on purpose: proves the case-insensitive match
+    "ini_key_filter": (
+        "SELECT COUNT(*) FROM SYS.M_INIFILE_CONTENTS WHERE LOWER(SECTION) = LOWER(?)"
+        " AND LOCATE(LOWER(\"KEY\"), LOWER(?)) > 0", ("MemoryManager", "Global_Allocation")),
+    "config_parameter_values": (
+        "SELECT COUNT(*) FROM SYS.M_CONFIGURATION_PARAMETER_VALUES", ()),
+    "config_parameter_columns": (
+        "SELECT COLUMN_NAME FROM SYS.VIEW_COLUMNS WHERE SCHEMA_NAME = 'SYS'"
+        " AND VIEW_NAME = 'M_CONFIGURATION_PARAMETER_VALUES' ORDER BY POSITION", ()),
+    "page_inner": (
+        "SELECT TOP ? FILE_NAME, SECTION, \"KEY\", LAYER_NAME FROM SYS.M_INIFILE_CONTENTS"
+        " ORDER BY FILE_NAME, SECTION, \"KEY\", LAYER_NAME", (21,)),
+    "page_wrap": (
+        "SELECT * FROM (SELECT TOP ? FILE_NAME, SECTION, \"KEY\", LAYER_NAME FROM "
+        "SYS.M_INIFILE_CONTENTS ORDER BY FILE_NAME, SECTION, \"KEY\", LAYER_NAME) "
+        "LIMIT ? OFFSET ?", (21, 10, 10)),
+    "page_wrap_with": (
+        "SELECT * FROM (WITH T AS (SELECT 1 AS A FROM SYS.DUMMY) SELECT A FROM T) "
+        "LIMIT ? OFFSET ?", (1, 0)),
+    "page_wrap_duplicate": (
+        "SELECT * FROM (SELECT 1 AS A, 2 AS A FROM SYS.DUMMY) LIMIT ? OFFSET ?", (1, 0)),
+}
+LAYER_NAME_RE = re.compile(r"^[A-Z]{1,16}$")
 
 
 class ProbeError(Exception):
@@ -229,6 +292,13 @@ class Facts:
     # yes | no (the write was accepted) | inconclusive (refused, not for being
     # read-only as far as READ_ONLY_REFUSAL_CODES knows) | untested
     write_refused: str = "untested"
+    # S13 (--admin-sql-facts): yes | no | untested each
+    ini_default_layer: str = "untested"
+    config_parameter_values: str = "untested"
+    page_wrap: str = "untested"
+    page_order: str = "untested"
+    page_wrap_with: str = "untested"
+    page_wrap_duplicate: str = "untested"
     schema_pin: bool = False
 
 
@@ -732,6 +802,12 @@ def report_block(facts: Facts) -> str:
             f"EXPLAIN_PLAN {facts.explain_plan}",
             f"PRIVILEGES {facts.privileges}",
             f"WRITE_REFUSED {facts.write_refused}",
+            f"INI_DEFAULT_LAYER {facts.ini_default_layer}",
+            f"CONFIG_PARAMETER_VALUES {facts.config_parameter_values}",
+            f"PAGE_WRAP {facts.page_wrap}",
+            f"PAGE_ORDER {facts.page_order}",
+            f"PAGE_WRAP_WITH {facts.page_wrap_with}",
+            f"PAGE_WRAP_DUPLICATE {facts.page_wrap_duplicate}",
             f"SCHEMA_PIN {_yes(facts.schema_pin)}",
         ]
     )
@@ -773,6 +849,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--explain-plan",
         action="store_true",
         help="run EXPLAIN PLAN (it writes plan rows for the session)",
+    )
+    parser.add_argument(
+        "--admin-sql-facts",
+        action="store_true",
+        help="read-only facts for iniContents and paging: counts and column names, never a row",
     )
     return parser
 
@@ -903,7 +984,7 @@ def _run(args, environ, facts, transport, open_socket, handshake, connect) -> No
     facts.tls = tls_fact(logins)
     if conn is None:
         for step in ("database", "schema_pin", "read_only", "write_refused", "query_timeout",
-                     "privileges", "explain_plan"):
+                     "privileges", "explain_plan", "admin_sql_facts"):
             say("SKIP", step, "no login")
         return
     try:
@@ -940,7 +1021,7 @@ def _sql_steps(conn, args, facts: Facts, checks: list[dict]) -> None:
         say("FAIL", "database", sql_code_of(exc))
 
     # S8a, --write-test only: the DML target, before the transaction is reset.
-    rw_table = _write_setup(cursor) if args.write_test else None
+    schema, rw_table = _write_setup(cursor) if args.write_test else (None, None)
 
     # S8: S7 opened a transaction (autocommit is off). End it, so the
     # transaction S9-S12 then run in starts here; mid-transaction SET
@@ -965,6 +1046,7 @@ def _sql_steps(conn, args, facts: Facts, checks: list[dict]) -> None:
         say("FAIL", "read_only", sql_code_of(exc))
 
     # S8b
+    ro_left = False
     if not args.write_test:
         say("SKIP", "write_refused", "no --write-test")
     elif not facts.schema_pin:
@@ -973,12 +1055,13 @@ def _sql_steps(conn, args, facts: Facts, checks: list[dict]) -> None:
     elif not facts.read_only:
         say("SKIP", "write_refused", "not read-only")
     else:
-        _write_test(conn, cursor, facts, rw_table)
+        ro_left = _write_test(conn, cursor, facts, schema, rw_table)
     if facts.write_refused == "no":
         # The transaction was not read-only: nothing else runs on this login.
-        for step in ("query_timeout", "privileges", "explain_plan", "checks"):
+        for step in ("query_timeout", "privileges", "explain_plan", "checks",
+                     "admin_sql_facts"):
             say("SKIP", step, "write was accepted")
-        _write_cleanup(conn, cursor, rw_table)
+        _write_cleanup(conn, cursor, schema, rw_table, ro_left)
         _close_cursor(cursor)
         return
 
@@ -1045,7 +1128,17 @@ def _sql_steps(conn, args, facts: Facts, checks: list[dict]) -> None:
         say("PASS" if not failed else "FAIL", "checks", f"passed={passed} failed={failed}")
     else:
         say("SKIP", "checks", "no --checks-file")
-    _write_cleanup(conn, cursor, rw_table)
+
+    # S13, --admin-sql-facts only
+    if not args.admin_sql_facts:
+        say("SKIP", "admin_sql_facts", "no --admin-sql-facts")
+    elif not facts.schema_pin:
+        say("SKIP", "admin_sql_facts", "schema pin failed")
+    elif not facts.read_only:
+        say("SKIP", "admin_sql_facts", "not read-only")
+    else:
+        run_admin_sql_facts(cursor, facts)
+    _write_cleanup(conn, cursor, schema, rw_table, ro_left)
     _close_cursor(cursor)
 
 
@@ -1056,49 +1149,77 @@ def _close_cursor(cursor) -> None:
         pass
 
 
-def _write_setup(cursor) -> str | None:
-    """S8a: the session-local table the DML attempt inserts into, in the
-    user's current schema; its qualified name, or None (nothing printed but
-    the step and a code: never the schema)."""
+def _write_setup(cursor) -> tuple[str | None, str | None]:
+    """S8a: the user's current schema (quoted, for both write attempts) and the
+    session-local table the DML attempt inserts into; ``None`` for what could
+    not be had (nothing printed but the step and a code: never the schema)."""
     try:
         cursor.execute("SELECT CURRENT_SCHEMA FROM SYS.DUMMY")
         row = cursor.fetchone()
         schema = row[0] if row else None
-        if not (isinstance(schema, str) and 0 < len(schema) <= 256 and "\0" not in schema):
-            say("FAIL", "write_setup", "no current schema")
-            return None
-        table = '"' + schema.replace('"', '""') + '".' + WRITE_DML_TABLE
+    except Exception as exc:  # noqa: BLE001 - code or class only
+        say("FAIL", "write_setup", sql_code_of(exc))
+        return None, None
+    if not (isinstance(schema, str) and 0 < len(schema) <= 256 and "\0" not in schema):
+        say("FAIL", "write_setup", "no current schema")
+        return None, None
+    quoted = '"' + schema.replace('"', '""') + '"'
+    table = f"{quoted}.{WRITE_DML_TABLE}"
+    try:
         cursor.execute(f"CREATE LOCAL TEMPORARY TABLE {table} (I INTEGER)")
     except Exception as exc:  # noqa: BLE001 - code or class only
         say("FAIL", "write_setup", sql_code_of(exc))
-        return None
+        return quoted, None
     say("PASS", "write_setup", "accepted")
-    return table
+    return quoted, table
+
+
+def read_only_text(exc: BaseException) -> bool:
+    """Does the driver's error text say read-only? The text never leaves here."""
+    texts = [getattr(exc, "errortext", None), *exc.args]
+    for text in texts:
+        if isinstance(text, str) and any(w in text.lower() for w in READ_ONLY_WORDS):
+            return True
+    return False
 
 
 def _write_attempt(cursor, step: str, statement: str) -> str:
     """One write inside the read-only transaction: ``refused`` (a read-only
-    code), ``other`` (another refusal) or ``accepted``."""
+    code or text), ``other`` (another refusal) or ``accepted``."""
     try:
         cursor.execute(statement)
     except Exception as exc:  # noqa: BLE001 - code or class only
-        if _int_sql_code(exc) in READ_ONLY_REFUSAL_CODES:
-            say("PASS", step, sql_code_of(exc))
+        by_text = read_only_text(exc)
+        words = f"{sql_code_of(exc)} read_only_text={_yes(by_text)}"
+        if by_text or _int_sql_code(exc) in READ_ONLY_REFUSAL_CODES:
+            say("PASS", step, words)
             return "refused"
-        say("INCONCLUSIVE", step, sql_code_of(exc))
+        say("INCONCLUSIVE", step, words)
         return "other"
     say("FAIL", step, "the write was accepted")
     return "accepted"
 
 
-def _write_test(conn, cursor, facts: Facts, rw_table: str | None) -> None:
+def _write_test(conn, cursor, facts: Facts, schema: str | None, rw_table: str | None) -> bool:
     """S8b: a DDL and a DML write inside the read-only transaction must both
-    be refused with a read-only code."""
+    be refused as read-only. True when an accepted RO table could not be
+    dropped at once (the cleanup tries again)."""
+    ro_left = False
     dml = "skipped"
-    ddl = _write_attempt(cursor, "write_refused_ddl", WRITE_TEST_STATEMENT)
+    if schema is None:
+        say("SKIP", "write_refused_ddl", "setup failed")
+        say("SKIP", "write_refused_dml", "setup failed")
+        facts.write_refused = "inconclusive"
+        return False
+    ro_table = f"{schema}.{WRITE_TEST_TABLE}"
+    ddl = _write_attempt(cursor, "write_refused_ddl",
+                         f"CREATE LOCAL TEMPORARY TABLE {ro_table} (I INTEGER)")
     if ddl == "accepted":
         # The transaction was not read-only. Undo, and run nothing more in it.
-        _undo(cursor.execute, f"DROP TABLE {WRITE_TEST_TABLE}")
+        try:
+            cursor.execute(f"DROP TABLE {ro_table}")
+        except Exception:  # noqa: BLE001 - the cleanup drops it once more
+            ro_left = True
         _undo(conn.rollback)
         say("SKIP", "write_refused_dml", "write was accepted")
     elif rw_table is None:
@@ -1114,6 +1235,7 @@ def _write_test(conn, cursor, facts: Facts, rw_table: str | None) -> None:
         facts.write_refused = "no"
     else:
         facts.write_refused = "yes" if ddl == dml == "refused" else "inconclusive"
+    return ro_left
 
 
 def _undo(action, *args) -> None:
@@ -1123,19 +1245,127 @@ def _undo(action, *args) -> None:
         pass
 
 
-def _write_cleanup(conn, cursor, rw_table: str | None) -> None:
-    """Drop the DML target once the steps are done (it would go with the
-    session anyway); a DDL statement, so after leaving the read-only
-    transaction."""
-    if rw_table is None:
+def _write_cleanup(conn, cursor, schema: str | None, rw_table: str | None,
+                   ro_left: bool) -> None:
+    """Drop what the write test made once the steps are done (it would go with
+    the session anyway). DDL, so the read-only transaction is left first: a
+    rollback, then READ WRITE in its own try (its refusal does not stop the
+    drop; the drop's outcome is the line)."""
+    if rw_table is None and not ro_left:
         return
+    _undo(conn.rollback)
+    _undo(cursor.execute, READ_WRITE_STATEMENT)
+    tables = [t for t in (rw_table,) if t]
+    if ro_left and schema:
+        tables.append(f"{schema}.{WRITE_TEST_TABLE}")
     try:
-        conn.rollback()
-        cursor.execute(f"DROP TABLE {rw_table}")
+        for table in tables:
+            cursor.execute(f"DROP TABLE {table}")
     except Exception as exc:  # noqa: BLE001 - code or class only
         say("FAIL", "write_cleanup", sql_code_of(exc))
         return
     say("PASS", "write_cleanup", "dropped")
+
+
+# ---- S13 admin SQL facts ------------------------------------------------------------------
+
+
+def _admin_read(cursor, name: str) -> list:
+    sql, binds = ADMIN_SQL_FACTS[name]
+    cursor.execute(sql, binds)
+    return [tuple(row) for row in cursor.fetchall()]
+
+
+def _count(rows: list) -> int | None:
+    value = rows[0][0] if len(rows) == 1 and len(rows[0]) == 1 else None
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _counted(cursor, name: str) -> int:
+    count = _count(_admin_read(cursor, name))
+    if count is None:
+        raise ProbeError("not a count")
+    return count
+
+
+def _admin_fail(name: str, exc: BaseException) -> None:
+    say("FAIL", name, "not a count" if isinstance(exc, ProbeError) else sql_code_of(exc))
+
+
+def run_admin_sql_facts(cursor, facts: Facts) -> None:
+    """S13: facts for the iniContents check and result paging. Prints counts
+    and names of a fixed form only, never a row; each statement in its own try."""
+    try:
+        count = _counted(cursor, "ini_default_layer")
+        facts.ini_default_layer = _yes(count > 0)
+        say("PASS", "ini_default_layer", f"rows={count}")
+    except Exception as exc:  # noqa: BLE001 - code or class only
+        facts.ini_default_layer = "no"
+        _admin_fail("ini_default_layer", exc)
+
+    try:
+        rows = _admin_read(cursor, "ini_layers")
+        parts = []
+        for row in rows:
+            layer = row[0] if row else None
+            count = row[1] if len(row) > 1 else None
+            fits = isinstance(layer, str) and LAYER_NAME_RE.fullmatch(layer)
+            shown = layer if fits else UNPRINTABLE
+            number = count if isinstance(count, int) and not isinstance(count, bool) else "?"
+            parts.append(f"{shown}={number}")
+        say("PASS", "ini_layers", " ".join(parts) or "none")
+    except Exception as exc:  # noqa: BLE001
+        _admin_fail("ini_layers", exc)
+
+    try:
+        say("PASS", "ini_key_filter", f"rows={_counted(cursor, 'ini_key_filter')}")
+    except Exception as exc:  # noqa: BLE001
+        _admin_fail("ini_key_filter", exc)
+
+    try:
+        count = _counted(cursor, "config_parameter_values")
+    except Exception as exc:  # noqa: BLE001
+        facts.config_parameter_values = "no"
+        _admin_fail("config_parameter_values", exc)
+    else:
+        facts.config_parameter_values = "yes"
+        try:
+            names = [
+                row[0] if row and isinstance(row[0], str) and SCHEMA_NAME_RE.fullmatch(row[0])
+                else UNPRINTABLE
+                for row in _admin_read(cursor, "config_parameter_columns")
+            ]
+            columns = ",".join(names) or "none"
+        except Exception as exc:  # noqa: BLE001
+            columns = "unknown"
+            _admin_fail("config_parameter_columns", exc)
+        say("PASS", "config_parameter_values", f"rows={count} columns={columns}")
+
+    inner = page = None
+    for name in ("page_inner", "page_wrap"):
+        try:
+            rows = _admin_read(cursor, name)
+        except Exception as exc:  # noqa: BLE001
+            _admin_fail(name, exc)
+            continue
+        say("PASS", name, f"rows={len(rows)}")
+        if name == "page_inner":
+            inner = rows
+        else:
+            page = rows
+    facts.page_wrap = _yes(page is not None)
+    if inner is not None and page is not None:
+        facts.page_order = _yes(page == inner[10:20])  # in memory, nothing printed
+
+    for name in ("page_wrap_with", "page_wrap_duplicate"):
+        try:
+            rows = _admin_read(cursor, name)
+            ok = True
+            say("PASS", name, f"rows={len(rows)}")
+        except Exception as exc:  # noqa: BLE001
+            ok = False
+            _admin_fail(name, exc)
+        setattr(facts, name, _yes(ok))
 
 
 def main(argv: list[str] | None = None) -> int:
