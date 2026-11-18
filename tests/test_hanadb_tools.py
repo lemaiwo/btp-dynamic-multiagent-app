@@ -111,9 +111,9 @@ def test_build_refuses_a_bad_entry() -> None:
 
 
 def test_run_select_is_registered_only_with_allow_select() -> None:
-    assert set(build().tools) == {"list_systems", "list_checks", "run_check"}
+    assert set(build().tools) == {"list_systems", "list_checks", "run_check", "export_result"}
     assert set(build(OAUTH_SELECT).tools) == {
-        "list_systems", "list_checks", "run_check", "run_select"}
+        "list_systems", "list_checks", "run_check", "run_select", "export_result"}
 
 
 def test_descriptions_state_defaults_categories_and_select_rules() -> None:

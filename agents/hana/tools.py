@@ -1,7 +1,7 @@
 """The ``builtin:hana`` toolset: what an agent may ask of the HANA systems its
 entry names, and what of the answer reaches the model.
 
-Four tools. ``list_systems`` and ``list_checks`` answer from configuration
+Five tools. ``list_systems`` and ``list_checks`` answer from configuration
 and the check registry; ``run_check`` runs one registered check (fixed SQL,
 the model passes only the check's arguments); ``run_select`` runs one SELECT
 the model wrote, through the guard, and exists only for an entry with
@@ -11,6 +11,15 @@ they did not exist). ``run_select`` reads the monitoring schemas only, unless
 the entry also has ``allow_select_all``: then any schema the database user
 can read (the guard's ``any_schema``; the ini / configuration views and the
 ``P_*`` tables stay refused).
+
+``export_result`` (always registered; ``sql`` only with ``allow_select``,
+through the same guard call) writes the full result of a check or a SELECT,
+up to :data:`EXPORT_MAX_ROWS` rows, as one Excel file of the web chat
+conversation (:mod:`agents.webchat.docgen`) and answers only the file's
+metadata and the first :data:`EXPORT_PREVIEW_ROWS` rows. It ignores a
+check's ``max_rows_cap`` (that cap protects the answer, not a file); masked
+columns stay masked in the file. Outside a web chat conversation it answers
+``no_chat``; one export runs at a time per toolset (``export_busy``).
 
 **Paging.** ``run_check`` and ``run_select`` take an ``offset`` (0 to
 :data:`OFFSET_MAX`). At ``offset`` 0 the statement is sent exactly as written;
@@ -42,6 +51,7 @@ tools: counts, fixed words, a registered check name and a refusal's code.
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import logging
 import math
@@ -90,9 +100,24 @@ CHECK_LOB_CHARS = 4096
 #: What the LOB values of one statement may read together: one more than the
 #: answer may hold, since anything larger is refused anyway.
 LOB_BUDGET = MAX_RESULT_CHARS + 1
+#: ``export_result``: the most rows a file holds (the web chat's sheet cap),
+#: whatever a check's ``max_rows_cap`` says (that cap exists for the
+#: 60,000 character answer, not for a file).
+EXPORT_MAX_ROWS = 10_000
+#: The rows of the file the model sees in the answer.
+EXPORT_PREVIEW_ROWS = 20
+#: What an export reads of each LOB value, and of all of them together.
+EXPORT_LOB_CHARS = 4096
+EXPORT_LOB_BUDGET = 5_000_000
+EXPORT_TOP_RULE = f"must be a whole number from 1 to {EXPORT_MAX_ROWS}"
+EXPORT_ONE_OF_RULE = "give exactly one of check and sql"
+EXPORT_NO_SQL_RULE = "free SQL is not allowed for this agent"
+EXPORT_CHECK_ONLY_RULE = "only with check"
+EXPORT_FILENAME_RULE = "must be a file name with at least one usable character"
 _UNSAFE_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
 
-__all__ = ["CHECK_LOB_CHARS", "LOB_BUDGET", "MAX_RESULT_CHARS", "OFFSET_MAX", "TOOL_NAMES",
+__all__ = ["CHECK_LOB_CHARS", "EXPORT_LOB_BUDGET", "EXPORT_LOB_CHARS", "EXPORT_MAX_ROWS",
+           "EXPORT_PREVIEW_ROWS", "LOB_BUDGET", "MAX_RESULT_CHARS", "OFFSET_MAX", "TOOL_NAMES",
            "activity_summary", "hana_toolset", "json_value", "page_sql"]
 
 
@@ -114,6 +139,43 @@ def json_value(value: Any) -> Any:
     if isinstance(value, Decimal):
         return str(value)
     return f"<{type(value).__name__}>"
+
+
+def _excel_value(value: Any) -> Any:
+    """One cell as the workbook stores it: :func:`json_value`, except that a
+    finite ``int`` / ``float`` stays a number and a ``Decimal`` becomes a
+    number only when the float says exactly the same (``1.25``), else text, so
+    a long decimal is never rounded in the file."""
+    if isinstance(value, Decimal):
+        if value.is_finite():
+            as_float = float(value)
+            if math.isfinite(as_float) and Decimal(repr(as_float)) == value:
+                return as_float
+        return str(value)
+    return json_value(value)
+
+
+def _fit_cells(parts: list[dict[str, Any]], max_cells: int) -> None:
+    """Cut the rows of the parts, in order, so the workbook stays within
+    ``max_cells`` (header cells count, as ``build_xlsx`` counts them); a part
+    that lost rows is ``truncated``."""
+    budget = max_cells - sum(len(p["columns"]) for p in parts)
+    for part in parts:
+        width = max(1, len(part["columns"]))
+        allowed = max(0, budget // width)
+        if len(part["rows"]) > allowed:
+            part["rows"] = part["rows"][:allowed]
+            part["truncated"] = True
+        budget -= len(part["rows"]) * width
+
+
+def _export_top(value: Any) -> int:
+    if value is None:
+        return EXPORT_MAX_ROWS
+    if not isinstance(value, int) or isinstance(value, bool) or not (
+            1 <= value <= EXPORT_MAX_ROWS):
+        raise InvalidArgument("top", EXPORT_TOP_RULE)
+    return value
 
 
 def _column_name(value: Any) -> str:
@@ -189,7 +251,8 @@ def _categories(allow_select: bool) -> list[str]:
 
 _OFFSET_DOC = f"""Rows to skip, 0 to {OFFSET_MAX:,}; use `next_offset` of the previous
         answer. Each page is a new read of live views:
-        rows can shift between pages. Default 0."""
+        rows can shift between pages. Default 0. A complete list is better
+        fetched with `export_result`, which writes it to an Excel file."""
 
 
 def _run_check_doc(allow_select: bool) -> str:
@@ -270,6 +333,39 @@ Args:
     sql: The SELECT statement, at most 4,000 characters.
     top: The most rows to return, 1 to {SELECT_MAX_TOP}. Default {SELECT_DEFAULT_TOP}.
     offset: {_OFFSET_DOC}
+"""
+
+
+def _export_doc(allow_select: bool) -> str:
+    sql = (" or of one SELECT (`sql`, the same rules as `run_select`)" if allow_select
+           else "")
+    return f"""Write the FULL result of a registered check (`check`){sql}
+to ONE Excel file attached to this conversation, up to {EXPORT_MAX_ROWS:,} rows. Use it
+when the user wants a complete list or more than about 50 wide rows, instead of
+paging with `offset`. You see only the first {EXPORT_PREVIEW_ROWS} rows (`preview`); the rest
+is in the file, never in your context: do not claim what you have not seen. Answers
+`{{system, check, file_id, filename, download_url, row_count, truncated, columns,
+preview}}` (a check of several parts: one sheet per part and `parts: [{{label, columns,
+row_count, truncated, preview}}]`). Link the file in your answer with its
+download_url, e.g. [name](download_url). `truncated: true` means more rows exist
+than the file holds; `preview_omitted: true` means the preview was too large to show.
+Masked columns of a check (statement texts) stay masked in the file. Long text
+values are cut at {EXPORT_LOB_CHARS:,} characters (`truncated_columns`). Only in the web
+chat; one export at a time.
+
+Args:
+    system: A system name from `list_systems`.
+    filename: The file's name, without extension.
+    check: A check name from `list_checks`; give either this or `sql`.
+    sql: One SELECT statement (only with Allow SELECT); give either this or `check`.
+    schema: As for `run_check` (a check only).
+    object: As for `run_check` (a check only).
+    hours: As for `run_check` (a check only).
+    host: As for `run_check` (a check only).
+    other_schema: As for `run_check` (a check only).
+    section: As for `run_check` (a check only).
+    key: As for `run_check` (a check only).
+    top: The most rows to write, 1 to {EXPORT_MAX_ROWS:,}. Default {EXPORT_MAX_ROWS:,}.
 """
 
 
@@ -440,18 +536,146 @@ def hana_toolset(
 
     run_select.__doc__ = _run_select_doc(allow_select_all)
 
+    # One export at a time per toolset: an export holds up to 10,000 rows in
+    # memory and a slot of the connection layer for its whole read.
+    export_lock = asyncio.Lock()
+
+    async def _read_check(target: HanaSystem, name: Any, top_rows: int,
+                          given: dict[str, Any]) -> tuple[dict[str, Any], list, list]:
+        found = lookup(name, allow_select=allow_select)
+        args = resolve_args(found, **given)  # top left out: the check's cap is not the file's
+        if "top" in args:
+            args["top"] = top_rows
+        results = [await run_query(target, statement.sql, bind_values(statement, args),
+                                   top_rows, lob_chars=EXPORT_LOB_CHARS,
+                                   lob_budget=EXPORT_LOB_BUDGET)
+                   for statement in found.statements]
+        cut = [_cut_columns(columns, rows) for columns, rows, _ in results]
+        answer = build_answer(found, results)  # masks the check's masked columns
+        parts = answer.get("parts", [answer])
+        labels = [part.get("label") or found.name for part in parts]
+        return {"system": target.name, "check": found.name,
+                "_composite": "parts" in answer}, parts, list(zip(labels, cut))
+
+    async def _read_select(target: HanaSystem, statement: Any, top_rows: int,
+                           given: dict[str, Any]) -> Any:
+        if not allow_select:
+            raise InvalidArgument("sql", EXPORT_NO_SQL_RULE)
+        for name, value in given.items():
+            if value is not None:
+                raise InvalidArgument(name, EXPORT_CHECK_ONLY_RULE)
+        try:
+            # The same guard call as run_select, on the model's SQL as written.
+            check_select(statement, any_schema=allow_select_all)
+        except SelectRefused as refused:
+            error = HanaError("select_refused").to_dict()
+            error["rule"] = refused.rule
+            return {"error": error}
+        columns, rows, truncated = await run_query(
+            target, statement, (), top_rows, lob_chars=EXPORT_LOB_CHARS,
+            lob_budget=EXPORT_LOB_BUDGET)
+        part = {"columns": list(columns), "rows": [list(r) for r in rows],
+                "truncated": bool(truncated)}
+        return ({"system": target.name, "_composite": False}, [part],
+                [("Result", _cut_columns(columns, rows))])
+
+    async def _write(docgen: Any, ctx: Any, filename: str, head: dict[str, Any],
+                     parts: list[dict[str, Any]], sheets_of: list) -> dict[str, Any]:
+        if any(len(part["columns"]) > docgen.MAX_COLUMNS for part in parts):
+            raise HanaError("export_too_large")
+        for part in parts:
+            part["columns"] = [_column_name(c) for c in part["columns"]]
+        _fit_cells(parts, docgen.MAX_CELLS)
+        # Built without validation: every cell is already a Cell (_excel_value).
+        sheets = [docgen.SheetSpec.model_construct(
+            name=label, columns=part["columns"],
+            rows=[[_excel_value(v) for v in row] for row in part["rows"]])
+            for part, (label, _) in zip(parts, sheets_of)]
+        info = await docgen.store_file(ctx, filename, docgen.XLSX,
+                                       lambda: docgen.build_xlsx(sheets))
+        if "error" in info:
+            code = info["error"].get("code") if isinstance(info["error"], dict) else None
+            raise HanaError("export_too_large" if code == "too_large" else "export_failed")
+        composite = head.pop("_composite")
+        answer: dict[str, Any] = {**head, "file_id": info.get("file_id"),
+                                  "filename": info.get("name"),
+                                  "download_url": info.get("download_url")}
+        shown = []
+        for part, (label, cut) in zip(parts, sheets_of):
+            preview = {"columns": part["columns"], "rows": part["rows"][:EXPORT_PREVIEW_ROWS]}
+            _safe_part(preview)
+            entry: dict[str, Any] = {"columns": preview["columns"],
+                                     "row_count": len(part["rows"]),
+                                     "truncated": bool(part["truncated"]),
+                                     "preview": preview["rows"]}
+            if cut:
+                entry["truncated_columns"] = cut
+            shown.append({"label": label, **entry} if composite else entry)
+        if composite:
+            answer["parts"] = shown
+        else:
+            answer.update(shown[0])
+        if result_chars(answer) > MAX_RESULT_CHARS:
+            # The file is stored: the call answers it, without the preview.
+            for entry in shown:
+                entry["preview"] = []
+                entry["preview_omitted"] = True
+            if not composite:
+                answer.update(shown[0])
+        return answer
+
+    async def export_result(system: str, filename: str, check: str | None = None,
+                            sql: str | None = None, schema: str | None = None,
+                            object: str | None = None,  # noqa: A002 - the tool's argument
+                            hours: int | None = None, host: str | None = None,
+                            other_schema: str | None = None, section: str | None = None,
+                            key: str | None = None, top: int | None = None
+                            ) -> dict[str, Any]:
+        async def body() -> dict[str, Any]:
+            # Imported here: the HANA toolset does not load the web chat at import.
+            from agents.webchat import docgen
+
+            ctx = docgen.current_chat_run.get()
+            if ctx is None:
+                raise HanaError("no_chat")
+            name = docgen.clean_filename(filename, ".xlsx")
+            if name is None:
+                raise InvalidArgument("filename", EXPORT_FILENAME_RULE)
+            if (check is None) == (sql is None):
+                raise InvalidArgument("check", EXPORT_ONE_OF_RULE)
+            if export_lock.locked():
+                raise HanaError("export_busy")
+            async with export_lock:
+                target = _system(system)
+                top_rows = _export_top(top)
+                given = {"schema": schema, "object": object, "hours": hours, "host": host,
+                         "other_schema": other_schema, "section": section, "key": key}
+                if check is not None:
+                    read = await _read_check(target, check, top_rows, given)
+                else:
+                    read = await _read_select(target, sql, top_rows, given)
+                if isinstance(read, dict):
+                    return read  # a refusal of the guard
+                head, parts, sheets_of = read
+                return await _write(docgen, ctx, name, head, parts, sheets_of)
+
+        return await _answer(body)
+
+    export_result.__doc__ = _export_doc(allow_select)
+
     toolset.add_function(list_systems)
     toolset.add_function(list_checks)
     toolset.add_function(run_check)
     if allow_select:
         toolset.add_function(run_select)
+    toolset.add_function(export_result)
     return toolset
 
 
 # ---- activity line ------------------------------------------------------------------
 # The tools as an agent lists them: plain, or behind the prefix the registry
 # gives each server of an agent that has several (`hana_`, `hana_0_`).
-TOOL_NAMES = ("list_systems", "list_checks", "run_check", "run_select")
+TOOL_NAMES = ("list_systems", "list_checks", "run_check", "run_select", "export_result")
 _ACTIVITY_NAME_RE = re.compile(r"(?:hana(?:_[0-9]+)?_)?(" + "|".join(TOOL_NAMES) + ")")
 _CODE_RE = re.compile(r"[a-z][a-z0-9_]{0,39}")
 
