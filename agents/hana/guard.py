@@ -43,6 +43,21 @@ The rules, in the order they are checked:
     ``fixed=True``, which skips the deny-list and nothing else: ``iniContents``,
     ``iniFiles`` and ``backupStatus`` read the ini contents for named keys.
 
+    ``any_schema=True`` (``run_select`` of an entry that may read business
+    schemas) accepts a two-part name ``<schema>.<name>`` or
+    ``"<schema>"."<name>"`` in every schema, nothing more: a three-part name
+    (a reference into another database) is still refused, an unqualified name
+    must still be an ``M_*`` name or a CTE (the session is pinned to ``SYS``,
+    so an unqualified business table would not even resolve), and table
+    functions and schema-qualified calls outside ``SYS`` / ``_SYS_STATISTICS``
+    stay refused. Every other rule above is unchanged. The ini / configuration
+    part of the deny-list then applies in EVERY schema and is compared
+    case-folded (a ``PUBLIC`` synonym of ``M_INIFILE_CONTENTS`` reads the same
+    values; a quoted lower-case name is refused as well); the ``P_*`` rule stays
+    on ``SYS`` and ``_SYS_STATISTICS``. Known gap, accepted: a synonym or view
+    of ANOTHER name in a business schema that points at an ini view or a
+    ``P_*`` table is not recognised; the guard reads names, it looks nothing up.
+
 How table references are found: the walker reads the tokens once, keeping a
 frame per parenthesis level. In a query frame ``FROM`` opens the FROM list;
 only ``WHERE`` / ``HAVING`` (followed by a condition), ``GROUP BY`` /
@@ -86,7 +101,8 @@ ALLOWED_SCHEMAS = frozenset({"SYS", "_SYS_STATISTICS"})
 #: let them through: they hold the ini and configuration values the fixed
 #: ``iniContents`` check deliberately hides. Matched unqualified and in every
 #: allowed schema (``SYS.``, ``_SYS_STATISTICS.``), after the allow rule's
-#: upper-casing (a quoted name verbatim).
+#: upper-casing (a quoted name verbatim); with ``any_schema`` in every schema,
+#: case-folded (a quoted name too).
 DENIED_VIEWS = frozenset({"M_INIFILE_CONTENTS", "M_CONFIGURATION_PARAMETER_VALUES"})
 #: Parts of a name that deny it, in the same schemas as :data:`DENIED_VIEWS`
 #: (the statistics server keeps copies and histories of these values too):
@@ -147,12 +163,17 @@ _EXPRESSION_FROM_FUNCTIONS = frozenset(
 )
 
 
-def check_select(sql: str, *, fixed: bool = False) -> None:
+def check_select(sql: str, *, fixed: bool = False, any_schema: bool = False) -> None:
     """Return when ``sql`` is one read of the monitoring views; else raise.
 
     ``fixed=True`` is for the registered checks only (their SQL is ours, and
     the masking of their answers is theirs): it skips the deny-list and no
     other rule. ``run_select`` keeps the strict default.
+
+    ``any_schema=True`` additionally accepts ``<schema>.<name>`` in any
+    schema and widens the ini / configuration deny-list to every schema; it
+    relaxes no other rule (see the module docstring). The two switches are
+    independent.
     """
     if not isinstance(sql, str):
         raise SelectRefused("unreadable")
@@ -165,7 +186,7 @@ def check_select(sql: str, *, fixed: bool = False) -> None:
         raise SelectRefused("one_statement")
     if not tokens or not tokens[0].is_word("SELECT", "WITH"):
         raise SelectRefused("select_only")
-    _Walker(tokens, deny=not fixed).run()
+    _Walker(tokens, deny=not fixed, any_schema=any_schema).run()
 
 
 @dataclass
@@ -176,9 +197,11 @@ class _Frame:
 
 
 class _Walker:
-    def __init__(self, tokens: list[Token], *, deny: bool = True) -> None:
+    def __init__(self, tokens: list[Token], *, deny: bool = True,
+                 any_schema: bool = False) -> None:
         self.tokens = tokens
         self.deny = deny
+        self.any_schema = any_schema
         self.size = len(tokens)
         # CTE name -> index of the ")" that closes its body: visible after it.
         self.ctes: dict[str, int] = {}
@@ -304,9 +327,12 @@ class _Walker:
             if name.startswith("M_"):
                 self._check_denied(None, name)
                 return
-        elif len(parts) == 2 and parts[0].value in ALLOWED_SCHEMAS and parts[1].value:
-            self._check_denied(parts[0].value, parts[1].value)
-            return
+        elif len(parts) == 2 and parts[1].value:
+            schema, name = parts[0].value, parts[1].value
+            # Exactly two parts: a three-part name reaches another database.
+            if schema in ALLOWED_SCHEMAS or (self.any_schema and schema):
+                self._check_denied(schema, name)
+                return
         raise SelectRefused("table_not_allowed")
 
     def _check_denied(self, schema: str | None, name: str) -> None:
@@ -314,9 +340,13 @@ class _Walker:
         if not self.deny:
             return
         # Every allowed schema, unqualified included: a copy in
-        # _SYS_STATISTICS holds the same values as the SYS view.
-        if (schema is None or schema in ALLOWED_SCHEMAS) and (
-                name in DENIED_VIEWS or any(part in name for part in DENIED_NAME_PARTS)):
+        # _SYS_STATISTICS holds the same values as the SYS view. With
+        # any_schema every schema, case-folded: a PUBLIC synonym (or a copy
+        # under a quoted lower-case name) reads the same values.
+        folded = name.upper() if self.any_schema else name
+        in_scope = schema is None or schema in ALLOWED_SCHEMAS or self.any_schema
+        if in_scope and (
+                folded in DENIED_VIEWS or any(part in folded for part in DENIED_NAME_PARTS)):
             raise SelectRefused("table_not_allowed")
         if schema in ALLOWED_SCHEMAS and name.startswith(DENIED_SYS_PREFIX):
             raise SelectRefused("table_not_allowed")
