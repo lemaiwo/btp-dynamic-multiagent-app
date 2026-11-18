@@ -370,6 +370,8 @@ class TurnRecorder:
         self._agent_started: dict[str, float] = {}
         self._card_ids: dict[str, str] = {}
         self._suppressed: set[str] = set()
+        # The files that have a card, so no file is shown twice.
+        self._file_ids: set[str] = set()
         self.note = WORKING
         self.delegations = 0
         self.last_activity = time.monotonic()
@@ -468,12 +470,29 @@ class TurnRecorder:
         self.turn.publish("usage", data)
 
     def file(self, info: dict[str, Any]) -> None:
+        file_id = info.get("file_id")
+        if file_id in self._file_ids:
+            return
+        if file_id:
+            self._file_ids.add(file_id)
         data = {k: info.get(k) for k in ("file_id", "name", "media_type", "size")}
         # A dashboard's card reads "Dashboard · <title> · n widgets".
         data.update({k: info[k] for k in ("title", "widgets") if k in info})
         self.parts.append({"type": "file", **data})
         self.turn.publish("file", data)
         self._touch()
+
+    def files_from(self, stored: list[dict[str, Any]]) -> None:
+        """A card for each file of the run that has none yet.
+
+        The document tools emit theirs from the event stream; a file another
+        tool stored through ``docgen.store_file`` (a specialist's or an admin
+        agent's own tool) is only in the run context's list, and would
+        otherwise never reach the viewer, which reads ``file`` parts.
+        """
+        for info in stored:
+            if info.get("file_id"):
+                self.file(info)
 
     def set_note(self, text: str) -> None:
         self.note = text
@@ -867,9 +886,12 @@ async def _run(turn: Turn, data: TurnInput) -> None:
             # Whatever is still open is closed first, so the usage part is
             # the last part and its event comes after every agent frame.
             rec.close_open_tools()
+            rec.files_from(ctx.files)
             rec.usage(result.usage(), runner.model_name)
         except asyncio.CancelledError:
             rec.finished = True
+            # A file stored before the cancel exists: it keeps its card.
+            rec.files_from(ctx.files)
             turn.publish("error", {"code": "canceled", "message": MSG_CANCELED})
             await _finish(turn, rec, status="canceled", content=rec.text_so_far or None,
                           model_json=None, error=CANCELED_ERROR, title=data.title)
@@ -893,6 +915,9 @@ async def _run(turn: Turn, data: TurnInput) -> None:
         if counter is not None:
             counter.value -= 1
         rec.finished = True
+        # A failed turn: the files stored before the failure exist (a no-op
+        # when the success or cancel path showed them already).
+        rec.files_from(ctx.files)
         beat.cancel()
         current_access.reset(access_token)
         current_chat_run.reset(ctx_token)
