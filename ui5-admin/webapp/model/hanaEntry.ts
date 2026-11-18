@@ -2,12 +2,15 @@ import type { AuthMode, McpServer } from "../service/types";
 
 /**
  * The agent's one `builtin:hana` server entry: which on-premise SAP HANA
- * databases the agent may read monitoring and catalogue views of, and
- * whether it may run its own SELECT on them.
+ * databases the agent may read monitoring and catalogue views of, whether
+ * it may run its own SELECT on them (`allow_select`) and whether that SELECT
+ * may read every schema, business data included (`allow_select_all`, which
+ * only ever extends `allow_select`).
  *
  * Pure rules, no controls, so they can be unit-tested. Mirrors
  * `agents/hana/config.py` rule for rule, which is authoritative: this module
- * adds no rule of its own. The entry holds exactly `{systems, allow_select}`
+ * adds no rule of its own. The entry holds exactly `{systems, allow_select,
+ * allow_select_all}`
  * and names no top-level destination (each system has its own) and no
  * identity (each destination's technical database user). The server refuses
  * every key that is not the entry's, so `clean` builds the block from
@@ -23,7 +26,7 @@ export const MAX_HANA_SYSTEMS = 10;
 const SYSTEM_NAME_RE = /^[a-z][a-z0-9_]{0,31}$/;
 /** `DESTINATION_PATTERN` in agents/hana/config.py, the OData gate's pattern. */
 const DESTINATION_RE = /^[A-Za-z0-9_.-]{1,200}$/;
-const ENTRY_KEYS = ["systems", "allow_select"];
+const ENTRY_KEYS = ["systems", "allow_select", "allow_select_all"];
 const SYSTEM_KEYS = ["name", "destination"];
 /** `_ECHOED`: tolerated only while they say nothing (`false`). */
 const ECHOED = ["has_client_secret", "user_context"];
@@ -35,10 +38,12 @@ export const HANA_TEXTS = {
     userContext: "SAP HANA (monitoring) cannot act as the signed-in user: it connects as the technical "
         + "user of each system's destination.",
     destination: "A SAP HANA (monitoring) entry has no destination of its own: the destinations are per system.",
-    oneKey: "A SAP HANA (monitoring) entry holds only its systems and the SELECT switch.",
+    oneKey: "A SAP HANA (monitoring) entry holds only its systems and the SELECT switches.",
     none: `Add 1 to ${MAX_HANA_SYSTEMS} systems.`,
     tooMany: `At most ${MAX_HANA_SYSTEMS} systems per entry.`,
     allowSelect: "Allow SELECT must be on or off.",
+    allowSelectAll: "Allow SELECT on all schemas must be on or off.",
+    allowSelectAllNeedsSelect: "Allow SELECT on all schemas needs Allow SELECT.",
     secondEntry: "An agent has one SAP HANA (monitoring) entry; add the systems to the existing one."
 };
 
@@ -59,6 +64,7 @@ export interface HanaSystem {
 export interface HanaEntry {
     systems: HanaSystem[];
     allow_select?: true;
+    allow_select_all?: true;
 }
 
 /** A refusal and, for one system, its position (0-based) and field. */
@@ -98,7 +104,10 @@ function present(cfg: Record<string, unknown>): string[] {
  * Exactly what the server's cleaner stores: `systems` as `{name,
  * destination}` per row, as typed (the server refuses edge whitespace
  * instead of repairing it, so `validate` and the server see the same text),
- * and `allow_select` only as the JSON boolean `true`.
+ * `allow_select` only as the JSON boolean `true`, and `allow_select_all`
+ * only as `true` and only next to `allow_select: true` (the server refuses
+ * the pair otherwise; `problem` still reports that for a block built
+ * elsewhere).
  */
 function clean(raw: Record<string, unknown> | undefined | null): HanaEntry {
     const systems = Array.isArray(raw?.systems) ? raw?.systems as unknown[] : [];
@@ -113,6 +122,9 @@ function clean(raw: Record<string, unknown> | undefined | null): HanaEntry {
     };
     if (raw?.allow_select === true) {
         out.allow_select = true;
+        if (raw?.allow_select_all === true) {
+            out.allow_select_all = true;
+        }
     }
     return out;
 }
@@ -167,6 +179,13 @@ function problem(oauth: McpServer["oauth"] | undefined, authMode: AuthMode | str
     if (allow !== null && allow !== undefined && typeof allow !== "boolean") {
         return { text: HANA_TEXTS.allowSelect };
     }
+    const wide = cfg.allow_select_all;
+    if (wide !== null && wide !== undefined && typeof wide !== "boolean") {
+        return { text: HANA_TEXTS.allowSelectAll };
+    }
+    if (wide === true && allow !== true) {
+        return { text: HANA_TEXTS.allowSelectAllNeedsSelect };
+    }
     return null;
 }
 
@@ -180,6 +199,14 @@ function validate(oauth: McpServer["oauth"] | undefined, authMode: AuthMode | st
 function selectNewlyAllowed(before: Record<string, unknown> | undefined | null,
     after: Record<string, unknown> | undefined | null): boolean {
     return before?.allow_select !== true && after?.allow_select === true;
+}
+
+/** True when a save would switch SELECT on all schemas on where it was
+ *  not: `before` the block as stored (or as the dialog opened), `after` the
+ *  one to send. Allow SELECT alone never counts. */
+function selectAllNewlyAllowed(before: Record<string, unknown> | undefined | null,
+    after: Record<string, unknown> | undefined | null): boolean {
+    return before?.allow_select_all !== true && after?.allow_select_all === true;
 }
 
 /** The position of the agent's `builtin:hana` entry, skipping `except` (the
@@ -208,8 +235,10 @@ function explicit(servers: readonly McpServer[] | undefined | null): McpServer[]
 
 /**
  * The systems of `current` that `confirmed` does not hold as the same name
- * AND destination: what Allow SELECT would cover that the admin was not
- * asked about. Compared exactly, as the server stores them.
+ * AND destination: what a switch would cover that the admin was not asked
+ * about. Compared exactly, as the server stores them. Each switch keeps a
+ * `confirmed` list of its own (Allow SELECT, and SELECT on all schemas): an
+ * answer to one question never counts for the other.
  */
 function unconfirmed(confirmed: readonly HanaSystem[] | undefined | null,
     current: readonly HanaSystem[]): HanaSystem[] {
@@ -266,6 +295,7 @@ export default {
     problem,
     validate,
     selectNewlyAllowed,
+    selectAllNewlyAllowed,
     unconfirmed,
     shownName,
     shownSystem,
