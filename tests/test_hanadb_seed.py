@@ -204,3 +204,14 @@ def test_the_entry_stays_without_select_on_all_schemas():
     (server,) = _agent()["mcp_servers"]
     assert "allow_select_all" not in server["oauth"]
     assert "allow_select_all" not in RAW
+
+
+def test_the_skill_says_what_to_do_on_result_too_large_and_a_wrong_name():
+    from agents.hana.guard import check_select
+
+    c = _skill()["content"]
+    for word in ("`result_too_large`", "`sql_error`", "`export_result`", "SYS.VIEW_COLUMNS",
+                 "259", "260", "at most twice"):
+        assert word in c, word
+    (example,) = re.findall(r"`(SELECT COLUMN_NAME FROM SYS\.VIEW_COLUMNS[^`]*)`", c)
+    check_select(example.replace("<VIEW>", "M_EXPENSIVE_STATEMENTS"))

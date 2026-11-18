@@ -20,13 +20,14 @@ The driver call and the guard are passed in by the toolset (``run``,
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 from collections.abc import Awaitable, Callable
 from decimal import Decimal
 from typing import Any
 
 from agents.hana.checks import InvalidArgument, bind_values, build_answer, lookup, resolve_args
-from agents.hana.connection import HanaSystem
+from agents.hana.connection import LOB_CUT_MARKER, HanaSystem
 from agents.hana.errors import HanaError
 from agents.hana.guard import SelectRefused
 from agents.hana.values import (
@@ -37,6 +38,8 @@ from agents.hana.values import (
     safe_part,
 )
 from agents.tool_results import result_chars
+
+logger = logging.getLogger(__name__)
 
 #: The most rows a file holds (the web chat's sheet cap), whatever a check's
 #: ``max_rows_cap`` says (that cap exists for the 60,000 character answer,
@@ -116,6 +119,32 @@ def _fit_cells(parts: list[dict[str, Any]], max_cells: int) -> None:
             part["rows"] = part["rows"][:allowed]
             part["truncated"] = True
         budget -= len(part["rows"]) * width
+
+
+def _fit_text(parts: list[dict[str, Any]], sheets_of: list[tuple[str, list[str]]],
+              max_chars: int) -> list[tuple[str, list[str]]]:
+    """Cut every text cell longer than the workbook's cell limit
+    (``max_chars``, ``MAX_CELL_CHARS`` of the web chat's ``docgen``) to fit,
+    ending in :data:`LOB_CUT_MARKER`, and add its column to that sheet's cut
+    columns. The second line behind the reader's per-value cap
+    (``EXPORT_LOB_CHARS``): one long cell must never fail the whole file,
+    which the workbook builder would refuse. Expects the parts' column names
+    already in their model form (:func:`column_name`)."""
+    keep = max_chars - len(LOB_CUT_MARKER)
+    fitted = []
+    for part, (label, cut) in zip(parts, sheets_of):
+        names = set(cut)
+        rows = []
+        for row in part["rows"]:
+            cells = list(row)
+            for i, value in enumerate(cells):
+                if isinstance(value, str) and len(value) > max_chars:
+                    cells[i] = value[:keep] + LOB_CUT_MARKER
+                    names.add(part["columns"][i])
+            rows.append(cells)
+        part["rows"] = rows
+        fitted.append((label, sorted(names)))
+    return fitted
 
 
 def export_top(value: Any) -> int:
@@ -198,6 +227,7 @@ class HanaExport:
         for part in parts:
             part["columns"] = [column_name(c) for c in part["columns"]]
         _fit_cells(parts, docgen.MAX_CELLS)
+        sheets_of = _fit_text(parts, sheets_of, docgen.MAX_CELL_CHARS)
         # Built without validation: every cell is already a Cell (_excel_value).
         sheets = [docgen.SheetSpec.model_construct(
             name=label, columns=part["columns"],
@@ -206,8 +236,14 @@ class HanaExport:
         info = await docgen.store_file(ctx, filename, docgen.XLSX,
                                        lambda: docgen.build_xlsx(sheets))
         if "error" in info:
-            code = info["error"].get("code") if isinstance(info["error"], dict) else None
-            raise HanaError("export_too_large" if code == "too_large" else "export_failed")
+            error = info["error"] if isinstance(info["error"], dict) else {}
+            code = error.get("code")
+            if code == "too_large":
+                raise HanaError("export_too_large")
+            # The store's codes and messages are fixed texts without a value
+            # (the workbook builder's SheetError included); nothing else is logged.
+            logger.warning("hana: export store failed (%s: %s)", code, error.get("message"))
+            raise HanaError("export_failed")
         # From here on the file is stored: every path answers it.
         composite = head.pop("_composite")
         answer: dict[str, Any] = {**head, "file_id": info.get("file_id"),

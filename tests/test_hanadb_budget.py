@@ -296,3 +296,77 @@ async def test_an_export_over_the_lob_budget_is_export_too_large_and_stores_noth
 
 def test_export_too_large_names_the_text_budget() -> None:
     assert "too much text" in MESSAGES["export_too_large"]
+
+
+# ---- a long text value that arrives as plain text (task F4) ----------------------------
+# Seen on a landscape (2026-11-18): an NCLOB of M_EXPENSIVE_STATEMENTS arrives from the
+# real driver as a plain str, so the reader must cut and count it like a LOB it read.
+
+
+def test_a_long_plain_str_is_cut_like_a_lob() -> None:
+    lobs = reading.LobReader(4096, 60_001)
+    value = lobs.value("s" * 131_072)
+    assert value == "s" * 4096 + reading.LOB_CUT_MARKER
+    assert lobs.left == 60_001 - 4096
+
+
+def test_a_long_plain_str_over_the_budget_is_lob_budget() -> None:
+    lobs = reading.LobReader(65_536, 60_001)
+    with pytest.raises(reading.LobBudget):
+        lobs.value("s" * 131_072)
+
+
+def test_a_plain_str_up_to_per_value_is_unchanged_and_not_counted() -> None:
+    lobs = reading.LobReader(4096, 5000)
+    text = "s" * 4096
+    assert lobs.value(text) is text
+    assert lobs.value(text) is text  # twice: nothing was counted
+    assert lobs.left == 5000
+
+
+def test_two_long_plain_values_within_the_budget_are_both_cut_and_counted() -> None:
+    lobs = reading.LobReader(100, 1000)
+    assert lobs.value("a" * 500) == "a" * 100 + reading.LOB_CUT_MARKER
+    assert lobs.value("b" * 500) == "b" * 100 + reading.LOB_CUT_MARKER
+    assert lobs.left == 800
+
+
+def test_long_plain_bytes_are_cut_without_a_marker_and_counted() -> None:
+    lobs = reading.LobReader(10, 100)
+    assert lobs.value(b"\x01" * 50) == b"\x01" * 10
+    assert lobs.value(bytearray(b"\x02" * 50)) == b"\x02" * 10
+    assert lobs.left == 80
+    short = b"\x03" * 10
+    assert lobs.value(short) is short and lobs.left == 80
+
+
+def test_a_long_plain_str_after_the_budget_is_used_up_is_lob_budget() -> None:
+    lobs = reading.LobReader(100, 150)
+    lobs.value("a" * 200)
+    assert lobs.left == 50
+    with pytest.raises(reading.LobBudget):
+        lobs.value("b" * 200)
+
+
+async def test_run_query_cuts_a_long_plain_str_and_names_the_column(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    from agents.hana.values import cut_columns
+    db = h.install(monkeypatch, h.FakeDbapi(rows=[(1, "s" * 131_072), (2, "short")]))
+    db.description = (("A",), ("STATEMENT_STRING",))
+    columns, rows, _ = await run_query(_system(), "SELECT A, STATEMENT_STRING FROM SYS.M_X",
+                                       [], 5, lob_chars=4096, lob_budget=60_001)
+    assert rows[0][1] == "s" * 4096 + reading.LOB_CUT_MARKER
+    assert rows[1][1] == "short"
+    assert cut_columns(columns, rows) == ["STATEMENT_STRING"]
+    _ends_clean(db)
+
+
+async def test_run_query_over_the_budget_with_plain_strs_is_result_too_large(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    db = h.install(monkeypatch, h.FakeDbapi(rows=[(1, "s" * 131_072)]))
+    db.description = (("A",), ("STATEMENT_STRING",))
+    with pytest.raises(HanaError) as caught:
+        await run_query(_system(), "SELECT A, STATEMENT_STRING FROM SYS.M_X", [], 5,
+                        lob_chars=65_536, lob_budget=60_001)
+    assert caught.value.code == "result_too_large"
+    _ends_clean(db)

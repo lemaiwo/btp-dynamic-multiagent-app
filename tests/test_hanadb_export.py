@@ -546,3 +546,55 @@ async def test_the_export_lock_is_released_after_a_failure_and_a_cancel(
     monkeypatch.setattr(tools, "run_query", real)
     assert "error" not in await export(toolset, system="erp_tenant", check="alerts",
                                        filename="after_cancel")
+
+
+# ---- one long cell never fails the export (task F4) ------------------------------------
+
+
+async def test_a_cell_over_the_workbook_limit_is_cut_and_named(
+        monkeypatch: pytest.MonkeyPatch, db: h.FakeDbapi, chat) -> None:
+    from agents.hana import export as export_module
+    _, saved = chat
+    monkeypatch.setattr(export_module, "EXPORT_LOB_CHARS", 50_000)
+    db.description = (("A",), ("TEXT",))
+    db.rows = [(1, "x" * 40_000), (2, "short")]
+    answer = await export(build(OAUTH_SELECT), system="erp_tenant", sql=SQL, filename="long")
+    assert "error" not in answer
+    assert answer["truncated_columns"] == ["TEXT"]
+    rows = sheets(saved.files[0][2])["Result"]
+    assert len(rows[1][1]) == docgen.MAX_CELL_CHARS
+    assert rows[1][1].endswith(LOB_CUT_MARKER)
+    assert rows[1][1].startswith("x" * 30_000)
+    assert rows[2][1] == "short"
+
+
+async def test_a_cell_at_the_workbook_limit_is_unchanged(
+        monkeypatch: pytest.MonkeyPatch, db: h.FakeDbapi, chat) -> None:
+    from agents.hana import export as export_module
+    _, saved = chat
+    monkeypatch.setattr(export_module, "EXPORT_LOB_CHARS", 50_000)
+    db.description = (("A",), ("TEXT",))
+    db.rows = [(1, "x" * docgen.MAX_CELL_CHARS)]
+    answer = await export(build(OAUTH_SELECT), system="erp_tenant", sql=SQL, filename="edge")
+    assert "truncated_columns" not in answer
+    assert sheets(saved.files[0][2])["Result"][1][1] == "x" * docgen.MAX_CELL_CHARS
+
+
+async def test_a_store_error_is_logged_by_code_and_is_export_failed(
+        monkeypatch: pytest.MonkeyPatch, db: h.FakeDbapi, chat,
+        caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.DEBUG)
+
+    async def refusing(ctx, name, media_type, build):  # noqa: ARG001
+        return {"error": {"code": "invalid_argument",
+                          "message": "A cell holds a number that is not finite."}}
+
+    monkeypatch.setattr(docgen, "store_file", refusing)
+    db.rows = [(1, "secret-row-value")]
+    answer = await export(system="erp_tenant", check="alerts", filename="x")
+    _refusal(answer, "export_failed")
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "invalid_argument" in warnings[0] and "store" in warnings[0]
+    assert "A cell holds a number that is not finite." in warnings[0]
+    assert "secret-row-value" not in warnings[0]

@@ -99,8 +99,11 @@ SELECT_DEFAULT_TOP = 100
 SELECT_MAX_TOP = 500
 OFFSET_MAX = 100_000
 OFFSET_RULE = f"must be a whole number from 0 to {OFFSET_MAX}"
-#: The fixed hint of a ``result_too_large`` refusal: a smaller page fits.
-PAGE_HINT = "lower top"
+#: The fixed hint of a ``result_too_large`` refusal: a smaller page or fewer,
+#: shorter columns fit, and the export holds what does not fit an answer (seen on
+#: a landscape: after "lower top" alone the model stopped instead of exporting).
+PAGE_HINT = ("lower top, select fewer or shorter columns, or call export_result with the "
+             "same check or sql to get the rows as a file")
 #: The fixed hint of an ``export_too_large`` refusal.
 EXPORT_HINT = "select fewer columns or rows"
 #: What a registered check reads of each LOB value (a statement text) unless

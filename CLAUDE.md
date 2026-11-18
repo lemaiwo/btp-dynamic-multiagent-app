@@ -1077,7 +1077,16 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     count too): a value that would pass it, or any further value once it is
     used up, stops the reading at once (no further `read` round trip) and
     the call is `result_too_large`, rollback and close as always; a failing
-    read the fixed `<unreadable LOB>`; `read(size)` unverified on the real
+    read the fixed `<unreadable LOB>`. **A long value that arrives as plain
+    text is cut and counted like a LOB**: seen on a landscape (2026-11-18),
+    an export of `STATEMENT_STRING` (`NCLOB`, values up to 131,072
+    characters) failed while the same SQL without that column did not;
+    inferred from that, without a stack trace, that the real driver hands an
+    `NCLOB` back as a plain `str`, so no cap applied. A `str`, `bytes` or
+    `bytearray` longer than the cap per value is now cut to it (text with
+    ` …[cut]`, bytes without) and counted against the budget with the same
+    `result_too_large` rule; a plain value up to the cap is unchanged and not
+    counted. `read(size)` of a LOB object is still unverified on the real
     driver. **The login protection**: every call is
     one login and HANA locks a user after a few invalid attempts (default 6,
     reset only by a successful login; the user may be a person's). The state
@@ -1285,7 +1294,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     `next_offset` (`offset + row_count` when `truncated`, else `null`); each
     page is a new read of live views, so rows can shift between pages. A
     `result_too_large` refusal of any tool of the toolset carries the hint
-    `lower top` (`PAGE_HINT`). **`export_result(system, filename, check=None, sql=None, schema,
+    `lower top, select fewer or shorter columns, or call export_result with
+    the same check or sql to get the rows as a file` (`PAGE_HINT`; seen on a
+    landscape: after `lower top` alone the model stopped instead of
+    exporting). **`export_result(system, filename, check=None, sql=None, schema,
     object, hours, host, other_schema, section, key, top=None)`**
     (`export.py`), registered for every entry: the FULL result of one
     registered check, or (only with `allow_select`, else `invalid_argument`
@@ -1303,7 +1315,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     its first row is fetched (`max_columns`); masked
     columns stay masked; a finite number stays a number, a `Decimal` only when
     the float says exactly the same, else text; rows cut to the workbook's
-    500,000 cells, the part then `truncated`). The answer is the file's
+    500,000 cells, the part then `truncated`; a text cell over the workbook's
+    32,767 characters (`MAX_CELL_CHARS`) cut to fit with ` …[cut]` and its
+    column named in `truncated_columns`, so one long cell never fails the
+    file, the second line behind the reader's cap). The answer is the file's
     metadata and `EXPORT_PREVIEW_ROWS` (20) rows: `{system, check, file_id,
     filename, download_url, row_count, truncated, columns, preview,
     truncated_columns?}` (a composite check: `parts: [{label, ...}]`); once
@@ -1314,7 +1329,8 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     classic chat), `export_too_large` (over 100 columns, before or after the read, a read over the LOB
     or the row-character budget, or the store's `too_large`; nothing is
     stored; hint `select fewer columns or rows`, `EXPORT_HINT`),
-    `export_failed`, `export_busy` (ONE export at a time per toolset, an
+    `export_failed` (a store error other than `too_large` is one WARNING
+    naming the store's code and fixed message), `export_busy` (ONE export at a time per toolset, an
     `asyncio.Lock`; a second call is refused, not queued; the registry shares
     one toolset across all users of an agent, so a second user's export of
     the same agent answers `export_busy` while the first runs); order:
@@ -1551,14 +1567,23 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   shown by that run: the app's own client for any of 2.44.0's features
   (`allow_select_all`, paging, `export_result`), the two `iniContents`
   statements as a whole (NULL binds with `LOWER(?)`), the runtime of a large
-  export.
-  **Not verified there**: the app's own client end to end (nothing is
-  deployed yet), the order `SET SCHEMA SYS` then `SET TRANSACTION READ ONLY`
+  export. On 2026-11-18 the app's own client (2.44.0, deployed) ran there
+  `run_select` with and without `allow_select_all` (a schema-qualified table
+  passed the guard and the database answered `not_authorized`, SQL 258, for a
+  schema the user has no grant on), `offset` paging with `next_offset`,
+  `iniContents` with a key filter and NULL file / section binds (both parts),
+  `export_result` of a check (200 rows) and of a SELECT (50 rows), and the
+  refusal of `PUBLIC.M_INIFILE_CONTENTS`; an export of a SELECT with a
+  131,072-character `NCLOB` failed before the plain-text LOB fix and has not
+  been rerun yet.
+  **Not verified there**: the app's own client end to end beyond the calls
+  of 2026-11-18 above, the order `SET SCHEMA SYS` then `SET TRANSACTION READ ONLY`
   in the app's own client (the probe sends it as `schema_pin`), the login
   breaker and the one-login gate, the LOB budget,
   `communicationTimeout`, the run_select deny-list against the real views,
   `traceContents` with a real host and file, a NULL bind of an optional
-  filter, LOB values (`read(size)` of hdbcli's LOB object), a multi-line ini
+  filter, a LOB object's `read(size)` (on the landscape an `NCLOB` arrived
+  as plain text, inferred above), a multi-line ini
   value, the word-based mapping of -10709, TLS, a Cloud Connector location
   id, the `tcp` destination shape. **The checks of Phases 2 and 3**
   (categories `database`, `schema`, `security`) ran there on 2026-11-13 (same system and

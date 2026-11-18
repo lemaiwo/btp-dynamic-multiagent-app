@@ -41,9 +41,22 @@ class LobReader:
     more round trips; the caller answers ``result_too_large``). Why a total:
     ``top`` 500 rows of a SELECT that repeats a LOB column would otherwise
     read gigabytes before the answer's cap refuses it. A failing read is the
-    fixed :data:`LOB_UNREADABLE`, never the driver's text. Unverified on the
-    real driver: ``read(size)`` as the first positional argument and the
-    type it returns.
+    fixed :data:`LOB_UNREADABLE`, never the driver's text.
+
+    **A long value that arrives as plain text is treated the same.** Seen on
+    a landscape (2026-11-18, SAP HANA 2.0 SPS07, the deployed app): an export
+    of ``STATEMENT_STRING`` (``NCLOB``, values up to 131,072 characters)
+    failed, while the same SQL without that column did not. Inferred from
+    that, without a stack trace: the real driver hands an ``NCLOB`` back as a
+    plain ``str``, not as an object with ``read``, so neither cap applied. So
+    a ``str``, ``bytes`` or ``bytearray`` longer than ``per_value`` is cut to
+    it (a text with :data:`LOB_CUT_MARKER`, bytes without, as for a ``BLOB``)
+    and its kept length counted against the budget, with the same
+    :class:`LobBudget` rule as a value read from a LOB object (as if
+    ``per_value + 1`` had been read). A plain value of at most ``per_value``
+    is returned unchanged and NOT counted: ordinary columns read as before.
+    Still unverified on the real driver: ``read(size)`` of a LOB object (the
+    first positional argument and the type it returns).
     """
 
     def __init__(self, per_value: int, budget: int) -> None:
@@ -51,6 +64,8 @@ class LobReader:
         self.left = budget
 
     def value(self, value: Any) -> Any:
+        if isinstance(value, (str, bytes, bytearray)):
+            return self._plain(value)
         read = getattr(value, "read", None)
         if not callable(read):
             return value
@@ -68,6 +83,20 @@ class LobReader:
         self.left -= len(kept)
         if isinstance(content, str):
             return kept + LOB_CUT_MARKER if len(content) > self.per_value else kept
+        return bytes(kept)
+
+    def _plain(self, value: str | bytes | bytearray) -> Any:
+        """A value the driver handed back whole: unchanged up to ``per_value``,
+        else cut and counted exactly as a LOB object's read of
+        ``min(per_value, left) + 1`` would be."""
+        if len(value) <= self.per_value:
+            return value
+        if self.left <= 0 or self.per_value + 1 > self.left:
+            raise LobBudget()
+        kept = value[:self.per_value]
+        self.left -= len(kept)
+        if isinstance(value, str):
+            return kept + LOB_CUT_MARKER
         return bytes(kept)
 
 

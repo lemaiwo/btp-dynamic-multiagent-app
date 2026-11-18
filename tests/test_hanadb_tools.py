@@ -26,6 +26,8 @@ from tests import hanadb_helpers as h
 SECRETS = (h.MARKER, h.HOST, h.USER, h.PASSWORD, h.TOKEN, "hana-dest-one", "hana-dest-two")
 STATEMENT = "SELECT * FROM SAPABAP1.KNA1 WHERE KUNNR = 'customer4711' AND X = 99"
 
+HINT = ("lower top, select fewer or shorter columns, or call export_result with the same "
+        "check or sql to get the rows as a file")
 OAUTH = {"systems": [{"name": "erp_tenant", "destination": "hana-dest-one"},
                      {"name": "erp_systemdb", "destination": "hana-dest-two"}]}
 OAUTH_SELECT = {**OAUTH, "allow_select": True}
@@ -343,7 +345,7 @@ async def test_result_too_large_refused(db: h.FakeDbapi) -> None:
     answer = await call(build(), "run_check", system="erp_tenant", check="alerts", top=100)
     assert answer == {"error": {"code": "result_too_large",
                                 "message": MESSAGES["result_too_large"],
-                                "hint": "lower top"}}
+                                "hint": HINT}}
 
 
 async def test_driver_failure_is_an_error_object(db: h.FakeDbapi,
@@ -872,9 +874,9 @@ async def test_a_page_over_the_cap_says_lower_top(db: h.FakeDbapi) -> None:
                         sql="SELECT * FROM SYS.DUMMY", top=100, offset=200)
     assert answer == {"error": {"code": "result_too_large",
                                 "message": MESSAGES["result_too_large"],
-                                "hint": "lower top"}}
+                                "hint": HINT}}
     answer = await call(build(), "run_check", system="erp_tenant", check="alerts", top=100,
                         offset=100)
-    assert answer["error"]["hint"] == "lower top"
+    assert answer["error"]["hint"] == HINT
     answer = await call(build(), "run_check", system="erp_tenant", check="nope")
     assert "hint" not in answer["error"]
