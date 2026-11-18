@@ -470,3 +470,75 @@ async def test_no_value_or_sql_in_errors_or_logs(db: h.FakeDbapi, chat,
         for secret in SECRETS + ("4711", "SECRET_TABLE"):
             assert secret not in message
         assert record.exc_info is None
+
+
+# ---- deferred minors of the export review ------------------------------------------------
+
+
+async def test_an_answer_too_large_without_previews_still_answers_its_file(
+        db: h.FakeDbapi, chat) -> None:
+    """Columns and ``truncated_columns`` alone can pass the cap once the file is
+    stored: the call then answers the file with counts only, never
+    ``result_too_large`` (the model would narrow a query whose export exists)."""
+    _, saved = chat
+    register(Check(name="wide", category="monitoring", purpose="Three wide parts.",
+                   source="bin/wide.js",
+                   statements=tuple(Statement(f"part{i}", f"SELECT * FROM SYS.M_W{i}", ())
+                                    for i in range(3))))
+    names = [f"C{i:03d}".ljust(tools.MAX_COLUMN_NAME_CHARS, "x") for i in range(100)]
+    db.description = tuple((n,) for n in names)
+    db.rows = [tuple(f"v{LOB_CUT_MARKER}" for _ in names)] * 2
+    answer = await export(system="erp_tenant", check="wide", filename="wide")
+    assert "error" not in answer
+    assert len(saved.files) == 1
+    assert set(answer) == {"system", "check", "file_id", "filename", "download_url",
+                           "row_count", "truncated", "column_count", "preview_omitted"}
+    assert answer["check"] == "wide" and answer["file_id"] == "f1"
+    assert answer["row_count"] == 6 and answer["truncated"] is False
+    assert answer["column_count"] == 300 and answer["preview_omitted"] is True
+    assert tools.activity_summary("export_result", answer) == "export_result: 6 rows"
+    assert list(sheets(saved.files[0][2])) == ["part0", "part1", "part2"]
+
+
+async def test_non_finite_numbers_are_exported_as_text(db: h.FakeDbapi, chat) -> None:
+    _, saved = chat
+    db.description = (("A",), ("B",), ("C",), ("D",))
+    db.rows = [(float("nan"), float("inf"), float("-inf"), 1.5)]
+    answer = await export(system="erp_tenant", check="alerts", filename="nan")
+    assert "error" not in answer
+    assert answer["preview"] == [["nan", "inf", "-inf", 1.5]]
+    ws = load_workbook(io.BytesIO(saved.files[0][2]))["alerts"]
+    assert [c.value for c in ws[2]] == ["nan", "inf", "-inf", 1.5]
+    assert [c.data_type for c in ws[2]][:3] == ["s", "s", "s"]
+    for value, text in ((float("nan"), "nan"), (float("inf"), "inf"),
+                        (float("-inf"), "-inf")):
+        assert tools._excel_value(value) == text == tools.json_value(value)
+
+
+async def test_the_export_lock_is_released_after_a_failure_and_a_cancel(
+        monkeypatch: pytest.MonkeyPatch, db: h.FakeDbapi, chat) -> None:
+    toolset = build()
+    db.fail_at["execute"] = h.driver_error(258, "insufficient privilege")
+    _refusal(await export(toolset, system="erp_tenant", check="alerts", filename="x"),
+             "not_authorized")
+    del db.fail_at["execute"]
+    assert "error" not in await export(toolset, system="erp_tenant", check="alerts",
+                                       filename="after_failure")
+
+    started = asyncio.Event()
+
+    async def hangs(system, sql, binds, max_rows, **kw):
+        started.set()
+        await asyncio.Event().wait()
+
+    real = tools.run_query
+    monkeypatch.setattr(tools, "run_query", hangs)
+    task = asyncio.create_task(export(toolset, system="erp_tenant", check="alerts",
+                                      filename="cancelled"))
+    await asyncio.wait_for(started.wait(), 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    monkeypatch.setattr(tools, "run_query", real)
+    assert "error" not in await export(toolset, system="erp_tenant", check="alerts",
+                                       filename="after_cancel")
