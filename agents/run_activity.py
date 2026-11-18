@@ -87,6 +87,12 @@ def _is_check_name(value: Any) -> bool:
     return isinstance(value, str) and CHECK_NAME_RE.fullmatch(value) is not None
 
 
+def _is_system_slug(value: Any) -> bool:
+    from agents.hana.config import SYSTEM_NAME_RE
+
+    return isinstance(value, str) and SYSTEM_NAME_RE.fullmatch(value) is not None
+
+
 def redact_args(tool_name: Any, args: Any) -> Any:
     """The arguments of one tool call as every preview may show them: the
     run activity (:func:`_detail_for`), the web chat's tool card and the
@@ -139,8 +145,11 @@ def redact_args(tool_name: Any, args: Any) -> Any:
         elif key == "check":
             if _is_check_name(shown[key]):
                 kept[key] = shown[key]
-        else:
-            kept[key] = shown[key]
+        elif key == "system":
+            if _is_system_slug(shown[key]):
+                kept[key] = shown[key]
+        elif isinstance(shown[key], int) and not isinstance(shown[key], bool):
+            kept[key] = shown[key]  # top, offset: only a real integer
     return kept
 
 

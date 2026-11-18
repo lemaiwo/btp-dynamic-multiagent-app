@@ -75,7 +75,7 @@ from agents.hana.checks import (
 from agents.hana.checks.base import TEXT_ARG_MAX
 from agents.hana.config import pins_of
 from agents.hana.connection import HanaSystem, run_query
-from agents.hana.errors import HanaError
+from agents.hana.errors import ERROR_CODES, HanaError
 from agents.hana.export import (  # noqa: F401 - _excel_value re-exported for the tests
     EXPORT_FILENAME_RULE,
     EXPORT_LOB_BUDGET,
@@ -552,7 +552,10 @@ def activity_summary(tool_name: Any, result: Any) -> str | None:
     if "error" in result:
         error = result.get("error")
         code = error.get("code") if isinstance(error, dict) else None
-        return f"error: {code}" if isinstance(code, str) and _CODE_RE.fullmatch(code) else "error"
+        if isinstance(code, str) and _CODE_RE.fullmatch(code):
+            # A code outside the closed list is not ours: fixed word instead.
+            return f"error: {code if code in ERROR_CODES else 'call_failed'}"
+        return "error"
     if tool == "list_systems":
         systems = result.get("systems")
         return f"{tool}: {len(systems) if isinstance(systems, list) else '?'} systems"

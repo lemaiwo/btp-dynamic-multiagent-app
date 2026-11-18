@@ -305,3 +305,40 @@ def test_a_run_records_export_result_without_its_file_name():
     assert _preview_args("export_result", args) == "system=erp, sql=<57 chars>, top=100"
     assert _tool_card_input("hana_export_result", args) == {
         "system": "erp", "sql": "<57 chars>", "top": 100}
+
+
+def test_error_line_shows_only_a_listed_code() -> None:
+    assert activity_summary("run_check", {"error": {"code": "something_else"}}) == \
+        "error: call_failed"
+    assert activity_summary("run_check", {"error": {"code": "login_failed"}}) == \
+        "error: login_failed"
+
+
+@pytest.mark.parametrize("name", ["run_select", "hana_run_select", "hana_0_export_result"])
+@pytest.mark.parametrize("key,bad", [
+    ("top", "customer4711"), ("top", True), ("top", 1.5), ("offset", "customer4711"),
+    ("system", {"a": "customer4711"}), ("system", "x" * 40), ("system", "Erp"),
+    ("system", 5),
+])
+def test_preview_drops_a_value_of_the_wrong_form(name: str, key: str, bad: object) -> None:
+    from agents.run_activity import redact_args
+
+    shown = redact_args(name, {"system": "erp", "sql": "SELECT 1", "top": 5, "offset": 2,
+                               key: bad})
+    assert key not in shown
+    assert "customer4711" not in str(shown)
+
+
+def test_preview_keeps_values_of_their_own_form() -> None:
+    from agents.run_activity import redact_args
+
+    assert redact_args("hana_run_select",
+                       {"system": "erp_1", "sql": "SELECT 1", "top": 5, "offset": 0}) == \
+        {"system": "erp_1", "sql": "<8 chars>", "top": 5, "offset": 0}
+
+
+def test_other_tools_preview_unchanged() -> None:
+    from agents.run_activity import redact_args
+
+    args = {"top": "anything"}
+    assert redact_args("run_check", args) is args
