@@ -745,7 +745,7 @@
             </HBox>
             <Text id="hanaAllowSelectHint" text="{i18n>hanaAllowSelectHint}" />
             <!-- The second switch only ever extends Allow SELECT: disabled while
-                 it is off, asked about on its own (HanaEntryPart.askAll). -->
+                 it is off, asked about on its own (HanaEntryPart.onAllowSelectAllChange). -->
             <HBox alignItems="Center" class="sapUiSmallMarginTop">
                 <Switch
                     id="hanaAllowSelectAll"

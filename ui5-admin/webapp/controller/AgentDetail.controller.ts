@@ -467,6 +467,8 @@ export default class AgentDetail extends BaseController {
             // starting point for a real one.
             serverModel.setProperty("/url", "");
         }
+        // --- hana --- Leaving the entry forgets its switches and answers.
+        this.hana.follow(serverModel.getProperty("/url") as string);
         serverModel.setProperty("/errors", {});
         this.syncServerKind();
     }
@@ -476,6 +478,8 @@ export default class AgentDetail extends BaseController {
         const serverModel = this.getModel("server") as JSONModel;
         const url = serverModel.getProperty("/url") as string;
         serverModel.setProperty("/kind", findBuiltin(url)?.url ?? "mcp");
+        // --- hana --- A url that leaves the entry forgets its switches and answers.
+        this.hana.follow(url);
         this.syncServerKind();
         if (odataEntry.isODataUrl(url)) {
             // The spelling the fragment's bindings test for.

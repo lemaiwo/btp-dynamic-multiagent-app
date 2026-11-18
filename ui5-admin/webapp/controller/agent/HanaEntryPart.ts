@@ -53,7 +53,7 @@ export interface HanaEntryState {
     /** "Allow SELECT on all schemas": only ever with Allow SELECT on. */
     allowSelectAll: boolean;
     /** What the entry said about it when the dialog opened; forgotten when
-     *  Allow SELECT is switched off, so switching it on again asks. */
+     *  either switch is switched off, so switching it on again asks. */
     storedAllowSelectAll: boolean;
     /** The systems the second switch was agreed for, its own track: an
      *  answer to the Allow SELECT question never counts for it. */
@@ -151,6 +151,28 @@ export default class HanaEntryPart {
         this.show();
     }
 
+    /**
+     * The dialog's url is now `url` (another toolset picked, or a url
+     * typed). Anything but the HANA entry: both switches go off and every
+     * answer and stored value about them is forgotten, so coming back asks
+     * again. The systems stay, as the other toolsets keep their fields.
+     */
+    public follow(url: string): void {
+        if (hanaEntry.isHanaUrl(url)) {
+            return;
+        }
+        const model = this.host.serverModel();
+        if (!model.getProperty("/hana")) {
+            return;
+        }
+        model.setProperty("/hana/allowSelect", false);
+        model.setProperty("/hana/storedAllowSelect", false);
+        model.setProperty("/hana/confirmed", []);
+        model.setProperty("/hana/allowSelectAll", false);
+        model.setProperty("/hana/storedAllowSelectAll", false);
+        model.setProperty("/hana/confirmedAll", []);
+    }
+
     /** What the entry says about the agent's other servers. */
     public show(): void {
         const model = this.host.serverModel();
@@ -216,6 +238,7 @@ export default class HanaEntryPart {
      * The second switch. Enabled only while Allow SELECT is on (the
      * fragment); switched on where the entry did not already allow it, it
      * asks its own question; Cancel is the default and puts it back off.
+     * Switched off, it forgets the stored value and every answer about it.
      */
     public onAllowSelectAllChange(event: Event): void {
         const model = this.host.serverModel();
@@ -226,7 +249,14 @@ export default class HanaEntryPart {
             return;
         }
         model.setProperty("/hana/allowSelectAll", on);
-        if (!on || !hanaEntry.selectAllNewlyAllowed(
+        if (!on) {
+            // Off forgets what the stored entry said and every answer, as
+            // Allow SELECT off does: switching it on again asks.
+            model.setProperty("/hana/storedAllowSelectAll", false);
+            model.setProperty("/hana/confirmedAll", []);
+            return;
+        }
+        if (!hanaEntry.selectAllNewlyAllowed(
             { allow_select: true, allow_select_all: model.getProperty("/hana/storedAllowSelectAll") === true },
             { allow_select: true, allow_select_all: true })) {
             return;

@@ -185,6 +185,7 @@ function iSwitchAllowSelectAll(When: Common, on: boolean): void {
         viewName: VIEW,
         searchOpenDialogs: true,
         // A disabled switch is not actionable: wait until Allow SELECT is on.
+        matchers: function (element: UI5Element) { return (element as Switch).getEnabled(); },
         actions: function (element: UI5Element | null) {
             const control = element as Switch;
             control.setState(on);
@@ -651,5 +652,95 @@ opaTest("a system added after the second switch was confirmed is asked about aga
             systems: [{ name: "dev", destination: "hana-dev" }, PROD], allow_select: true, allow_select_all: true
         }, "the answer goes on with OK");
     }, (data) => data.mcp_servers.length === 3);
+    Then.iStopTheApp();
+});
+
+// --- Nothing but the admin's confirmed action turns a switch on.
+
+opaTest("a stored allow_select_all switched off and on again is asked about; Cancel leaves it off and OK asks nothing more", function (Given: Common, When: Common, Then: Common) {
+    iOpenAgent(Given, When, 101, () => storeEntry(101, { systems: [TENANT], allow_select: true, allow_select_all: true }));
+    iSeeTheServers(When, 3);
+    iEditServer(When, 2);
+    iSeeTheEntry(Then, "the stored entry", (entry) => entry.rows.length === 1 && entry.allowSelectAll, function (entry) {
+        Opa5.assert.strictEqual(entry.allowSelect, true, "Allow SELECT is on as stored");
+    });
+    iSwitchAllowSelectAll(When, false);
+    iSeeTheEntry(Then, "the second switch off", (entry) => !entry.allowSelectAll, function (entry) {
+        Opa5.assert.strictEqual(entry.allowSelect, true, "Allow SELECT stays on");
+    });
+    iSwitchAllowSelectAll(When, true);
+    iSeeAMessage(Then, "the question again", function (dialog) {
+        Opa5.assert.strictEqual(messageOf(dialog), ALL_TEXT("\"erp_tenant\" (hana-erp-tenant)"),
+            "switching it off forgot what the stored entry said");
+    });
+    iAnswer(When, "Cancel");
+    iSeeTheEntry(Then, "the second switch back off", (entry) => !entry.allowSelectAll, function (entry) {
+        Opa5.assert.strictEqual(entry.allowSelect, true, "Allow SELECT stays on");
+    });
+    iSeeNoMessage(Then, "the question is closed");
+    iPressInTheDialog(When, "serverConfirm");
+    iSeeTheForm(Then, "the entry without the second switch", function (data) {
+        Opa5.assert.deepEqual(data.mcp_servers[2].oauth, { systems: [TENANT], allow_select: true },
+            "OK asks nothing and allow_select_all is gone");
+    }, (data) => !(data.mcp_servers[2].oauth as Record<string, unknown>).allow_select_all);
+    Then.iStopTheApp();
+});
+
+opaTest("another toolset and back to SAP HANA: both switches are off and each asks again", function (Given: Common, When: Common, Then: Common) {
+    iOpenAgent(Given, When, 101);
+    iAddTwoSystems(When, Then);
+    iSwitchAllowSelect(When, true);
+    iAnswer(When, "Allow SELECT");
+    iSwitchAllowSelectAll(When, true);
+    iAnswer(When, "Allow all schemas");
+    iSeeTheEntry(Then, "both switches on", (entry) => entry.allowSelect && entry.allowSelectAll, function () {
+        Opa5.assert.ok(true, "both were confirmed");
+    });
+    iPickTheKind(When, "builtin:gmail");
+    iPickTheKind(When, HANA);
+    iSeeTheEntry(Then, "both switches off again", (entry) => entry.visible("hanaSystemsTable")
+        && !entry.allowSelect && !entry.allowSelectAll, function (entry) {
+        Opa5.assert.strictEqual(entry.allowSelectAllEnabled, false, "the second switch is disabled");
+        Opa5.assert.strictEqual(entry.rows.length, 2, "the systems stay");
+    });
+    iSwitchAllowSelect(When, true);
+    iSeeAMessage(Then, "the Allow SELECT question again", function (dialog) {
+        Opa5.assert.strictEqual(messageOf(dialog), CONFIRM, "the earlier answer did not survive the other toolset");
+    });
+    iAnswer(When, "Allow SELECT");
+    iSwitchAllowSelectAll(When, true);
+    iSeeAMessage(Then, "the all-schemas question again", function (dialog) {
+        Opa5.assert.strictEqual(messageOf(dialog), ALL_TEXT(BOTH), "the earlier answer did not survive the other toolset");
+    });
+    iAnswer(When, "Cancel");
+    iPressInTheDialog(When, "serverConfirm");
+    iSeeTheForm(Then, "the entry with Allow SELECT only", function (data) {
+        Opa5.assert.deepEqual(data.mcp_servers[2].oauth, { systems: [TENANT, SYSTEMDB], allow_select: true },
+            "only what was confirmed after coming back");
+    }, (data) => data.mcp_servers.length === 3);
+    Then.iStopTheApp();
+});
+
+opaTest("a stored entry that allows both: another toolset and back opens both switches off", function (Given: Common, When: Common, Then: Common) {
+    iOpenAgent(Given, When, 101, () => storeEntry(101, { systems: [TENANT], allow_select: true, allow_select_all: true }));
+    iSeeTheServers(When, 3);
+    iEditServer(When, 2);
+    iSeeTheEntry(Then, "the stored entry", (entry) => entry.rows.length === 1 && entry.allowSelectAll, function () {
+        Opa5.assert.ok(true, "both on as stored");
+    });
+    iPickTheKind(When, "builtin:gmail");
+    iPickTheKind(When, HANA);
+    iSeeTheEntry(Then, "both switches off", (entry) => entry.visible("hanaSystemsTable")
+        && !entry.allowSelect && !entry.allowSelectAll, function () {
+        Opa5.assert.ok(true, "the stored switches are forgotten");
+    });
+    iSwitchAllowSelect(When, true);
+    iSeeAMessage(Then, "the Allow SELECT question", function (dialog) {
+        Opa5.assert.ok(messageOf(dialog).indexOf("\"erp_tenant\" (hana-erp-tenant)") > -1, "asked, naming the system");
+    });
+    iAnswer(When, "Cancel");
+    iSeeTheEntry(Then, "Allow SELECT off", (entry) => !entry.allowSelect, function () {
+        Opa5.assert.ok(true, "Cancel keeps it off");
+    });
     Then.iStopTheApp();
 });
