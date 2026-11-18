@@ -195,10 +195,10 @@ def _bedrock_client(captured: list[dict]):
     return client
 
 
-async def _converse(client):
+async def _converse(client, operation: str = "converse"):
     def call():
         try:
-            return client.converse(
+            return getattr(client, operation)(
                 modelId="anthropic.claude", messages=[
                     {"role": "user", "content": [{"text": "hello"}]}])
         except Exception:  # noqa: BLE001 - the captured request is what counts
@@ -211,11 +211,12 @@ def _ai(headers: dict) -> dict[str, str]:
             for k, v in headers.items() if str(k).lower().startswith("ai-")}
 
 
-async def test_bedrock_route_sends_the_headers():
+@pytest.mark.parametrize("operation", ["converse", "converse_stream"])
+async def test_bedrock_route_sends_the_headers(operation):
     captured: list[dict] = []
     client = _bedrock_client(captured)
     with sending(OURS):
-        await _converse(client)
+        await _converse(client, operation)
     assert len(captured) == 1 and _ai(captured[0]) == OURS
 
 

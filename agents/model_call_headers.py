@@ -22,7 +22,11 @@ current_call_headers: ContextVar[dict[str, str] | None] = ContextVar(
 
 @contextmanager
 def sending(headers: Mapping[str, str] | None) -> Iterator[None]:
-    """Publish ``headers`` for the calls made inside the block (``None`` / empty: nothing).
+    """Publish ``headers`` for the calls made inside the block.
+
+    ``None`` / empty publishes nothing AND hides a binding of an enclosing
+    block: a call that has no headers of its own (a direct provider's model)
+    must never go out with those of another call that is still open around it.
 
     The binding is cleared on every exit. A token can only be reset in the
     Context it was made in: when the block is closed from another one (an
@@ -30,10 +34,7 @@ def sending(headers: Mapping[str, str] | None) -> Iterator[None]:
     ``ValueError`` and the variable is set to ``None`` in the closing context
     instead, so no exit ever raises here.
     """
-    if not headers:
-        yield
-        return
-    token = current_call_headers.set(dict(headers))
+    token = current_call_headers.set(dict(headers) if headers else None)
     try:
         yield
     finally:

@@ -83,6 +83,17 @@ def test_sending_nothing_sets_nothing(headers):
     assert seen == [None]
 
 
+@pytest.mark.parametrize("headers", [None, {}])
+def test_sending_nothing_hides_an_outer_binding(headers):
+    # A direct provider's call made while an AI Core call is still open must
+    # not go out with that call's headers.
+    with sending({"a": "b"}):
+        with sending(headers):
+            assert current_call_headers.get() is None
+        assert current_call_headers.get() == {"a": "b"}
+    assert current_call_headers.get() is None
+
+
 def test_sending_closed_in_another_context_does_not_raise():
     cm = sending({"a": "b"})
     cm.__enter__()
