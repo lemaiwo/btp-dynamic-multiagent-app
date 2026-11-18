@@ -3,11 +3,11 @@
 A check is DATA: a name (hana-cli's command name), a category, a one-line
 purpose, the upstream file it was derived from, and one or more fixed SQL
 statements whose only variable parts are ``?`` bind parameters. The model
-picks a check by name and passes at most six arguments (``schema``,
-``object``, ``top``, ``hours``, ``host``, ``other_schema``); it never supplies
-SQL. Every argument is checked here, before anything is sent, and a refusal
-names the argument and the rule, never the value: the value is model output
-and may hold anything.
+picks a check by name and passes at most eight arguments (``schema``,
+``object``, ``top``, ``hours``, ``host``, ``other_schema``, ``section``,
+``key``); it never supplies SQL. Every argument is checked here, before
+anything is sent, and a refusal names the argument and the rule, never the
+value: the value is model output and may hold anything.
 
 Standard library and the package's own pure modules only (no ``hdbcli``, no
 pydantic-ai, no ``agents.db``): the registry is imported by the admin gate and
@@ -17,6 +17,7 @@ by ``python -m agents.hana.checks --dump`` as well as by the toolset.
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
 
@@ -51,6 +52,14 @@ letters, digits, ``.``, ``_`` and ``-``, at most 255 characters, as
 ``M_TRACEFILES.HOST`` writes it. Only ever a bind parameter; no port, no
 ``:`` and no ``/``, so it cannot be read as an address or a path."""
 
+TEXT_ARG_MAX = 128
+"""The longest ``text`` argument (``section``, ``key``)."""
+_UNSAFE_TEXT = frozenset({"Cc", "Cf", "Zl", "Zp", "Cs"})
+"""Unicode categories a ``text`` argument may not hold: control and format
+characters (zero width, bidi overrides, a byte order mark), line and paragraph
+separators and lone surrogates. A value with one could read differently in a
+log or an answer than what is bound."""
+
 MAX_PURPOSE = 120
 MAX_ROWS = 500
 MAX_LOB_CHARS = 20_000
@@ -62,7 +71,14 @@ _FORBIDDEN_MARKERS = ("{", "}", "%s", "%(")
 
 @dataclass(frozen=True)
 class Arg:
-    """One argument a check may declare. ``kind`` is ``int``, ``ident`` or ``host``."""
+    """One argument a check may declare. ``kind`` is ``int``, ``ident``, ``host`` or ``text``.
+
+    A ``text`` argument (``section``, ``key``: an ini file's section and
+    parameter name) is one line of 1 to :data:`TEXT_ARG_MAX` characters
+    without a control or format character. Like every argument it is only
+    ever a bind parameter, never part of the SQL text, so any other character
+    (a quote, a space, ``%``) cannot change the statement.
+    """
 
     name: str
     kind: str
@@ -75,6 +91,9 @@ class Arg:
     def rule(self) -> str:
         if self.kind == "int":
             return f"must be a whole number from {self.low} to {self.high}"
+        if self.kind == "text":
+            return (f"must be one line of 1 to {TEXT_ARG_MAX} characters without control"
+                    " or format characters")
         if self.kind == "host":
             return ("must be a host name: a letter or digit then letters, digits, . _ -,"
                     " at most 255")
@@ -93,6 +112,10 @@ ARGS: dict[str, Arg] = {
     # same rule as `schema`, bound as given. Last, so the order of the
     # arguments a check lists and of the first refusal stays as it was.
     "other_schema": Arg("other_schema", "ident", None, sample="SYS"),
+    # An ini file's section and parameter name, for the checks that filter
+    # ini parameters; last, for the same reason as other_schema.
+    "section": Arg("section", "text", None, sample="memorymanager"),
+    "key": Arg("key", "text", None, sample="global_allocation_limit"),
 }
 """The closed set of arguments. A statement binds only these names."""
 
@@ -313,6 +336,11 @@ def _check_value(arg: Arg, value: Any) -> Any:
                 arg.low <= value <= arg.high):
             raise InvalidArgument(arg.name, arg.rule)
         return value
+    if arg.kind == "text":
+        if (not isinstance(value, str) or not 1 <= len(value) <= TEXT_ARG_MAX
+                or any(unicodedata.category(ch) in _UNSAFE_TEXT for ch in value)):
+            raise InvalidArgument(arg.name, arg.rule)
+        return value
     pattern = HOST_NAME_RE if arg.kind == "host" else HANA_IDENT_RE
     if not isinstance(value, str) or not pattern.fullmatch(value):
         raise InvalidArgument(arg.name, arg.rule)
@@ -328,6 +356,8 @@ def resolve_args(
     hours: Any = None,
     host: Any = None,
     other_schema: Any = None,
+    section: Any = None,
+    key: Any = None,
 ) -> dict[str, Any]:
     """The values of the arguments ``check`` declares, defaults filled in.
 
@@ -338,7 +368,7 @@ def resolve_args(
     is :class:`InvalidArgument` naming the argument and the rule only.
     """
     given = {"schema": schema, "object": object, "top": top, "hours": hours,
-             "host": host, "other_schema": other_schema}
+             "host": host, "other_schema": other_schema, "section": section, "key": key}
     resolved: dict[str, Any] = {}
     for name in ARGS:  # a fixed order: the first refused argument is deterministic
         value = given[name]
@@ -423,7 +453,8 @@ def dump_entries(categories: Iterable[str] | None = None) -> list[dict[str, Any]
 
     One entry per statement (a composite check's as ``<name>.<label>``), with
     the sample values of :data:`ARGS` (``SYS``, ``DUMMY``, 1, 24,
-    ``probe-no-such-host``, ``other_schema`` ``SYS``; ``top_plus_one`` 2)
+    ``probe-no-such-host``, ``other_schema`` ``SYS``, ``section``
+    ``memorymanager``, ``key`` ``global_allocation_limit``; ``top_plus_one`` 2)
     as binds. ``categories`` keeps the checks of those categories only (a
     landscape run of one phase's checks); a name that is not one of
     :data:`CATEGORIES` is a ``ValueError`` that does not repeat it.
