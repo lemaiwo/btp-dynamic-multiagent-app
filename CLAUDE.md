@@ -2771,12 +2771,15 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     synchronous and a no-op while the integration is off.
   - **Tests** `tests/test_nexus_*.py` (about 300, helpers `tests/nexus_helpers.py`, the
     entry-point drivers `tests/nexus_entry_drivers.py`) pin every entry point, the off path
-    (nothing sent, nothing queued), the token sum and the lifecycle. **Unit-tested only
-    (`httpx.MockTransport` and scripted models): never run against a real register on a
-    landscape.** Not verified until the smoke test: the register's actual answers (the shape
-    of `registerAgents`' reply and of its use case assignments), that it accepts every field
-    sent, the user-token exchange through the user destination, the stream tracking against
-    a real provider stream, and the cost of the side channel under load. Operator setup
+    (nothing sent, nothing queued), the token sum and the lifecycle. **Run against a real register on a
+    landscape** (2026-11-18, the 2.43.0 build of the branch): the switch-on by the
+    destination, `registerAgents` accepted for the whole agent list, and `logRequest` /
+    `logResponse` of a chat turn sent as the signed-in user through the user destination
+    and recorded there. Not verified there: an Invoke API or A2A call as a user, a
+    scheduled run (technical identity), `NEXUS_SEND_PAYLOAD`, the fallback use case, the
+    stream tracking of a cancelled stream, and the cost of the side channel under load. A
+    direct provider's model (`anthropic:` / `openai:`) is logged like any other, with the
+    AI Core resource group, although the call did not go through AI Core. Operator setup
     notes: `docs/NEXUS_SETUP.md` (local, not in repo)
 - `agents/jira_tools.py` — in-process Jira tools over REST v2
   (`builtin:jira`), reached through a destination. JQL is built server-side
@@ -4476,8 +4479,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   2.45.0 adds the optional agent register (`agents/nexus/`): no new resource, role, table or
   column (HANA schema generation unchanged, still 12); the `NEXUS_*` settings are not in the
   descriptor (set per landscape in an `.mtaext`); the integration is off unless the
-  destination exists, and every model is wrapped (`NexusLoggedModel`) either way. Unit-tested
-  only: not yet run against a real register on a landscape
+  destination exists, and every model is wrapped (`NexusLoggedModel`) either way. Run on a
+  landscape as the 2.43.0 build of its branch (registration and a chat turn logged as the
+  signed-in user)
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets
