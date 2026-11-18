@@ -20,6 +20,7 @@ import os
 from collections.abc import Mapping
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
+from types import ModuleType
 
 from dotenv import load_dotenv
 
@@ -307,6 +308,26 @@ def serve_address(environ: Mapping[str, str] | None = None) -> tuple[str, int]:
     return host, int(env.get("PORT") or 7932)
 
 
+def _nexus_lifecycle() -> ModuleType:
+    """The agent register's lifecycle module, imported only when it is used.
+
+    Never at module level: its import pulls in the register client and the
+    destination code, and a failure there must stay inside the lifespan's
+    guards instead of keeping the app from starting.
+    """
+    from agents.nexus import lifecycle
+
+    return lifecycle
+
+
+async def _stop_nexus(flush_seconds: float) -> None:
+    """Shutdown of the agent register; a raise must not cut the shutdown gather short."""
+    try:
+        await _nexus_lifecycle().stop(flush_seconds=flush_seconds)
+    except Exception as exc:
+        logger.warning("agent register shutdown failed (%s)", type(exc).__name__)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Fail closed before anything is served: with AUTH_REQUIRED on (the
@@ -375,6 +396,12 @@ async def lifespan(app: FastAPI):
     await model_providers.refresh()
     await registry.reload()
     dynamic_chat_app.refresh()
+    # The agent register: never raises itself, but an unexpected error must
+    # not keep the app from starting.
+    try:
+        await _nexus_lifecycle().start()
+    except Exception as exc:
+        logger.warning("agent register start-up failed (%s)", type(exc).__name__)
     heartbeat: asyncio.Task | None = None
     if DB_HEARTBEAT_SECONDS > 0:
         heartbeat = asyncio.create_task(_db_heartbeat(DB_HEARTBEAT_SECONDS))
@@ -423,7 +450,11 @@ async def lifespan(app: FastAPI):
     # Side by side, not one after the other: Cloud Foundry kills the app 10 s
     # after SIGTERM. An AI Core deploy in flight is waited for, never
     # cancelled (drain_embedding_deploys, bounded, never raises).
-    await asyncio.gather(drain_embedding_deploys(), drain_ide_approvals())
+    await asyncio.gather(
+        drain_embedding_deploys(),
+        drain_ide_approvals(),
+        _stop_nexus(3.0),
+    )
     # A write whose run was cancelled above still has its result to store
     # (its own shielded task). Bounded: `drain` gives up after its timeout
     # and never raises; a row left `intent` is explained in agents.odata.audit.

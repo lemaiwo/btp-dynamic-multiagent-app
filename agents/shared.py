@@ -920,12 +920,20 @@ def get_model(name: str | None = None):
     routed to AI Core's Bedrock proxy, everything else to its
     OpenAI-compatible proxy. Instances are cached per name for the process
     lifetime.
+
+    Every model is returned behind the agent register's logging wrapper
+    (``agents.nexus.logged_model.wrap``), the one choke point of all model
+    calls; while the register is off the wrapper calls straight through and
+    every attribute (``model_name``, ``client``, ``profile`` ...) is the
+    wrapped model's. The cache holds the wrapped object. The import is
+    deferred: ``agents.nexus`` must not be loaded with this module.
     """
     name = (name or default_model_name()).strip()
     cached = _models.get(name)
     if cached is not None:
         return cached
     model = _build_model(name)
+    model = _logged(model, name)
     _models[name] = model
     return model
 
@@ -953,3 +961,35 @@ def _build_model(name: str):
     if _is_anthropic(name):
         return _build_bedrock_model(name)
     return _build_openai_model(name)
+
+
+# One WARNING per process when the logging wrapper cannot be applied.
+_wrap_failure_warned = False
+
+
+def _logged(model, name: str):
+    """Put ``model`` behind the register's logging wrapper, or hand it back as is.
+
+    Logging is a side concern: a wrapper that cannot be imported or built must
+    never fail a model build, so the plain model is used instead, with one
+    WARNING per process that names the exception class only (its text could
+    carry anything).
+    """
+    global _wrap_failure_warned
+    try:
+        from agents.nexus.logged_model import wrap
+
+        return wrap(model, name)
+    except Exception as e:  # noqa: BLE001
+        if not _wrap_failure_warned:
+            _wrap_failure_warned = True
+            logger.warning(
+                "agent register logging wrapper unavailable (%s); models are used unwrapped",
+                type(e).__name__,
+            )
+        return model
+
+
+# tests/test_agent_model.py replaces ``get_model`` on this module for the whole
+# test session at import; tests that need the real function call this name.
+_get_model_unpatched = get_model

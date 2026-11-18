@@ -209,6 +209,25 @@ _STORED_LOGON_FIELDS = frozenset({"sap-user", "sap-password", "mysapsso2"})
 _SIGNS_IN_AS_USER = frozenset({
     "OAuth2JWTBearer", "OAuth2UserTokenExchange", "OAuth2SAMLBearerAssertion",
 })
+
+
+def signs_in_as_user(destination: Destination) -> bool:
+    """Whether ``destination`` signs in as the user it was resolved for.
+
+    The one rule, shared by the direct path of a run as the signed-in user
+    (``_as_user``) and the agent register client: resolved for the user,
+    of a type whose minted token is that user's (``_SIGNS_IN_AS_USER``) and
+    without a ``SystemUser`` (the service would mint the token for that
+    fixed user instead). Which headers may then be sent is the caller's
+    rule: this says nothing about a stored ``Authorization``. A local
+    ``SAMLAssertion`` destination is minted by this app for the validated
+    user (``agents.local_destinations``): it signs in as them too.
+    """
+    auth_type = (destination.auth_type or "").strip()
+    signs_in = auth_type in _SIGNS_IN_AS_USER or (
+        destination.local and auth_type == "SAMLAssertion"
+    )
+    return bool(destination.per_user and signs_in and not destination.system_user)
 # The header names (lower case) `_apply` set on a request from the
 # destination: on a retry they are not the caller's.
 _FROM_DESTINATION_EXTENSION = "agents.destination_auth.from_destination"
@@ -787,13 +806,7 @@ class DestinationAuth(httpx.Auth):
         are not built by ``routed_auth`` and behave as they always did.
         """
         name = self.destination_name
-        auth_type = (destination.auth_type or "").strip()
-        # A local SAMLAssertion destination is minted by this app for the
-        # validated user (agents.local_destinations): it signs in as them.
-        signs_in = auth_type in _SIGNS_IN_AS_USER or (
-            destination.local and auth_type == "SAMLAssertion"
-        )
-        if not destination.per_user or not signs_in or destination.system_user:
+        if not signs_in_as_user(destination):
             raise not_user_propagating(self.server_key, name)
         stored = destination.static_headers
         headers = {

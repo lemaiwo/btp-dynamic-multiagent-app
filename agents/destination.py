@@ -96,6 +96,15 @@ class DestinationError(RuntimeError):
     """
 
 
+class DestinationNotFound(DestinationError):
+    """The destination service answered 404: no destination of that name.
+
+    A subclass, so every caller that catches ``DestinationError`` is
+    unaffected; a caller that treats "not configured" as "feature off"
+    (the agent-register logging) can tell it from a failure.
+    """
+
+
 @dataclass(frozen=True)
 class DestinationServiceConfig:
     """Credentials for the destination service itself, not for the target."""
@@ -628,7 +637,7 @@ class DestinationResolver:
                     f"{failure}"
                 )
             if response.status_code == 404:
-                raise DestinationError(
+                raise DestinationNotFound(
                     f"destination {self.name!r} does not exist in the subaccount "
                     f"this app's destination service instance belongs to"
                 )

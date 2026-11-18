@@ -1678,8 +1678,36 @@ async def api_create_agent(payload: AgentPayload) -> dict[str, Any]:
         _unknown_model_note(payload.name, payload.model_name)
         answer = row.to_dict()
         after = _entry_signature(row.mcp_servers, row.enabled)
+    _push_agents_to_register()
     answer.update(await _reload_for_changed_entry(before, after, f"agent '{payload.name}' saved"))
     return answer
+
+
+def _push_agents_to_register() -> None:
+    """Ask the agent register for a push of the agent list.
+
+    Called only AFTER the commit of a save, delete or import (the push reads
+    the committed rows), never awaited: ``request_push`` is synchronous and a
+    no-op while the integration is off. Nothing it does may fail the save.
+    """
+    try:
+        from agents.nexus import register as nexus_register
+
+        nexus_register.request_push()
+    except Exception as e:  # noqa: BLE001 - the text of an error is never logged
+        logger.warning("agent register: push request failed (%s)", type(e).__name__)
+
+
+async def _reevaluate_agent_register() -> None:
+    """Admin Reload / Restart: re-evaluate the register switch ("I fixed it").
+
+    Never raises (the lifecycle's own contract; guarded again here)."""
+    try:
+        from agents.nexus import lifecycle as nexus_lifecycle
+
+        await nexus_lifecycle.reevaluate()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("agent register: re-evaluation failed (%s)", type(e).__name__)
 
 
 def _entry_signature(servers: Any, enabled: Any = True) -> list[Any]:
@@ -1999,6 +2027,7 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
         _unknown_model_note(payload.name, payload.model_name)
         answer = row.to_dict()
         odata_after = _entry_signature(row.mcp_servers, row.enabled)
+    _push_agents_to_register()
     # `reloaded` / `reload_failed`, always present: `_reload_for_changed_entry`.
     answer.update(
         await _reload_for_changed_entry(
@@ -2059,6 +2088,7 @@ async def api_delete_agent(
         odata_before = _entry_signature(row.mcp_servers, row.enabled)
         await rename_agent_references(session, row.name, None)
         await delete_agent(session, agent_id)
+    _push_agents_to_register()
     outcome = await _reload_for_changed_entry(odata_before, [], f"agent '{name}' deleted")
     response.headers["X-OData-Reloaded"] = str(outcome["reloaded"]).lower()
     response.headers["X-OData-Reload-Failed"] = str(outcome["reload_failed"]).lower()
@@ -2665,6 +2695,7 @@ def _forget_hana_logins() -> None:
 async def api_reload() -> dict[str, Any]:
     """Rebuild the orchestrator from the database without restarting."""
     _forget_hana_logins()
+    await _reevaluate_agent_register()
     build = await registry.reload()
     dynamic_chat_app.refresh()
     return {
@@ -2686,6 +2717,7 @@ async def api_restart() -> JSONResponse:
     agents to take effect.
     """
     _forget_hana_logins()
+    await _reevaluate_agent_register()
     build = await registry.reload()
     dynamic_chat_app.refresh()
 
@@ -3357,6 +3389,7 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
     from agents.data_catalog.importer import rebuild_safely
 
     await rebuild_safely(None, what="import")
+    _push_agents_to_register()
 
     return {
         **reload_outcome,

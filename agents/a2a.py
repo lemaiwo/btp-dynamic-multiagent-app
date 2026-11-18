@@ -41,6 +41,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from agents.auth import current_principal, require_a2a
+from agents.nexus.context import nexus_run
 from agents.registry import registry
 from agents.shared import run_usage_limits
 
@@ -419,7 +420,10 @@ def _start_run(task_id: str, text: str, context_id: str) -> asyncio.Task[str]:
     Created inside the request, so it inherits the bound JWT and principal
     (contextvars are copied at task creation).
     """
-    run = asyncio.create_task(_run_orchestrator(text, context_id))
+    # The register's run id is the task id; the task copies the context here,
+    # so every model call of the run (delegations included) carries it.
+    with nexus_run(task_id):
+        run = asyncio.create_task(_run_orchestrator(text, context_id))
     _running[task_id] = run
     return run
 

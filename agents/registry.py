@@ -22,6 +22,13 @@ from urllib.parse import urlparse
 from pydantic_ai import Agent, ModelRetry, RunContext
 from pydantic_ai.tools import ToolDefinition
 
+# --- deep agents ---
+from agents.access import BASIC, agent_allowed, effective_tier, tier_of
+from agents.ariba_tools import BUILTIN_ARIBA_URL
+from agents.ariba_tools import activity_summary as ariba_activity_summary
+from agents.bitbucket_config import BUILTIN_BITBUCKET_URL, asks_to_approve
+from agents.bitbucket_tools import activity_summary as bitbucket_activity_summary
+from agents.builtins import build_builtin_toolset, is_builtin_url
 from agents.db import (
     AgentConfig,
     SessionLocal,
@@ -35,16 +42,14 @@ from agents.db import (
     list_skills,
     odata_entries,
 )
-from agents.bitbucket_config import BUILTIN_BITBUCKET_URL, asks_to_approve
-from agents.ariba_tools import BUILTIN_ARIBA_URL
-from agents.ariba_tools import activity_summary as ariba_activity_summary
-from agents.bitbucket_tools import activity_summary as bitbucket_activity_summary
+from agents.deep import deep_toolset, scoped_deep_instructions
+from agents.errors import describe_exception, mask_text
 from agents.git_config import BUILTIN_GIT_URL
 from agents.git_tools import activity_summary as git_activity_summary
-from agents.builtins import build_builtin_toolset, is_builtin_url
 from agents.hana import BUILTIN_HANA_URL
 from agents.hana.connection import soft_reset_login_state as soft_reset_hana_logins
 from agents.hana.tools import activity_summary as hana_activity_summary
+from agents.ide.readonly import ReadOnlyGuard
 from agents.ina import BUILTIN_INA_URL
 from agents.ina.tools import NoUsableQueryError, attached_queries
 from agents.ina.tools import activity_summary as ina_activity_summary
@@ -59,11 +64,6 @@ from agents.shared import (
     run_usage_limits,
 )
 from agents.sharepoint_tools import activity_summary as sharepoint_activity_summary
-# --- deep agents ---
-from agents.access import BASIC, agent_allowed, effective_tier, tier_of
-from agents.deep import deep_toolset, scoped_deep_instructions
-from agents.errors import describe_exception, mask_text
-from agents.ide.readonly import ReadOnlyGuard
 
 logger = logging.getLogger(__name__)
 
@@ -1443,6 +1443,7 @@ def _attach_delegation_tool(
     async def _delegate(ctx: RunContext, query: str) -> str:
         from uuid import uuid4
 
+        from agents.nexus.context import current_agent_name
         from agents.progress import (
             current_delegation,
             report_delegation_end,
@@ -1480,10 +1481,14 @@ def _attach_delegation_tool(
             delegation_id=delegation_id, query=query,
         )
         delegation_token = current_delegation.set(delegation_id)
+        # The agent register logs the specialist's model calls under its name;
+        # deep sub-agents run in this context and inherit it.
+        agent_token = current_agent_name.set(row.name)
         try:
             answer = await _work(ctx, query, outcome)
             return answer
         finally:
+            current_agent_name.reset(agent_token)
             current_delegation.reset(delegation_token)
             _delegation_stack.reset(stack_token)
             if counter is not None:
@@ -1635,6 +1640,19 @@ def _attach_delegation_tool(
 # ---------------------------------------------------------------------------
 # Registry singleton
 # ---------------------------------------------------------------------------
+def _request_register_push() -> None:
+    """The agent list may have changed: ask the agent register for a push.
+
+    Synchronous, a no-op while the integration is off, and never a reason for
+    a reload to fail (deferred import: agents.nexus must not load at import)."""
+    try:
+        from agents.nexus.register import request_push
+
+        request_push()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("agent register: push request failed (%s)", type(e).__name__)
+
+
 class Registry:
     """Holds the current orchestrator and provides atomic reload."""
 
@@ -1681,6 +1699,7 @@ class Registry:
             new = await build_orchestrator()
             self._build = new
             soft_reset_hana_logins()  # builtin:hana: keeps failed credentials
+            _request_register_push()
             logger.info(
                 "Registry reloaded: %d enabled / %d total specialists",
                 len(new.specialists),

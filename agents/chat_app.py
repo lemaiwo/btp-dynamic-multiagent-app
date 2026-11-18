@@ -27,6 +27,7 @@ from pathlib import Path
 from time import monotonic
 from uuid import uuid4
 
+from agents.nexus.context import nexus_run
 from agents.progress import ProgressUpdate, current_progress
 from agents.registry import registry
 from agents.run_activity import redact_args
@@ -366,7 +367,10 @@ class DynamicChatApp:
         # the contextvar is copied into it (and into the nested specialist runs
         # it spawns), exactly like JWTBindingMiddleware does for current_jwt.
         token = current_progress.set(sink)
-        pump_task = asyncio.create_task(pump())
+        # One register run id per turn; the task copies the context here, so
+        # the orchestrator and its delegated specialists carry it.
+        with nexus_run(uuid4().hex):
+            pump_task = asyncio.create_task(pump())
         hb_task = asyncio.create_task(heartbeat())
         try:
             response = adapter.streaming_response(merged())
