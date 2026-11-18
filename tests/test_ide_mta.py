@@ -56,6 +56,7 @@ def test_python_module_archive_excludes_local_only_folders():
     ignore = module["build-parameters"]["ignore"]
     # Makefile_*.mta: mbt's temporary makefile, written into the module path
     # (".") during a build; it holds a local absolute path.
+    # .playwright-mcp/: screenshots and page snapshots of local browser sessions.
     for entry in ("docs/", "memory/", ".sdd/", "tests/", "CLAUDE.local.md",
-                  "Makefile_*.mta"):
+                  "Makefile_*.mta", ".playwright-mcp/"):
         assert entry in ignore, entry

@@ -60,6 +60,7 @@ modules:
         - "tmp/"
         - "resources/"
         - ".claude/"
+        - ".playwright-mcp/"
         - ".mcp.json"
         - ".github/"
         - ".pytest_cache/"
