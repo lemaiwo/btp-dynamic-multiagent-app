@@ -4267,3 +4267,7 @@ from agents.ina.admin_routes import reload_if_in_use as reload_ina_if_in_use  # 
 from agents.ina.admin_routes import router as _ina_router  # noqa: E402
 
 router.include_router(_ina_router)
+
+from agents.model_provider_routes import router as _model_providers_router  # noqa: E402
+
+router.include_router(_model_providers_router)

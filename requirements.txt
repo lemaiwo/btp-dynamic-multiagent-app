@@ -6,6 +6,12 @@
 # Bump deliberately: change the pin, run the suites, then deploy.
 pydantic-ai[mcp,web,openai,bedrock]==1.72.0
 sap-ai-sdk-gen[all]==6.6.0
+# The Anthropic SDK behind the direct "anthropic:<model>" provider
+# (agents/shared.py). pydantic-ai names no upper bound for it, and with
+# anthropic 2.x its 1.72.0 fails every request ("Cannot instantiate
+# typing.Union" while mapping the messages; 1.x refuses its "temperature"
+# argument): the last 0.x release is the newest one it works with.
+anthropic==0.125.0
 mcp==1.26.0
 httpx==0.28.1
 uvicorn==0.54.0

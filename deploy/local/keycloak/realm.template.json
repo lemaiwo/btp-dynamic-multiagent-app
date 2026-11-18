@@ -1,0 +1,179 @@
+{
+  "realm": "agents",
+  "enabled": true,
+  "displayName": "Agent app (local identity provider)",
+  "sslRequired": "none",
+  "accessTokenLifespan": 900,
+  "ssoSessionIdleTimeout": 28800,
+  "roles": {
+    "realm": [
+      {
+        "name": "user",
+        "description": "Chat access (the XSUAA scope 'user')"
+      },
+      {
+        "name": "admin",
+        "description": "Admin UI and API (scope 'admin')"
+      },
+      {
+        "name": "developer",
+        "description": "Advanced access and the ABAP Assistant (scope 'developer')"
+      },
+      {
+        "name": "a2a",
+        "description": "A2A endpoint (scope 'a2a')"
+      },
+      {
+        "name": "invoke",
+        "description": "Invoke API (scope 'invoke')"
+      },
+      {
+        "name": "JOBSCHEDULER",
+        "description": "Scheduler run endpoints (scope 'JOBSCHEDULER')"
+      }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "agent-app",
+      "name": "Agent app (oauth2-proxy signs users in with it)",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": "__OIDC_CLIENT_SECRET__",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": true,
+      "implicitFlowEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [
+        "__APP_URL__/oauth2/callback"
+      ],
+      "webOrigins": [
+        "__APP_URL__"
+      ],
+      "attributes": {
+        "post.logout.redirect.uris": "__APP_URL__/*"
+      },
+      "protocolMappers": [
+        {
+          "name": "agent-app-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "agent-app",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        },
+        {
+          "name": "arc1-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "arc1-local",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "arc1-local",
+      "name": "ARC-1 MCP clients that sign in themselves (Claude Code, VS Code; curl tests)",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "implicitFlowEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [
+        "http://localhost:56789/*",
+        "http://127.0.0.1:56789/*"
+      ],
+      "webOrigins": [
+        "+"
+      ],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "+"
+      },
+      "protocolMappers": [
+        {
+          "name": "arc1-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "arc1-local",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "developer",
+      "enabled": true,
+      "email": "__USER_EMAIL__",
+      "emailVerified": true,
+      "firstName": "Dev",
+      "lastName": "User",
+      "realmRoles": [
+        "user",
+        "developer",
+        "admin"
+      ],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "__USER_PASSWORD__",
+          "temporary": false
+        },
+        {
+          "type": "otp",
+          "userLabel": "authenticator",
+          "secretData": "{\"value\": \"__USER_OTP__\"}",
+          "credentialData": "{\"subType\": \"totp\", \"digits\": 6, \"counter\": 0, \"period\": 30, \"algorithm\": \"HmacSHA1\"}"
+        }
+      ]
+    },
+    {
+      "username": "basic",
+      "enabled": true,
+      "email": "basic@example.com",
+      "emailVerified": true,
+      "firstName": "Basic",
+      "lastName": "User",
+      "realmRoles": [
+        "user"
+      ],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "__BASIC_PASSWORD__",
+          "temporary": false
+        },
+        {
+          "type": "otp",
+          "userLabel": "authenticator",
+          "secretData": "{\"value\": \"__BASIC_OTP__\"}",
+          "credentialData": "{\"subType\": \"totp\", \"digits\": 6, \"counter\": 0, \"period\": 30, \"algorithm\": \"HmacSHA1\"}"
+        }
+      ]
+    }
+  ],
+  "bruteForceProtected": true,
+  "failureFactor": 8,
+  "permanentLockout": false,
+  "maxFailureWaitSeconds": 900,
+  "waitIncrementSeconds": 60,
+  "otpPolicyType": "totp",
+  "otpPolicyAlgorithm": "HmacSHA1",
+  "otpPolicyDigits": 6,
+  "otpPolicyPeriod": 30
+}

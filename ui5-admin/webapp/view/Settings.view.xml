@@ -24,6 +24,50 @@
                 </f:SimpleForm>
             </Panel>
 
+            <!-- The direct model providers Anthropic and OpenAI:
+                 controller/settings/ModelProviders.ts keeps the `mp` model;
+                 one fragment per provider, bound to its block. -->
+            <Panel
+                id="modelProvidersPanel"
+                headerText="{i18n>mpPanelTitle}"
+                expandable="false"
+                busy="{mp>/loading}"
+                busyIndicatorDelay="200"
+                class="sapUiSmallMarginTop">
+                <MessageStrip
+                    id="mpLoadError"
+                    type="Error"
+                    showIcon="true"
+                    visible="{= !!${mp>/loadError} }"
+                    text="{mp>/loadError}"
+                    class="sapUiTinyMarginTopBottom">
+                    <link>
+                        <Link id="mpRetry" text="{i18n>mpRetry}" press=".onRetryModelProviders" />
+                    </link>
+                </MessageStrip>
+                <MessageStrip
+                    id="mpInfoStrip"
+                    type="Information"
+                    showIcon="true"
+                    visible="{mp>/loaded}"
+                    text="{mp>/info}"
+                    class="sapUiTinyMarginTopBottom" />
+                <VBox id="mpAnthropicBlock" binding="{mp>/providers/anthropic}" visible="{mp>/loaded}">
+                    <core:Fragment
+                        xmlns:core="sap.ui.core"
+                        id="mpAnthropic"
+                        fragmentName="com.agent.admin.fragment.ModelProviderBlock"
+                        type="XML" />
+                </VBox>
+                <VBox id="mpOpenaiBlock" binding="{mp>/providers/openai}" visible="{mp>/loaded}" class="sapUiSmallMarginTop">
+                    <core:Fragment
+                        xmlns:core="sap.ui.core"
+                        id="mpOpenai"
+                        fragmentName="com.agent.admin.fragment.ModelProviderBlock"
+                        type="XML" />
+                </VBox>
+            </Panel>
+
             <!-- Data catalogue embeddings (design addendum (l), point 4):
                  controller/settings/Embeddings.ts keeps the `emb` model. -->
             <Panel

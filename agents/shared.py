@@ -364,6 +364,12 @@ def _destination_mcp_server(
     )
 
 
+def _oidc_enabled() -> bool:
+    from agents.auth import oidc_enabled
+
+    return oidc_enabled()
+
+
 def create_mcp_server(
     name: str,
     base_url: str,
@@ -420,7 +426,9 @@ def create_mcp_server(
         return _destination_mcp_server(
             mcp_url, oauth or {}, tool_prefix=tool_prefix, max_retries=max_retries
         )
-    elif ON_CF:
+    elif ON_CF or _oidc_enabled():
+        # Behind an OIDC proxy the user's token is forwarded as on CF: the
+        # MCP server validates it against the same issuer.
         auth = JWTForwardAuth()
     else:
         # OAuthClientProvider discovers endpoints from the server root, not /mcp.
@@ -607,25 +615,164 @@ def _discover_deployed_models(refresh: bool = False) -> list[str] | None:
         return []
 
 
+# --- direct API providers, next to SAP AI Core -------------------------------
+#
+# A model name with a provider prefix is served by that provider's own API
+# instead of an AI Core deployment: ``anthropic:<model>`` (ANTHROPIC_API_KEY)
+# and ``openai:<model>`` (OPENAI_API_KEY; OPENAI_BASE_URL for any
+# OpenAI-compatible endpoint). A name without a prefix is an AI Core
+# deployment, as before. A key comes from the admin's setting (the table
+# ``model_providers``) or the environment, is read when a model is built, and
+# is never listed or logged.
+DIRECT_PROVIDERS = ("anthropic", "openai")
+_DIRECT_KEY_ENV = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}
+_DIRECT_MODELS_ENV = {"anthropic": "ANTHROPIC_MODELS", "openai": "OPENAI_MODELS"}
+_DIRECT_DEFAULT_MODELS = {
+    "anthropic": "claude-opus-5-5,claude-sonnet-5-5,claude-haiku-5-5",
+    "openai": "gpt-4o",
+}
+
+
+def direct_provider_of(name: str) -> str | None:
+    """``anthropic`` / ``openai`` for a prefixed model name, else ``None``."""
+    prefix, sep, rest = (name or "").partition(":")
+    if sep and rest.strip() and prefix.strip().lower() in DIRECT_PROVIDERS:
+        return prefix.strip().lower()
+    return None
+
+
+# What an admin stored per provider (agents/model_providers.py, the table
+# ``model_providers``): ``{provider: {"enabled", "api_key", "base_url",
+# "models"}}``. A stored setting wins over the environment: switched off, the
+# provider is off even with a key in the environment; switched on, each value
+# that is stored is used and each one that is not falls back to its variable.
+# Kept here, in memory, because the functions below are synchronous; it is
+# loaded at startup and after every save.
+_provider_settings: dict[str, dict[str, Any]] = {}
+
+
+def set_direct_provider_settings(settings: dict[str, dict[str, Any]]) -> None:
+    """Replace the stored provider settings and forget the direct models that
+    were built with the old ones (a changed key must not live on in a cached
+    client). The caller reloads the registry afterwards."""
+    global _provider_settings
+    _provider_settings = {name: dict(value) for name, value in settings.items()}
+    for name in [n for n in _models if direct_provider_of(n) is not None]:
+        del _models[name]
+
+
+def _provider_setting(provider: str) -> dict[str, Any]:
+    return _provider_settings.get(provider) or {}
+
+
+def direct_api_key(provider: str) -> str:
+    """The provider's key: the stored one, else the environment's; ``""``
+    when the provider is switched off or has none."""
+    setting = _provider_setting(provider)
+    if setting and not setting.get("enabled", True):
+        return ""
+    stored = str(setting.get("api_key") or "").strip()
+    return stored or (os.environ.get(_DIRECT_KEY_ENV[provider]) or "").strip()
+
+
+def direct_key_source(provider: str) -> str:
+    """``setting`` | ``env`` | ``none``: where the key in effect comes from."""
+    setting = _provider_setting(provider)
+    if setting and not setting.get("enabled", True):
+        return "none"
+    if str(setting.get("api_key") or "").strip():
+        return "setting"
+    return "env" if (os.environ.get(_DIRECT_KEY_ENV[provider]) or "").strip() else "none"
+
+
+def direct_base_url(provider: str) -> str | None:
+    stored = str(_provider_setting(provider).get("base_url") or "").strip()
+    variable = "OPENAI_BASE_URL" if provider == "openai" else "ANTHROPIC_BASE_URL"
+    return stored or (os.environ.get(variable) or "").strip() or None
+
+
+def _direct_configured(provider: str) -> bool:
+    return bool(direct_api_key(provider))
+
+
+def direct_models() -> list[str]:
+    """The prefixed names of the direct providers that have a key: the stored
+    list, else ``<PROVIDER>_MODELS`` (comma-separated), else a short default."""
+    names: list[str] = []
+    for provider in DIRECT_PROVIDERS:
+        if not _direct_configured(provider):
+            continue
+        stored = _provider_setting(provider).get("models") or []
+        raw = (os.environ.get(_DIRECT_MODELS_ENV[provider]) or "").strip()
+        listed = stored or (raw or _DIRECT_DEFAULT_MODELS[provider]).split(",")
+        for model in listed:
+            model = str(model).strip()
+            if not model:
+                continue
+            if direct_provider_of(model) is None:
+                model = f"{provider}:{model}"
+            if model not in names:
+                names.append(model)
+    return names
+
+
+def aicore_configured() -> bool:
+    """Whether this process has SAP AI Core credentials at all: a binding,
+    the ``AICORE_*`` variables or the SDK's config file. Decides only whether
+    AI Core is asked for its deployments when direct providers are in use."""
+    if any(
+        (os.environ.get(name) or "").strip()
+        for name in ("AICORE_CLIENT_ID", "AICORE_SERVICE_KEY", "AICORE_AUTH_URL")
+    ):
+        return True
+    try:
+        if "aicore" in json.loads(os.environ.get("VCAP_SERVICES") or "{}"):
+            return True
+    except (TypeError, ValueError):
+        pass
+    home = os.environ.get("AICORE_HOME") or os.path.join(
+        os.path.expanduser("~"), ".aicore"
+    )
+    return os.path.isfile(os.path.join(home, "config.json"))
+
+
 def available_models() -> list[str]:
     """Models offered in the admin UI and chat dropdown.
 
     Resolution order:
-      1. `AICORE_AVAILABLE_MODELS` env var (explicit override, comma-separated)
-      2. Live query of SAP AI Core for deployed models
+      1. `AICORE_AVAILABLE_MODELS` env var (explicit override, comma-separated;
+         it may name direct models with their prefix)
+      2. Live query of SAP AI Core for deployed models, followed by the
+         models of the direct providers that have an API key
       3. `DEFAULT_AVAILABLE_MODELS` as a last-resort fallback
+
+    With a direct provider configured and no AI Core credentials, AI Core is
+    not asked and its fallback list is not offered: only the direct models.
     """
     raw = os.environ.get("AICORE_AVAILABLE_MODELS")
     if raw:
         return [m.strip() for m in raw.split(",") if m.strip()]
+    direct = direct_models()
+    if direct and not aicore_configured():
+        return direct
     discovered = _discover_deployed_models()
     if discovered:
-        return discovered
-    return [m.strip() for m in DEFAULT_AVAILABLE_MODELS.split(",") if m.strip()]
+        return discovered + [m for m in direct if m not in discovered]
+    fallback = [m.strip() for m in DEFAULT_AVAILABLE_MODELS.split(",") if m.strip()]
+    return fallback + direct
 
 
 def default_model_name() -> str:
-    return os.environ.get("AICORE_MODEL", "gpt-4o")
+    """``DEFAULT_MODEL``, else ``AICORE_MODEL``; without either, the first
+    direct model when no AI Core is configured, else ``gpt-4o``."""
+    for name in ("DEFAULT_MODEL", "AICORE_MODEL"):
+        value = (os.environ.get(name) or "").strip()
+        if value:
+            return value
+    direct = direct_models()
+    if direct and not aicore_configured():
+        return direct[0]
+    return "gpt-4o"
 
 
 _models: dict[str, Any] = {}
@@ -722,17 +869,87 @@ def _build_bedrock_model(name: str):
     )
 
 
-def get_model(name: str | None = None):
-    """Return a Pydantic AI model instance for the given deployment name.
+class DirectModelError(RuntimeError):
+    """A direct provider model was asked for without its API key."""
 
-    Names containing "claude" or starting with "anthropic" are routed to
-    SAP AI Core's Bedrock proxy; everything else uses the OpenAI-compatible
-    proxy. Instances are cached per name for the process lifetime.
+
+def _direct_api_key(provider: str) -> str:
+    key = direct_api_key(provider)
+    if not key:
+        raise DirectModelError(
+            f"the {provider} provider has no API key (admin Settings, or "
+            f"{_DIRECT_KEY_ENV[provider]} in the environment) or is switched off"
+        )
+    return key
+
+
+def _build_direct_openai_model(model: str) -> SAPAICoreModel:
+    """An OpenAI (or OpenAI-compatible, ``OPENAI_BASE_URL``) chat model.
+
+    The same model class as the AI Core route, so token counts, the
+    empty-response rule and the tool schema clean-up behave alike."""
+    from openai import AsyncOpenAI
+
+    client = AsyncOpenAI(
+        api_key=_direct_api_key("openai"),
+        base_url=direct_base_url("openai"),
+        max_retries=_max_retries(),
+    )
+    return SAPAICoreModel(model, provider=OpenAIProvider(openai_client=client))
+
+
+def _build_direct_anthropic_model(model: str):
+    from anthropic import AsyncAnthropic
+    from pydantic_ai.models.anthropic import AnthropicModel
+    from pydantic_ai.providers.anthropic import AnthropicProvider
+
+    client = AsyncAnthropic(
+        api_key=_direct_api_key("anthropic"),
+        base_url=direct_base_url("anthropic"),
+        max_retries=_max_retries(),
+    )
+    return AnthropicModel(model, provider=AnthropicProvider(anthropic_client=client))
+
+
+def get_model(name: str | None = None):
+    """Return a Pydantic AI model instance for the given model name.
+
+    A name prefixed ``anthropic:`` or ``openai:`` goes to that provider's own
+    API (see ``direct_provider_of``). Any other name is an SAP AI Core
+    deployment: names containing "claude" or starting with "anthropic" are
+    routed to AI Core's Bedrock proxy, everything else to its
+    OpenAI-compatible proxy. Instances are cached per name for the process
+    lifetime.
     """
     name = (name or default_model_name()).strip()
     cached = _models.get(name)
     if cached is not None:
         return cached
-    model = _build_bedrock_model(name) if _is_anthropic(name) else _build_openai_model(name)
+    model = _build_model(name)
     _models[name] = model
     return model
+
+
+def registered_name(model: Any) -> str | None:
+    """The name ``model`` was built under by ``get_model``, or ``None``.
+
+    A direct provider's model object carries the provider's own name
+    (``claude-opus-5-5``), not the name this app knows it by
+    (``anthropic:claude-opus-5-5``); offered under the bare name it would be
+    looked up as an AI Core deployment."""
+    for name, built in _models.items():
+        if built is model:
+            return name
+    return None
+
+
+def _build_model(name: str):
+    """The model for ``name``, by the routing ``get_model`` describes."""
+    provider = direct_provider_of(name)
+    if provider == "anthropic":
+        return _build_direct_anthropic_model(name.partition(":")[2].strip())
+    if provider == "openai":
+        return _build_direct_openai_model(name.partition(":")[2].strip())
+    if _is_anthropic(name):
+        return _build_bedrock_model(name)
+    return _build_openai_model(name)

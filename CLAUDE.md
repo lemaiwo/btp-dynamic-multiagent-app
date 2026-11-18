@@ -336,6 +336,96 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `require_a2a` (the `a2a` scope, on `/a2a`) and `require_jobscheduler` (the
   `JOBSCHEDULER` scope, on the two scheduler run endpoints), and `run_as`, the
   context manager a "Run now" job uses to run under the agent's principal
+- **Without BTP** (test branch `test/local-docker-sso`; `deploy/local/README.md`
+  is the guide): the app in Docker next to PostgreSQL, an OIDC provider
+  (Keycloak) and oauth2-proxy, reaching on-premise SAP directly.
+  - `agents/oidc.py` — `OidcValidator`, chosen by `auth.get_validator()` when
+    `OIDC_ISSUER` is set and no XSUAA is bound (`auth.oidc_enabled()`): the
+    same `validate` / `has_scope` as `XsuaaValidator`, so every `require_*`
+    works unchanged. `OIDC_AUDIENCE` is required (no switch skips the
+    audience check), keys from `OIDC_JWKS_URL` or discovery, asymmetric
+    algorithms only, roles from `OIDC_ROLES_CLAIM` (default
+    `realm_access.roles,roles,groups`) plus `scope` / `scp`, named like the
+    XSUAA scopes. `AUTH_TOKEN_HEADER` names the proxy's token header (wins
+    over `Authorization`; the token is validated either way).
+    `auth.auth_enforced()` (CF or OIDC) is what the middleware's "token
+    required" rules use, and `create_mcp_server`'s `jwt` mode forwards the
+    user's token under OIDC as on CF. `tests/test_oidc_auth.py`
+  - `agents/local_destinations.py` — `LOCAL_DESTINATIONS_FILE`: a JSON file
+    in place of the destination service (a bound service wins).
+    `config_from_environment` returns a `LocalDestinationConfig` and
+    `DestinationResolver._fetch_payload` answers from `find`, in the
+    service's own "find destination" shape, so caches, `DestinationAuth`
+    and every built-in are unchanged; `Destination.local` marks the result.
+    `Authentication`: `NoAuthentication`, `BasicAuthentication`,
+    `SAMLAssertion` and `ForwardUserToken` (the last two are the signed-in
+    user: the token is validated again, never merely decoded; no validator
+    or no user token mints nothing). `${VAR}` in a value is read from the
+    environment; `ProxyType: OnPremise` is refused; `http://` only with
+    `AllowPlainHttp` exactly `"true"` (`Destination.plain_http`, the one
+    exception `DestinationAuth._target` makes; never for `SAMLAssertion`);
+    `TLSServerName` is the name the server's certificate is checked against
+    when it is not the URL's host (`Destination.tls_server_name`, sent as
+    httpcore's `sni_hostname`; verification stays on). `_as_user` accepts a
+    LOCAL `SAMLAssertion` destination as user-propagating (BTP's is still
+    refused there). The OData destination picker lists the file
+    (`_list_local`). `tests/test_local_destinations.py`
+  - `agents/saml_bearer.py` — the SAML 2.0 bearer assertion of a local
+    `SAMLAssertion` destination (`Authorization: SAML2.0 <base64>`, RSA-SHA256,
+    enveloped, exclusive C14N; ARC-1's `proto/saml-bearer-pp` layout). No XML
+    library signs (signxml needs lxml): the assertion is written directly in
+    canonical form and values canonical XML cannot carry are refused.
+    `tests/test_saml_bearer.py` re-derives digest and signature with the
+    standard library; checked once with xml-crypto. An assertion is minted
+    per resolve (`expires_in` 0, about a second of cache). **Ran against
+    an ABAP Platform 2025 system** (2026-11-15): OData `$metadata` and a
+    one-row read as the signed-in user, on the system's own HTTPS port (the
+    same assertion got 401 through an nginx in front of it). Not run: OData
+    writes, InA, a replayed assertion.
+  - `agents/shared.py` — direct providers: a model named `anthropic:<model>`
+    (`ANTHROPIC_API_KEY`) or `openai:<model>` (`OPENAI_API_KEY`,
+    `OPENAI_BASE_URL`) is served by that API (`_build_model`), any other name
+    is an AI Core deployment. `available_models()` adds
+    `ANTHROPIC_MODELS` / `OPENAI_MODELS`; with no AI Core credentials
+    (`aicore_configured()`) only those are offered. `DEFAULT_MODEL` wins over
+    `AICORE_MODEL`. **An admin can set a provider from the UI**
+    (`agents/model_providers.py`, table `model_providers`, HANA schema
+    generation 12; routes `agents/model_provider_routes.py`: `GET
+    /admin/api/model-providers`, `PUT .../{provider}` with `{enabled,
+    api_key?, base_url?, models}` where an absent `api_key` keeps the stored
+    one and `null` clears it, `POST .../{provider}/test`, a free "list
+    models" call answering `{ok, status?, error?}`): a stored row wins over
+    the environment (switched off = off even with a key in the environment;
+    a value not stored falls back to its variable), is loaded into
+    `shared._provider_settings` at startup and after a save (which drops the
+    cached direct models and reloads the registry; another instance sees it
+    at its next start or reload). The key is stored like the other stored
+    credentials, never returned (`has_key`, `key_source`), exported or
+    logged; a save is one WARNING naming provider and principal.
+    `tests/test_model_provider_settings.py`; UI5 admin Settings panel
+    "Model providers". The direct OpenAI model is a `SAPAICoreModel` (same usage
+    and empty-response handling). The direct Anthropic route ran with a real key
+    (2026-11-15: answers, delegation, OData tools, token counts). It needs
+    `anthropic==0.125.0` (pinned): pydantic-ai 1.72.0 fails every request
+    with anthropic 1.x (`temperature`) and 2.x ("Cannot instantiate
+    typing.Union").
+    `tests/test_model_providers.py`
+  - `Dockerfile`, `deploy/local/` — `setup.sh` (generates `secrets/`,
+    gitignored), `stack.sh`, `compose.yaml`, the Keycloak realm template,
+    `entrypoint.sh` (CA certificates in `/extra-ca` are trusted next to the
+    public ones), `compose.arc1.yaml` (an ARC-1 of the prototype branch on
+    the same realm and SAML key, joined by `stack.sh` when `secrets/arc1.env`
+    exists; reached through the `ARC1` destination). `setup.sh <e-mail> <app URL>
+    <idp URL>` sets public addresses (`APP_URL`, `IDP_URL` in
+    `secrets/stack.env`, a Caddy snippet with two site blocks); the realm's
+    users have a TOTP credential from the import. Tests: `test/e2e.mjs`
+    (browser, with `STACK_TEST_MODEL=1` and `test/fake_model.py`),
+    `test/pp.sh` (OData / InA as the signed-in user). The realm's tokens name
+    `agent-app` and `arc1-local` in `aud` by client mappers: a `clientScopes`
+    block in the realm file makes Keycloak skip its built-in scopes (email,
+    profile, roles). `web/Caddyfile` (a web server between the proxy and the app) serves
+    the built UI5 apps at `/ui5admin/` and `/ui5ide/` (`build-ui5.sh`) with
+    the approuter's backend routes, SAPUI5 from the CDN.
 - `agents/errors.py` — `describe_exception` / `mask_text` /
   `exception_class`: the one way exception text leaves the log (to the
   model, a tool card, a `job_runs` / `workflow_runs` row). It keeps the
@@ -4031,7 +4121,15 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   never a peer; a stored row that breaks them is built without the HANA tools;
   2.42.1 replaces the SAP logo by our own neutral icon (`static/agent-icon.svg`: the web chat's
   sidebar, empty state and favicon, the stock chat's favicon and header logo; `static/sap.png`
-  is removed): front end only, no new resource, variable, table or column
+  is removed): front end only, no new resource, variable, table or column;
+  2.43.0 adds the direct model providers and their admin setting (table
+  `model_providers`, HANA schema generation 12: one new table, nothing
+  undeployed; `anthropic` pinned in `requirements.txt`) and, for a
+  deployment without BTP, OIDC sign-in, local destinations with a SAML
+  bearer assertion, the `Dockerfile` and `deploy/local` (none of it active
+  on Cloud Foundry: XSUAA and a bound destination service win; `deploy/`,
+  `files/` and the `Dockerfile` are not packaged); no new resource,
+  environment variable or role
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets

@@ -475,7 +475,10 @@ class DestinationAuth(httpx.Auth):
         """
         dest_url = httpx.URL(destination.url)
         through_proxy = self._through_proxy(destination)
-        if not through_proxy and dest_url.scheme != "https":
+        # The one exception to https on the direct path: a local destination
+        # that says AllowPlainHttp (agents.local_destinations).
+        plain = destination.local and destination.plain_http and dest_url.scheme == "http"
+        if not through_proxy and dest_url.scheme != "https" and not plain:
             raise DestinationError(
                 f"destination {self.destination_name!r} must use https://, "
                 f"not {dest_url.scheme!r}: its credential travels with every request"
@@ -531,6 +534,10 @@ class DestinationAuth(httpx.Auth):
             request.url = target
             # httpx set Host when the request was built, from the placeholder.
             request.headers["Host"] = target.netloc.decode("ascii")
+        if destination.local and destination.tls_server_name:
+            # The certificate is checked against this name instead of the
+            # URL's host (httpcore's `sni_hostname`); the check itself stays.
+            request.extensions["sni_hostname"] = destination.tls_server_name
         routed = self._route is not None
         ours: set[str] = request.extensions.get(_FROM_DESTINATION_EXTENSION) or set()
         applied: set[str] = set()
@@ -781,11 +788,12 @@ class DestinationAuth(httpx.Auth):
         """
         name = self.destination_name
         auth_type = (destination.auth_type or "").strip()
-        if (
-            not destination.per_user
-            or auth_type not in _SIGNS_IN_AS_USER
-            or destination.system_user
-        ):
+        # A local SAMLAssertion destination is minted by this app for the
+        # validated user (agents.local_destinations): it signs in as them.
+        signs_in = auth_type in _SIGNS_IN_AS_USER or (
+            destination.local and auth_type == "SAMLAssertion"
+        )
+        if not destination.per_user or not signs_in or destination.system_user:
             raise not_user_propagating(self.server_key, name)
         stored = destination.static_headers
         headers = {

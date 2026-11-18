@@ -1,0 +1,88 @@
+<!-- One direct model provider of the "Model providers" panel (Settings page).
+     Included once per provider, inside a container bound to
+     `mp>/providers/<name>`; controller/settings/ModelProviders.ts keeps the
+     `mp` model. The labels are tied to their fields by the SimpleForm: one field per
+     label (a container would take the label). -->
+<core:FragmentDefinition
+    xmlns="sap.m"
+    xmlns:core="sap.ui.core"
+    xmlns:f="sap.ui.layout.form">
+    <f:SimpleForm id="form" layout="ResponsiveGridLayout" editable="true" title="{mp>title}">
+        <Label id="enabledLabel" text="{i18n>mpUseLabel}" />
+        <Switch id="enabled" state="{mp>form/enabled}" enabled="{= !${mp>busy} }" />
+
+        <Label id="apiKeyLabel" text="{i18n>mpKeyLabel}" />
+        <Input
+            id="apiKey"
+            type="Password"
+            value="{mp>form/apiKey}"
+            valueLiveUpdate="true"
+            autocomplete="false"
+            showSuggestion="false"
+            placeholder="{mp>keyPlaceholder}"
+            valueState="{mp>keyState}"
+            valueStateText="{mp>keyStateText}" />
+
+        <Label id="keySourceLabel" text="{i18n>mpKeySourceLabel}" />
+        <ObjectStatus id="keySource" text="{mp>keySource/text}" state="{mp>keySource/state}" />
+        <Button
+            id="removeKey"
+            text="{i18n>mpRemoveKey}"
+            enabled="{= ${mp>hasStoredKey} &amp;&amp; !${mp>busy} }"
+            press=".onModelProviderRemoveKey" />
+
+        <Label id="baseUrlLabel" text="{i18n>mpBaseUrlLabel}" />
+        <Input
+            id="baseUrl"
+            type="Url"
+            value="{mp>form/baseUrl}"
+            valueLiveUpdate="true"
+            autocomplete="false"
+            placeholder="{i18n>mpBaseUrlPlaceholder}"
+            valueState="{mp>baseUrlState}"
+            valueStateText="{mp>baseUrlStateText}" />
+
+        <Label id="modelsLabel" text="{i18n>mpModelsLabel}" />
+        <Input
+            id="models"
+            value="{mp>form/models}"
+            valueLiveUpdate="true"
+            autocomplete="false"
+            placeholder="{i18n>mpModelsPlaceholder}"
+            valueState="{mp>modelsState}"
+            valueStateText="{mp>modelsStateText}" />
+
+        <Label id="effectiveLabel" text="{i18n>mpEffectiveLabel}" />
+        <Text id="effective" text="{mp>effective}" />
+
+        <Label text="" />
+        <HBox alignItems="Center" wrap="Wrap">
+            <Button
+                id="save"
+                text="{i18n>mpSave}"
+                type="Emphasized"
+                enabled="{= !${mp>busy} }"
+                press=".onModelProviderSave" />
+            <Button
+                id="test"
+                text="{i18n>mpTest}"
+                enabled="{= !${mp>busy} &amp;&amp; !${mp>dirty} }"
+                tooltip="{= ${mp>dirty} ? ${i18n>mpTestSaveFirst} : ${i18n>mpTestTooltip} }"
+                press=".onModelProviderTest"
+                class="sapUiTinyMarginBegin" />
+            <Text
+                id="saveFirst"
+                text="{i18n>mpTestSaveFirst}"
+                visible="{= !!${mp>dirty} }"
+                class="sapUiSmallMarginBegin" />
+        </HBox>
+
+        <Label text="" />
+        <MessageStrip
+            id="testResult"
+            showIcon="true"
+            type="{mp>test/type}"
+            text="{mp>test/text}"
+            visible="{= !!${mp>test/visible} }" />
+    </f:SimpleForm>
+</core:FragmentDefinition>

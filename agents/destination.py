@@ -169,6 +169,14 @@ def config_from_environment(
     if from_vcap is not None:
         return from_vcap
 
+    # A deployment without BTP: a local file stands in for the service
+    # (agents.local_destinations). Imported here: that module imports this one.
+    from agents import local_destinations
+
+    local = local_destinations.config_from_environment(environ)
+    if local is not None:
+        return local
+
     client_id = str(environ.get("DESTINATION_CLIENT_ID") or "").strip()
     secret = str(environ.get("DESTINATION_CLIENT_SECRET") or "").strip()
     api = str(environ.get("DESTINATION_URI") or "").strip().rstrip("/")
@@ -338,6 +346,19 @@ class Destination:
     # user's (``per_user``, a user-propagating type, a minted header) and is
     # not. Only the fact is kept, never the name.
     system_user: bool = False
+    # True when it came from the local destinations file
+    # (agents.local_destinations), where this app itself mints the user's
+    # credential, instead of from the destination service.
+    local: bool = False
+    # True only for a local destination whose file says ``AllowPlainHttp``
+    # exactly ``true``: ``http://`` to a service on the same private network
+    # (an ARC-1 container next to the app). Never set for a destination of
+    # the destination service.
+    plain_http: bool = False
+    # A local destination's ``TLSServerName``: the name the server's
+    # certificate is checked against (and sent as SNI) when it differs from
+    # the URL's host. Verification stays on; only the expected name changes.
+    tls_server_name: str = ""
 
 
 # Destination property names whose value is a credential. Matched
@@ -578,6 +599,12 @@ class DestinationResolver:
 
     async def _fetch_payload(self, *, user_token: str | None = None) -> Any:
         """The destination service's "find destination" response, as JSON."""
+        from agents import local_destinations
+
+        if local_destinations.is_local(self._config):
+            return await local_destinations.find(
+                self._config, self.name, user_token=user_token
+            )
         async with self._client() as http:
             token = await self._service_token(http)
             headers = {"Authorization": f"Bearer {token}"}
@@ -681,6 +708,13 @@ class DestinationResolver:
         url = str(config.get("URL") or "").strip().rstrip("/")
         if not url:
             raise DestinationError(f"destination {self.name!r} has no URL configured")
+        from agents import local_destinations
+
+        local = local_destinations.is_local(self._config)
+        plain_http = local and config.get(local_destinations.PLAIN_HTTP) == "true"
+        tls_server_name = (
+            str(config.get(local_destinations.TLS_SERVER_NAME) or "").strip() if local else ""
+        )
         auth_type = str(config.get("Authentication") or "").strip()
 
         # Static headers set as `URL.headers.<Name>` additional properties.
@@ -736,7 +770,8 @@ class DestinationResolver:
                     auth_type=auth_type, per_user=per_user,
                     proxy_type=proxy_type, location_id=location_id,
                     queries=queries, static_headers=frozenset(static),
-                    system_user=system_user,
+                    system_user=system_user, local=local,
+                    plain_http=plain_http, tls_server_name=tls_server_name,
                 )
             # A destination created with NoAuthentication resolves perfectly
             # well and hands back no credential at all. Saying so here beats
@@ -790,7 +825,8 @@ class DestinationResolver:
             url=url, headers=headers, expires_at=deadline,
             auth_type=auth_type, per_user=per_user,
             proxy_type=proxy_type, location_id=location_id, queries=queries,
-            static_headers=frozenset(static), system_user=system_user,
+            static_headers=frozenset(static), system_user=system_user, local=local,
+            plain_http=plain_http, tls_server_name=tls_server_name,
         )
 
 

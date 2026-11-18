@@ -13,6 +13,9 @@ import type {
 import type {
     InaDescribeResult, InaQuery, InaQueryInput, InaQuerySummary, InaQueryUpdate, InaTestResult
 } from "./inaTypes";
+import type {
+    ModelProviderName, ModelProviderSave, ModelProviderTestResult, ModelProvidersSaved, ModelProvidersStatus
+} from "./modelProviderTypes";
 
 /**
  * A non-2xx response from the admin API.
@@ -524,6 +527,38 @@ export default class AdminService {
     public deployEmbeddingModel(model: string): Promise<EmbeddingDeployResult> {
         return this.request<EmbeddingDeployResult>("data-catalog/embeddings/deploy", {
             method: "POST", ...AdminService.json({ model })
+        });
+    }
+
+    // --- model providers ---
+    // The direct model providers Anthropic and OpenAI (`/admin/api/model-providers`).
+    // No answer carries an API key.
+
+    /** Both providers (Anthropic first), whether SAP AI Core is configured, the models on offer. */
+    public getModelProviders(): Promise<ModelProvidersStatus> {
+        return this.request<ModelProvidersStatus>("model-providers");
+    }
+
+    /**
+     * Saves one provider and answers the status plus `reloaded` /
+     * `reload_failed`. `api_key` is sent only when the body holds it (absent:
+     * the stored key stays; `null`: it is removed). A refusal is a 422 whose
+     * `detail` is `<field>: <rule>`.
+     */
+    public saveModelProvider(provider: ModelProviderName, body: ModelProviderSave): Promise<ModelProvidersSaved> {
+        const sent: Record<string, unknown> = { enabled: body.enabled, base_url: body.base_url, models: body.models };
+        if ("api_key" in body) {
+            sent.api_key = body.api_key;
+        }
+        return this.request<ModelProvidersSaved>(`model-providers/${encodeURIComponent(provider)}`, {
+            method: "PUT", ...AdminService.json(sent)
+        });
+    }
+
+    /** One call to the provider with the STORED key in effect: `{ok, status?, error?}`. */
+    public testModelProvider(provider: ModelProviderName): Promise<ModelProviderTestResult> {
+        return this.request<ModelProviderTestResult>(`model-providers/${encodeURIComponent(provider)}/test`, {
+            method: "POST"
         });
     }
 }

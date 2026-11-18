@@ -7,6 +7,7 @@ import { DEEP_DEFAULTS } from "com/agent/admin/service/types";
 import FakeDataCatalog from "./FakeDataCatalog";
 import FakeEmbeddings from "./FakeEmbeddings";
 import FakeIna from "./FakeIna";
+import FakeModelProviders from "./FakeModelProviders";
 
 /** What `FakeBackend#failNext` accepts: the next call to `path` answers with `body`/`status` instead. */
 export interface FailNext {
@@ -53,6 +54,8 @@ export default class FakeBackend {
     public embeddings = new FakeEmbeddings();
     /** The `ina/...` routes: the analytical queries of `builtin:ina`. */
     public ina = new FakeIna();
+    /** The `model-providers...` routes: the direct model providers, never a key in an answer. */
+    public modelProviders = new FakeModelProviders();
     /**
      * --- hana --- A refusal of the next agent save at
      * `mcp_servers[server]` naming `oauth.systems[system].<field>`, as
@@ -165,6 +168,7 @@ export default class FakeBackend {
         this.dataCatalog.reset();
         this.embeddings.reset();
         this.ina.reset();
+        this.modelProviders.reset();
         this.hanaRefuseNext = null;
         this.requests = [];
         this.bodies = {};
@@ -1758,6 +1762,11 @@ export default class FakeBackend {
             this.agents.map((agent) => agent.name));
         if (catalogue) {
             return catalogue;
+        }
+        const providers = this.modelProviders.handle(path, method, body, (b, s, h) => this.json(b, s, h),
+            this.reloadKeys());
+        if (providers) {
+            return providers;
         }
         const ina = this.ina.handle(path, method, body, (b, s, h) => this.json(b, s, h), this.reloadKeys());
         if (ina) {

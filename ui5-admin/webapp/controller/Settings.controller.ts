@@ -10,6 +10,8 @@ import bitbucketEntry from "../model/bitbucketEntry";
 import type { ImportPayload, ImportResult } from "../service/types";
 import type { Router$RouteMatchedEvent } from "sap/ui/core/routing/Router";
 import Embeddings from "./settings/Embeddings";
+import ModelProviders from "./settings/ModelProviders";
+import type Event from "sap/ui/base/Event";
 
 /** How an import names the fields of `odata_identity_changes`. */
 const IDENTITY_FIELD_TEXT: Record<string, string> = {
@@ -34,6 +36,9 @@ export default class Settings extends BaseController {
     /** The "Data catalogue embeddings" panel. */
     private embeddings!: Embeddings;
 
+    /** The "Model providers" panel. */
+    private modelProviders!: ModelProviders;
+
     /** An import is being asked about or sent: no second one meanwhile. */
     private importing = false;
 
@@ -51,8 +56,17 @@ export default class Settings extends BaseController {
         });
         this.setModel(this.embeddings.model, "emb");
 
+        this.modelProviders = new ModelProviders({
+            service: () => this.getAdminService(),
+            text: (key, args) => this.text(key, args),
+            warnIfNotLive: (outcome, leadKey) => this.warnIfNotLive(outcome, leadKey),
+            modelsChanged: () => void this.loadModel()
+        });
+        this.setModel(this.modelProviders.model, "mp");
+
         this.getRouter().getRoute("settings")?.attachPatternMatched(() => {
             void this.load();
+            void this.modelProviders.load();
             void this.embeddings.show();
         });
         // Another page, by a route or by an address that matches none
@@ -81,13 +95,7 @@ export default class Settings extends BaseController {
         return this.withBusy(async () => {
             const model = this.getModel("settings") as JSONModel;
 
-            const modelInfo = await this.run(
-                this.getAdminService().getModel(),
-                "Could not load the LLM model configuration."
-            );
-            if (modelInfo) {
-                model.setProperty("/model", modelInfo);
-            }
+            await this.loadModel();
 
             const orchestrator = await this.run(
                 this.getAdminService().getOrchestrator(),
@@ -97,6 +105,44 @@ export default class Settings extends BaseController {
                 model.setProperty("/orchestrator", orchestrator);
             }
         });
+    }
+
+    /** The "LLM model" panel: the model in effect and the models on offer. */
+    private async loadModel(): Promise<void> {
+        const modelInfo = await this.run(
+            this.getAdminService().getModel(),
+            "Could not load the LLM model configuration."
+        );
+        if (modelInfo) {
+            (this.getModel("settings") as JSONModel).setProperty("/model", modelInfo);
+        }
+    }
+
+    // --- model providers (controller/settings/ModelProviders.ts) ---
+
+    public onModelProviderSave(event: Event): void {
+        const name = this.modelProviders.providerOfEvent(event);
+        if (name) {
+            void this.modelProviders.save(name);
+        }
+    }
+
+    public onModelProviderTest(event: Event): void {
+        const name = this.modelProviders.providerOfEvent(event);
+        if (name) {
+            void this.modelProviders.test(name);
+        }
+    }
+
+    public onModelProviderRemoveKey(event: Event): void {
+        const name = this.modelProviders.providerOfEvent(event);
+        if (name) {
+            this.modelProviders.removeKey(name);
+        }
+    }
+
+    public onRetryModelProviders(): void {
+        void this.modelProviders.load();
     }
 
     public async onSaveModel(): Promise<void> {
