@@ -12,7 +12,7 @@ os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 import pytest  # noqa: E402
 
-TOOLS = ("list_systems", "list_checks", "run_check", "run_select")
+TOOLS = ("list_systems", "list_checks", "run_check", "run_select", "export_result")
 
 
 @pytest.mark.parametrize("policy", ["change", "diagnose"])
@@ -36,7 +36,7 @@ def test_the_tool_names_are_the_toolsets_own():
 @pytest.mark.parametrize("prefix", [None, "hana"])
 async def test_a_guarded_hana_toolset_forwards_none_in_a_change_session(prefix):
     # Through ReadOnlyGuard around a real built toolset (allow_select, so all
-    # four tools exist): bound to an IDE session, none is listed and a direct
+    # five tools exist): bound to an IDE session, none is listed and a direct
     # call is refused before the toolset is reached.
     from pydantic_ai import ModelRetry, RunContext
     from pydantic_ai.models.test import TestModel
@@ -54,7 +54,8 @@ async def test_a_guarded_hana_toolset_forwards_none_in_a_change_session(prefix):
     guard = ReadOnlyGuard(toolset)
     ctx = RunContext(deps=None, model=TestModel(), usage=RunUsage())
     unbound = await guard.get_tools(ctx)
-    assert len(unbound) == 4  # outside a session the guard passes them on
+    assert len(unbound) == len(TOOLS)  # outside a session the guard passes them on
+    assert {n.removeprefix("hana_") for n in unbound} == set(TOOLS)
     token = current_workspace.set(WorkspaceScope(session_id="s-hana",
                                                  state=DeepState(run_id="s-hana")))
     try:

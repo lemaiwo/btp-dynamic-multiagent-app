@@ -2865,7 +2865,8 @@ def _clean_git_entry(oauth: Any, mode: str) -> dict[str, Any]:
     return clean_entry(oauth)
 
 
-# builtin:hana: the systems (slug and destination each) and `allow_select`.
+# builtin:hana: the systems (slug and destination each), `allow_select` and
+# `allow_select_all`.
 # Nothing else is stored for it.
 _HANA_URL = BUILTIN_HANA_URL
 
@@ -2878,7 +2879,8 @@ def _clean_hana_entry(oauth: Any, mode: str) -> dict[str, Any]:
     read by ``agents.hana.config`` (the reading the admin gate and the
     toolset use), a value is stored only in the form that was checked, an
     unknown key and ``user_context: true`` are a ValueError, and
-    ``allow_select`` is stored only for the JSON boolean ``true``. No
+    ``allow_select`` and ``allow_select_all`` are stored only for the JSON
+    boolean ``true`` (the second only together with the first). No
     fallback to the row being replaced: the block holds no secret (each
     system's destination holds the credential).
     """

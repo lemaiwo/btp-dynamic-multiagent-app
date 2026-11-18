@@ -9,13 +9,13 @@ read, the SELECT guard, the row limit) are in ``tests/test_hanadb_checks.py``.
 
 from __future__ import annotations
 
-import re
 from typing import Any
 
 import pytest
 
 from agents.hana import tools
 from agents.hana.checks import all_checks, get_check, system
+from agents.hana.checks.base import bind_values, resolve_args
 from agents.hana.connection import HanaSystem
 from agents.hana.sqltokens import tokenize
 from tests import hanadb_helpers as h
@@ -32,7 +32,7 @@ EXPECTED: dict[str, tuple[tuple[str, ...], frozenset[str]]] = {
     "features": (("",), frozenset({"top"})),
     "featureUsage": (("",), frozenset({"top"})),
     "iniFiles": (("",), frozenset({"top"})),
-    "iniContents": (("",), frozenset({"top", "object"})),
+    "iniContents": (("files", "effective"), frozenset({"top", "object", "section", "key"})),
     # composite (task 13b)
     "healthCheck": (("overview", "databases", "disks", "memory", "connections",
                      "transactions", "backups"), frozenset({"top"})),
@@ -118,99 +118,92 @@ async def test_runs_on_the_fake_with_two_rows(name: str, db: h.FakeDbapi) -> Non
     assert len(executed) == len(labels)
 
 
-async def test_ini_contents_binds_the_optional_file(db: h.FakeDbapi) -> None:
+_INI_FILTER_BINDS = ("top_plus_one", "object", "object", "section", "section", "key", "key")
+
+
+async def test_ini_contents_binds_file_section_and_key(db: h.FakeDbapi) -> None:
     await _run(check="iniContents", top=5)
-    await _run(check="iniContents", top=5, object="global.ini")
     executed = [c for c in db.calls if c[0] == "execute"]
-    assert executed[0][2] == (6, None, None)
-    assert executed[1][2] == (6, "global.ini", "global.ini")
-    assert "CAST(? AS NVARCHAR(256)) IS NULL OR FILE_NAME = ?" in executed[0][1]
+    none = (6, None, None, None, None, None, None)
+    assert [c[2] for c in executed] == [none, none]  # files, effective
+    # run_check does not take section / key yet (the next task wires them):
+    # the binds are held through the registry's own resolve and bind.
+    check = get_check("iniContents")
+    args = resolve_args(check, top=5, object="global.ini", section="memorymanager",
+                        key="global_allocation")
+    for statement in check.statements:
+        assert statement.binds == _INI_FILTER_BINDS
+        assert bind_values(statement, args) == (
+            6, "global.ini", "global.ini", "memorymanager", "memorymanager",
+            "global_allocation", "global_allocation")
+        assert "LOWER(SECTION) = LOWER(?)" in statement.sql
+        assert 'LOCATE(LOWER("KEY"), LOWER(?)) > 0' in statement.sql
+        assert "CAST(? AS NVARCHAR(256)) IS NULL OR LOWER(FILE_NAME) = LOWER(?)" in statement.sql
+        assert "LIKE" not in _words(statement.sql)
 
 
-def _case_spans(tokens) -> list[tuple[int, int]]:
-    """Every outermost CASE ... END of a statement, as token index pairs."""
-    spans, depth, start = [], 0, 0
-    for i, token in enumerate(tokens):
-        if token.is_word("CASE"):
-            if depth == 0:
-                start = i
-            depth += 1
-        elif token.is_word("END") and depth:
-            depth -= 1
-            if depth == 0:
-                spans.append((start, i))
-    assert depth == 0, "CASE has no END"
-    return spans
+def test_only_ini_contents_filters_the_file_case_insensitively() -> None:
+    ci = "LOWER(FILE_NAME) = LOWER(?)"
+    for statement in get_check("iniContents").statements:
+        assert ci in statement.sql and statement.sql.count("FILE_NAME = ?") == 0
+        assert statement.binds == _INI_FILTER_BINDS
+    for check in all_checks():
+        if check.name == "iniContents":
+            continue
+        for statement in check.statements:
+            assert ci not in statement.sql, check.name
 
 
-def _is_name(token, name: str) -> bool:
-    return token.kind in ("word", "quoted") and token.value == name
+def test_ini_contents_returns_values_as_stored() -> None:
+    files = get_check("iniContents").statements[0]
+    assert files.label == "files"
+    tokens = tokenize(files.sql)
+    select_list = files.sql.split(" FROM ")[0]
+    columns = [c.strip().strip('"') for c in select_list.removeprefix("SELECT TOP ? ").split(",")]
+    assert columns == ["FILE_NAME", "LAYER_NAME", "TENANT_NAME", "HOST", "SECTION", "KEY",
+                       "VALUE"]
+    assert "SYS.M_INIFILE_CONTENTS" in files.sql
+    for statement in get_check("iniContents").statements:
+        words = _words(statement.sql)
+        assert "CASE" not in words and "VALUE_HIDDEN" not in words
+        assert "<hidden>" not in statement.sql
+    assert not any(t.kind == "string" for t in tokens)
+    for gone in ("INI_VALUE_SQL", "DENY_WORDS", "HIDDEN", "SHAPE_PATTERN", "SHAPE_MAX"):
+        assert not hasattr(system, gone), gone
 
 
-def test_ini_contents_value_only_through_the_hiding_case() -> None:
-    """The fake does not evaluate SQL, so the rule is held on the tokens: the
-    raw VALUE column appears only inside a CASE and as an alias after one."""
-    sql = get_check("iniContents").statements[0].sql
-    tokens = tokenize(sql)
-    spans = _case_spans(tokens)
-    assert len(spans) == 2  # VALUE and VALUE_HIDDEN
-    aliases = {end + 2 for _, end in spans if tokens[end + 1].is_word("AS")}
-    for i, token in enumerate(tokens):
-        if _is_name(token, "VALUE"):
-            assert any(s < i < e for s, e in spans) or i in aliases, "VALUE outside CASE"
-    (s1, e1), (s2, e2) = spans
-    assert _is_name(tokens[e1 + 2], "VALUE") and _is_name(tokens[e2 + 2], "VALUE_HIDDEN")
-    # default-deny: the CASE ends in the hidden literal, and 1 for VALUE_HIDDEN
-    assert tokens[e1 - 2].is_word("ELSE") and tokens[e1 - 1].text == f"'{system.HIDDEN}'"
-    assert tokens[e2 - 2].is_word("ELSE") and tokens[e2 - 1].text == "1"
+def test_ini_contents_args() -> None:
+    check = get_check("iniContents")
+    assert check.args == {"top", "object", "section", "key"}
+    assert not check.required
 
 
-def test_ini_contents_deny_words_and_shape() -> None:
-    sql = system.INI_VALUE_SQL
-    for word in ("password", "passwd", "pwd", "pass", "secret", "credential", "passphrase",
-                 "token", "auth", "cert", "salt", "saml", "jwt", "proxy", "keystore",
-                 "private", "ssl", "ldap"):
-        assert word in system.DENY_WORDS
-        assert f"LOCATE(LOWER(\"KEY\"), '{word}') > 0" in sql
-        assert f"LOCATE(LOWER(SECTION), '{word}') > 0" in sql
-    assert "RIGHT(LOWER(\"KEY\"), 3) = 'key'" in sql
-    assert f"LENGTH(\"VALUE\") <= {system.SHAPE_MAX}" in sql
-    assert f"\"VALUE\" LIKE_REGEXPR '{system.SHAPE_PATTERN}'" in sql
-    assert system.SHAPE_MAX == 64
-
-
-def test_ini_contents_never_shows_a_multi_line_value() -> None:
-    """Whether ^ and $ anchor the whole string in HANA's LIKE_REGEXPR is not
-    verified: a line feed, carriage return or tab hides the value anyway, in
-    both CASEs (VALUE and VALUE_HIDDEN)."""
-    sql = get_check("iniContents").statements[0].sql
-    for code in (10, 13, 9):
-        term = f"LOCATE(\"VALUE\", CHAR({code})) = 0"
-        assert term in system.INI_VALUE_SQL
-        assert sql.count(term) == 2
-    from agents.hana.guard import MAX_SQL_CHARS
-    assert len(sql) < MAX_SQL_CHARS
-
-
-@pytest.mark.parametrize("value", ["1024", "true", "on", "80%", "1.5", "row_store", "a-b,c +d"])
-def test_ini_shape_lets_plain_values_through(value: str) -> None:
-    assert len(value) <= system.SHAPE_MAX
-    assert re.fullmatch(system.SHAPE_PATTERN.strip("^$"), value)
-
-
-@pytest.mark.parametrize("value", [
-    "ldap://host:389", "jdbc:sap://u:p@host:30015", "user@host", "a=b", "/hana/data/SID",
-    "C:\\x", "x;y", "it's", 'say "x"', "a" * 65, "tab\tbed", "line\nbreak", "naïve"])
-def test_ini_shape_hides_everything_else(value: str) -> None:
-    shown = len(value) <= system.SHAPE_MAX and re.fullmatch(
-        system.SHAPE_PATTERN.strip("^$"), value)
-    assert not shown
-
-
-def test_ini_contents_purpose_says_what_is_hidden() -> None:
+def test_ini_contents_purpose_names_the_filters() -> None:
     purpose = get_check("iniContents").purpose
-    for word in ("secrets", "paths", "hosts", "URLs"):
+    for word in ("section", "key", "every layer"):
         assert word in purpose
+    assert "\n" not in purpose and len(purpose) <= 120
+
+
+def test_ini_contents_effective_part() -> None:
+    """SPS07 rev 79 has ``M_CONFIGURATION_PARAMETER_VALUES`` (probe 2026-11-18,
+    SYSTEMDB and a tenant): the value in effect per host and port, with the
+    same three filters; RAW_VALUE, the HAS_* flags and VIOLATED_RESTRICTIONS
+    are not selected."""
+    check = get_check("iniContents")
+    assert check.composite
+    assert tuple(s.label for s in check.statements) == ("files", "effective")
+    effective = check.statements[1]
+    assert "FROM SYS.M_CONFIGURATION_PARAMETER_VALUES WHERE" in effective.sql
+    assert effective.sql.startswith("SELECT TOP ? ")
+    select_list = effective.sql.split(" FROM ")[0]
+    columns = [c.strip().strip('"') for c in select_list.removeprefix("SELECT TOP ? ").split(",")]
+    assert columns == ["HOST", "PORT", "FILE_NAME", "SECTION", "KEY", "LAYER_NAME", "VALUE",
+                       "RESTART_REQUIRED"]
+    words = _words(effective.sql)
+    for left_out in ("RAW_VALUE", "HAS_KEY_INDEX", "HAS_PROPERTIES", "VIOLATED_RESTRICTIONS",
+                     "DEFAULT_VALUE"):
+        assert left_out not in words
 
 
 def test_host_information_returns_fixed_keys_only() -> None:

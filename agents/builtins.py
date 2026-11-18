@@ -97,8 +97,11 @@ name, which goes into the trailer of every commit; see :mod:`agents.git_tools`.
 over SQL (``hdbcli`` through the Cloud Connector, ``tcp``) as the technical
 user of one destination per system, and has no per-user mode:
 ``user_context`` is refused. Its config block lists the systems (``systems``:
-a slug and a destination each) and holds the one switch ``allow_select``,
-which adds ``run_select``. The driver is imported only when a call connects,
+a slug and a destination each) and holds two switches: ``allow_select``,
+which adds ``run_select`` (and ``export_result``'s ``sql``) over the
+catalogue and the monitoring views, and ``allow_select_all`` (only with
+``allow_select``), which opens that SQL to every schema the database user
+can read. The driver is imported only when a call connects,
 so building the toolset needs neither ``hdbcli`` nor a binding; see
 :mod:`agents.hana.tools`.
 

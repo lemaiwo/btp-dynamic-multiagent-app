@@ -66,7 +66,9 @@ def test_error_codes_are_the_closed_list():
         "destination_error", "proxy_refused", "unreachable", "login_failed",
         "not_authorized", "timeout", "unknown_system", "unknown_check",
         "invalid_argument", "select_refused", "result_too_large", "sql_error",
-        "call_failed"})
+        "call_failed",
+        # export_result's own refusals.
+        "no_chat", "export_too_large", "export_failed", "export_busy"})
     assert set(MESSAGES) == ERROR_CODES
 
 

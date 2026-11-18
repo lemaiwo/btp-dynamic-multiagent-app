@@ -291,6 +291,21 @@ def test_every_statement_passes_the_select_guard(check: Check, statement: Statem
     _assert_guard(check, statement, GUARD_EXCEPTIONS)
 
 
+@pytest.mark.parametrize(
+    "check, statement",
+    [(c, s) for c in EVERY_CHECK for s in c.statements],
+    ids=lambda v: getattr(v, "name", None) or getattr(v, "label", None) or "single",
+)
+def test_every_statement_passes_the_guard_when_paged(check: Check, statement: Statement) -> None:
+    """``run_check`` with an ``offset`` sends the statement inside
+    :func:`agents.hana.tools.page_sql`; that form must be a read the guard
+    accepts too."""
+    from agents.hana.tools import page_sql
+
+    _assert_guard(check, Statement(statement.label, page_sql(statement.sql),
+                                   statement.binds), GUARD_EXCEPTIONS)
+
+
 BUSINESS_READ = _variant(
     name="dummyBusiness", source="bin/dummyBusiness.js",
     statements=(Statement("", "SELECT TOP ? VBELN FROM SAPABAP1.VBAK", ("top",)),))
@@ -362,6 +377,7 @@ def test_defaults() -> None:
     assert base.resolve_args(DUMMY_TWO) == {
         "top": 50, "hours": 24, "schema": None, "object": None}
     assert ARGS["top"].default == 50 and ARGS["hours"].default == 24
+    assert ARGS["section"].default is None and ARGS["key"].default is None
 
 
 @pytest.mark.parametrize(
@@ -711,6 +727,99 @@ def test_other_schema_dump_sample(monkeypatch) -> None:
     assert base.dump_entries()[0]["binds"] == [2, "SYS", "SYS"]
 
 
+# ---- text arguments: section and key --------------------------------------------------
+
+DUMMY_INI = Check(
+    name="dummyIni", category="system", purpose="Dummy check filtering ini parameters.",
+    source="bin/dummyIni.js",
+    statements=(Statement(
+        "", "SELECT TOP ? SECTION, KEY FROM SYS.M_INIFILE_CONTENTS"
+            " WHERE SECTION = ? AND (? IS NULL OR KEY = ?)",
+        ("top_plus_one", "section", "key", "key")),),
+    args=frozenset({"top", "section", "key"}),
+    required=frozenset({"section"}),
+)
+DUMMY_INI_OPTIONAL = Check(
+    name="dummyIniOpt", category="system", purpose="Dummy check with optional ini filters.",
+    source="bin/dummyIniOpt.js",
+    statements=(Statement(
+        "", "SELECT TOP ? SECTION FROM SYS.M_INIFILE_CONTENTS"
+            " WHERE (? IS NULL OR SECTION = ?) AND (? IS NULL OR KEY = ?)",
+        ("top_plus_one", "section", "section", "key", "key")),),
+    args=frozenset({"top", "section", "key"}),
+)
+TEXT_RULE = ("must be one line of 1 to 128 characters, not empty, without control or format"
+             " characters")
+
+
+def test_section_and_key_are_text_arguments() -> None:
+    assert list(ARGS) == [
+        "schema", "object", "top", "hours", "host", "other_schema", "section", "key"]
+    for name, sample in (("section", "memorymanager"), ("key", "global_allocation_limit")):
+        arg = ARGS[name]
+        assert arg.kind == "text" and arg.default is None and arg.sample == sample
+        assert arg.rule == TEXT_RULE
+    assert base.TEXT_ARG_MAX == 128
+    base.validate_check(DUMMY_INI)
+    base.validate_check(DUMMY_INI_OPTIONAL)
+
+
+def test_text_argument_defaults() -> None:
+    assert base.resolve_args(DUMMY_INI_OPTIONAL) == {"top": 50, "section": None, "key": None}
+    args = base.resolve_args(DUMMY_INI, section="memorymanager", key="global_allocation_limit")
+    assert args == {"top": 50, "section": "memorymanager", "key": "global_allocation_limit"}
+    assert base.bind_values(DUMMY_INI.statements[0], args) == (
+        51, "memorymanager", "global_allocation_limit", "global_allocation_limit")
+
+
+@pytest.mark.parametrize("value", ["memorymanager", "Global_Allocation", "a b.c-d/e", "x" * 128])
+def test_text_argument_accepts_one_line(value) -> None:
+    assert base.resolve_args(DUMMY_INI, section=value)["section"] == value
+    assert base.resolve_args(DUMMY_INI_OPTIONAL, key=value)["key"] == value
+
+
+@pytest.mark.parametrize("value", [
+    "", "x" * 129, "a\nb", "a\tb", "a\rb", "a\x00b", "a​b", "a‮b", "a b",
+    "a b", "a\ud800b", "a﻿b", 3, True, ["a"], b"ab"])
+def test_text_argument_refusals_name_the_rule_not_the_value(value) -> None:
+    for name in ("section", "key"):
+        with pytest.raises(InvalidArgument) as info:
+            base.resolve_args(DUMMY_INI_OPTIONAL, **{name: value})
+        assert (info.value.argument, info.value.rule) == (name, TEXT_RULE)
+        shown = json.dumps(info.value.to_dict()) + str(info.value)
+        if isinstance(value, str) and value:
+            assert value not in shown
+
+
+def test_text_refusal_never_holds_a_secret() -> None:
+    value = SECRET + "\n"
+    with pytest.raises(InvalidArgument) as info:
+        base.resolve_args(DUMMY_INI, section=value)
+    assert SECRET not in json.dumps(info.value.to_dict()) + str(info.value)
+
+
+def test_a_required_text_argument_left_out_is_refused_by_name() -> None:
+    with pytest.raises(InvalidArgument) as info:
+        base.resolve_args(DUMMY_INI)
+    assert (info.value.argument, info.value.rule) == ("section", base.REQUIRED_RULE)
+
+
+def test_section_and_key_are_refused_where_not_declared() -> None:
+    for name in ("section", "key"):
+        with pytest.raises(InvalidArgument) as info:
+            base.resolve_args(DUMMY_TWO, **{name: "memorymanager"})
+        assert (info.value.argument, info.value.rule) == (name, base.UNDECLARED_RULE)
+    assert "section" not in base.resolve_args(DUMMY_TWO)
+    assert "key" not in base.resolve_args(DUMMY_TWO)
+
+
+def test_section_and_key_dump_samples(monkeypatch) -> None:
+    monkeypatch.setattr(base, "_REGISTRY", {})
+    registry.register(DUMMY_INI)
+    assert base.dump_entries()[0]["binds"] == [
+        2, "memorymanager", "global_allocation_limit", "global_allocation_limit"]
+
+
 def test_lob_chars_defaults_to_none_and_is_validated() -> None:
     import dataclasses
 
@@ -870,7 +979,7 @@ def test_column_and_table_rules_across_modules(check: Check, statement: Statemen
 
 def test_the_shared_rules_run_over_the_whole_registry() -> None:
     """The parametrized test above skips silently on an empty registry: the
-    registry of Phases 1 to 3 holds 139 statements."""
+    registry of Phases 1 to 3 holds 140 statements."""
     assert len(_registered_statements()) > 100
 
 

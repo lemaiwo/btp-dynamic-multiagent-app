@@ -467,6 +467,8 @@ export default class AgentDetail extends BaseController {
             // starting point for a real one.
             serverModel.setProperty("/url", "");
         }
+        // --- hana --- Leaving the entry forgets its switches and answers.
+        this.hana.follow(serverModel.getProperty("/url") as string);
         serverModel.setProperty("/errors", {});
         this.syncServerKind();
     }
@@ -476,6 +478,8 @@ export default class AgentDetail extends BaseController {
         const serverModel = this.getModel("server") as JSONModel;
         const url = serverModel.getProperty("/url") as string;
         serverModel.setProperty("/kind", findBuiltin(url)?.url ?? "mcp");
+        // --- hana --- A url that leaves the entry forgets its switches and answers.
+        this.hana.follow(url);
         this.syncServerKind();
         if (odataEntry.isODataUrl(url)) {
             // The spelling the fragment's bindings test for.
@@ -513,6 +517,10 @@ export default class AgentDetail extends BaseController {
 
     public onHanaAllowSelectChange(event: Event): void {
         this.hana.onAllowSelectChange(event);
+    }
+
+    public onHanaAllowSelectAllChange(event: Event): void {
+        this.hana.onAllowSelectAllChange(event);
     }
 
     /** --- ina --- A tick, a selection or a removed token in the query box. */
@@ -890,6 +898,7 @@ export default class AgentDetail extends BaseController {
         // --- hana --- Likewise its own keys.
         delete oauthRaw.systems;
         delete oauthRaw.allow_select;
+        delete oauthRaw.allow_select_all;
         if (gitEntry.isGitUrl(url)) {
             // Only the entry's own values reach cleanOAuth: the destination
             // name and what the Git fields hold now, as typed.
@@ -940,7 +949,7 @@ export default class AgentDetail extends BaseController {
         }
         if (hanaEntry.isHanaUrl(url)) {
             // --- hana --- Only the entry's own values reach cleanOAuth: the
-            // systems as typed and the switch as a real boolean.
+            // systems as typed and the switches as real booleans.
             if (!this.hana.confirm(this.byId("hanaSystemsTable") as Table | undefined, () => this.onConfirmServer())) {
                 return;
             }
@@ -948,6 +957,7 @@ export default class AgentDetail extends BaseController {
             Object.keys(oauthRaw).forEach((key) => { delete oauthRaw[key]; });
             oauthRaw.systems = block.systems;
             oauthRaw.allow_select = block.allow_select === true;
+            oauthRaw.allow_select_all = block.allow_select_all === true;
         }
         if (oauthConfig.supportsMailTheme(url)) {
             const parsedTheme = oauthConfig.parseMailTheme(serverModel.getProperty("/themeJson") as string);

@@ -1742,14 +1742,17 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
         # builtin:hana: destination mode only, systems and one switch,
         # collected by their own function.
         check("hana is a known destination built-in",
-              "'builtin:hana':" in html and "['systems', 'allow_select']" in html
+              "'builtin:hana':" in html and "['systems', 'allow_select', 'allow_select_all']" in html
               and "const HANA_BUILTIN = 'builtin:hana';" in html
               and "function collectHanaConfig(row)" in html)
         check("hana is offered under its toolset name",
               "const HANA_TOOLSET_LABEL = 'SAP HANA (monitoring)';" in html)
         check("hana has its fields",
               'class="dest-systems"' in html and 'class="dest-allow_select"' in html
-              and "Allow SELECT on monitoring views" in html)
+              and "Allow SELECT on monitoring views" in html
+              and 'class="dest-allow_select_all"' in html
+              and "Allow SELECT on all schemas (read-only)" in html
+              and "const HANA_ALLOW_SELECT_ALL_CONFIRM = " in html)
         check("the hint list names builtin:hana", "builtin:git, builtin:hana, builtin:sapnotes," in html)
         check("the views placeholder shows a calendar view with its kinds",
               '"kinds": ["Presence", "Guard"]' in html)
@@ -2317,6 +2320,11 @@ assert.strictEqual(row.querySelector('.dest-base_branch').value, '');
 const HANA_CONFIRM = 'This lets the agent run its own SELECT statements on the system and monitoring views '
     + '(SYS, _SYS_STATISTICS, M_*) of the listed systems. Catalogue data, statement texts with '
     + 'their values and trace file contents come back unmasked. Continue?';
+const HANA_ALL_CONFIRM = 'This lets the agent run its own SELECT statements on every schema the '
+    + 'database user of the listed systems can read, including business tables. Rows of business '
+    + 'and personal data reach the AI model and stay in the stored conversation and in exported '
+    + 'files. On a system database it also reaches the monitoring views of all tenant databases. '
+    + 'The statements stay read-only. Continue?';
 const HANA_OAUTH = { systems: [{ name: 'erp_tenant', destination: 'hana-erp-tenant' },
                                { name: 'erp_systemdb', destination: 'HANA_ERP.SYS' }],
                      allow_select: true };
@@ -2331,7 +2339,7 @@ global.confirm = (msg) => { hanaAsked.push(msg); return hanaAnswer; };
 ({ row, out } = addAndCollect({ url: 'builtin:hana', auth_mode: 'destination',
     oauth: { ...HANA_OAUTH, user_context: false, has_client_secret: false, project: 'ABC',
              allow_write: true, repositories: ['a/b'], provider: 'gitlab', allow_push: true } }));
-for (const k of ['systems', 'allow_select']) {
+for (const k of ['systems', 'allow_select', 'allow_select_all']) {
     assert.strictEqual(row.querySelector('.dest-field-' + k).style.display, '', k + ' is shown');
 }
 for (const k of ['destination', 'user_context', 'project', 'allow_write', 'repositories', 'provider',
@@ -2418,6 +2426,95 @@ hanaUrl(row, 'builtin:han');
 hanaUrl(row, '');
 hanaUrl(row, 'builtin:hana');
 assert.strictEqual(selectBox.checked, true, 'a half-typed URL back to hana keeps the tick');
+// "Allow SELECT on all schemas" needs Allow SELECT and asks its own question.
+hanaAsked.length = 0;
+hanaAnswer = false;
+({ row, out } = addAndCollect({ url: 'builtin:hana', auth_mode: 'destination',
+    oauth: { systems: [{ name: 'erp_tenant', destination: 'd' }] } }));
+const allBox = row.querySelector('.dest-allow_select_all');
+const selBox = row.querySelector('.dest-allow_select');
+assert.strictEqual(row.querySelector('.dest-field-allow_select_all').style.display, '');
+assert.strictEqual(allBox.checked, false);
+assert.strictEqual(allBox.disabled, true, 'disabled while Allow SELECT is unticked');
+hanaAnswer = true;
+selBox.checked = true;
+hanaFire(selBox);
+assert.deepStrictEqual(hanaAsked, [HANA_CONFIRM]);
+assert.strictEqual(allBox.disabled, false, 'enabled once Allow SELECT is ticked');
+assert.strictEqual(allBox.checked, false, 'ticking Allow SELECT ticks nothing more');
+hanaAnswer = false;
+allBox.checked = true;
+hanaFire(allBox);
+assert.deepStrictEqual(hanaAsked, [HANA_CONFIRM, HANA_ALL_CONFIRM], 'its own question, naming no system');
+assert.strictEqual(allBox.checked, false, 'Cancel leaves it unticked');
+assert.deepStrictEqual(collectMcpServers()[0].oauth,
+    { systems: [{ name: 'erp_tenant', destination: 'd' }], allow_select: true });
+hanaAnswer = true;
+allBox.checked = true;
+hanaFire(allBox);
+assert.strictEqual(allBox.checked, true, 'OK keeps it ticked');
+assert.deepStrictEqual(collectMcpServers()[0].oauth,
+    { systems: [{ name: 'erp_tenant', destination: 'd' }], allow_select: true, allow_select_all: true });
+// Unticking it asks nothing.
+allBox.checked = false;
+hanaFire(allBox);
+assert.strictEqual(hanaAsked.length, 3);
+allBox.checked = true;
+hanaFire(allBox);
+assert.strictEqual(hanaAsked.length, 4);
+// Unticking Allow SELECT unticks and disables it, asking nothing.
+selBox.checked = false;
+hanaFire(selBox);
+assert.strictEqual(hanaAsked.length, 4);
+assert.strictEqual(allBox.checked, false, 'unticked with Allow SELECT');
+assert.strictEqual(allBox.disabled, true, 'disabled with Allow SELECT');
+assert.deepStrictEqual(collectMcpServers()[0].oauth, { systems: [{ name: 'erp_tenant', destination: 'd' }] });
+// Cancel on Allow SELECT leaves it disabled.
+hanaAnswer = false;
+selBox.checked = true;
+hanaFire(selBox);
+assert.strictEqual(selBox.checked, false);
+assert.strictEqual(allBox.disabled, true);
+// Never sent without Allow SELECT, even when the box was set by hand.
+allBox.checked = true;
+assert.deepStrictEqual(collectMcpServers()[0].oauth, { systems: [{ name: 'erp_tenant', destination: 'd' }] });
+// A stored block with both switches loads both ticked, asks nothing, and goes back as stored.
+hanaAsked.length = 0;
+({ row, out } = addAndCollect({ url: 'builtin:hana', auth_mode: 'destination',
+    oauth: { ...HANA_OAUTH, allow_select_all: true } }));
+assert.deepStrictEqual(out, { url: 'builtin:hana', auth_mode: 'destination',
+    oauth: { ...HANA_OAUTH, allow_select_all: true } });
+assert.strictEqual(row.querySelector('.dest-allow_select_all').checked, true);
+assert.strictEqual(row.querySelector('.dest-allow_select_all').disabled, false);
+assert.deepStrictEqual(hanaAsked, []);
+// A URL edit to another toolset unticks both; what the URL passes through while typed does not.
+hanaUrl(row, 'builtin:han');
+hanaUrl(row, '');
+hanaUrl(row, 'builtin:hana');
+assert.strictEqual(row.querySelector('.dest-allow_select').checked, true);
+assert.strictEqual(row.querySelector('.dest-allow_select_all').checked, true);
+hanaUrl(row, 'builtin:git');
+assert.strictEqual(row.querySelector('.dest-allow_select').checked, false);
+assert.strictEqual(row.querySelector('.dest-allow_select_all').checked, false);
+assert.strictEqual(row.querySelector('.dest-allow_select_all').disabled, true);
+hanaUrl(row, 'builtin:hana');
+assert.strictEqual(row.querySelector('.dest-allow_select_all').checked, false, 'not carried back');
+// Stored without allow_select, or not as the JSON boolean true: not loaded.
+({ row, out } = addAndCollect({ url: 'builtin:hana', auth_mode: 'destination',
+    oauth: { systems: [{ name: 'erp_tenant', destination: 'd' }], allow_select_all: true } }));
+assert.deepStrictEqual(out.oauth, { systems: [{ name: 'erp_tenant', destination: 'd' }] });
+assert.strictEqual(row.querySelector('.dest-allow_select_all').checked, false);
+assert.strictEqual(row.querySelector('.dest-allow_select_all').disabled, true);
+({ row, out } = addAndCollect({ url: 'builtin:hana', auth_mode: 'destination',
+    oauth: { systems: [{ name: 'erp_tenant', destination: 'd' }], allow_select: true,
+             allow_select_all: 'true' } }));
+assert.deepStrictEqual(out.oauth, { systems: [{ name: 'erp_tenant', destination: 'd' }], allow_select: true });
+// Another type's block never loads it.
+({ row, out } = addAndCollect({ url: 'builtin:git', auth_mode: 'destination',
+    oauth: { destination: 'GH', provider: 'github', repositories: ['a/b'], allow_select: true,
+             allow_select_all: true } }));
+assert.strictEqual(row.querySelector('.dest-allow_select_all').checked, false);
+assert.ok(!('allow_select_all' in out.oauth));
 // Only the destination mode.
 ({ row } = addAndCollect({ url: 'builtin:hana', auth_mode: 'destination',
     oauth: { systems: [{ name: 'erp_tenant', destination: 'hana-erp-tenant' }] } }));
@@ -3355,6 +3452,44 @@ assert.ok(errText({ detail: [{ loc: ['body', 'mcp_servers', 0], type: 'value_err
         await save();
         assert.deepStrictEqual(asked, [HANA_CONFIRM], 'nothing is covered after a type change');
         assert.deepStrictEqual(calls, []);
+        // (e) "Allow SELECT on all schemas" has its own question and its own coverage.
+        asked.length = 0;
+        const allOf = (r2) => r2.querySelector('.dest-allow_select_all');
+        r = hanaRow({ systems: [{ name: 'erp_tenant', destination: 'HANA_ERP_TENANT' }],
+                      allow_select: true, allow_select_all: true });
+        okAnswer = true;
+        await save();
+        assert.deepStrictEqual(asked, [], 'the stored systems are covered for both switches');
+        assert.strictEqual(hanaSent().oauth.allow_select_all, true);
+        sys(r).value = 'erp_tenant HANA_ERP_TENANT\nerp_systemdb HANA_ERP_SYS';
+        global.confirm = (msg) => { asked.push(msg); return msg === HANA_CONFIRM; };
+        await save();
+        assert.deepStrictEqual(asked, [HANA_CONFIRM, HANA_ALL_CONFIRM], 'both questions, in this order');
+        assert.deepStrictEqual(calls, [], 'Cancel on the second sends nothing');
+        assert.strictEqual(allOf(r).checked, true, 'Cancel leaves the box as it is');
+        global.confirm = (msg) => { asked.push(msg); return true; };
+        await save();
+        assert.deepStrictEqual(asked.slice(2), [HANA_ALL_CONFIRM], 'the first OK covered its systems');
+        assert.deepStrictEqual(hanaSent().oauth, {
+            systems: [{ name: 'erp_tenant', destination: 'HANA_ERP_TENANT' },
+                      { name: 'erp_systemdb', destination: 'HANA_ERP_SYS' }],
+            allow_select: true, allow_select_all: true });
+        await save();
+        assert.strictEqual(asked.length, 3, 'covered now');
+        // Ticked here (OK), then a system added: its question again at the save.
+        asked.length = 0;
+        r = hanaRow({ systems: [{ name: 'erp_tenant', destination: 'HANA_ERP_TENANT' }],
+                      allow_select: true });
+        allOf(r).checked = true;
+        allOf(r).dispatchEvent(new window.Event('change', { bubbles: true }));
+        assert.deepStrictEqual(asked, [HANA_ALL_CONFIRM], 'ticking asks');
+        await save();
+        assert.strictEqual(asked.length, 1, 'ticked with OK, saved unchanged: not asked again');
+        assert.strictEqual(hanaSent().oauth.allow_select_all, true);
+        sys(r).value = 'erp_tenant HANA_ERP_TENANT\nerp_systemdb HANA_ERP_SYS';
+        await save();
+        assert.deepStrictEqual(asked, [HANA_ALL_CONFIRM, HANA_CONFIRM, HANA_ALL_CONFIRM],
+            'a system added after the tick asks both');
         global.confirm = () => true;
     }
 

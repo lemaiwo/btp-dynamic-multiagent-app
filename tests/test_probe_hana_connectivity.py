@@ -499,6 +499,12 @@ def test_report_block_and_exit_code():
         "EXPLAIN_PLAN no",
         "PRIVILEGES ok",
         "WRITE_REFUSED untested",
+        "INI_DEFAULT_LAYER untested",
+        "CONFIG_PARAMETER_VALUES untested",
+        "PAGE_WRAP untested",
+        "PAGE_ORDER untested",
+        "PAGE_WRAP_WITH untested",
+        "PAGE_WRAP_DUPLICATE untested",
         "SCHEMA_PIN yes",
     ]
     assert probe.exit_code(facts) == 0
@@ -539,7 +545,8 @@ def _mock_transport(destination: dict) -> httpx.MockTransport:
 class FakeConnection:
     def __init__(self, privileges, explain_fails=False, read_only_fails=False,
                  write_refused=False, schema_fails=False, write_error=None,
-                 insert_refused=None, insert_error=None, setup_fails=False):
+                 insert_refused=None, insert_error=None, setup_fails=False,
+                 admin_fail_on=None, page_differs=False, drop_ro_fails=False):
         self.privileges = privileges
         self.explain_fails = explain_fails
         self.read_only_fails = read_only_fails
@@ -551,6 +558,13 @@ class FakeConnection:
         self.insert_refused = write_refused if insert_refused is None else insert_refused
         self.insert_error = insert_error or write_error
         self.setup_fails = setup_fails
+        # the --admin-sql-facts answers: a refusal (code 259) for a statement
+        # holding this text, and a page that is not rows 10..19 of the inner read
+        self.admin_fail_on = admin_fail_on
+        self.page_differs = page_differs
+        # the DROP of an accepted RO table fails once (it is then left over)
+        self.drop_ro_fails = drop_ro_fails
+        self.executed: list[tuple[str, tuple]] = []
         self.closed = False
         self.rolled_back = False
         self.statements: list[str] = []
@@ -570,6 +584,17 @@ class FakeConnection:
 
             def execute(self, sql, binds=()):
                 conn.statements.append(sql)
+                conn.executed.append((sql, tuple(binds)))
+                if conn.admin_fail_on and conn.admin_fail_on in sql:
+                    raise dbapi.Error(259, "invalid table name: secret text")
+                admin = _admin_answer(sql, conn.page_differs)
+                if admin is not None:
+                    self.result = admin
+                    return True
+                if (sql.startswith("DROP") and "AGENT_PROBE_RO" in sql
+                        and conn.drop_ro_fails):
+                    conn.drop_ro_fails = False
+                    raise dbapi.Error(258, "insufficient privilege: secret text")
                 if "M_DATABASE" in sql:
                     self.result = [("TENANTDB", "2.00.079.00.1234567890")]
                 elif "EFFECTIVE_PRIVILEGES" in sql:
@@ -616,6 +641,31 @@ class FakeConnection:
 
     def close(self):
         self.closed = True
+
+
+MARKER = "ADMIN-ROW-MARKER"
+INNER_ROWS = [(f"{MARKER}-{i:02d}.ini", "S", "K", "DEFAULT") for i in range(21)]
+
+
+def _admin_answer(sql: str, page_differs: bool):
+    """The rows the --admin-sql-facts statements get; every value a marker."""
+    if "M_INIFILE_CONTENTS" in sql and "LIMIT" in sql:
+        return list(reversed(INNER_ROWS[10:20])) if page_differs else INNER_ROWS[10:20]
+    if "M_INIFILE_CONTENTS" in sql and "SELECT TOP" in sql:
+        return list(INNER_ROWS)
+    if "M_INIFILE_CONTENTS" in sql and "GROUP BY" in sql:
+        return [("DEFAULT", 4), ("SYSTEM", 2), (MARKER, 1)]
+    if "M_INIFILE_CONTENTS" in sql and "LOCATE" in sql:
+        return [(3,)]
+    if "M_INIFILE_CONTENTS" in sql:
+        return [(5,)]
+    if "VIEW_COLUMNS" in sql:
+        return [("FILE_NAME",), ("LAYER_NAME",), (MARKER,)]
+    if "M_CONFIGURATION_PARAMETER_VALUES" in sql:
+        return [(7,)]
+    if "LIMIT" in sql and "DUMMY" in sql:
+        return [(MARKER, MARKER)] if "2 AS A" in sql else [(MARKER,)]
+    return None
 
 
 class FakeSocket:
@@ -861,7 +911,7 @@ def test_a_refused_write_passes_inside_the_read_only_transaction(tmp_path, capsy
     _assert_clean(out)
     s = conn.statements
     read_only = s.index("SET TRANSACTION READ ONLY")
-    create = s.index("CREATE LOCAL TEMPORARY TABLE #AGENT_PROBE_RO (I INTEGER)")
+    create = s.index('CREATE LOCAL TEMPORARY TABLE "PROBEUSER".#AGENT_PROBE_RO (I INTEGER)')
     assert create == read_only + 1  # same transaction, nothing in between
     # the DML target is made before the read-only transaction, in the user's
     # own schema, and dropped once the steps are done
@@ -869,8 +919,9 @@ def test_a_refused_write_passes_inside_the_read_only_transaction(tmp_path, capsy
     assert s.index("SELECT CURRENT_SCHEMA FROM SYS.DUMMY") < setup
     assert setup < s.index("ROLLBACK") < s.index("SET SCHEMA SYS")
     assert s[create + 1] == 'INSERT INTO "PROBEUSER".#AGENT_PROBE_RW VALUES (1)'
-    assert not any(x == "DROP TABLE #AGENT_PROBE_RO" for x in s)
-    assert s[-3:] == ["ROLLBACK", 'DROP TABLE "PROBEUSER".#AGENT_PROBE_RW', "ROLLBACK"]
+    assert not any("DROP TABLE" in x and "AGENT_PROBE_RO" in x for x in s)
+    assert s[-4:] == ["ROLLBACK", "SET TRANSACTION READ WRITE",
+                      'DROP TABLE "PROBEUSER".#AGENT_PROBE_RW', "ROLLBACK"]
     assert out.index("PASS checks") < out.index("PASS write_cleanup: dropped")
     assert "PASS checks: passed=1 failed=0" in out
 
@@ -893,8 +944,9 @@ def test_an_accepted_write_fails_is_dropped_and_rolled_back(tmp_path, capsys):
     assert "EXPLAIN_PLAN untested" in out and "QUERY_TIMEOUT no" in out
     _assert_clean(out)
     s = conn.statements
-    create = s.index("CREATE LOCAL TEMPORARY TABLE #AGENT_PROBE_RO (I INTEGER)")
-    assert s[create + 1:] == ["DROP TABLE #AGENT_PROBE_RO", "ROLLBACK", "ROLLBACK",
+    create = s.index('CREATE LOCAL TEMPORARY TABLE "PROBEUSER".#AGENT_PROBE_RO (I INTEGER)')
+    assert s[create + 1:] == ['DROP TABLE "PROBEUSER".#AGENT_PROBE_RO', "ROLLBACK",
+                              "ROLLBACK", "SET TRANSACTION READ WRITE",
                               'DROP TABLE "PROBEUSER".#AGENT_PROBE_RW', "ROLLBACK"]
     assert not any("M_ALERTS" in x for x in s)
 
@@ -932,7 +984,7 @@ def test_the_write_test_is_skipped_when_read_only_was_refused(capsys):
                       read_only_fails=True, extra=["--write-test"])
     out = capsys.readouterr().out
     assert "SKIP write_refused: not read-only" in out
-    assert not any(x.startswith("CREATE LOCAL TEMPORARY TABLE #AGENT_PROBE_RO")
+    assert not any(("CREATE" in x and "AGENT_PROBE_RO" in x)
                    or x.startswith("INSERT") for x in conn.statements)
 
 
@@ -992,7 +1044,7 @@ def test_a_failed_schema_pin_stops_the_write_test_and_the_checks(tmp_path, capsy
     assert "SKIP write_refused: schema pin failed" in out
     assert "SKIP checks: schema pin failed" in out
     assert out.splitlines()[-1] == "SCHEMA_PIN no"
-    assert not any(x.startswith("CREATE LOCAL TEMPORARY TABLE #AGENT_PROBE_RO")
+    assert not any(("CREATE" in x and "AGENT_PROBE_RO" in x)
                    or x.startswith("INSERT") for x in conn.statements)
     assert 'DROP TABLE "PROBEUSER".#AGENT_PROBE_RW' in conn.statements  # the setup is undone
     assert not any("M_ALERTS" in x for x in conn.statements)
@@ -1075,4 +1127,240 @@ def test_a_failed_setup_skips_the_insert_and_is_inconclusive(capsys):
     assert "SKIP write_refused_dml: setup failed" in out
     assert "WRITE_REFUSED inconclusive" in out
     assert not any(x.startswith("INSERT") or x.startswith("DROP") for x in conn.statements)
+    assert "secret text" not in out
+
+
+# ---- --admin-sql-facts: read-only facts for iniContents and paging ------------------------
+
+
+ADMIN_KEYS = ("INI_DEFAULT_LAYER", "CONFIG_PARAMETER_VALUES", "PAGE_WRAP", "PAGE_ORDER",
+              "PAGE_WRAP_WITH", "PAGE_WRAP_DUPLICATE")
+
+
+def test_parser_admin_sql_facts_flag():
+    assert probe.build_parser().parse_args(["--destination", "d"]).admin_sql_facts is False
+    assert probe.build_parser().parse_args(
+        ["--destination", "d", "--admin-sql-facts"]).admin_sql_facts is True
+
+
+def test_admin_sql_facts_run_only_with_their_flag(capsys):
+    code, _, conn = _run(HTTP_DESTINATION, privileges=[("MONITORING", None)])
+    out = capsys.readouterr().out
+    assert code == 0, out
+    assert "SKIP admin_sql_facts: no --admin-sql-facts" in out
+    for key in ADMIN_KEYS:
+        assert f"{key} untested" in out.splitlines()
+    assert not any("M_INIFILE_CONTENTS" in x or "M_CONFIGURATION" in x
+                   for x in conn.statements)
+
+
+def test_admin_sql_facts_print_counts_and_names_never_rows(capsys):
+    code, _, conn = _run(HTTP_DESTINATION, privileges=[("MONITORING", None)],
+                         extra=["--admin-sql-facts"])
+    out = capsys.readouterr().out
+    assert code == 0, out
+    assert "PASS ini_default_layer: rows=5" in out
+    assert "PASS ini_layers: DEFAULT=4 SYSTEM=2 <unprintable>=1" in out
+    assert "PASS ini_key_filter: rows=3" in out
+    assert ("PASS config_parameter_values: rows=7 "
+            "columns=FILE_NAME,LAYER_NAME,<unprintable>") in out
+    assert "PASS page_wrap: rows=10" in out
+    lines = out.splitlines()
+    for key in ADMIN_KEYS:
+        assert f"{key} yes" in lines, key
+    assert MARKER not in out and "secret text" not in out
+    _assert_clean(out)
+    # every statement as the brief names it, with its binds
+    for sql, binds in probe.ADMIN_SQL_FACTS.values():
+        assert (sql, binds) in conn.executed, sql
+    assert probe.ADMIN_SQL_FACTS["ini_key_filter"][1] == ("MemoryManager", "Global_Allocation")
+    # after the schema pin and the read-only statement, before the cleanup
+    s = conn.statements
+    first = min(i for i, x in enumerate(s) if "M_INIFILE_CONTENTS" in x)
+    assert s.index("SET TRANSACTION READ ONLY") < first
+    assert "ROLLBACK" not in s[s.index("SET TRANSACTION READ ONLY"):first]
+
+
+def test_admin_sql_facts_failures_show_the_sql_code_only(capsys):
+    code, _, conn = _run(HTTP_DESTINATION, privileges=[("MONITORING", None)],
+                         admin_fail_on="M_CONFIGURATION_PARAMETER_VALUES",
+                         extra=["--admin-sql-facts"])
+    out = capsys.readouterr().out
+    assert code == 0, out  # information, not a pass criterion
+    assert "FAIL config_parameter_values: sql_code=259" in out
+    assert "CONFIG_PARAMETER_VALUES no" in out.splitlines()
+    assert "secret text" not in out and MARKER not in out
+    assert "PAGE_WRAP yes" in out.splitlines()  # the others still ran
+
+
+def test_admin_sql_facts_start_untested():
+    facts = probe.Facts()
+    assert all(getattr(facts, f) == "untested" for f in (
+        "ini_default_layer", "config_parameter_values", "page_wrap", "page_order",
+        "page_wrap_with", "page_wrap_duplicate"))
+
+
+@pytest.mark.parametrize("differs,value", [(False, "yes"), (True, "no")])
+def test_page_order_compares_in_memory(capsys, differs, value):
+    _run(HTTP_DESTINATION, privileges=[("MONITORING", None)], page_differs=differs,
+         extra=["--admin-sql-facts"])
+    out = capsys.readouterr().out
+    assert f"PAGE_ORDER {value}" in out.splitlines()
+    assert "PAGE_WRAP yes" in out.splitlines()
+    assert MARKER not in out
+
+
+def test_page_order_is_untested_when_the_inner_read_fails(capsys):
+    _run(HTTP_DESTINATION, privileges=[("MONITORING", None)], admin_fail_on="SELECT TOP ?",
+         extra=["--admin-sql-facts"])
+    out = capsys.readouterr().out
+    assert "PAGE_ORDER untested" in out.splitlines()
+    assert "PAGE_WRAP no" in out.splitlines()
+
+
+def test_admin_sql_facts_skip_after_an_accepted_write(capsys):
+    _, _, conn = _run(HTTP_DESTINATION, privileges=[("MONITORING", None)],
+                      extra=["--write-test", "--admin-sql-facts"])
+    out = capsys.readouterr().out
+    assert "SKIP admin_sql_facts: write was accepted" in out
+    assert not any("M_INIFILE_CONTENTS" in x for x in conn.statements)
+
+
+def test_admin_sql_facts_skip_after_a_failed_schema_pin(capsys):
+    _, _, conn = _run(HTTP_DESTINATION, privileges=[("MONITORING", None)], schema_fails=True,
+                      extra=["--admin-sql-facts"])
+    out = capsys.readouterr().out
+    assert "SKIP admin_sql_facts: schema pin failed" in out
+    assert not any("M_INIFILE_CONTENTS" in x for x in conn.statements)
+
+
+def test_admin_sql_facts_skip_when_not_read_only(capsys):
+    _, _, conn = _run(HTTP_DESTINATION, privileges=[("MONITORING", None)],
+                      read_only_fails=True, extra=["--admin-sql-facts"])
+    out = capsys.readouterr().out
+    assert "SKIP admin_sql_facts: not read-only" in out
+    assert not any("M_INIFILE_CONTENTS" in x for x in conn.statements)
+
+
+def test_admin_keys_come_before_schema_pin(capsys):
+    _run(HTTP_DESTINATION, privileges=[("MONITORING", None)], extra=["--admin-sql-facts"])
+    lines = capsys.readouterr().out.splitlines()
+    keys = [line.split()[0] for line in lines[-7:]]
+    assert keys == [*ADMIN_KEYS, "SCHEMA_PIN"]
+    assert lines[-8].startswith("WRITE_REFUSED ")
+
+
+def test_docstring_names_the_flag():
+    assert "--admin-sql-facts" in probe.__doc__
+
+
+# ---- the write test made conclusive (run of 2026-11-18) ----------------------------------
+
+
+def test_a_refusal_whose_text_says_read_only_passes(capsys):
+    error = dbapi.Error(129, "cannot run in a read only transaction: secret text")
+    code, _, _ = _run(HTTP_DESTINATION, privileges=[("MONITORING", None)],
+                      write_refused=True, write_error=error, extra=["--write-test"])
+    out = capsys.readouterr().out
+    assert code == 0, out
+    assert "PASS write_refused_ddl: sql_code=129 read_only_text=yes" in out
+    assert "PASS write_refused_dml: sql_code=129 read_only_text=yes" in out
+    assert "WRITE_REFUSED yes" in out
+    assert "secret text" not in out and "read only transaction" not in out
+
+
+def test_read_only_with_a_hyphen_is_recognised_too():
+    assert probe.read_only_text(dbapi.Error(129, "Transaction is READ-ONLY")) is True
+    assert probe.read_only_text(dbapi.Error(129, "transaction rolled back")) is False
+    assert probe.read_only_text(RuntimeError("read only")) is True
+    assert probe.read_only_text(RuntimeError()) is False
+
+
+def test_the_same_code_with_another_text_is_inconclusive(capsys):
+    error = dbapi.Error(129, "transaction rolled back by an internal error: secret text")
+    code, _, _ = _run(HTTP_DESTINATION, privileges=[("MONITORING", None)],
+                      write_refused=True, write_error=error, extra=["--write-test"])
+    out = capsys.readouterr().out
+    assert code == 1, out
+    assert "INCONCLUSIVE write_refused_ddl: sql_code=129 read_only_text=no" in out
+    assert "WRITE_REFUSED inconclusive" in out
+    assert "secret text" not in out and "internal error" not in out
+
+
+def test_the_refusal_codes_are_not_widened_by_the_first_run():
+    assert 129 not in probe.READ_ONLY_REFUSAL_CODES
+    assert 258 not in probe.READ_ONLY_REFUSAL_CODES
+
+
+def test_the_ddl_attempt_is_schema_qualified(capsys):
+    _, _, conn = _run(HTTP_DESTINATION, privileges=[("MONITORING", None)],
+                      write_refused=True, extra=["--write-test"])
+    out = capsys.readouterr().out
+    assert "PROBEUSER" not in out
+    assert ('CREATE LOCAL TEMPORARY TABLE "PROBEUSER".#AGENT_PROBE_RO (I INTEGER)'
+            in conn.statements)
+    assert "CREATE LOCAL TEMPORARY TABLE #AGENT_PROBE_RO (I INTEGER)" not in conn.statements
+
+
+def test_the_cleanup_leaves_the_read_only_transaction_before_the_drop(capsys):
+    _, _, conn = _run(HTTP_DESTINATION, privileges=[("MONITORING", None)],
+                      write_refused=True, extra=["--write-test"])
+    out = capsys.readouterr().out
+    assert "PASS write_cleanup: dropped" in out
+    s = conn.statements
+    drop = s.index('DROP TABLE "PROBEUSER".#AGENT_PROBE_RW')
+    assert s[drop - 2:drop] == ["ROLLBACK", "SET TRANSACTION READ WRITE"]
+
+
+def test_a_refused_read_write_statement_does_not_stop_the_drop(capsys):
+    # the fake refuses every SET TRANSACTION: READ ONLY is refused too, so the
+    # write test is skipped, but the setup's table is still dropped
+    _, _, conn = _run(HTTP_DESTINATION, privileges=[("MONITORING", None)],
+                      read_only_fails=True, extra=["--write-test"])
+    out = capsys.readouterr().out
+    assert "PASS write_cleanup: dropped" in out
+    assert 'DROP TABLE "PROBEUSER".#AGENT_PROBE_RW' in conn.statements
+    assert "secret text" not in out
+
+
+def test_an_accepted_ro_table_left_over_is_dropped_by_the_cleanup(capsys):
+    _, _, conn = _run(HTTP_DESTINATION, privileges=[("MONITORING", None)],
+                      drop_ro_fails=True, extra=["--write-test"])
+    out = capsys.readouterr().out
+    assert "PASS write_cleanup: dropped" in out
+    s = conn.statements
+    rw_drop = s.index('DROP TABLE "PROBEUSER".#AGENT_PROBE_RW')
+    ro_drops = [i for i, x in enumerate(s) if x == 'DROP TABLE "PROBEUSER".#AGENT_PROBE_RO']
+    assert len(ro_drops) == 2  # the failed one in the test, the one of the cleanup
+    assert s.index("SET TRANSACTION READ WRITE") < ro_drops[1]
+    assert rw_drop > s.index("SET TRANSACTION READ WRITE")
+
+
+def test_a_failing_cleanup_shows_the_code_only(capsys):
+    conn_ref = {}
+
+    def connect(kwargs, conn):
+        conn_ref["c"] = conn
+        original = conn.cursor
+
+        def cursor():
+            cur = original()
+            execute = cur.execute
+
+            def guarded(sql, binds=()):
+                if sql.startswith("DROP"):
+                    conn.statements.append(sql)
+                    raise dbapi.Error(129, "read only: secret text")
+                return execute(sql, binds)
+
+            cur.execute = guarded
+            return cur
+
+        conn.cursor = cursor
+        return conn
+
+    _run(HTTP_DESTINATION, privileges=[("MONITORING", None)], write_refused=True,
+         connect=connect, extra=["--write-test"])
+    out = capsys.readouterr().out
+    assert "FAIL write_cleanup: sql_code=129" in out
     assert "secret text" not in out

@@ -48,7 +48,7 @@ def _refused(cfg, field: str, *secrets: str) -> str:
 
 def test_constants():
     assert BUILTIN_HANA_URL == "builtin:hana"
-    assert ENTRY_KEYS == ("systems", "allow_select")
+    assert ENTRY_KEYS == ("systems", "allow_select", "allow_select_all")
     assert SYSTEM_KEYS == ("name", "destination")
     assert MAX_SYSTEMS == 10
     assert HANA_SINGLE_ENTRY_MESSAGE == (
@@ -180,6 +180,47 @@ def test_allow_select_must_be_a_json_boolean(value):
     _refused(_with(allow_select=value), "oauth.allow_select:")
 
 
+ALL_NEEDS_SELECT = (
+    "oauth.allow_select_all: needs oauth.allow_select true; free SELECT on every "
+    "schema extends Allow SELECT")
+ALL_NOT_BOOLEAN = (
+    "oauth.allow_select_all: must be the JSON boolean true or false; a string or a "
+    "number does not set it")
+
+
+def test_allow_select_all_is_stored_only_as_true_with_allow_select():
+    cleaned = clean_entry(_with(allow_select_all=True))
+    assert cleaned == {"systems": VALID["systems"], "allow_select": True,
+                       "allow_select_all": True}
+    assert list(cleaned) == ["systems", "allow_select", "allow_select_all"]
+    cfg = {"allow_select_all": True, "allow_select": True,
+           "systems": [{"destination": "HANA_X", "name": "x"}]}
+    assert list(clean_entry(cfg)) == ["systems", "allow_select", "allow_select_all"]
+    assert clean_entry(_with(allow_select_all=False)) == VALID
+    assert clean_entry(_with(allow_select_all=None)) == VALID
+
+
+@pytest.mark.parametrize("allow_select", ["absent", False, None])
+def test_allow_select_all_requires_allow_select(allow_select):
+    cfg = _with(allow_select_all=True)
+    if allow_select == "absent":
+        del cfg["allow_select"]
+    else:
+        cfg["allow_select"] = allow_select
+    assert _refused(cfg, "oauth.allow_select_all:") == ALL_NEEDS_SELECT
+    with pytest.raises(HanaConfigError):
+        check_entry(cfg)
+    # Switched off, it needs nothing.
+    cfg["allow_select_all"] = False
+    assert "allow_select_all" not in clean_entry(cfg)
+
+
+@pytest.mark.parametrize("value", ["true", 1, [], 0, "false", {"x": 1}])
+def test_allow_select_all_must_be_a_json_boolean(value):
+    assert _refused(_with(allow_select_all=value), "oauth.allow_select_all:") \
+        == ALL_NOT_BOOLEAN
+
+
 def test_user_context_true_is_refused():
     _refused(_with(user_context=True), "oauth.user_context:")
 
@@ -218,6 +259,10 @@ def test_pins_of():
     cfg = _with()
     del cfg["allow_select"]
     assert pins_of(cfg).allow_select is False
+    assert pins.allow_select_all is False
+    assert pins_of(cfg).allow_select_all is False
+    assert pins_of(_with(allow_select_all=False)).allow_select_all is False
+    assert pins_of(_with(allow_select_all=True)).allow_select_all is True
 
 
 def test_pins_of_refuses_what_check_refuses():

@@ -312,7 +312,8 @@ def test_an_update_that_leaves_allow_select_out_stores_none_over_a_row_that_had_
 
 # --- factory ------------------------------------------------------------------
 
-TOOLS = {"list_systems", "list_checks", "run_check"}
+# export_result is registered for every entry, like the three reading tools.
+TOOLS = {"list_systems", "list_checks", "run_check", "export_result"}
 
 
 def test_hana_is_a_known_builtin():
@@ -651,3 +652,169 @@ def test_credential_health_docstring_no_longer_calls_it_a_tcp_destination():
     import agents.admin as admin
 
     assert "TCP destination (no URL" not in (admin._hana_destination_health.__doc__ or "")
+
+
+# --- allow_select_all ----------------------------------------------------------
+
+WIDE = {**FULL, "allow_select_all": True}
+
+
+async def _api_client():
+    from httpx import ASGITransport, AsyncClient
+
+    import app as app_module
+    from agents.db import init_db
+
+    await init_db()
+    await _wipe()
+    return AsyncClient(transport=ASGITransport(app=app_module.app), base_url="http://test")
+
+
+async def _stored_block(name: str) -> dict[str, Any]:
+    from agents.db import SessionLocal, list_agents
+
+    async with SessionLocal() as session:
+        row = next(r for r in await list_agents(session) if r.name == name)
+    return next(s for s in row.mcp_servers if s["url"] == URL)["oauth"]
+
+
+async def test_the_admin_payload_keeps_allow_select_all_true():
+    """Create and update through the admin API store exactly the block: the
+    lax payload model must not drop the switch on its way to storage."""
+    def agent(block: dict[str, Any]) -> dict[str, Any]:
+        return {"name": "dba", "description": "d", "instructions": "i",
+                "expose_chat": False, "mcp_servers": [_server(_copy(block))]}
+
+    async with await _api_client() as client:
+        r = await client.post("/admin/api/agents", json=agent(WIDE))
+        assert r.status_code == 201, r.text
+        assert await _stored_block("dba") == WIDE
+        agent_id = r.json()["id"]
+        r = await client.put(f"/admin/api/agents/{agent_id}", json=agent(FULL))
+        assert r.status_code == 200, r.text
+        assert await _stored_block("dba") == FULL
+        r = await client.put(f"/admin/api/agents/{agent_id}", json=agent(WIDE))
+        assert r.status_code == 200, r.text
+        assert await _stored_block("dba") == WIDE
+    await _wipe()
+
+
+def test_the_gate_hands_storage_allow_select_all_true():
+    assert _payload(_copy(WIDE)).oauth.to_config() == WIDE
+    spelled_out = {**_copy(FULL), "allow_select_all": False}
+    assert _payload(spelled_out).oauth.to_config() == FULL
+    assert _payload({**_copy(FULL), "allow_select_all": None}).oauth.to_config() == FULL
+
+
+def test_the_admin_payload_refuses_allow_select_all_without_allow_select():
+    from agents.admin import AgentPayload
+
+    for block in ({**_copy(BASE), "allow_select_all": True},
+                  {**_copy(BASE), "allow_select": False, "allow_select_all": True}):
+        assert "oauth.allow_select_all: needs oauth.allow_select true; " in _refusal(block)
+        with pytest.raises(ValidationError) as info:
+            AgentPayload.model_validate({
+                "name": "dba", "description": "d", "instructions": "i",
+                "expose_chat": False, "mcp_servers": [_server(block)]})
+        (error,) = info.value.errors()
+        assert error["loc"][:2] == ("mcp_servers", 0)
+        assert "oauth.allow_select_all: needs oauth.allow_select true; " in error["msg"]
+
+
+@pytest.mark.parametrize("value", ["true", "True", 1, 0, "false", [], {}])
+def test_allow_select_all_string_is_refused_before_the_lax_model(value):
+    said = _refusal({**_copy(FULL), "allow_select_all": value})
+    assert "oauth.allow_select_all: must be the JSON boolean true or false" in said
+
+
+@pytest.mark.parametrize("url, block", [
+    ("builtin:jira", {"destination": "J", "project": "P", "allow_select_all": True}),
+    ("builtin:slack", {"destination": "S", "allow_select_all": True}),
+    ("https://mcp.example.hana.ondemand.com/mcp", {"allow_select_all": True}),
+])
+def test_allow_select_all_on_another_server_is_refused(url, block):
+    mode = "jwt" if url.startswith("https") else "destination"
+    said = _refusal(block, mode=mode, url=url)
+    assert ("oauth.systems, oauth.allow_select and oauth.allow_select_all belong to a "
+            "builtin:hana entry only; no other server reads them") in said
+
+
+def test_allow_select_all_false_on_another_server_passes_and_is_not_stored():
+    config = _payload({"destination": "S", "allow_select_all": False},
+                      url="builtin:slack").oauth.to_config()
+    assert "allow_select_all" not in config
+
+
+async def test_storage_stores_allow_select_all_only_as_true():
+    from agents.db import SessionLocal, upsert_agent
+
+    await _wipe()
+    async with SessionLocal() as session:
+        await upsert_agent(session, name="dba", description="d", instructions="i",
+                           expose_chat=False,
+                           mcp_servers=[_server({**_copy(FULL), "allow_select_all": False})])
+    stored = await _stored_block("dba")
+    assert stored == FULL and "allow_select_all" not in stored
+    async with SessionLocal() as session:
+        await upsert_agent(session, name="dba", description="d", instructions="i",
+                           expose_chat=False, mcp_servers=[_server(_copy(WIDE))])
+    assert await _stored_block("dba") == WIDE
+    async with SessionLocal() as session:
+        for value in ("true", 1):
+            with pytest.raises(ValueError, match=r"^oauth\.allow_select_all: must be"):
+                await upsert_agent(
+                    session, name="dba", description="d", instructions="i",
+                    expose_chat=False,
+                    mcp_servers=[_server({**_copy(FULL), "allow_select_all": value})])
+            await session.rollback()
+    assert await _stored_block("dba") == WIDE
+    await _wipe()
+
+
+async def test_credential_health_ignores_allow_select_all(monkeypatch):
+    import agents.admin as admin
+
+    monkeypatch.setattr(admin, "SessionLocal", lambda: _NoSession())
+    seen: list[list[dict[str, Any]]] = []
+    for block in (FULL, WIDE):
+        rows = [_Row("dba", [_server(_copy(block))])]
+
+        async def fake_list_agents(session, rows=rows):
+            return rows
+
+        monkeypatch.setattr(admin, "list_agents", fake_list_agents)
+        seen.append(await admin._destination_health())
+    assert seen[0] == seen[1] and len(seen[0]) == 2
+    assert "allow_select_all" not in json.dumps(seen[1])
+
+
+@pytest.mark.usefixtures("real_agents_and_mcp")
+async def test_a_save_without_allow_select_all_drops_it_and_reloads(monkeypatch):
+    """An older client does not know ``allow_select_all`` and leaves it out of
+    its PUT: the key is gone from the stored block (never kept silently) and
+    the registry reloads, as for any change of what the entry allows."""
+    from pydantic_ai.models.test import TestModel
+
+    import agents.registry as registry_module
+    from agents.chat_app import dynamic_chat_app
+    from agents.odata import admin_routes
+
+    monkeypatch.setattr(registry_module, "get_model", lambda *a, **k: TestModel())
+    monkeypatch.setattr(admin_routes, "_live_registry", REAL_LIVE_REGISTRY)
+    monkeypatch.setattr(registry_module.registry, "_build", None)
+    monkeypatch.setattr(dynamic_chat_app, "refresh", lambda: None)
+
+    def agent(block: dict[str, Any]) -> dict[str, Any]:
+        return {"name": "dba", "description": "d", "instructions": "i",
+                "expose_chat": False, "mcp_servers": [_server(_copy(block))]}
+
+    async with await _api_client() as client:
+        r = await client.post("/admin/api/agents", json=agent(WIDE))
+        assert r.status_code == 201, r.text
+        await registry_module.registry.reload()
+        assert await _stored_block("dba") == WIDE
+        r = await client.put(f"/admin/api/agents/{r.json()['id']}", json=agent(FULL))
+        assert r.status_code == 200, r.text
+        assert r.json()["reloaded"] is True
+        assert "allow_select_all" not in await _stored_block("dba")
+    await _wipe()

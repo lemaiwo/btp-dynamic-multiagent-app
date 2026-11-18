@@ -461,3 +461,155 @@ def test_fixed_is_keyword_only_and_off_by_default() -> None:
     parameter = inspect.signature(check_select).parameters["fixed"]
     assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
     assert parameter.default is False
+
+
+# ---- any_schema: free SQL on business schemas, every other rule kept ------------------------
+# run_select of an entry that reads any schema passes any_schema=True: a
+# two-part name <schema>.<name> is then a table reference in every schema.
+# Everything else stays refused: three-part names, unqualified non-M_ names,
+# table functions, qualified calls outside SYS / _SYS_STATISTICS, writes,
+# INTO, FOR UPDATE, comments, ";", the length cap, and the ini /
+# configuration deny-list, which then applies in EVERY schema, case-folded.
+
+ANY_SCHEMA_NOW_ACCEPTED = [
+    "SELECT * FROM SAPHANADB.BKPF WHERE ZQX = 1",
+    'SELECT * FROM "sys"."m_tables" WHERE ZQX = 1',
+    "SELECT * FROM _SYS_REPO.X WHERE ZQX = 1",
+]
+
+
+def _refused_except_the_three() -> list[tuple[str, str]]:
+    cases = [case for case in REFUSED if case[0] not in ANY_SCHEMA_NOW_ACCEPTED]
+    assert len(cases) == len(REFUSED) - len(ANY_SCHEMA_NOW_ACCEPTED)
+    return cases
+
+
+@pytest.mark.parametrize(("sql", "rule"), _refused_except_the_three())
+def test_every_other_refusal_stays_with_any_schema(sql: str, rule: str) -> None:
+    with pytest.raises(SelectRefused) as caught:
+        check_select(sql, any_schema=True)
+    assert caught.value.rule == rule
+    assert "ZQX" not in str(caught.value)
+    assert all("ZQX" not in str(arg) for arg in caught.value.args)
+
+
+@pytest.mark.parametrize("sql", ANY_SCHEMA_NOW_ACCEPTED)
+def test_the_three_become_reads_only_with_any_schema(sql: str) -> None:
+    check_select(sql, any_schema=True)
+    with pytest.raises(SelectRefused) as caught:
+        check_select(sql)
+    assert caught.value.rule == "table_not_allowed"
+
+
+ANY_SCHEMA_ACCEPTED = [
+    "SELECT TOP 5 MANDT, BUKRS FROM SAPABAP1.BKPF WHERE GJAHR = '2026'",
+    'SELECT * FROM "SAPABAP1"."/BIC/AZSALES00"',
+    "SELECT a.X FROM SAPABAP1.T001 a JOIN SYS.M_TABLES m ON m.TABLE_NAME = a.X",
+    "WITH c AS (SELECT BUKRS FROM SAPABAP1.T001) SELECT COUNT(*) FROM c",
+    "SELECT USER_NAME, SUM(CPU_TIME) FROM SYS.M_EXPENSIVE_STATEMENTS "
+    "GROUP BY USER_NAME ORDER BY 2 DESC",
+    "SELECT * FROM M_SERVICES s, SAPABAP1.T001 t WHERE s.HOST = t.X",
+    "SELECT * FROM M_SERVICES WHERE HOST IN (SELECT X FROM SAPABAP1.T001)",
+]
+
+
+@pytest.mark.parametrize("sql", ANY_SCHEMA_ACCEPTED)
+def test_any_schema_accepts_two_part_names(sql: str) -> None:
+    check_select(sql, any_schema=True)
+
+
+ANY_SCHEMA_REFUSED = [
+    # a cross-database reference
+    ("SELECT * FROM ZQX.SAPABAP1.BKPF", "table_not_allowed"),
+    ('SELECT * FROM "ZQX"."SAPABAP1"."BKPF"', "table_not_allowed"),
+    ("SELECT * FROM M_SERVICES s JOIN ZQX.SAPABAP1.BKPF b ON 1 = 1", "table_not_allowed"),
+    # the session is pinned to SYS: an unqualified name stays M_* or a CTE
+    ("SELECT * FROM BKPF WHERE ZQX = 1", "table_not_allowed"),
+    ('SELECT * FROM "BKPF" WHERE ZQX = 1', "table_not_allowed"),
+    # an empty schema
+    ('SELECT * FROM "".BKPF WHERE ZQX = 1', "unreadable"),
+    # table functions and qualified calls outside SYS / _SYS_STATISTICS
+    ("SELECT * FROM SAPABAP1.ZQX(1)", "table_not_allowed"),
+    ("SELECT SAPABAP1.ZQX(1) FROM M_SERVICES", "table_not_allowed"),
+    ('SELECT "SAPABAP1"."ZQX"(1) FROM M_SERVICES', "table_not_allowed"),
+    ("SELECT * FROM M_SERVICES WHERE SAPABAP1.ZQX(HOST) = 1", "table_not_allowed"),
+    ("SELECT * FROM SAPABAP1.BKPF AS OF UTCTIMESTAMP '2026' ZQX", "table_not_allowed"),
+    ("SELECT * FROM SAPABAP1.BKPF TABLESAMPLE BERNOULLI (10) ZQX", "table_not_allowed"),
+    ("SELECT * FROM SAPABAP1.BKPF, LATERAL (SELECT * FROM SAPABAP1.T001) ZQX",
+     "table_not_allowed"),
+    ("SELECT * FROM JSON_TABLE(ZQX, '$' COLUMNS (A INT PATH '$.a'))", "table_not_allowed"),
+    ("SELECT * FROM SAPABAP1.JSON_TABLE(ZQX)", "table_not_allowed"),
+    ("SELECT * FROM SAPABAP1.BKPF ZQX (A, B)", "table_not_allowed"),
+    ("SELECT * FROM (SAPABAP1.BKPF JOIN SAPABAP1.T001 ON 1 = 1) ZQX", "table_not_allowed"),
+    ('SELECT * FROM "_SYS_BIC"."pkg/ZQX" (\'PLACEHOLDER\' = (\'$$a$$\', \'b\'))',
+     "table_not_allowed"),
+    # writes, whatever the schema
+    ("INSERT INTO SAPABAP1.ZQX VALUES (1)", "select_only"),
+    ("UPDATE SAPABAP1.ZQX SET A = 1", "select_only"),
+    ("DELETE FROM SAPABAP1.ZQX", "select_only"),
+    ("MERGE INTO SAPABAP1.ZQX USING SAPABAP1.BKPF ON 1 = 1", "select_only"),
+    ("UPSERT SAPABAP1.ZQX VALUES (1) WITH PRIMARY KEY", "select_only"),
+    ("CALL SAPABAP1.ZQX()", "select_only"),
+    ("SELECT * FROM SAPABAP1.BKPF WHERE ZQX = (DELETE FROM SAPABAP1.BKPF)", "select_only"),
+    ("SELECT SAPABAP1.ZQX.NEXTVAL FROM M_SERVICES", "select_only"),
+    ("SELECT * INTO ZQX FROM SAPABAP1.BKPF", "no_into"),
+    ("SELECT * FROM SAPABAP1.BKPF FOR UPDATE ZQX", "no_for_update"),
+    ("SELECT * FROM SAPABAP1.BKPF WHERE ZQX = 1 FOR SHARE LOCK", "no_for_update"),
+    ("SELECT * FROM SAPABAP1.BKPF -- ZQX", "no_comments"),
+    ("SELECT * FROM SAPABAP1.BKPF /* ZQX */", "no_comments"),
+    ("SELECT * FROM SAPABAP1.BKPF; DELETE FROM SAPABAP1.ZQX", "one_statement"),
+    ("SELECT * FROM SAPABAP1.BKPF WHERE ZQX = 1;", "one_statement"),
+    ("SELECT * FROM SAPABAP1.BKPF WHERE X = '" + "a" * 3990 + "ZQX'", "too_long"),
+]
+
+
+@pytest.mark.parametrize(("sql", "rule"), ANY_SCHEMA_REFUSED)
+def test_any_schema_still_refuses(sql: str, rule: str) -> None:
+    with pytest.raises(SelectRefused) as caught:
+        check_select(sql, any_schema=True)
+    assert caught.value.rule == rule
+    assert "ZQX" not in str(caught.value)
+    assert all("ZQX" not in str(arg) for arg in caught.value.args)
+
+
+ANY_SCHEMA_DENIED = [
+    "PUBLIC.M_INIFILE_CONTENTS",
+    "SAPABAP1.M_INIFILE_CONTENTS",
+    '"PUBLIC"."M_CONFIGURATION_PARAMETER_VALUES"',
+    '"public"."m_inifile_contents"',
+    '"SAPABAP1"."M_IniFile_Content_History"',
+    "SAPABAP1.ZINIFILE_COPY",
+    '"x"."configuration_parameter_x"',
+    '"M_inifile_contents"',
+    "SYS.P_USERS_",
+    "_SYS_STATISTICS.P_X",
+    *DENIED_NAMES,
+    *NAME_PART_DENIED,
+]
+
+
+@pytest.mark.parametrize("position", POSITIONS)
+@pytest.mark.parametrize("name", ANY_SCHEMA_DENIED)
+def test_deny_list_holds_in_every_schema_with_any_schema(name: str, position: str) -> None:
+    with pytest.raises(SelectRefused) as info:
+        check_select(position.format(t=name), any_schema=True)
+    assert info.value.rule == "table_not_allowed"
+
+
+def test_any_schema_is_keyword_only_and_off_by_default() -> None:
+    import inspect
+
+    parameter = inspect.signature(check_select).parameters["any_schema"]
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is False
+
+
+def test_fixed_and_any_schema_are_independent() -> None:
+    check_select("SELECT * FROM PUBLIC.M_INIFILE_CONTENTS", fixed=True, any_schema=True)
+    check_select("SELECT * FROM SYS.M_INIFILE_CONTENTS", fixed=True, any_schema=True)
+    with pytest.raises(SelectRefused) as caught:
+        check_select("SELECT * FROM ZQX.SAPABAP1.BKPF", fixed=True, any_schema=True)
+    assert caught.value.rule == "table_not_allowed"
+    with pytest.raises(SelectRefused) as caught:
+        check_select("SELECT * FROM SAPABAP1.BKPF", fixed=True)
+    assert caught.value.rule == "table_not_allowed"

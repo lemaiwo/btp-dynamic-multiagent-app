@@ -34,7 +34,7 @@ def test_ide_env_vars_are_quoted_strings():
 
 def test_mta_version_is_2_24_0():
     mta = yaml.safe_load((ROOT / "mta.yaml").read_text())
-    assert mta["version"] == "2.42.1"
+    assert mta["version"] == "2.44.0"
 
 
 def test_every_ide_and_odata_property_is_read_by_the_app():
@@ -56,6 +56,7 @@ def test_python_module_archive_excludes_local_only_folders():
     ignore = module["build-parameters"]["ignore"]
     # Makefile_*.mta: mbt's temporary makefile, written into the module path
     # (".") during a build; it holds a local absolute path.
+    # .playwright-mcp/: screenshots and page snapshots of local browser sessions.
     for entry in ("docs/", "memory/", ".sdd/", "tests/", "CLAUDE.local.md",
-                  "Makefile_*.mta"):
+                  "Makefile_*.mta", ".playwright-mcp/"):
         assert entry in ignore, entry

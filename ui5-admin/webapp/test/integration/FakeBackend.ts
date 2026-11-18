@@ -1725,8 +1725,19 @@ export default class FakeBackend {
                 systems: systems.map((system) => ({ name: system.name, destination: system.destination })),
                 has_client_secret: false
             };
+            if (cfg.allow_select_all !== undefined && cfg.allow_select_all !== null && typeof cfg.allow_select_all !== "boolean") {
+                return refuse(["mcp_servers", i], "oauth.allow_select_all: must be the JSON boolean true or false; a string "
+                    + "or a number does not set it");
+            }
+            if (cfg.allow_select_all === true && cfg.allow_select !== true) {
+                return refuse(["mcp_servers", i], "oauth.allow_select_all: needs oauth.allow_select true; free SELECT on "
+                    + "every schema extends Allow SELECT");
+            }
             if (cfg.allow_select === true) {
                 stored.allow_select = true;
+            }
+            if (cfg.allow_select_all === true) {
+                stored.allow_select_all = true;
             }
             servers[i] = { ...servers[i], url: "builtin:hana", oauth: stored };
         }

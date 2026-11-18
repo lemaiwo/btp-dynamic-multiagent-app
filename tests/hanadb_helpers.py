@@ -81,6 +81,7 @@ class FakeCursor:
         self.db = db
         self.conn = conn
         self.description: tuple | None = None
+        self._fetched = 0
 
     def _step(self, name: str, *args: Any) -> None:
         self.db.calls.append((name, *args))
@@ -106,7 +107,11 @@ class FakeCursor:
 
     def fetchmany(self, size: int) -> list[tuple]:
         self._step("fetchmany", size)
-        return [tuple(r) for r in self.db.rows[:size]]
+        # Each call goes on where the last one stopped, as a real cursor does
+        # (a read in chunks fetches more than once).
+        start = self._fetched
+        self._fetched = min(len(self.db.rows), start + size)
+        return [tuple(r) for r in self.db.rows[start:self._fetched]]
 
     def close(self) -> None:
         self._step("cursor_close")

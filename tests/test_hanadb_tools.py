@@ -26,9 +26,14 @@ from tests import hanadb_helpers as h
 SECRETS = (h.MARKER, h.HOST, h.USER, h.PASSWORD, h.TOKEN, "hana-dest-one", "hana-dest-two")
 STATEMENT = "SELECT * FROM SAPABAP1.KNA1 WHERE KUNNR = 'customer4711' AND X = 99"
 
+HINT = ("lower top, select fewer or shorter columns, or call export_result with the same "
+        "check or sql to get the rows as a file")
 OAUTH = {"systems": [{"name": "erp_tenant", "destination": "hana-dest-one"},
                      {"name": "erp_systemdb", "destination": "hana-dest-two"}]}
 OAUTH_SELECT = {**OAUTH, "allow_select": True}
+OAUTH_ALL = {**OAUTH_SELECT, "allow_select_all": True}
+#: The registered iniContents check, taken before the fixture swaps the registry.
+REAL_INI = base.get_check("iniContents")
 
 
 @pytest.fixture(autouse=True)
@@ -108,9 +113,9 @@ def test_build_refuses_a_bad_entry() -> None:
 
 
 def test_run_select_is_registered_only_with_allow_select() -> None:
-    assert set(build().tools) == {"list_systems", "list_checks", "run_check"}
+    assert set(build().tools) == {"list_systems", "list_checks", "run_check", "export_result"}
     assert set(build(OAUTH_SELECT).tools) == {
-        "list_systems", "list_checks", "run_check", "run_select"}
+        "list_systems", "list_checks", "run_check", "run_select", "export_result"}
 
 
 def test_descriptions_state_defaults_categories_and_select_rules() -> None:
@@ -173,7 +178,8 @@ async def test_run_check_ok(db: h.FakeDbapi) -> None:
     db.rows = [(1, "x"), (2, "y")]
     answer = await call(build(), "run_check", system="erp_tenant", check="alerts")
     assert answer == {"system": "erp_tenant", "check": "alerts", "columns": ["A", "B"],
-                      "rows": [[1, "x"], [2, "y"]], "row_count": 2, "truncated": False}
+                      "rows": [[1, "x"], [2, "y"]], "row_count": 2, "truncated": False,
+                      "offset": 0, "next_offset": None}
     assert ("fetchmany", 51) in db.calls  # default top 50, one more fetched
     assert "commit" not in db.steps()
 
@@ -338,7 +344,8 @@ async def test_result_too_large_refused(db: h.FakeDbapi) -> None:
     db.rows = [(i, "y" * 1000) for i in range(70)]
     answer = await call(build(), "run_check", system="erp_tenant", check="alerts", top=100)
     assert answer == {"error": {"code": "result_too_large",
-                                "message": MESSAGES["result_too_large"]}}
+                                "message": MESSAGES["result_too_large"],
+                                "hint": HINT}}
 
 
 async def test_driver_failure_is_an_error_object(db: h.FakeDbapi,
@@ -396,7 +403,8 @@ async def test_run_select_ok_unmasked(db: h.FakeDbapi) -> None:
     answer = await call(build(OAUTH_SELECT), "run_select", system="erp_tenant",
                         sql="SELECT STATEMENT_STRING FROM M_EXPENSIVE_STATEMENTS")
     assert answer == {"system": "erp_tenant", "columns": ["STATEMENT_STRING"],
-                      "rows": [[STATEMENT]], "row_count": 1, "truncated": False}
+                      "rows": [[STATEMENT]], "row_count": 1, "truncated": False,
+                      "offset": 0, "next_offset": None}
     assert ("fetchmany", 101) in db.calls
     executed = [c for c in db.calls if c[0] == "execute"]
     assert executed == [("execute", "SELECT STATEMENT_STRING FROM M_EXPENSIVE_STATEMENTS")]
@@ -652,3 +660,223 @@ async def test_masked_lob_cut_is_named_too(db: h.FakeDbapi) -> None:
     db.rows = [(1, lob)]
     answer = await call(build(), "run_check", system="erp_tenant", check="longRunning")
     assert answer["truncated_columns"] == ["STATEMENT_STRING"]
+
+
+# ---- offset paging, section / key, run_select on any schema -------------------------------
+
+PAGED = Check(name="topped", category="performance", purpose="A check with a row limit.",
+              source="bin/topped.js",
+              statements=(Statement(
+                  "", "SELECT TOP ? A, STATEMENT_STRING FROM SYS.M_X "
+                      "WHERE (? IS NULL OR SCHEMA_NAME = ?)",
+                  ("top_plus_one", "schema", "schema")),),
+              args=frozenset({"top", "schema"}),
+              masked_columns=frozenset({"STATEMENT_STRING"}))
+
+
+def _executed(db: h.FakeDbapi) -> list[tuple]:
+    return [c for c in db.calls if c[0] == "execute"]
+
+
+@pytest.mark.parametrize("given", [{}, {"offset": 0}, {"offset": None}])
+async def test_run_check_offset_zero_sends_the_statement_unchanged(
+        db: h.FakeDbapi, given: dict) -> None:
+    register(PAGED)
+    db.description = (("A",), ("STATEMENT_STRING",))
+    db.rows = [(i, None) for i in range(3)]
+    answer = await call(build(), "run_check", system="erp_tenant", check="topped",
+                        top=5, **given)
+    assert _executed(db) == [("execute", PAGED.statements[0].sql, (6, None, None))]
+    assert ("fetchmany", 6) in db.calls
+    assert answer["offset"] == 0 and answer["next_offset"] is None
+    db.calls.clear()
+    db.rows = [(i, None) for i in range(6)]
+    answer = await call(build(), "run_check", system="erp_tenant", check="topped",
+                        top=5, **given)
+    assert answer["truncated"] is True and answer["row_count"] == 5
+    assert answer["offset"] == 0 and answer["next_offset"] == 5
+
+
+async def test_run_check_offset_wraps_and_binds(db: h.FakeDbapi) -> None:
+    register(PAGED)
+    db.description = (("A",), ("STATEMENT_STRING",))
+    db.rows = [(i, None) for i in range(21)]
+    answer = await call(build(), "run_check", system="erp_tenant", check="topped",
+                        top=20, offset=40, schema="SAPABAP1")
+    sql = PAGED.statements[0].sql
+    assert _executed(db) == [("execute", f"SELECT * FROM ({sql}) LIMIT ? OFFSET ?",
+                              (61, "SAPABAP1", "SAPABAP1", 21, 40))]
+    assert ("fetchmany", 21) in db.calls  # max_rows 20, one more fetched
+    assert answer["row_count"] == 20 and answer["truncated"] is True
+    assert answer["offset"] == 40 and answer["next_offset"] == 60
+    assert tools.page_sql(sql) == f"SELECT * FROM ({sql}) LIMIT ? OFFSET ?"
+
+
+async def test_run_check_offset_without_a_limit_or_top_uses_the_cap(db: h.FakeDbapi) -> None:
+    db.description = (("A",),)
+    db.rows = [(1,), (2,)]
+    answer = await call(build(), "run_check", system="erp_tenant", check="version", offset=5)
+    assert _executed(db) == [("execute", "SELECT * FROM (SELECT A FROM SYS.M_DATABASE) "
+                                         "LIMIT ? OFFSET ?", (6, 5))]
+    assert ("fetchmany", 6) in db.calls
+    assert answer["offset"] == 5 and answer["next_offset"] is None
+
+
+async def test_run_check_offset_composite_pages_every_part(db: h.FakeDbapi) -> None:
+    db.description = (("A",),)
+    db.rows = [(i,) for i in range(4)]
+    answer = await call(build(), "run_check", system="erp_tenant", check="backups",
+                        top=3, offset=6)
+    assert _executed(db) == [
+        ("execute", "SELECT * FROM (SELECT A FROM SYS.M_BACKUP_CATALOG) LIMIT ? OFFSET ?",
+         (4, 6)),
+        ("execute", "SELECT * FROM (SELECT B FROM SYS.M_BACKUP_SIZE) LIMIT ? OFFSET ?",
+         (4, 6))]
+    assert "offset" not in answer and "next_offset" not in answer
+    for part in answer["parts"]:
+        assert part["offset"] == 6 and part["next_offset"] == 9
+    db.calls.clear()
+    answer = await call(build(), "run_check", system="erp_tenant", check="backups")
+    assert [(p["offset"], p["next_offset"]) for p in answer["parts"]] == [(0, None)] * 2
+
+
+@pytest.mark.parametrize("offset", [-1, 100_001, 1.5, True, "10"])
+@pytest.mark.parametrize("tool, kw", [
+    ("run_check", {"check": "alerts"}),
+    ("run_select", {"sql": "SELECT * FROM SYS.DUMMY"}),
+])
+async def test_offset_refusals(db: h.FakeDbapi, offset: Any, tool: str, kw: dict) -> None:
+    answer = await call(build(OAUTH_SELECT), tool, system="erp_tenant", offset=offset, **kw)
+    assert answer["error"]["code"] == "invalid_argument"
+    assert answer["error"]["argument"] == "offset"
+    assert answer["error"]["rule"] == "must be a whole number from 0 to 100000"
+    assert db.calls == []
+
+
+async def test_run_check_passes_section_and_key(db: h.FakeDbapi) -> None:
+    register(REAL_INI)
+    db.description = (("FILE_NAME",), ("VALUE",))
+    db.rows = [("global.ini", "1")]
+    answer = await call(build(), "run_check", system="erp_tenant", check="iniContents",
+                        section="memorymanager", key="global_alloc", top=10)
+    assert [p["label"] for p in answer["parts"]] == ["files", "effective"]
+    executed = _executed(db)
+    assert [c[1] for c in executed] == [s.sql for s in REAL_INI.statements]
+    expected = (11, None, None, "memorymanager", "memorymanager",
+                "global_alloc", "global_alloc")
+    assert [c[2] for c in executed] == [expected, expected]
+    db.calls.clear()
+    await call(build(), "run_check", system="erp_tenant", check="iniContents",
+               object="global.ini", section="memorymanager", key="global_alloc",
+               top=10, offset=10)
+    paged = (21, "global.ini", "global.ini", "memorymanager", "memorymanager",
+             "global_alloc", "global_alloc", 11, 10)
+    assert [c[1] for c in _executed(db)] == [tools.page_sql(s.sql)
+                                            for s in REAL_INI.statements]
+    assert [c[2] for c in _executed(db)] == [paged, paged]
+    db.calls.clear()
+    for argument in ("section", "key"):
+        answer = await call(build(), "run_check", system="erp_tenant", check="alerts",
+                            **{argument: "evil'text"})
+        assert answer["error"]["argument"] == argument
+        assert answer["error"]["rule"] == base.UNDECLARED_RULE
+        _clean(answer, "evil'text")
+    assert db.calls == []
+
+
+async def test_run_select_offset_wraps(db: h.FakeDbapi) -> None:
+    db.rows = [(i, i) for i in range(51)]
+    sql = "SELECT A, B FROM SYS.M_SERVICES ORDER BY A"
+    answer = await call(build(OAUTH_SELECT), "run_select", system="erp_tenant", sql=sql,
+                        top=50, offset=100)
+    assert _executed(db) == [("execute", f"SELECT * FROM ({sql}) LIMIT ? OFFSET ?",
+                              (51, 100))]
+    assert ("fetchmany", 51) in db.calls
+    assert answer["offset"] == 100 and answer["next_offset"] == 150
+    assert answer["row_count"] == 50 and answer["truncated"] is True
+    db.calls.clear()
+    answer = await call(build(OAUTH_SELECT), "run_select", system="erp_tenant",
+                        sql="SELECT * FROM SAPABAP1.KNA1", offset=100)
+    assert answer["error"]["code"] == "select_refused"
+    assert db.calls == []
+
+
+async def test_run_select_with_offset_and_with_is_wrapped(db: h.FakeDbapi) -> None:
+    # The landscape accepted a WITH statement inside the wrapper: it is sent.
+    db.rows = [(1, 1)]
+    sql = "WITH X AS (SELECT A, B FROM SYS.M_SERVICES) SELECT A, B FROM X"
+    answer = await call(build(OAUTH_SELECT), "run_select", system="erp_tenant", sql=sql,
+                        offset=1)
+    assert _executed(db) == [("execute", tools.page_sql(sql), (101, 1))]
+    assert answer["next_offset"] is None
+
+
+async def test_run_select_any_schema_only_with_allow_select_all(db: h.FakeDbapi) -> None:
+    sql = "SELECT BELNR, BUTXT FROM SAPABAP1.BKPF"
+    answer = await call(build(OAUTH_SELECT), "run_select", system="erp_tenant", sql=sql)
+    assert answer["error"]["code"] == "select_refused"
+    assert answer["error"]["rule"] == "table_not_allowed"
+    _clean(answer, "BKPF", "SAPABAP1")
+    assert db.calls == []
+    db.description = (("BELNR",), ("BUTXT",))
+    db.rows = [("0100000001", "SELECT X FROM Y WHERE Z = 'customer4711'")]
+    answer = await call(build(OAUTH_ALL), "run_select", system="erp_tenant", sql=sql)
+    assert _executed(db) == [("execute", sql)]
+    assert answer["rows"] == [["0100000001", "SELECT X FROM Y WHERE Z = 'customer4711'"]]
+    db.calls.clear()
+    for denied in ('SELECT "KEY" FROM SYS.M_INIFILE_CONTENTS', "SELECT * FROM SYS.P_USERS_"):
+        answer = await call(build(OAUTH_ALL), "run_select", system="erp_tenant", sql=denied)
+        assert answer["error"]["rule"] == "table_not_allowed"
+    assert db.calls == []
+
+
+def test_run_select_doc_follows_the_switch() -> None:
+    narrow = build(OAUTH_SELECT).tools["run_select"].function.__doc__
+    wide = build(OAUTH_ALL).tools["run_select"].function.__doc__
+    assert narrow == tools._run_select_doc(False) and wide == tools._run_select_doc(True)
+    assert "any schema" in build(OAUTH_ALL).tools["run_select"].description
+    for doc in (narrow, wide):
+        assert "offset: " in doc and "`next_offset`" in doc and "100,000" in doc
+        assert "rows can shift between pages" in doc
+        assert "`INIFILE`" in doc and "`CONFIGURATION_PARAMETER`" in doc and "SYS.P_*" in doc
+    assert "any schema" not in narrow and "SYS.<view>" in narrow
+    assert "any schema" in wide and "`<schema>.<table>`" in wide
+    assert "unqualified" in wide and "CTE" in wide
+    assert "business" in wide and "personal data" in wide and "conversation" in wide
+    assert "GROUP BY" in wide and "instead of raising `top`" in wide
+    properties = build(OAUTH_ALL).tools["run_select"].function_schema.json_schema["properties"]
+    assert set(properties) == {"system", "sql", "top", "offset"}
+    assert "next_offset" in properties["offset"]["description"]
+
+
+def test_run_check_doc_names_offset_section_and_key() -> None:
+    doc = tools._run_check_doc(False)
+    for words in ("offset: ", "`next_offset`", "100,000", "rows can shift between pages",
+                  "section: ", "key: "):
+        assert words in doc, words
+    properties = build().tools["run_check"].function_schema.json_schema["properties"]
+    assert {"offset", "section", "key"} <= set(properties)
+
+
+async def test_list_checks_shows_text_arguments() -> None:
+    register(REAL_INI)
+    answer = await call(build(), "list_checks", category="system")
+    ini = next(c for c in answer["checks"] if c["name"] == "iniContents")
+    by_name = {a["name"]: a for a in ini["arguments"]}
+    rule = "one line of text, at most 128 characters (bound, never part of the SQL)"
+    assert by_name["section"] == {"name": "section", "default": None, "rule": rule}
+    assert by_name["key"] == {"name": "key", "default": None, "rule": rule}
+
+
+async def test_a_page_over_the_cap_says_lower_top(db: h.FakeDbapi) -> None:
+    db.rows = [("y" * 1000, i) for i in range(70)]
+    answer = await call(build(OAUTH_SELECT), "run_select", system="erp_tenant",
+                        sql="SELECT * FROM SYS.DUMMY", top=100, offset=200)
+    assert answer == {"error": {"code": "result_too_large",
+                                "message": MESSAGES["result_too_large"],
+                                "hint": HINT}}
+    answer = await call(build(), "run_check", system="erp_tenant", check="alerts", top=100,
+                        offset=100)
+    assert answer["error"]["hint"] == HINT
+    answer = await call(build(), "run_check", system="erp_tenant", check="nope")
+    assert "hint" not in answer["error"]

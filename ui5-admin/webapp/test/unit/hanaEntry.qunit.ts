@@ -55,6 +55,25 @@ QUnit.test("clean builds { systems, allow_select } from nothing", function (asse
     assert.notStrictEqual(out.systems[0], raw.systems[0], "a new object, not the dialog's row");
 });
 
+QUnit.test("clean keeps allow_select_all only as true and only with allow_select true", function (assert) {
+    const all = hanaEntry.clean(form({ allow_select_all: true }));
+    assert.deepEqual(all, { systems: [TENANT, SYSTEMDB], allow_select: true, allow_select_all: true });
+    assert.deepEqual(Object.keys(all), ["systems", "allow_select", "allow_select_all"], "the server's key order");
+    assert.deepEqual(hanaEntry.clean(form({ allow_select_all: false })), { systems: [TENANT, SYSTEMDB], allow_select: true },
+        "false is not stored");
+    assert.deepEqual(hanaEntry.clean(form({ allow_select_all: "true" })), { systems: [TENANT, SYSTEMDB], allow_select: true },
+        "a string does not switch it on");
+    assert.deepEqual(hanaEntry.clean(form({ allow_select_all: 1 })), { systems: [TENANT, SYSTEMDB], allow_select: true },
+        "a number does not switch it on");
+    assert.deepEqual(hanaEntry.clean(form({ allow_select: false, allow_select_all: true })), { systems: [TENANT, SYSTEMDB] },
+        "dropped without Allow SELECT: the server would refuse the pair");
+    assert.deepEqual(hanaEntry.clean(form({ allow_select: "true", allow_select_all: true })), { systems: [TENANT, SYSTEMDB] },
+        "dropped when allow_select is not exactly true");
+    const cleaned = oauthConfig.cleanOAuth(form({ allow_select_all: true }), "destination", URL) as Record<string, unknown>;
+    assert.deepEqual(cleaned, { systems: [TENANT, SYSTEMDB], allow_select: true, allow_select_all: true },
+        "cleanOAuth carries the switch, so a stored true survives an edit");
+});
+
 QUnit.test("values are sent as typed, never trimmed, and refused before the save", function (assert) {
     const out = hanaEntry.clean({ systems: [{ name: " erp", destination: "hana-erp " }] });
     assert.deepEqual(out.systems, [{ name: " erp", destination: "hana-erp " }]);
@@ -91,7 +110,18 @@ QUnit.test("validate: each rule of agents/hana/config.py with a fixed text that 
         ["no destination", { systems: [{ name: "abc" }] }, "System 1: the destination"],
         ["a destination with a space", { systems: [{ name: "abc", destination: `${secret} x` }] }, "System 1: the destination"],
         ["a destination of 201 characters", { systems: [{ name: "abc", destination: "d".repeat(201) }] }, "System 1: the destination"],
-        ["allow_select a string", { ...ok, allow_select: "true" }, HANA_TEXTS.allowSelect]
+        ["allow_select a string", { ...ok, allow_select: "true" }, HANA_TEXTS.allowSelect],
+        ["allow_select_all a string", { ...ok, allow_select: true, allow_select_all: "true" }, HANA_TEXTS.allowSelectAll],
+        ["allow_select_all a number", { ...ok, allow_select: true, allow_select_all: 1 }, HANA_TEXTS.allowSelectAll],
+        ["allow_select_all without allow_select", { ...ok, allow_select_all: true }, HANA_TEXTS.allowSelectAllNeedsSelect],
+        ["allow_select_all with allow_select false", { ...ok, allow_select: false, allow_select_all: true },
+            HANA_TEXTS.allowSelectAllNeedsSelect],
+        ["allow_select_all with allow_select null", { ...ok, allow_select: null, allow_select_all: true },
+            HANA_TEXTS.allowSelectAllNeedsSelect],
+        ["both switches strings: the allow_select rule comes first", { ...ok, allow_select: "x", allow_select_all: "x" },
+            HANA_TEXTS.allowSelect],
+        ["allow_select a string with allow_select_all true: the allow_select rule comes first",
+            { ...ok, allow_select: "true", allow_select_all: true }, HANA_TEXTS.allowSelect]
     ];
     cases.forEach(([what, cfg, expected]) => {
         const text = hanaEntry.validate(cfg as McpServer["oauth"], "destination");
@@ -109,6 +139,10 @@ QUnit.test("validate accepts what the server accepts", function (assert) {
         { systems: ten, allow_select: true },
         { systems: [TENANT], allow_select: false },
         { systems: [TENANT], allow_select: null, user_context: false, has_client_secret: false },
+        { systems: [TENANT], allow_select: true, allow_select_all: true },
+        { systems: [TENANT], allow_select: true, allow_select_all: false },
+        { systems: [TENANT], allow_select: false, allow_select_all: false },
+        { systems: [TENANT], allow_select_all: null },
         { systems: [{ name: `a${"b".repeat(31)}`, destination: "A.b_c-1" }] },
         { systems: [{ name: "abc", destination: "d", extra: null }] }
     ];
@@ -137,6 +171,27 @@ QUnit.test("selectNewlyAllowed is true only when allow_select goes from off to o
     assert.notOk(hanaEntry.selectNewlyAllowed(undefined, undefined));
 });
 
+QUnit.test("the allow_select_all texts are fixed and say what the server says", function (assert) {
+    assert.strictEqual(HANA_TEXTS.allowSelectAll, "Allow SELECT on all schemas must be on or off.");
+    assert.strictEqual(HANA_TEXTS.allowSelectAllNeedsSelect, "Allow SELECT on all schemas needs Allow SELECT.");
+    assert.deepEqual(hanaEntry.problem({ systems: [TENANT], allow_select_all: true } as McpServer["oauth"], "destination"),
+        { text: HANA_TEXTS.allowSelectAllNeedsSelect }, "the entry, not a system row");
+});
+
+QUnit.test("selectAllNewlyAllowed is true only when allow_select_all goes from off to on", function (assert) {
+    assert.ok(hanaEntry.selectAllNewlyAllowed(undefined, { allow_select: true, allow_select_all: true }));
+    assert.ok(hanaEntry.selectAllNewlyAllowed({ allow_select: true }, { allow_select: true, allow_select_all: true }));
+    assert.ok(hanaEntry.selectAllNewlyAllowed({ allow_select_all: false }, { allow_select_all: true }));
+    assert.ok(hanaEntry.selectAllNewlyAllowed({ allow_select_all: "true" }, { allow_select_all: true }),
+        "a string was never on");
+    assert.notOk(hanaEntry.selectAllNewlyAllowed({ allow_select_all: true }, { allow_select_all: true }));
+    assert.notOk(hanaEntry.selectAllNewlyAllowed({ allow_select_all: true }, {}));
+    assert.notOk(hanaEntry.selectAllNewlyAllowed({}, { allow_select_all: "true" }));
+    assert.notOk(hanaEntry.selectAllNewlyAllowed({ allow_select: false }, { allow_select: true }),
+        "Allow SELECT alone is not the wider switch");
+    assert.notOk(hanaEntry.selectAllNewlyAllowed(undefined, undefined));
+});
+
 QUnit.test("entryIndex and explicit: one entry per agent, sent as exactly its block", function (assert) {
     const servers: McpServer[] = [
         { url: "https://a.hana.ondemand.com/mcp", auth_mode: "jwt" },
@@ -149,6 +204,10 @@ QUnit.test("entryIndex and explicit: one entry per agent, sent as exactly its bl
     assert.deepEqual(sent[1].oauth, { systems: [TENANT] }, "the server's echo is dropped");
     assert.strictEqual(sent[0], servers[0], "another server is passed on as it is");
     assert.deepEqual((servers[1].oauth as Record<string, unknown>).has_client_secret, false, "nothing given is changed");
+    const wide = hanaEntry.explicit([entry({ systems: [TENANT], allow_select: true, allow_select_all: true,
+        has_client_secret: false })]);
+    assert.deepEqual(wide[0].oauth as Record<string, unknown>, { systems: [TENANT], allow_select: true, allow_select_all: true },
+        "a stored allow_select_all survives the save");
     assert.deepEqual(validators.validateServers([entry({ systems: [TENANT] }), entry({ systems: [SYSTEMDB] })])[1],
         HANA_TEXTS.secondEntry, "a second entry is refused with a fixed text");
 });
@@ -174,6 +233,15 @@ QUnit.test("unconfirmed: the systems Allow SELECT would cover that were not conf
         [{ name: "other", destination: TENANT.destination }], "the same destination under another name");
     assert.deepEqual(hanaEntry.unconfirmed([], []), []);
     assert.deepEqual(hanaEntry.unconfirmed(undefined, [TENANT]), [TENANT]);
+});
+
+QUnit.test("unconfirmed keeps a track of its own per switch: Allow SELECT and all schemas", function (assert) {
+    const selectConfirmed = [TENANT, SYSTEMDB];
+    const allConfirmed = [TENANT];
+    const current = [TENANT, SYSTEMDB];
+    assert.deepEqual(hanaEntry.unconfirmed(selectConfirmed, current), [], "Allow SELECT was agreed for both");
+    assert.deepEqual(hanaEntry.unconfirmed(allConfirmed, current), [SYSTEMDB],
+        "all schemas was agreed for one: an answer for Allow SELECT does not count for it");
 });
 
 QUnit.test("shownSystem names a system with its destination, each part capped", function (assert) {

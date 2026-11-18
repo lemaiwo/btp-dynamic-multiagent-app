@@ -34,10 +34,18 @@ MESSAGES: dict[str, str] = {
     "unknown_system": "No system of that name is configured for this agent.",
     "unknown_check": "No check of that name exists.",
     "invalid_argument": "An argument of the call is not valid.",
-    "select_refused": "The statement is not a read of the allowed monitoring views.",
+    "select_refused": "The statement is not a read the guard allows.",
     "result_too_large": "The result is too large to return; narrow the query.",
     "sql_error": "The database refused the statement.",
     "call_failed": "The call could not be completed. Tell the user instead of retrying.",
+    "no_chat": (
+        "Files can only be exported in a web chat conversation. Narrow the query, or "
+        "page through it with offset."),
+    "export_too_large": (
+        "The export is over the file's caps (10,000 rows, 100 columns, "
+        "500,000 cells, 10 MiB) or holds too much text; narrow the query."),
+    "export_failed": "The file could not be stored. Tell the user instead of retrying.",
+    "export_busy": "Another export of this agent is running; wait for it to finish.",
 }
 
 ERROR_CODES: frozenset[str] = frozenset(MESSAGES)

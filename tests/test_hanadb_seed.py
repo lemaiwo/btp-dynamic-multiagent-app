@@ -177,3 +177,41 @@ def test_the_seed_names_no_customer_or_landscape():
 def test_only_the_expected_entries_were_added():
     assert [a["name"] for a in SEED["agents"]][:2] == ["ABAP Development Agent", "pr-reviewer"]
     assert "hana-monitoring" in [s["name"] for s in SEED["skills"]]
+
+
+def test_the_skill_says_aggregate_page_or_export():
+    c = _skill()["content"]
+    for word in ("`GROUP BY`", "`offset`", "`next_offset`", "`export_result`",
+                 "more than about 50", "rows can shift between pages"):
+        assert word in c, word
+
+
+def test_the_skill_explains_ini_filters():
+    c = _skill()["content"]
+    for word in ("`iniContents`", "`section`", "`key`", "exact", "contains",
+                 "values as stored"):
+        assert word in c, word
+
+
+def test_the_skill_explains_select_on_all_schemas():
+    c = _skill()["content"]
+    for word in ("only when the administrator allowed", "`<schema>.<table>`",
+                 "personal data", "filter and aggregate"):
+        assert word in c, word
+
+
+def test_the_entry_stays_without_select_on_all_schemas():
+    (server,) = _agent()["mcp_servers"]
+    assert "allow_select_all" not in server["oauth"]
+    assert "allow_select_all" not in RAW
+
+
+def test_the_skill_says_what_to_do_on_result_too_large_and_a_wrong_name():
+    from agents.hana.guard import check_select
+
+    c = _skill()["content"]
+    for word in ("`result_too_large`", "`sql_error`", "`export_result`", "SYS.VIEW_COLUMNS",
+                 "259", "260", "at most twice"):
+        assert word in c, word
+    (example,) = re.findall(r"`(SELECT COLUMN_NAME FROM SYS\.VIEW_COLUMNS[^`]*)`", c)
+    check_select(example.replace("<VIEW>", "M_EXPENSIVE_STATEMENTS"))
