@@ -63,6 +63,7 @@ if TYPE_CHECKING:
     from pydantic_ai import RunContext
 
 from agents.errors import describe_exception, mask_text
+from agents.model_call_headers import sending
 from agents.nexus import sender, state
 from agents.nexus.context import (
     MAX_ID,
@@ -203,8 +204,14 @@ def _response_text(response: ModelResponse) -> str:
 
 
 def _begin(deployment: str, model_settings: ModelSettings | None,
-           messages: list[ModelMessage]) -> _Call | None:
-    """Queue the ``logRequest``; ``None`` when that failed (the response is then not logged)."""
+           messages: list[ModelMessage], correlation_id: str, *,
+           aicore: bool) -> _Call | None:
+    """Queue the ``logRequest``; ``None`` when that failed (the response is then not logged).
+
+    ``correlation_id`` is made by the caller first, so the AI Core headers carry
+    it even when this fails. ``resourceGroup`` is sent only for an AI Core
+    deployment: a direct provider's call does not run in one.
+    """
     try:
         from agents.nexus import config, register
         agent = (current_agent_name.get() or "").strip()[:MAX_ID]
@@ -215,11 +222,12 @@ def _begin(deployment: str, model_settings: ModelSettings | None,
                 _warned_no_run_id.add(agent)
                 logger.warning("agent register: a model call of agent %s ran without a run "
                                "id; logged under a fresh id", agent)
-        call = _Call(str(uuid.uuid4()), agent, run_id[:MAX_ID],
+        call = _Call(correlation_id, agent, run_id[:MAX_ID],
                      register.use_case_for(agent), _payload_on(), capture_identity())
         body = call.base()
         body["modelName"] = (deployment or "")[:MAX_MODEL_NAME]
-        body["resourceGroup"] = config.resource_group()[:MAX_RESOURCE_GROUP]
+        if aicore:
+            body["resourceGroup"] = config.resource_group()[:MAX_RESOURCE_GROUP]
         settings = model_settings or {}
         for key, field in (("temperature", "temperature"), ("top_p", "topP")):
             value = _decimal_5_4(settings.get(key))
@@ -239,6 +247,38 @@ def _begin(deployment: str, model_settings: ModelSettings | None,
         sender.enqueue("logRequest", body, call.identity)
         return call
     except Exception as e:  # noqa: BLE001 - logging must never break a model call
+        _swallowed(e)
+        return None
+
+
+def _is_aicore(deployment: str) -> bool:
+    """Whether ``deployment`` is an AI Core deployment (not ``openai:`` / ``anthropic:``).
+
+    Any failure says no: no observability header is the safe side.
+    """
+    try:
+        from agents.shared import direct_provider_of
+        return direct_provider_of(deployment) is None
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _call_headers(aicore: bool, correlation_id: str, call: _Call | None) -> dict[str, str] | None:
+    """The AI Core observability headers of this call; ``None`` for a direct provider.
+
+    The use case is the ``logRequest``'s when there is one, else looked up
+    again (the ``logRequest`` failed). A failure is swallowed: no headers.
+    """
+    if not aicore:
+        return None
+    try:
+        from agents.nexus import observability, register
+        if call is not None:
+            use_case = call.use_case
+        else:
+            use_case = register.use_case_for((current_agent_name.get() or "").strip()[:MAX_ID])
+        return observability.headers_for(correlation_id, use_case, state.landscape())
+    except Exception as e:  # noqa: BLE001 - a header must never break a model call
         _swallowed(e)
         return None
 
@@ -423,15 +463,20 @@ class NexusLoggedModel(WrapperModel):
     def __init__(self, wrapped: Model, deployment: str):
         super().__init__(wrapped)
         self._deployment = deployment
+        self._aicore = _is_aicore(deployment)
 
     async def request(self, messages: list[ModelMessage], model_settings: ModelSettings | None,
                       model_request_parameters: ModelRequestParameters) -> ModelResponse:
         if not state.enabled():
             return await self.wrapped.request(messages, model_settings, model_request_parameters)
-        call = _begin(self._deployment, model_settings, messages)
+        correlation_id = str(uuid.uuid4())
+        call = _begin(self._deployment, model_settings, messages, correlation_id,
+                      aicore=self._aicore)
+        headers = _call_headers(self._aicore, correlation_id, call)
         try:
-            response = await self.wrapped.request(messages, model_settings,
-                                                  model_request_parameters)
+            with sending(headers):
+                response = await self.wrapped.request(messages, model_settings,
+                                                      model_request_parameters)
         except BaseException as exc:
             _finish_failed(call, exc)
             raise
@@ -450,16 +495,22 @@ class NexusLoggedModel(WrapperModel):
                                                    run_context) as streamed:
                 yield streamed
             return
-        call = _begin(self._deployment, model_settings, messages)
+        correlation_id = str(uuid.uuid4())
+        call = _begin(self._deployment, model_settings, messages, correlation_id,
+                      aicore=self._aicore)
+        headers = _call_headers(self._aicore, correlation_id, call)
         tracker = _Tracker()
         streamed: StreamedResponse | None = None
         try:
-            async with self.wrapped.request_stream(messages, model_settings,
-                                                   model_request_parameters,
-                                                   run_context) as streamed:
-                if call is not None:
-                    _track(streamed, tracker)
-                yield streamed
+            # Around the whole stream; cleared on every exit, also when this
+            # generator is finalised from another context (see ``sending``).
+            with sending(headers):
+                async with self.wrapped.request_stream(messages, model_settings,
+                                                       model_request_parameters,
+                                                       run_context) as streamed:
+                    if call is not None:
+                        _track(streamed, tracker)
+                    yield streamed
         except (asyncio.CancelledError, GeneratorExit):
             if tracker.error is not None:
                 _finish_failed(call, tracker.error, streamed=streamed)

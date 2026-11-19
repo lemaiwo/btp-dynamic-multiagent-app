@@ -21,7 +21,7 @@ def _app() -> dict:
 
 
 def test_mta_version():
-    assert mta()["version"] == "2.45.0"
+    assert mta()["version"] == "2.46.0"
 
 
 def test_connectivity_resource_is_lite_and_bound_to_the_app():

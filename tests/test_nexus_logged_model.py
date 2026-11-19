@@ -11,6 +11,7 @@ import pytest
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import ModelHTTPError
 
+from agents.model_call_headers import current_call_headers
 from agents.nexus import logged_model, register, sender, state
 from agents.nexus.context import calling_agent, nexus_run
 from agents.nexus.logged_model import NexusLoggedModel, wrap
@@ -318,3 +319,28 @@ async def test_temperature_and_top_p_out_of_decimal_5_4_are_left_out(rec, given)
     await sender.drain()
     body = rec.of("logRequest")[0]["body"]
     assert "temperature" not in body and "topP" not in body
+
+
+async def test_the_logged_correlation_id_is_in_the_call_headers(rec):
+    from pydantic_ai.messages import ModelResponse, TextPart
+    from pydantic_ai.models.function import FunctionModel
+    seen = []
+
+    def answer(messages, info):
+        seen.append(current_call_headers.get())
+        return ModelResponse(parts=[TextPart("ok")])
+    with nexus_run("r"):
+        await Agent(wrap(FunctionModel(answer), "gpt-4o")).run("hi")
+    await sender.drain()
+    cid = rec.of("logRequest")[0]["body"]["correlationId"]
+    assert rec.of("logResponse")[0]["body"]["correlationId"] == cid
+    assert f"ext.ai.sap.com/correlation={cid}" in seen[0]["ai-inference-observability-labels"]
+    assert current_call_headers.get() is None
+
+
+@pytest.mark.parametrize("name", ["openai:gpt-4o", "anthropic:claude-x"])
+async def test_direct_provider_sends_no_resource_group(rec, name):
+    with nexus_run("r"):
+        await Agent(wrap(scripted_model(), name)).run("hi")
+    await sender.drain()
+    assert "resourceGroup" not in rec.of("logRequest")[0]["body"]

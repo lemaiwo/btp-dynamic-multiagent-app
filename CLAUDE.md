@@ -450,7 +450,8 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   name becomes `<unknown field>`. Save-time validators name the field or
   position, never the value (`tests/test_admin_validation_errors.py`)
 - `agents/shared.py` — `JWTForwardAuth`, `create_mcp_server` (JWT forward
-  on CF / browser OAuth locally / per-user `oauth2`), `SAPAICoreModel`.
+  on CF / browser OAuth locally, from `agents/local_oauth.py` / per-user `oauth2`),
+  `SAPAICoreModel`.
   `create_mcp_server` returns a `PerRunMCPServer`: the registry shares one
   server object across all users, so each agent run must open its own MCP
   session, or overlapping runs send requests with whichever user opened the
@@ -2647,8 +2648,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `NEXUS_FALLBACK_USE_CASE` (at most 60 characters, sent for an agent the register assigned
   no use case), `NEXUS_REPUSH_MINUTES` (default 15, 0 = no timer), `NEXUS_SEND_PAYLOAD`
   (exactly `true` sends prompt and response text, default off), `NEXUS_QUEUE_MAX` (default
-  2000), `NEXUS_TIMEOUT_SECONDS` (default 5, at most 30). The resource group sent is
-  `AICORE_RESOURCE_GROUP` (blank = `default`). One process-wide state per module, like the
+  2000), `NEXUS_TIMEOUT_SECONDS` (default 5, at most 30), `NEXUS_LANDSCAPE` (optional, a
+  label of the AI Core observability record, below). The resource group sent, for an AI Core
+  model only, is `AICORE_RESOURCE_GROUP` (blank = `default`). One process-wide state per module, like the
   job runner: with several instances each reports on its own.
   - `state.py` / `lifecycle.py` — the switch is a plain boolean read on every model call
     (no I/O) and is decided only by `lifecycle`: `start()` (the lifespan, after
@@ -2702,7 +2704,8 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     one WARNING per process, class only). Every model request, from every entry point (web
     chat, classic chat, A2A, jobs, invoke, workflows, IDE, delegation, deep sub-agents),
     queues one `logRequest` before and one `logResponse` after, with one `correlationId`,
-    `agent` (omitted when blank), `runId`, the model, the resource group and the use case;
+    `agent` (omitted when blank), `runId`, the model, the resource group (AI Core models
+    only) and the use case;
     tokens are that request's own `usage`, never the run's running total, so the register can
     sum them. Status: `COMPLETED`; `FILTERED` for a RETURNED response whose finish reason is
     `content_filter` (not an exception at this layer); `FAILED` for a model error or a
@@ -2721,6 +2724,35 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     pass-through generator: a test pins that attribute on the pinned pydantic-ai, and when it
     is gone tracking is switched off with one WARNING (`untracked_streams`) and a normal exit
     is logged `COMPLETED`, never a false `FAILED`.
+  - `observability.py` + `agents/model_call_headers.py` — the AI Core observability record
+    of each model call, joined to the register's entries by the `correlationId`, which the
+    wrapper makes BEFORE the call. Around a wrapped call of an AI Core chat model (not
+    `openai:` / `anthropic:`), and only while the integration is on, the wrapper publishes
+    two headers in the contextvar `model_call_headers.current_call_headers` (`sending`,
+    cleared on every exit): `ai-inference-observability-persistence-mode: metadata` (AI Core
+    keeps a record without prompt or response text) and `ai-inference-observability-labels`
+    with `ext.ai.sap.com/correlation=<id>`, `ext.ai.sap.com/landscape=<NEXUS_LANDSCAPE>` and
+    `ext.ai.sap.com/use-case=<use case>`. A label value is used only when it already is 1 to
+    64 characters of `[A-Za-z0-9./-]`; a value of any other form is left out, never
+    rewritten (no correlation id in that form: no headers). No user label. `NEXUS_LANDSCAPE`
+    is not in `mta.yaml` (set per landscape in an `.mtaext`) and is read at switch-on and at
+    every re-evaluation. The two AI Core routes of `agents/shared.py` put the headers on the
+    request: the OpenAI-style route by merging them into a copy of the settings'
+    `extra_headers` in `SAPAICoreModel._completions_create` (ours win over a caller's of the
+    same name), the Bedrock route by a botocore `before-call` handler on `Converse` /
+    `ConverseStream` (`_register_call_headers`, in the call's worker thread, which carries
+    the caller's context). With the variable unset (the integration off, a direct provider,
+    the wrapper unavailable, the app standalone) the settings object is passed on untouched
+    and every request is exactly as before; adding them never fails a call (one WARNING per
+    process, exception class only). `agents/shared.py` imports only
+    `agents.model_call_headers` for this, never `agents.nexus`. Embeddings and the AI Core
+    admin calls (`agents/aicore_deployments.py`) send no such headers.
+    `tests/test_nexus_observability.py`, `tests/test_model_call_headers.py`. **Ran on a
+    landscape** (2026-11-18, the Bedrock route only): one streamed web chat turn on a Claude
+    deployment left one record per model request (8, all `streaming` true, HTTP 200, input and
+    output token counts present, the three labels as sent), read back by the correlation
+    label. Not verified there: the OpenAI-style route (unit tests only), whether a retried
+    request leaves two records, a non-streamed call.
   - `context.py` — `current_agent_name` (default `orchestrator`) and `current_nexus_run_id`
     (cut to 64 characters, an id already bound wins), bound by the synchronous context
     managers `calling_agent` and `nexus_run` around the call that starts a run (so a task
@@ -2778,8 +2810,8 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     and recorded there. Not verified there: an Invoke API or A2A call as a user, a
     scheduled run (technical identity), `NEXUS_SEND_PAYLOAD`, the fallback use case, the
     stream tracking of a cancelled stream, and the cost of the side channel under load. A
-    direct provider's model (`anthropic:` / `openai:`) is logged like any other, with the
-    AI Core resource group, although the call did not go through AI Core. Operator setup
+    direct provider's model (`anthropic:` / `openai:`) is logged like any other, without a
+    resource group and without the AI Core observability headers. Operator setup
     notes: `docs/NEXUS_SETUP.md` (local, not in repo)
 - `agents/jira_tools.py` — in-process Jira tools over REST v2
   (`builtin:jira`), reached through a destination. JQL is built server-side
@@ -4481,7 +4513,14 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   descriptor (set per landscape in an `.mtaext`); the integration is off unless the
   destination exists, and every model is wrapped (`NexusLoggedModel`) either way. Run on a
   landscape as the 2.43.0 build of its branch (registration and a chat turn logged as the
-  signed-in user)
+  signed-in user);
+  2.46.0 adds the AI Core observability headers (`agents/nexus/observability.py`,
+  `agents/model_call_headers.py`: a metadata record per AI Core chat call, labelled with the
+  register's `correlationId`, sent only while the agent register is on) and moves the
+  local-dev browser OAuth of `agents/shared.py` to `agents/local_oauth.py` unchanged: no new
+  resource, role, table or column (HANA schema generation unchanged, still 12);
+  `NEXUS_LANDSCAPE` is not in the descriptor. Ran on a landscape for the Bedrock route
+  (streamed calls are recorded with token counts); the OpenAI-style route is unit-tested only
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets

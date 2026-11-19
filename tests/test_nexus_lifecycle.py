@@ -113,6 +113,16 @@ async def test_unresolvable_is_on(env):
     await lifecycle.stop()
 
 
+async def test_landscape_read_at_switch_on_and_reevaluation(env, monkeypatch):
+    monkeypatch.setenv("NEXUS_LANDSCAPE", "acc")
+    await lifecycle.start()
+    assert state.landscape() == "acc"
+    monkeypatch.setenv("NEXUS_LANDSCAPE", "prd")
+    await lifecycle.reevaluate()
+    assert state.landscape() == "prd"
+    await lifecycle.stop()
+
+
 async def test_a_hanging_destination_service_is_bounded_by_the_timeout(env, monkeypatch):
     monkeypatch.setenv("NEXUS_TIMEOUT_SECONDS", "0.2")
     env.fakes[TECH].hang = True

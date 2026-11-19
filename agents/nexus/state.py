@@ -19,6 +19,9 @@ _user_forwarding = False
 # re-evaluated (a Reload): the model wrapper reads this flag on every call
 # instead of parsing the settings (and warning about a bad one) each time.
 _send_payload = False
+# ``NEXUS_LANDSCAPE`` as read at switch-on / re-evaluation, for the AI Core
+# observability labels; read on every model call, never parsed there.
+_landscape: str | None = None
 
 
 def enabled() -> bool:
@@ -40,11 +43,12 @@ def set_on(destination: str) -> None:
 
 def set_off(reason: str) -> None:
     """Switch off for the given reason (shown as given); user forwarding ends too."""
-    global _enabled, _reason, _user_forwarding, _send_payload
+    global _enabled, _reason, _user_forwarding, _send_payload, _landscape
     _enabled = False
     _reason = reason
     _user_forwarding = False
     _send_payload = False
+    _landscape = None
 
 
 def user_forwarding() -> bool:
@@ -69,10 +73,22 @@ def set_send_payload(on: bool) -> None:
     _send_payload = bool(on)
 
 
+def landscape() -> str | None:
+    """The landscape label of the AI Core observability record (``NEXUS_LANDSCAPE``)."""
+    return _landscape
+
+
+def set_landscape(value: str | None) -> None:
+    """Set by the lifecycle at switch-on and at every re-evaluation."""
+    global _landscape
+    _landscape = value or None
+
+
 def reset_for_tests() -> None:
     """Back to the state of a fresh process: off, not started."""
-    global _enabled, _reason, _user_forwarding, _send_payload
+    global _enabled, _reason, _user_forwarding, _send_payload, _landscape
     _enabled = False
     _reason = _NOT_STARTED
     _user_forwarding = False
     _send_payload = False
+    _landscape = None

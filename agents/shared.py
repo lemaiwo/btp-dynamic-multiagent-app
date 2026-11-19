@@ -13,16 +13,13 @@ import copy
 import json
 import logging
 import os
-import threading
-import webbrowser
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 import httpx
-from mcp.client.auth import OAuthClientProvider, TokenStorage
-from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthToken
+from mcp.client.auth import OAuthClientProvider
+from mcp.shared.auth import OAuthClientMetadata
 from openai import omit as OMIT
 from pydantic import AnyUrl
 from pydantic_ai.exceptions import ModelRetry
@@ -38,107 +35,12 @@ from pydantic_ai.usage import RequestUsage
 
 from agents.auth import current_jwt
 from agents.errors import describe_exception, mask_text
+from agents.local_oauth import CALLBACK_URL, FileTokenStorage, callback_handler, redirect_handler
+from agents.model_call_headers import current_call_headers
 
 logger = logging.getLogger(__name__)
 
 ON_CF = "VCAP_APPLICATION" in os.environ
-
-CALLBACK_PORT = int(os.environ.get("CALLBACK_PORT", "3000"))
-CALLBACK_URL = f"http://localhost:{CALLBACK_PORT}/callback"
-
-
-# ---------------------------------------------------------------------------
-# Persistent token storage (file-based, one file per MCP server) — local only
-# ---------------------------------------------------------------------------
-class FileTokenStorage(TokenStorage):
-    """Persists OAuth2 client registration and tokens to a local JSON file."""
-
-    def __init__(self, path: Path):
-        self.path = path
-        self._data: dict = {}
-        if self.path.exists():
-            self._data = json.loads(self.path.read_text())
-
-    def _save(self) -> None:
-        self.path.write_text(json.dumps(self._data, indent=2))
-
-    async def get_tokens(self) -> OAuthToken | None:
-        if "tokens" in self._data:
-            return OAuthToken(**self._data["tokens"])
-        return None
-
-    async def set_tokens(self, tokens: OAuthToken) -> None:
-        self._data["tokens"] = tokens.model_dump(mode="json")
-        self._save()
-
-    async def get_client_info(self) -> OAuthClientInformationFull | None:
-        if "client_info" in self._data:
-            return OAuthClientInformationFull(**self._data["client_info"])
-        return None
-
-    async def set_client_info(self, client_info: OAuthClientInformationFull) -> None:
-        self._data["client_info"] = client_info.model_dump(mode="json")
-        self._save()
-
-
-# ---------------------------------------------------------------------------
-# OAuth2 callback handling (local dev only)
-# ---------------------------------------------------------------------------
-_callback_future: asyncio.Future | None = None
-_callback_loop: asyncio.AbstractEventLoop | None = None
-
-
-class _CallbackHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        global _callback_future, _callback_loop
-
-        if self.path.startswith("/callback"):
-            params = parse_qs(urlparse(self.path).query)
-            code = params.get("code", [None])[0]
-            state = params.get("state", [None])[0]
-
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html")
-            self.end_headers()
-            self.wfile.write(
-                b"<html><body>"
-                b"<h1>Authorization successful!</h1>"
-                b"<p>You can close this tab and return to the chat.</p>"
-                b"</body></html>"
-            )
-
-            if _callback_loop and _callback_future and not _callback_future.done():
-                _callback_loop.call_soon_threadsafe(
-                    _callback_future.set_result, (code, state)
-                )
-        else:
-            self.send_response(404)
-            self.end_headers()
-
-    def log_message(self, format, *args):
-        pass
-
-
-async def _redirect_handler(auth_url: str) -> None:
-    print("\nOpening browser for OAuth2 authentication...")
-    print(f"If the browser doesn't open, visit:\n  {auth_url}\n")
-    webbrowser.open(auth_url)
-
-
-async def _callback_handler() -> tuple[str, str | None]:
-    global _callback_future, _callback_loop
-    _callback_loop = asyncio.get_running_loop()
-    _callback_future = _callback_loop.create_future()
-
-    server = HTTPServer(("localhost", CALLBACK_PORT), _CallbackHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-
-    try:
-        code, state = await _callback_future
-        return code, state
-    finally:
-        server.shutdown()
 
 
 # ---------------------------------------------------------------------------
@@ -442,8 +344,8 @@ def create_mcp_server(
                 response_types=["code"],
             ),
             storage=FileTokenStorage(Path(f".tokens-{name}.json")),
-            redirect_handler=_redirect_handler,
-            callback_handler=_callback_handler,
+            redirect_handler=redirect_handler,
+            callback_handler=callback_handler,
         )
 
     return PerRunMCPServer(
@@ -512,6 +414,74 @@ class SAPAICoreStreamedResponse(OpenAIStreamedResponse):
 # deployment that refuses the parameter.
 AICORE_STREAM_USAGE = "AICORE_STREAM_USAGE"
 
+# The per-call headers of ``agents.model_call_headers`` (set only by the agent
+# register's wrapper, only for an AI Core model, only while that integration
+# is on). Adding them must never fail a model call: a failure is logged once
+# per process by exception class and the request goes out without them.
+_call_headers_warned = False
+
+
+def _warn_call_headers(exc: BaseException) -> None:
+    global _call_headers_warned
+    if not _call_headers_warned:
+        _call_headers_warned = True
+        logger.warning("model call headers not added (%s)", type(exc).__name__)
+
+
+def _with_call_headers(model_settings):
+    """``model_settings`` with the call headers in ``extra_headers`` (ours win).
+
+    Unset: the very same object, untouched, so a request is exactly as it was
+    without the agent register. Set: a copy; the caller's dicts are not changed.
+    """
+    headers = current_call_headers.get()
+    if headers is None:
+        return model_settings
+    try:
+        merged = dict(model_settings or {})
+        merged["extra_headers"] = {**(merged.get("extra_headers") or {}), **headers}
+        return merged
+    except Exception as e:  # noqa: BLE001 - a header must never break a model call
+        _warn_call_headers(e)
+        return model_settings
+
+
+def _add_call_headers(params, **_) -> None:
+    """botocore ``before-call`` handler of the Bedrock route.
+
+    Returns ``None`` always: a ``before-call`` handler that returns a value
+    replaces the call's response.
+    """
+    headers = current_call_headers.get()
+    if headers is None:
+        return None
+    try:
+        params["headers"].update(headers)
+    except Exception as e:  # noqa: BLE001 - a header must never break a model call
+        _warn_call_headers(e)
+    return None
+
+
+_BEDROCK_CALL_EVENTS = (
+    "before-call.bedrock-runtime.Converse",
+    "before-call.bedrock-runtime.ConverseStream",
+)
+
+
+def _register_call_headers(client) -> None:
+    """Hook :func:`_add_call_headers` into a Bedrock runtime client's calls.
+
+    ``before-call`` sees the request dict after gen_ai_hub's client wrapper
+    set its own headers, once per API call (not per retry). The handler runs
+    in the worker thread of the call, which carries a copy of the caller's
+    context, so it reads the caller's ``current_call_headers``.
+    """
+    try:
+        for event in _BEDROCK_CALL_EVENTS:
+            client.meta.events.register(event, _add_call_headers)
+    except Exception as e:  # noqa: BLE001 - never fails building the model
+        _warn_call_headers(e)
+
 
 class SAPAICoreModel(OpenAIChatModel):
     """OpenAI-compatible model adapted for SAP AI Core compatibility.
@@ -526,6 +496,17 @@ class SAPAICoreModel(OpenAIChatModel):
         if os.environ.get(AICORE_STREAM_USAGE, "1").strip() == "0":
             return OMIT
         return super()._get_stream_options(model_settings)
+
+    async def _completions_create(self, messages, stream, model_settings,
+                                  model_request_parameters):  # type: ignore[override]
+        """The parent's call, with the per-call headers when they are set.
+
+        pydantic-ai passes ``model_settings['extra_headers']`` to
+        ``chat.completions.create``; unset, the settings are passed on as they
+        came (``_with_call_headers``).
+        """
+        return await super()._completions_create(
+            messages, stream, _with_call_headers(model_settings), model_request_parameters)
 
     @property
     def _streamed_response_cls(self):  # type: ignore[override]
@@ -864,6 +845,7 @@ def _build_bedrock_model(name: str):
             },
         ),
     )
+    _register_call_headers(bedrock_client)
     return BedrockConverseModel(
         name, provider=BedrockProvider(bedrock_client=bedrock_client)
     )
