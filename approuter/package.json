@@ -4,7 +4,10 @@
   "scripts": {
     "start": "node node_modules/@sap/approuter/approuter.js"
   },
+  "engines": {
+    "node": "^24"
+  },
   "dependencies": {
-    "@sap/approuter": "^16"
+    "@sap/approuter": "^23"
   }
 }
