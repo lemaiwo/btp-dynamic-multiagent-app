@@ -496,15 +496,16 @@ async def test_a_replace_import_that_removes_an_agent_with_an_entry_reloads(live
     assert "buyer" not in live.registry.build.specialists
 
 
-async def test_an_import_that_leaves_every_odata_entry_alone_does_not_reload(live, client, saved):
+async def test_an_import_that_leaves_every_odata_entry_alone_reloads_once(live, client, saved):
+    """An import that carries agents always reloads, once."""
     agents = await exported_agents(client)
     agents[0]["description"] = "another text"
     odata_oauth(agents[0])["services"].reverse()
     plain = agent_body({"url": "builtin:sapnotes", "auth_mode": "none"}, name="notes")
     r = await client.post("/admin/api/import", json={"agents": [*agents, plain]})
     assert r.status_code == 200, r.text
-    assert r.json()["reloaded"] is False and r.json()["reload_failed"] is False
-    assert (live.reloads, live.refreshes) == (0, 0)
+    assert r.json()["reloaded"] is True and r.json()["reload_failed"] is False
+    assert (live.reloads, live.refreshes) == (1, 1)
 
 
 async def test_an_import_reloads_once_when_a_service_and_an_entry_change(live, client, saved):

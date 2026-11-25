@@ -251,14 +251,17 @@ async def test_a_replace_import_that_removes_the_agent_reloads(live, client):
     assert live.reloads == 1 and "reviewer" not in live.registry.build.specialists
 
 
-async def test_an_import_that_leaves_the_entry_alone_does_not_reload(live, client):
+async def test_an_import_that_leaves_the_entry_alone_reloads_once_and_keeps_it(live, client):
+    """An import that carries agents always reloads, once
+    (``tests/test_agent_save_reload.py``); the entry is unchanged."""
     agents = await exported(client)
     agents[0]["description"] = "another text"
     r = await client.post("/admin/api/import",
                           json={"agents": [*agents, body(NOTES, name="notes")]})
     assert r.status_code == 200, r.text
-    assert r.json()["reloaded"] is False and r.json()["reload_failed"] is False
-    assert (live.reloads, live.refreshes) == (0, 0)
+    assert r.json()["reloaded"] is True and r.json()["reload_failed"] is False
+    assert (live.reloads, live.refreshes) == (1, 1)
+    assert "complete_approval" in await live.tools()
 
 
 async def test_a_failing_reload_after_an_import_is_said_not_raised(live, client):

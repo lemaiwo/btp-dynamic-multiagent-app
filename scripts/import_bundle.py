@@ -28,6 +28,11 @@ refused query is ``FAIL   ina query <name>: <rule>`` (by its position when
 the entry has no usable name), and an entry must say ``enabled``, as for the
 HTTP import. Nothing is removed: this script has no ``replace``.
 
+The script writes the database from outside the app, so a running app does
+not see the rows until its agents are rebuilt: press Reload in the admin (or
+``POST /admin/api/reload``), or restart the app. The HTTP import reloads by
+itself.
+
 Secrets come from --secrets (a Google client_secret_*.json, or a flat
 {"<url>": {"client_secret": "..."}} map). Without it, the repo root is searched
 for a client_secret_*.json, which covers builtin:gmail.

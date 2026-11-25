@@ -1,4 +1,6 @@
-"""Every agent create, update and delete reaches the running agents.
+"""Every admin save the running build reads reaches the running agents.
+
+Agents, skills, the orchestrator instructions and the HTTP bundle import.
 
 A run takes its specialist from the running registry build. Before this rule
 only a save that changed an agent's data or review entry rebuilt the
@@ -8,7 +10,11 @@ Now every successful create, update and delete through the admin API
 rebuilds the registry and the chat app once after the commit and answers
 the outcome (``reloaded`` / ``reload_failed``; the two ``X-OData-*`` headers
 for the 204 of a delete). The data catalogue is rebuilt only when the
-agent's catalogue sources changed, as before.
+agent's catalogue sources changed, as before. Skills (create, update,
+delete), the orchestrator instructions and an import that carries agents,
+skills or orchestrator instructions, or removes agents or skills, do the
+same; a workflow-only import does not (a workflow run reads its definition
+from the database at run time).
 
 Run:  python -m pytest tests/test_agent_save_reload.py
 """
@@ -221,3 +227,156 @@ async def test_without_a_running_build_nothing_is_reloaded(client, monkeypatch):
     r = await client.delete(f"{AGENTS}/{r.json()['id']}")
     assert r.headers["x-odata-reloaded"] == "false"
     assert r.headers["x-odata-reload-failed"] == "false"
+
+
+# ------------------------------------------------------------------ skills
+
+SKILLS = "/admin/api/skills"
+
+
+def skill(name: str = "triage", **patch: Any) -> dict[str, Any]:
+    return {"name": name, "description": "when to triage", "content": "steps", **patch}
+
+
+async def test_a_skill_create_update_and_delete_each_reload_once(live, client):
+    r = await client.post(SKILLS, json=skill())
+    assert r.status_code == 201, r.text
+    assert r.json()["reloaded"] is True and r.json()["reload_failed"] is False
+    assert (live.reloads, live.refreshes) == (1, 1)
+    skill_id = r.json()["id"]
+    r = await client.put(f"{SKILLS}/{skill_id}", json=skill(content="new steps"))
+    assert r.status_code == 200, r.text
+    assert r.json()["reloaded"] is True and r.json()["reload_failed"] is False
+    assert live.reloads == 2
+    r = await client.delete(f"{SKILLS}/{skill_id}")
+    assert r.status_code == 204, r.text
+    assert r.headers["x-odata-reloaded"] == "true"
+    assert r.headers["x-odata-reload-failed"] == "false"
+    assert live.reloads == 3
+    assert live.catalogue_rebuilds == 0
+
+
+async def test_renaming_or_deleting_an_attached_skill_reloads_once(live, client):
+    r = await client.post(SKILLS, json=skill())
+    skill_id = r.json()["id"]
+    r = await client.post(AGENTS, json=body(skills=["triage"]))
+    assert r.status_code == 201, r.text
+    before = live.reloads
+    r = await client.put(f"{SKILLS}/{skill_id}", json=skill("triage-2"))
+    assert r.status_code == 200 and r.json()["reloaded"] is True
+    assert live.reloads == before + 1
+    r = await client.delete(f"{SKILLS}/{skill_id}")
+    assert r.status_code == 204 and r.headers["x-odata-reloaded"] == "true"
+    assert live.reloads == before + 2
+
+
+@pytest.mark.parametrize("step", ["create", "update", "delete"])
+async def test_a_failing_reload_after_a_skill_save_is_said_not_raised(live, client, step):
+    skill_id = None
+    if step != "create":
+        skill_id = (await client.post(SKILLS, json=skill())).json()["id"]
+    live.fail = RuntimeError("boom at https://aicore.internal/secret-path")
+    if step == "create":
+        r = await client.post(SKILLS, json=skill())
+        assert r.status_code == 201, r.text
+        assert r.json()["reload_failed"] is True and r.json()["reloaded"] is False
+    elif step == "update":
+        r = await client.put(f"{SKILLS}/{skill_id}", json=skill(content="new"))
+        assert r.status_code == 200, r.text
+        assert r.json()["reload_failed"] is True and r.json()["content"] == "new"
+    else:
+        r = await client.delete(f"{SKILLS}/{skill_id}")
+        assert r.status_code == 204, r.text
+        assert r.headers["x-odata-reload-failed"] == "true"
+        assert (await client.get(f"{SKILLS}/{skill_id}")).status_code == 404
+    assert "secret-path" not in r.text
+
+
+async def test_a_refused_skill_save_does_not_reload(live, client):
+    r = await client.put(f"{SKILLS}/999999", json=skill())
+    assert r.status_code == 404
+    r = await client.delete(f"{SKILLS}/999999")
+    assert r.status_code == 404
+    assert live.reloads == 0
+
+
+async def test_a_skill_save_without_a_running_build_reloads_nothing(client, monkeypatch):
+    await _empty_registry()
+    monkeypatch.setattr(admin_routes, "_live_registry", lambda: None)
+    r = await client.post(SKILLS, json=skill())
+    assert r.status_code == 201, r.text
+    assert r.json()["reloaded"] is False and r.json()["reload_failed"] is False
+    r = await client.delete(f"{SKILLS}/{r.json()['id']}")
+    assert r.headers["x-odata-reloaded"] == "false"
+
+
+# ------------------------------------------------------------ orchestrator
+
+
+async def test_the_orchestrator_save_reloads_once(live, client):
+    r = await client.put("/admin/api/orchestrator", json={"instructions": "route well"})
+    assert r.status_code == 200, r.text
+    assert r.json() == {"instructions": "route well", "reloaded": True, "reload_failed": False}
+    assert (live.reloads, live.refreshes) == (1, 1)
+
+
+async def test_a_failing_reload_after_the_orchestrator_save_is_said(live, client):
+    live.fail = RuntimeError("boom")
+    r = await client.put("/admin/api/orchestrator", json={"instructions": "route well"})
+    assert r.status_code == 200, r.text
+    assert r.json()["reload_failed"] is True and r.json()["reloaded"] is False
+    r = await client.get("/admin/api/orchestrator")
+    assert r.json()["instructions"] == "route well"
+
+
+# ------------------------------------------------------------------ import
+
+IMPORT = "/admin/api/import"
+
+
+@pytest.mark.parametrize("bundle", [
+    {"agents": [body()]},
+    {"skills": [skill()]},
+    {"orchestrator_instructions": "route well"},
+    {"agents": [body(), body("second")], "skills": [skill()],
+     "orchestrator_instructions": "route well"},
+], ids=["agents", "skills", "orchestrator", "all"])
+async def test_an_import_of_what_the_build_reads_reloads_once(live, client, bundle):
+    r = await client.post(IMPORT, json=bundle)
+    assert r.status_code == 200, r.text
+    assert r.json()["reloaded"] is True and r.json()["reload_failed"] is False
+    assert (live.reloads, live.refreshes) == (1, 1)
+
+
+async def test_a_replace_import_that_removes_agents_reloads_once(live, client):
+    await client.post(AGENTS, json=body())
+    before = live.reloads
+    r = await client.post(IMPORT, json={"replace": True, "skills": [skill()]})
+    assert r.status_code == 200, r.text
+    assert r.json()["removed"] == 1 and r.json()["reloaded"] is True
+    assert live.reloads == before + 1
+    assert "plain" not in live.specialists
+
+
+async def test_an_import_with_a_changed_entry_still_reloads_once(live, client):
+    await client.post(AGENTS, json=body())
+    before = live.reloads
+    r = await client.post(IMPORT, json={"agents": [body("plain", BITBUCKET)]})
+    assert r.status_code == 200, r.text
+    assert r.json()["reloaded"] is True and live.reloads == before + 1
+
+
+async def test_an_import_that_carries_nothing_the_build_reads_does_not_reload(live, client):
+    r = await client.post(IMPORT, json={"workflows": []})
+    assert r.status_code == 200, r.text
+    assert r.json()["reloaded"] is False and r.json()["reload_failed"] is False
+    assert live.reloads == 0
+
+
+async def test_a_failing_reload_after_an_import_is_said_not_raised(live, client):
+    live.fail = RuntimeError("boom at https://aicore.internal/secret-path")
+    r = await client.post(IMPORT, json={"agents": [body()]})
+    assert r.status_code == 200, r.text
+    assert r.json()["reload_failed"] is True and r.json()["reloaded"] is False
+    assert "secret-path" not in r.text
+    assert live.reloads == 1
