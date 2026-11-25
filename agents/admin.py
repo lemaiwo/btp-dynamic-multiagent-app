@@ -1642,7 +1642,7 @@ async def api_create_agent(payload: AgentPayload) -> dict[str, Any]:
     """Create an agent (or replace the one of that name: ``upsert_agent``).
 
     The answer is the agent plus ``reloaded`` and ``reload_failed``, both
-    always present: see `_reload_for_changed_entry`.
+    always present: see `_reload_after_agent_change`.
     """
     async with SessionLocal() as session:
         from agents.db import get_agent_by_name
@@ -1679,7 +1679,7 @@ async def api_create_agent(payload: AgentPayload) -> dict[str, Any]:
         answer = row.to_dict()
         after = _entry_signature(row.mcp_servers, row.enabled)
     _push_agents_to_register()
-    answer.update(await _reload_for_changed_entry(before, after, f"agent '{payload.name}' saved"))
+    answer.update(await _reload_after_agent_change(before, after, f"agent '{payload.name}' saved"))
     return answer
 
 
@@ -1818,28 +1818,26 @@ def _entry_signature(servers: Any, enabled: Any = True) -> list[Any]:
             + sorted(reconcile))
 
 
-async def _reload_for_changed_entry(before: Any, after: Any, what: str) -> dict[str, bool]:
-    """``{reloaded, reload_failed}`` of an agent save, create or delete.
+async def _reload_after_agent_change(before: Any, after: Any, what: str) -> dict[str, bool]:
+    """``{reloaded, reload_failed}`` of a successful agent create, update or
+    delete, called once per request after the commit.
 
-    The running build answers from the entries it was built with, and a run
-    takes its specialist from that build. So a save that changes the agent's
-    ``builtin:odata`` entry (a service added or removed, Allow writes
-    switched) or its ``builtin:bitbucket`` entry (Commenting or Approving
-    switched, a repository, the branch, the builds rule, the workspace or
-    the destination changed), adds or removes such an entry, or disables or
-    enables an agent that has one (`_entry_signature`) rebuilds the registry
-    and the chat app after the commit: a closed write or approval must not
-    stay open until somebody presses Reload, and one the admin was just
-    asked about must not need a second step. Any other agent save behaves
-    as it always did (no reload; the admin UIs call reload) and answers both
-    keys ``false``.
+    A run takes its specialist from the running build, so every agent save
+    rebuilds the registry and the chat app at once: a new or renamed agent
+    must be runnable (the web chat offers it right away), and a closed write,
+    approval or data source (an agent's ``builtin:odata``,
+    ``builtin:bitbucket``, ... entry, `_entry_signature`) must not stay open
+    until somebody presses Reload. The data catalogue graph is rebuilt only
+    when the agent's catalogue sources changed (``before`` / ``after`` are
+    the `_entry_signature` of the row before and after the change).
 
-    Never a 500 for a rebuild that fails after the commit
-    (`agents.odata.admin_routes.reload_running_agents`).
+    Nothing is reloaded while no build exists (``reloaded: false``); a
+    rebuild that fails after the commit is answered ``reload_failed: true``,
+    never a 500 (`agents.odata.admin_routes.reload_running_agents`, which
+    logs the exception class only). The reload reaches only the app instance
+    that served the request.
     """
-    if before == after:
-        return dict(NOT_RELOADED)
-    outcome = await reload_running_agents(f"{what} with a changed data or review entry")
+    outcome = await reload_running_agents(what)
     await _rebuild_data_catalog(before, after, what)
     return outcome
 
@@ -2028,9 +2026,9 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
         answer = row.to_dict()
         odata_after = _entry_signature(row.mcp_servers, row.enabled)
     _push_agents_to_register()
-    # `reloaded` / `reload_failed`, always present: `_reload_for_changed_entry`.
+    # `reloaded` / `reload_failed`, always present: `_reload_after_agent_change`.
     answer.update(
-        await _reload_for_changed_entry(
+        await _reload_after_agent_change(
             odata_before, odata_after, f"agent '{payload.name}' saved"
         )
     )
@@ -2060,9 +2058,8 @@ async def api_delete_agent(
     transaction; a workflow step is never edited behind the operator's back,
     so it has to be changed first.
 
-    An agent that had a ``builtin:odata`` or ``builtin:bitbucket`` entry is
-    taken out of the running
-    build at once (`_reload_for_changed_entry`). The 204 has no body: the
+    The agent is taken out of the running build at once
+    (`_reload_after_agent_change`). The 204 has no body: the
     outcome is in the headers ``X-OData-Reloaded`` and
     ``X-OData-Reload-Failed`` (``true`` / ``false``), always present.
     """
@@ -2089,7 +2086,7 @@ async def api_delete_agent(
         await rename_agent_references(session, row.name, None)
         await delete_agent(session, agent_id)
     _push_agents_to_register()
-    outcome = await _reload_for_changed_entry(odata_before, [], f"agent '{name}' deleted")
+    outcome = await _reload_after_agent_change(odata_before, [], f"agent '{name}' deleted")
     response.headers["X-OData-Reloaded"] = str(outcome["reloaded"]).lower()
     response.headers["X-OData-Reload-Failed"] = str(outcome["reload_failed"]).lower()
 
@@ -3375,8 +3372,9 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
         # `builtin:odata`, `builtin:ina`, `builtin:bitbucket`, `builtin:git`,
         # `builtin:hana` or `builtin:reconcile` entry changed or went, or
         # the agent was removed or disabled, with no catalogue service in
-        # use touched. Same rule as an
-        # agent save (`_reload_for_changed_entry`); one rebuild at most.
+        # use touched. An import reloads only then (unlike an agent save,
+        # `_reload_after_agent_change`, which always reloads); one rebuild
+        # at most.
         async with SessionLocal() as session:
             odata_after = _entry_signatures(await list_agents(session))
         if odata_after != odata_before:
