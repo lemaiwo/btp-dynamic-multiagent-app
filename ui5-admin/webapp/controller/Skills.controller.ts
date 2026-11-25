@@ -2,6 +2,7 @@ import JSONModel from "sap/ui/model/json/JSONModel";
 import MessageBox from "sap/m/MessageBox";
 import MessageToast from "sap/m/MessageToast";
 import BaseController from "./BaseController";
+import ErrorHandler from "../service/ErrorHandler";
 import type Event from "sap/ui/base/Event";
 import type ColumnListItem from "sap/m/ColumnListItem";
 import type Control from "sap/ui/core/Control";
@@ -57,14 +58,18 @@ export default class Skills extends BaseController {
     }
 
     private async doDelete(skill: Skill): Promise<void> {
-        const ok = await this.runOk(
-            this.getAdminService().deleteSkill(skill.id),
-            `Could not delete the skill "${skill.name}".`
-        );
-        if (ok) {
-            MessageToast.show(this.text("skillDeleted"));
-            void this.load();
+        let answer;
+        try {
+            answer = await this.getAdminService().deleteSkill(skill.id);
+        } catch (error) {
+            ErrorHandler.handle(error, `Could not delete the skill "${skill.name}".`);
+            return;
         }
+        // Deleted, but still part of the running agents: a box that stays.
+        if (!this.warnIfNotLive(answer, "reloadFailedSkillDeleted")) {
+            MessageToast.show(this.text("skillDeleted"));
+        }
+        void this.load();
     }
 
 }

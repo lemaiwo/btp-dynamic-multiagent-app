@@ -597,10 +597,10 @@ async def test_an_import_that_drops_allow_select_reloads(monkeypatch):
         assert r.json()["reloaded"] is True and reloads == [1]
         assert await _tool_names(registry.build.specialists["dba"]) == TOOLS
 
-        # Unchanged entry: no reload.
+        # Unchanged entry: an import that carries agents still reloads, once.
         agents[0]["description"] = "another text"
         r = await client.post("/admin/api/import", json={"agents": agents})
-        assert r.status_code == 200 and r.json()["reloaded"] is False and reloads == [1]
+        assert r.status_code == 200 and r.json()["reloaded"] is True and reloads == [1, 1]
 
 
 @pytest.mark.parametrize("override", [

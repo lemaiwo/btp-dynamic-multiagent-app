@@ -156,15 +156,16 @@ async def test_any_change_of_the_block_reloads(live, client, change):
     assert r.json()["reloaded"] is True and live.reloads == 1
 
 
-async def test_an_edit_that_leaves_the_entry_alone_does_not_reload(live, client):
-    """Also not for a block that only says its defaults out loud."""
+async def test_an_edit_that_leaves_the_entry_alone_reloads_once_and_keeps_it(live, client):
+    """Every agent save reloads (``tests/test_agent_save_reload.py``); a block
+    that only says its defaults out loud keeps what the agent may do."""
     same = {**APPROVING, "branch": None, "require_green_builds": True,
             "has_client_secret": False}
     r = await client.put(f"{AGENTS}/{live.id}",
                          json=body(entry(same), description="another text"))
     assert r.status_code == 200, r.text
-    assert r.json()["reloaded"] is False and r.json()["reload_failed"] is False
-    assert (live.reloads, live.refreshes) == (0, 0)
+    assert r.json()["reloaded"] is True and r.json()["reload_failed"] is False
+    assert (live.reloads, live.refreshes) == (1, 1)
     assert "complete_approval" in await live.tools()
 
 
@@ -250,14 +251,17 @@ async def test_a_replace_import_that_removes_the_agent_reloads(live, client):
     assert live.reloads == 1 and "reviewer" not in live.registry.build.specialists
 
 
-async def test_an_import_that_leaves_the_entry_alone_does_not_reload(live, client):
+async def test_an_import_that_leaves_the_entry_alone_reloads_once_and_keeps_it(live, client):
+    """An import that carries agents always reloads, once
+    (``tests/test_agent_save_reload.py``); the entry is unchanged."""
     agents = await exported(client)
     agents[0]["description"] = "another text"
     r = await client.post("/admin/api/import",
                           json={"agents": [*agents, body(NOTES, name="notes")]})
     assert r.status_code == 200, r.text
-    assert r.json()["reloaded"] is False and r.json()["reload_failed"] is False
-    assert (live.reloads, live.refreshes) == (0, 0)
+    assert r.json()["reloaded"] is True and r.json()["reload_failed"] is False
+    assert (live.reloads, live.refreshes) == (1, 1)
+    assert "complete_approval" in await live.tools()
 
 
 async def test_a_failing_reload_after_an_import_is_said_not_raised(live, client):

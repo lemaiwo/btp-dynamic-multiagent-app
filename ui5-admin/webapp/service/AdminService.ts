@@ -3,7 +3,7 @@ import type {
     Agent, AgentInput, AgentSaved, AgentWhereUsed, AdminConfig, CredentialHealth, CredentialStatus, ImportPayload,
     JobRun, JobRunDetail, ModelInfo, NotificationList, ODataDestinationList, ODataDuplicateRequest, ODataMetadataPreview,
     ODataMetadataRequest, ODataService, ODataServiceInput, ODataServiceSummary, ODataServiceUpdate, ODataTestResult,
-    OrchestratorInfo, ReloadOutcome, ReloadResult, Skill, SkillInput, WhoAmI,
+    OrchestratorInfo, OrchestratorSaved, ReloadOutcome, ReloadResult, Skill, SkillInput, SkillSaved, WhoAmI,
     Workflow, WorkflowDetail, WorkflowInput, WorkflowRun, WorkflowRunDetail
 } from "./types";
 import type {
@@ -190,14 +190,15 @@ export default class AdminService {
         return this.request<Skill>(`skills/${id}`);
     }
 
-    public upsertSkill(skill: SkillInput, id?: number): Promise<Skill> {
+    public upsertSkill(skill: SkillInput, id?: number): Promise<SkillSaved> {
         return id === undefined
-            ? this.request<Skill>("skills", { method: "POST", ...AdminService.json(skill) })
-            : this.request<Skill>(`skills/${id}`, { method: "PUT", ...AdminService.json(skill) });
+            ? this.request<SkillSaved>("skills", { method: "POST", ...AdminService.json(skill) })
+            : this.request<SkillSaved>(`skills/${id}`, { method: "PUT", ...AdminService.json(skill) });
     }
 
-    public deleteSkill(id: number): Promise<void> {
-        return this.request<void>(`skills/${id}`, { method: "DELETE" });
+    /** Resolves with what the 204 says about the reload of the running agents. */
+    public deleteSkill(id: number): Promise<ReloadOutcome> {
+        return this.remove(`skills/${id}`);
     }
 
     // --- Runs ------------------------------------------------------------
@@ -224,8 +225,8 @@ export default class AdminService {
         return this.request<OrchestratorInfo>("orchestrator");
     }
 
-    public setOrchestrator(instructions: string): Promise<OrchestratorInfo> {
-        return this.request<OrchestratorInfo>("orchestrator", {
+    public setOrchestrator(instructions: string): Promise<OrchestratorSaved> {
+        return this.request<OrchestratorSaved>("orchestrator", {
             method: "PUT", ...AdminService.json({ instructions })
         });
     }

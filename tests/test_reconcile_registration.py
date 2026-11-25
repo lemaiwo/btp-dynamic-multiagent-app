@@ -618,7 +618,7 @@ def test_the_reconcile_entry_is_part_of_the_entry_signature():
     assert _entry_signature([_reconcile(dict(BLOCK))], enabled=False) == []
 
 
-async def test_a_save_with_a_changed_target_reloads_and_an_unchanged_one_does_not(
+async def test_every_save_reloads_once_whether_the_target_changed_or_not(
     client, monkeypatch
 ):
     from agents.chat_app import dynamic_chat_app
@@ -642,7 +642,8 @@ async def test_a_save_with_a_changed_target_reloads_and_an_unchanged_one_does_no
     same = _agent("recon-r", [_reconcile(dict(BLOCK)), _arc1()])
     r = await client.put(f"/admin/api/agents/{agent_id}", json=same)
     assert r.status_code == 200, r.text
-    assert r.json()["reloaded"] is False and reloads == []
+    assert r.json()["reloaded"] is True and reloads == [1]
+    reloads.clear()
 
     changed = _agent("recon-r", [_reconcile({**BLOCK, "target": "OTHER/100"}), _arc1()])
     r = await client.put(f"/admin/api/agents/{agent_id}", json=changed)

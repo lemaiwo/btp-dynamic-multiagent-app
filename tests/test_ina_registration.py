@@ -424,12 +424,16 @@ async def test_a_save_that_changes_the_queries_reloads_and_rebuilds_the_catalogu
     assert f"Purpose of {STOCK}" in instructions
 
 
-async def test_a_save_that_leaves_the_queries_alone_does_not_reload(live, client):
+async def test_a_save_that_leaves_the_queries_alone_does_not_rebuild_the_catalogue(
+    live, client
+):
+    """Every agent save reloads the registry once; the catalogue graph only
+    when the queries changed."""
     r = await client.put(f"{AGENTS}/{live['id']}",
                          json=payload(ina_server(SALES), description="another text"))
     assert r.status_code == 200, r.text
-    assert r.json()["reloaded"] is False
-    assert (live["reloads"], live["rebuilds"]) == (0, 0)
+    assert r.json()["reloaded"] is True
+    assert (live["reloads"], live["rebuilds"]) == (1, 0)
 
 
 # --- the registry -------------------------------------------------------------

@@ -71,7 +71,7 @@ def test_the_import_reload_names_every_entry_kind():
 
     import agents.admin as admin
 
-    assert "HANA" in inspect.getdoc(admin._entry_signatures)
+    assert "HANA" in inspect.getdoc(admin._entry_signature)
     source = inspect.getsource(admin)
     assert "changed OData or Bitbucket entry of an agent" not in source
 

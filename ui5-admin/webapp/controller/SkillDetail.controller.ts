@@ -59,7 +59,10 @@ export default class SkillDetail extends BaseController {
 
         try {
             const saved = await this.getAdminService().upsertSkill(data, this.skillId);
-            MessageToast.show(this.text("skillSaved"));
+            // Saved, but the running agents keep the old text: a box that stays.
+            if (!this.warnIfNotLive(saved, "reloadFailedSkillSaved")) {
+                MessageToast.show(this.text("skillSaved"));
+            }
             this.skillId = saved.id;
             model.setProperty("/title", saved.name);
             this.getRouter().navTo("skills");

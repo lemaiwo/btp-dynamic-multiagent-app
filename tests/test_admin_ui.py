@@ -3493,6 +3493,100 @@ assert.ok(errText({ detail: [{ loc: ['body', 'mcp_servers', 0], type: 'value_err
         global.confirm = () => true;
     }
 
+    // 24d. An agent save or delete reloads the running agents on the server;
+    //      the toast says what the answer says (reloaded / reload_failed, the
+    //      X-OData-* headers of a delete), the old advice when it says neither.
+    {
+        const realLoadAgents = loadAgents;
+        loadAgents = async () => {};
+        global.confirm = () => true;
+        document.getElementById('agent-mcp-servers').innerHTML = '';
+        addMcpServerRow({ url: 'builtin:sapnotes', auth_mode: 'none' });
+        const toastEl = document.getElementById('toast');
+        const saved = (outcome) => () => ({ ok: true, status: 200,
+            json: async () => ({ id: 7, name: 'uiodata', ...outcome }) });
+        const deleted = (h) => () => ({ ok: true, status: 204,
+            headers: { get: (n) => h[n.toLowerCase()] ?? null },
+            json: async () => { throw new Error('no body'); } });
+        answer = saved({ reloaded: true, reload_failed: false });
+        await saveAgent();
+        assert.strictEqual(toastEl.textContent, 'Saved and active.');
+        assert.ok(toastEl.className.includes('success'));
+        answer = saved({ reloaded: false, reload_failed: true });
+        await saveAgent();
+        assert.strictEqual(toastEl.textContent,
+            'Saved, but not active yet: click "Reload agents".');
+        assert.ok(toastEl.className.includes('warning'));
+        answer = saved({});
+        await saveAgent();
+        assert.strictEqual(toastEl.textContent, 'Saved. Click "Reload agents" to activate.');
+        answer = deleted({ 'x-odata-reloaded': 'true', 'x-odata-reload-failed': 'false' });
+        await deleteAgentRow(7, 'uiodata');
+        assert.strictEqual(toastEl.textContent, 'Deleted and active.');
+        answer = deleted({ 'x-odata-reloaded': 'false', 'x-odata-reload-failed': 'true' });
+        await deleteAgentRow(7, 'uiodata');
+        assert.strictEqual(toastEl.textContent,
+            'Deleted, but not active yet: click "Reload agents".');
+        assert.ok(toastEl.className.includes('warning'));
+        answer = deleted({});
+        await deleteAgentRow(7, 'uiodata');
+        assert.strictEqual(toastEl.textContent, 'Deleted. Click "Reload agents" to activate.');
+
+        // 24e. Skills, the orchestrator instructions and the import follow the
+        //      same outcome through the same helper (changeToast / reloadState).
+        const realLoadSkills = loadSkills, realLoadOrch = loadOrchestrator;
+        loadSkills = async () => {};
+        loadOrchestrator = async () => {};
+        document.body.insertAdjacentHTML('beforeend', `
+          <div id="skill-modal"></div><input id="skill-id" value="3">
+          <input id="skill-name" value="triage"><input id="skill-description" value="d">
+          <textarea id="skill-content">c</textarea>
+          <textarea id="orch-instructions">route well</textarea>`);
+        for (const [outcome, text, kind] of [
+            [{ reloaded: true, reload_failed: false }, 'Saved and active.', 'success'],
+            [{ reloaded: false, reload_failed: true },
+             'Saved, but not active yet: click "Reload agents".', 'warning'],
+            [{}, 'Saved. Click "Reload agents" to activate.', 'success'],
+        ]) {
+            answer = saved(outcome);
+            await saveSkill();
+            assert.strictEqual(toastEl.textContent, text, 'skill save');
+            assert.ok(toastEl.className.includes(kind));
+            answer = saved(outcome);
+            await saveOrchestrator();
+            assert.strictEqual(toastEl.textContent, text, 'orchestrator save');
+            assert.ok(toastEl.className.includes(kind));
+        }
+        answer = deleted({ 'x-odata-reloaded': 'true', 'x-odata-reload-failed': 'false' });
+        await deleteSkillRow(3, 'triage');
+        assert.strictEqual(toastEl.textContent, 'Deleted and active.');
+        answer = deleted({ 'x-odata-reloaded': 'false', 'x-odata-reload-failed': 'true' });
+        await deleteSkillRow(3, 'triage');
+        assert.strictEqual(toastEl.textContent,
+            'Deleted, but not active yet: click "Reload agents".');
+        const importOf = async (outcome, warnings) => {
+            answer = () => ({ ok: true, status: 200, json: async () => ({
+                imported: 2, imported_skills: 1, removed: 0, warnings: warnings || [],
+                ...outcome }) });
+            const evt = { target: { value: 'x', files: [{ text: async () => '{"agents": []}' }] } };
+            await importConfig(evt);
+            return toastEl.textContent;
+        };
+        assert.strictEqual(await importOf({ reloaded: true, reload_failed: false }),
+            'Imported 2 agents, 1 skills (removed 0). Active.');
+        assert.ok(toastEl.className.includes('success'));
+        assert.strictEqual(await importOf({ reloaded: false, reload_failed: true }),
+            'Imported 2 agents, 1 skills (removed 0). Not active yet: click "Reload agents".');
+        assert.ok(toastEl.className.includes('warning'));
+        assert.strictEqual(await importOf({ reloaded: false, reload_failed: false }),
+            'Imported 2 agents, 1 skills (removed 0). Reload to activate.');
+        assert.ok((await importOf({ reloaded: true }, ['w1'])).endsWith('Active. 1 warning(s): w1'));
+        assert.ok(toastEl.className.includes('error'), 'a warning still wins');
+        loadSkills = realLoadSkills;
+        loadOrchestrator = realLoadOrch;
+        loadAgents = realLoadAgents;
+    }
+
     // 25. The entry as the live API stored it: load, collect, same entry. The
     //     catalogue here lists by name, the stored entry does not.
     if (STORED_ODATA) {

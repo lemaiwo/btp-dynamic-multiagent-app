@@ -397,19 +397,20 @@ async def test_removing_a_service_from_an_agent_closes_it_for_the_next_run(live,
     assert await execute_code(live.buyer) == "unknown_service"
 
 
-async def test_an_agent_edit_that_leaves_the_odata_entry_alone_does_not_reload(
+async def test_an_agent_edit_that_leaves_the_odata_entry_alone_reloads_once(
     live, client, saved
 ):
+    """Every agent save reloads, once (``tests/test_agent_save_reload.py``)."""
     body = agent_body(odata_server(PR, JOBS, allow_write=True), description="another text")
     r = await client.put(f"{AGENTS}/{saved['id']}", json=body)
     assert r.status_code == 200, r.text
     assert r.json()["description"] == "another text"
-    assert r.json()["reloaded"] is False and r.json()["reload_failed"] is False
-    # The order of the services is not a change either.
+    assert r.json()["reloaded"] is True and r.json()["reload_failed"] is False
+    # Reordering the services is a save like any other.
     body = agent_body(odata_server(JOBS, PR, allow_write=True))
     r = await client.put(f"{AGENTS}/{saved['id']}", json=body)
-    assert r.status_code == 200 and r.json()["reloaded"] is False
-    assert (live.reloads, live.refreshes) == (0, 0)
+    assert r.status_code == 200 and r.json()["reloaded"] is True
+    assert (live.reloads, live.refreshes) == (2, 2)
 
 
 async def test_a_failing_reload_after_an_agent_save_is_said_not_raised(live, client, saved):
@@ -439,14 +440,14 @@ async def test_creating_and_deleting_an_agent_with_an_odata_entry_reloads(live, 
     assert live.reloads == 2 and "second" not in live.registry.build.specialists
 
 
-async def test_an_agent_without_an_odata_entry_never_reloads(live, client, saved):
+async def test_an_agent_without_an_odata_entry_reloads_too(live, client, saved):
     plain = {"url": "builtin:sapnotes", "auth_mode": "none"}
     r = await client.post(AGENTS, json=agent_body(plain, name="notes"))
     assert r.status_code == 201, r.text
-    assert r.json()["reloaded"] is False and r.json()["reload_failed"] is False
+    assert r.json()["reloaded"] is True and r.json()["reload_failed"] is False
     r = await client.delete(f"{AGENTS}/{r.json()['id']}")
-    assert r.status_code == 204 and r.headers["x-odata-reloaded"] == "false"
-    assert live.reloads == 0
+    assert r.status_code == 204 and r.headers["x-odata-reloaded"] == "true"
+    assert live.reloads == 2
 
 
 # ------------------------------- N2: the import and the enabled flag of an agent
@@ -495,15 +496,16 @@ async def test_a_replace_import_that_removes_an_agent_with_an_entry_reloads(live
     assert "buyer" not in live.registry.build.specialists
 
 
-async def test_an_import_that_leaves_every_odata_entry_alone_does_not_reload(live, client, saved):
+async def test_an_import_that_leaves_every_odata_entry_alone_reloads_once(live, client, saved):
+    """An import that carries agents always reloads, once."""
     agents = await exported_agents(client)
     agents[0]["description"] = "another text"
     odata_oauth(agents[0])["services"].reverse()
     plain = agent_body({"url": "builtin:sapnotes", "auth_mode": "none"}, name="notes")
     r = await client.post("/admin/api/import", json={"agents": [*agents, plain]})
     assert r.status_code == 200, r.text
-    assert r.json()["reloaded"] is False and r.json()["reload_failed"] is False
-    assert (live.reloads, live.refreshes) == (0, 0)
+    assert r.json()["reloaded"] is True and r.json()["reload_failed"] is False
+    assert (live.reloads, live.refreshes) == (1, 1)
 
 
 async def test_an_import_reloads_once_when_a_service_and_an_entry_change(live, client, saved):
@@ -556,12 +558,12 @@ async def test_an_import_that_disables_an_agent_with_an_odata_entry_reloads(live
     assert "buyer" not in live.registry.build.specialists
 
 
-async def test_disabling_an_agent_without_an_odata_entry_does_not_reload(live, client, saved):
+async def test_disabling_an_agent_without_an_odata_entry_reloads_once(live, client, saved):
     plain = {"url": "builtin:sapnotes", "auth_mode": "none"}
     r = await client.post(AGENTS, json=agent_body(plain, name="notes"))
     assert r.status_code == 201, r.text
     r = await client.put(
         f"{AGENTS}/{r.json()['id']}", json=agent_body(plain, name="notes", enabled=False)
     )
-    assert r.status_code == 200 and r.json()["reloaded"] is False
-    assert live.reloads == 0
+    assert r.status_code == 200 and r.json()["reloaded"] is True
+    assert live.reloads == 2
