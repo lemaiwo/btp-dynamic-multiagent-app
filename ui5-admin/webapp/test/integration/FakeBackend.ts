@@ -94,7 +94,8 @@ export default class FakeBackend {
      * PUT and DELETE, the agent POST, PUT and DELETE, the import): `none`
      * (no rebuild was due: both false), `reloaded`, or `failed` -- the
      * change is stored, `reload_failed` is true. JSON keys on the answers
-     * with a body, the two `X-OData-...` headers on a 204.
+     * with a body, the two `X-OData-...` headers on a 204. An agent save or
+     * delete always rebuilds (`agentReloadKeys`): `none` answers `reloaded`.
      */
     public reloadOutcome: "none" | "reloaded" | "failed" = "none";
     /** Merged into the answer of `POST import` (`warnings`,
@@ -1655,8 +1656,7 @@ export default class FakeBackend {
 
     /** Both delete endpoints really return 204; the fake must too, or the
      *  journeys would pass against behaviour the server does not have. */
-    private noContent(): Promise<Response> {
-        const outcome = this.reloadKeys();
+    private noContent(outcome = this.reloadKeys()): Promise<Response> {
         return Promise.resolve(new Response(null, {
             status: 204,
             headers: {
@@ -1668,6 +1668,13 @@ export default class FakeBackend {
     /** `reloaded` / `reload_failed` as the reloading routes answer them. */
     private reloadKeys(): { reloaded: boolean; reload_failed: boolean } {
         return { reloaded: this.reloadOutcome === "reloaded", reload_failed: this.reloadOutcome === "failed" };
+    }
+
+    /** The same for an agent create, update or delete, which always reloads
+     *  the running agents: only `failed` is not `reloaded`. */
+    private agentReloadKeys(): { reloaded: boolean; reload_failed: boolean } {
+        const failed = this.reloadOutcome === "failed";
+        return { reloaded: !failed, reload_failed: failed };
     }
 
     /**
@@ -1839,7 +1846,7 @@ export default class FakeBackend {
         if (path === "agents" && method === "POST") {
             const created = { ...this.makeAgent(String(body?.name)), ...body, id: this.nextId++ } as Agent;
             this.agents.push(created);
-            return this.json({ ...created, ...this.reloadKeys() }, 201);
+            return this.json({ ...created, ...this.agentReloadKeys() }, 201);
         }
         if (/^agents\/\d+$/.test(path)) {
             const id = Number(path.split("/")[1]);
@@ -1849,11 +1856,11 @@ export default class FakeBackend {
             }
             if (method === "PUT") {
                 this.agents[index] = { ...this.agents[index], ...body } as Agent;
-                return this.json({ ...this.agents[index], ...this.reloadKeys() });
+                return this.json({ ...this.agents[index], ...this.agentReloadKeys() });
             }
             if (method === "DELETE") {
                 this.agents.splice(index, 1);
-                return this.noContent();
+                return this.noContent(this.agentReloadKeys());
             }
         }
         if (/^agents\/\d+\/run$/.test(path) && method === "POST") {
