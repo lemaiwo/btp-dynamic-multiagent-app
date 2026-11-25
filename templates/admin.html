@@ -134,6 +134,7 @@
         #toast.show { opacity: 1; }
         #toast.error { background: var(--danger); }
         #toast.success { background: var(--success); }
+        #toast.warning { background: var(--warn); }
         .status-badge {
             display: inline-block;
             padding: 2px 8px;
@@ -2301,7 +2302,7 @@ async function saveAgent() {
         return;
     }
     closeAgentModal();
-    toast('Saved. Click "Reload agents" to activate.', 'success');
+    agentChangeToast('Saved', await res.json().catch(() => ({})));
     loadAgents();
 }
 
@@ -2309,8 +2310,26 @@ async function deleteAgentRow(id, name) {
     if (!confirm(`Delete agent "${name}"?`)) return;
     const res = await api(`/agents/${id}`, {method: 'DELETE'});
     if (!res.ok) { toast('Delete failed', 'error'); return; }
-    toast('Deleted. Click "Reload agents" to activate.', 'success');
+    // The 204 has no body: the outcome is in two headers.
+    const header = (n) => (res.headers && res.headers.get && res.headers.get(n)) === 'true';
+    agentChangeToast('Deleted', {
+        reloaded: header('X-OData-Reloaded'),
+        reload_failed: header('X-OData-Reload-Failed'),
+    });
     loadAgents();
+}
+
+// An agent save or delete reloads the running agents on the server, which
+// answers the outcome (`reloaded` / `reload_failed`). Neither key (an older
+// server, or no build running yet) keeps the old advice.
+function agentChangeToast(verb, outcome) {
+    if (outcome && outcome.reload_failed === true) {
+        toast(`${verb}, but not active yet: click "Reload agents".`, 'warning');
+    } else if (outcome && outcome.reloaded === true) {
+        toast(`${verb} and active.`, 'success');
+    } else {
+        toast(`${verb}. Click "Reload agents" to activate.`, 'success');
+    }
 }
 
 async function loadModel() {

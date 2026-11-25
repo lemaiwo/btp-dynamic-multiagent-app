@@ -3493,6 +3493,47 @@ assert.ok(errText({ detail: [{ loc: ['body', 'mcp_servers', 0], type: 'value_err
         global.confirm = () => true;
     }
 
+    // 24d. An agent save or delete reloads the running agents on the server;
+    //      the toast says what the answer says (reloaded / reload_failed, the
+    //      X-OData-* headers of a delete), the old advice when it says neither.
+    {
+        const realLoadAgents = loadAgents;
+        loadAgents = async () => {};
+        global.confirm = () => true;
+        document.getElementById('agent-mcp-servers').innerHTML = '';
+        addMcpServerRow({ url: 'builtin:sapnotes', auth_mode: 'none' });
+        const toastEl = document.getElementById('toast');
+        const saved = (outcome) => () => ({ ok: true, status: 200,
+            json: async () => ({ id: 7, name: 'uiodata', ...outcome }) });
+        const deleted = (h) => () => ({ ok: true, status: 204,
+            headers: { get: (n) => h[n.toLowerCase()] ?? null },
+            json: async () => { throw new Error('no body'); } });
+        answer = saved({ reloaded: true, reload_failed: false });
+        await saveAgent();
+        assert.strictEqual(toastEl.textContent, 'Saved and active.');
+        assert.ok(toastEl.className.includes('success'));
+        answer = saved({ reloaded: false, reload_failed: true });
+        await saveAgent();
+        assert.strictEqual(toastEl.textContent,
+            'Saved, but not active yet: click "Reload agents".');
+        assert.ok(toastEl.className.includes('warning'));
+        answer = saved({});
+        await saveAgent();
+        assert.strictEqual(toastEl.textContent, 'Saved. Click "Reload agents" to activate.');
+        answer = deleted({ 'x-odata-reloaded': 'true', 'x-odata-reload-failed': 'false' });
+        await deleteAgentRow(7, 'uiodata');
+        assert.strictEqual(toastEl.textContent, 'Deleted and active.');
+        answer = deleted({ 'x-odata-reloaded': 'false', 'x-odata-reload-failed': 'true' });
+        await deleteAgentRow(7, 'uiodata');
+        assert.strictEqual(toastEl.textContent,
+            'Deleted, but not active yet: click "Reload agents".');
+        assert.ok(toastEl.className.includes('warning'));
+        answer = deleted({});
+        await deleteAgentRow(7, 'uiodata');
+        assert.strictEqual(toastEl.textContent, 'Deleted. Click "Reload agents" to activate.');
+        loadAgents = realLoadAgents;
+    }
+
     // 25. The entry as the live API stored it: load, collect, same entry. The
     //     catalogue here lists by name, the stored entry does not.
     if (STORED_ODATA) {
