@@ -2394,7 +2394,7 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `same_object` of that pair out (`_curated_pairs`), a drawn `aggregates` leaves it.
   Rebuilt for the changed sources by `reload_after_catalogue_change`, by a `PUT`,
   `DELETE` or Describe of an InA query in use, by an agent save that changes its
-  OData or InA entry (`_reload_for_changed_entry`), after a bundle import, and in the
+  OData or InA entry (`_reload_after_agent_change`), after a bundle import, and in the
   background at startup (`app.py`; a full rebuild first drops sources no enabled agent
   names, `wanted_ina_queries` for InA); failures are logged, never a 500 of the
   save. `embeddings.py` (design addendum l): **the setting** is two columns of the
@@ -3836,20 +3836,26 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   changed, added or gone, the agent removed by `replace`, disabled or
   enabled) (answer keys `reloaded`, `reload_failed`, as for the catalogue
   routes).
-  An agent create, update or delete that changes that agent's
-  `builtin:odata` entry (services, `allow_write`, the entry itself) or its
-  `builtin:bitbucket` entry (the stored block: Commenting, Approving, the
-  builds rule, repositories, branch, workspace, destination; the entry
-  itself), or
-  disables or enables an agent that has one, reloads
-  the same way after the commit (`_entry_signature`,
-  `_reload_for_changed_entry`: a run takes its specialist, and so the pins,
-  from the running build, so an unticked Approving must not wait for
-  somebody to press Reload; `tests/test_bitbucket_reload.py`; the reload reaches only the app instance
-  that served the request: run one instance, or restart all instances after
-  an edit that closes approving or commenting); create and update always answer `reloaded`
-  and `reload_failed` (both `false` for any other save, which does not
-  reload), the 204 of a delete carries the two `X-OData-*` headers.
+  **Every successful agent create, update and delete** (`POST`, `PUT`,
+  `DELETE /admin/api/agents...`) reloads the registry and the chat app the
+  same way, once, after the commit (`_reload_after_agent_change`, through
+  `reload_running_agents`): a run takes its specialist, and so its pins,
+  from the running build, so a new or renamed agent is runnable at once (the
+  web chat offers it right away; before 2.47.0 its run failed with
+  `agent_unavailable` until an admin pressed Reload) and an unticked
+  Approving or Allow writes does not wait for anybody
+  (`tests/test_agent_save_reload.py`, `tests/test_bitbucket_reload.py`).
+  Create and update always answer `reloaded` and `reload_failed`, the 204 of
+  a delete carries the two `X-OData-*` headers; no build yet answers both
+  `false`, a rebuild that fails after the commit is `reload_failed: true`
+  (never a 500; the log names the exception class only), and a refused
+  request (404, 409, 422) reloads nothing. The data catalogue graph is
+  rebuilt only when the agent's catalogue sources changed (the OData and InA
+  part of `_entry_signature` before and after). The reload reaches only the
+  app instance that served the request: run one instance, or restart all
+  instances after an edit that closes approving, commenting or writing.
+  Skill saves, the orchestrator instructions, the model change and the
+  bundle import keep their own rules (above).
   `GET /admin/api/credential-health` lists a
   `builtin:odata` entry once per attached service (`service`,
   `service_enabled`, `destination`, `user_context`, `state`: `resolvable` |
@@ -3961,8 +3967,13 @@ SAP AI Core's Generative AI Hub is the LLM provider.
 - `agents/cf_api.py` — CF v3 API restart helper (optional, password grant)
 - `templates/admin.html` — Admin UI (single-page, vanilla JS); attaches
   catalogue services to an agent (checkbox list and Allow writes), the
-  catalogue itself is edited only in `ui5-admin/`; it does not read
-  `reloaded` / `reload_failed`, so a failed reload is not shown there. It
+  catalogue itself is edited only in `ui5-admin/`. An agent save or delete
+  reads the outcome (`reloaded` / `reload_failed`, the `X-OData-*` headers
+  of a delete): "Saved and active." / "Deleted and active.", a warning toast
+  "Saved, but not active yet: click "Reload agents"." for a failed reload,
+  the old "Click "Reload agents" to activate." when the answer says neither
+  (`agentChangeToast`); every other save on this page does not read the two
+  keys, so a failed reload there is not shown. It
   offers `builtin:sharepoint` in destination mode only, with the views
   edited as JSON and the three pins sent through `DESTINATION_EXACT_KEYS`
   (as typed, never trimmed). A server stored on an auth mode this page does
@@ -4520,7 +4531,15 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   local-dev browser OAuth of `agents/shared.py` to `agents/local_oauth.py` unchanged: no new
   resource, role, table or column (HANA schema generation unchanged, still 12);
   `NEXUS_LANDSCAPE` is not in the descriptor. Ran on a landscape for the Bedrock route
-  (streamed calls are recorded with token counts); the OpenAI-style route is unit-tested only
+  (streamed calls are recorded with token counts); the OpenAI-style route is unit-tested only;
+  2.47.0 makes every successful agent create, update and delete through the admin API reload
+  the running registry and chat app of the app instance that served the request
+  (`_reload_after_agent_change`; before, only a changed data or review entry did, and a new
+  agent picked in the web chat failed with `agent_unavailable` until an admin pressed
+  Reload), and the classic admin's agent toasts say whether the agent is active: no new
+  resource, environment variable, role, table or column (HANA schema generation unchanged,
+  still 12); skill saves, the orchestrator, the model change and the bundle imports reload
+  as before
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets
