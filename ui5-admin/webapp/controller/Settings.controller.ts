@@ -186,7 +186,7 @@ export default class Settings extends BaseController {
             this.getAdminService().setOrchestrator(instructions),
             "Could not save the orchestrator instructions."
         );
-        if (saved) {
+        if (saved && !this.warnIfNotLive(saved, "reloadFailedOrchestratorSaved")) {
             MessageToast.show(this.text("instructionsSaved"));
         }
     }

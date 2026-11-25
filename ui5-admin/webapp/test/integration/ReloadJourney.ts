@@ -1,7 +1,11 @@
 import opaTest from "sap/ui/test/opaQunit";
 import Opa5 from "sap/ui/test/Opa5";
 import Press from "sap/ui/test/actions/Press";
-import Common from "./pages/Common";
+import type UI5Element from "sap/ui/core/Element";
+import type Control from "sap/ui/core/Control";
+import type Dialog from "sap/m/Dialog";
+import Common, { backend } from "./pages/Common";
+import { buttonsOf, messageOf } from "./pages/ODataList";
 
 Opa5.extendConfig({ viewNamespace: "com.agent.admin.view.", autoWait: true });
 
@@ -36,5 +40,30 @@ opaTest("reload succeeds and reports success without a session-expired dialog", 
         }
     });
 
+    Then.iStopTheApp();
+});
+
+opaTest("an orchestrator save the running agents did not get says so in a box that stays", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("settings");
+    When.waitFor({
+        id: "saveOrchestratorButton",
+        viewName: "Settings",
+        actions: function (element: UI5Element | null) {
+            backend.reloadOutcome = "failed";
+            new Press().executeOn(element as Control);
+        }
+    });
+    Then.waitFor({
+        controlType: "sap.m.Dialog",
+        searchOpenDialogs: true,
+        matchers: function (dialog: UI5Element) { return (dialog as Dialog).getType() === "Message"; },
+        success: function (dialogs: UI5Element[]) {
+            Opa5.assert.strictEqual(messageOf(dialogs[0]), "The orchestrator instructions were saved, but the running "
+                + "agents could not be reloaded: they still use the previous configuration. Go to Settings and "
+                + "press Reload to make the change active.");
+            Opa5.assert.deepEqual(buttonsOf(dialogs[0]), ["OK"]);
+            new Press().executeOn((dialogs[0] as Dialog).getButtons()[0]);
+        }
+    });
     Then.iStopTheApp();
 });

@@ -347,9 +347,10 @@ export interface InvokeLimits {
  * reload works. Never both; both false (or absent, on an older server and on
  * the routes that report none): no rebuild was due.
  *
- * JSON keys on `PUT odata/services/{name}`, `POST agents`, `PUT agents/{id}`
- * and `POST import`; the headers `X-OData-Reloaded` / `X-OData-Reload-Failed`
- * on the 204 of `DELETE odata/services/{name}` and `DELETE agents/{id}`.
+ * JSON keys on `PUT odata/services/{name}`, `POST agents`, `PUT agents/{id}`,
+ * `POST skills`, `PUT skills/{id}`, `PUT orchestrator` and `POST import`; the
+ * headers `X-OData-Reloaded` / `X-OData-Reload-Failed` on the 204 of
+ * `DELETE odata/services/{name}`, `DELETE agents/{id}` and `DELETE skills/{id}`.
  */
 export interface ReloadOutcome {
     reloaded?: boolean;
@@ -369,6 +370,8 @@ export interface Agent extends AgentInput {
 
 /** What POST /admin/api/agents and PUT /admin/api/agents/{id} answer. */
 export type AgentSaved = Agent & ReloadOutcome;
+/** What a skill save answers: the skill plus the reload outcome. */
+export type SkillSaved = Skill & ReloadOutcome;
 
 export interface SkillInput {
     name: string;
@@ -519,6 +522,9 @@ export interface ModelInfo {
 export interface OrchestratorInfo {
     instructions: string;
 }
+
+/** What `PUT orchestrator` answers: the instructions plus the reload outcome. */
+export type OrchestratorSaved = OrchestratorInfo & ReloadOutcome;
 
 export interface ImportPayload {
     orchestrator_instructions?: string | null;

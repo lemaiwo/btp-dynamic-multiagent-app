@@ -94,8 +94,10 @@ export default class FakeBackend {
      * PUT and DELETE, the agent POST, PUT and DELETE, the import): `none`
      * (no rebuild was due: both false), `reloaded`, or `failed` -- the
      * change is stored, `reload_failed` is true. JSON keys on the answers
-     * with a body, the two `X-OData-...` headers on a 204. An agent save or
-     * delete always rebuilds (`agentReloadKeys`): `none` answers `reloaded`.
+     * with a body, the two `X-OData-...` headers on a 204. An agent or skill
+     * save or delete, the orchestrator save and an import of agents, skills
+     * or instructions always rebuild (`saveReloadKeys`): `none` answers
+     * `reloaded`.
      */
     public reloadOutcome: "none" | "reloaded" | "failed" = "none";
     /** Merged into the answer of `POST import` (`warnings`,
@@ -1670,9 +1672,10 @@ export default class FakeBackend {
         return { reloaded: this.reloadOutcome === "reloaded", reload_failed: this.reloadOutcome === "failed" };
     }
 
-    /** The same for an agent create, update or delete, which always reloads
-     *  the running agents: only `failed` is not `reloaded`. */
-    private agentReloadKeys(): { reloaded: boolean; reload_failed: boolean } {
+    /** The same for an agent or skill create, update or delete, the
+     *  orchestrator save and an import, which always reload the running
+     *  agents: only `failed` is not `reloaded`. */
+    private saveReloadKeys(): { reloaded: boolean; reload_failed: boolean } {
         const failed = this.reloadOutcome === "failed";
         return { reloaded: !failed, reload_failed: failed };
     }
@@ -1846,7 +1849,7 @@ export default class FakeBackend {
         if (path === "agents" && method === "POST") {
             const created = { ...this.makeAgent(String(body?.name)), ...body, id: this.nextId++ } as Agent;
             this.agents.push(created);
-            return this.json({ ...created, ...this.agentReloadKeys() }, 201);
+            return this.json({ ...created, ...this.saveReloadKeys() }, 201);
         }
         if (/^agents\/\d+$/.test(path)) {
             const id = Number(path.split("/")[1]);
@@ -1856,11 +1859,11 @@ export default class FakeBackend {
             }
             if (method === "PUT") {
                 this.agents[index] = { ...this.agents[index], ...body } as Agent;
-                return this.json({ ...this.agents[index], ...this.agentReloadKeys() });
+                return this.json({ ...this.agents[index], ...this.saveReloadKeys() });
             }
             if (method === "DELETE") {
                 this.agents.splice(index, 1);
-                return this.noContent(this.agentReloadKeys());
+                return this.noContent(this.saveReloadKeys());
             }
         }
         if (/^agents\/\d+\/run$/.test(path) && method === "POST") {
@@ -1888,7 +1891,7 @@ export default class FakeBackend {
         if (path === "skills" && method === "POST") {
             const created = { ...body, id: this.nextId++, created_at: null, updated_at: null } as Skill;
             this.skills.push(created);
-            return this.json(created, 201);
+            return this.json({ ...created, ...this.saveReloadKeys() }, 201);
         }
         if (/^skills\/\d+$/.test(path)) {
             const id = Number(path.split("/")[1]);
@@ -1898,11 +1901,11 @@ export default class FakeBackend {
             }
             if (method === "PUT") {
                 this.skills[index] = { ...this.skills[index], ...body } as Skill;
-                return this.json(this.skills[index]);
+                return this.json({ ...this.skills[index], ...this.saveReloadKeys() });
             }
             if (method === "DELETE") {
                 this.skills.splice(index, 1);
-                return this.noContent();
+                return this.noContent(this.saveReloadKeys());
             }
         }
         if (path === "runs" && method === "GET") {
@@ -2020,7 +2023,7 @@ export default class FakeBackend {
             return this.json({ instructions: "Delegate wisely." });
         }
         if (path === "orchestrator" && method === "PUT") {
-            return this.json({ instructions: String(body?.instructions) });
+            return this.json({ instructions: String(body?.instructions), ...this.saveReloadKeys() });
         }
         if (path === "export") {
             return this.json({ agents: [], skills: [], orchestrator_instructions: "", replace: false });
@@ -2030,7 +2033,7 @@ export default class FakeBackend {
             // the catalogue comes from `importAnswer`.
             return this.json({
                 status: "imported", removed_odata_service_names: [], odata_identity_changes: [], warnings: [],
-                ...this.importAnswer, ...this.reloadKeys()
+                ...this.importAnswer, ...this.saveReloadKeys()
             });
         }
         // --- odata ---
