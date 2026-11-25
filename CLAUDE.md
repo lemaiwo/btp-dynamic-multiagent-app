@@ -3828,14 +3828,17 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `removed_odata_service_names` and `odata_identity_changes`. The HTTP
   import is all-or-nothing (one transaction, nothing written on any
   error); `scripts/import_bundle.py` writes agent by agent, skips a refused
-  one with a `FAIL agent <name>: <rule>` line and exits 1. The import
-  does not reload the registry for agents, skills or workflows, but it does
-  when it created, changed or removed a catalogue service that is in use,
-  or changed what an agent's `builtin:odata` or `builtin:bitbucket` entry
-  allows (the entry
-  changed, added or gone, the agent removed by `replace`, disabled or
-  enabled) (answer keys `reloaded`, `reload_failed`, as for the catalogue
-  routes).
+  one with a `FAIL agent <name>: <rule>` line and exits 1; it runs outside
+  the app and cannot reload it, so a running app needs Reload (or a
+  restart) after it. The HTTP import reloads the registry and the chat app
+  at most once after the commit (answer keys `reloaded`, `reload_failed`, as
+  for the catalogue routes): when it created, changed or removed a
+  catalogue service or InA query that is in use, and otherwise whenever it
+  carried agents, skills or orchestrator instructions or removed an agent
+  or a skill (carrying is enough: the upserts do not say whether a row
+  changed). A workflow-only import does not reload: a workflow run reads its
+  definition from the database when it starts and takes only its agents
+  from the build (`tests/test_agent_save_reload.py`).
   **Every successful agent create, update and delete** (`POST`, `PUT`,
   `DELETE /admin/api/agents...`) reloads the registry and the chat app the
   same way, once, after the commit (`_reload_after_agent_change`, through
@@ -3854,8 +3857,15 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   part of `_entry_signature` before and after). The reload reaches only the
   app instance that served the request: run one instance, or restart all
   instances after an edit that closes approving, commenting or writing.
-  Skill saves, the orchestrator instructions, the model change and the
-  bundle import keep their own rules (above).
+  **Every successful skill create, update and delete** (`/admin/api/skills...`;
+  a rename or delete also rewrites the agents that attach the skill: still
+  one reload) and the **orchestrator instructions save** (`PUT
+  /admin/api/orchestrator`, which answers `{instructions, reloaded,
+  reload_failed}`) reload the same way, with the same keys and, for the 204
+  of a skill delete, the same two `X-OData-*` headers (`_reload_headers`).
+  The model change (`PUT /admin/api/model`) and a model provider save
+  reload as before. Workflow CRUD does not reload (definitions are read at
+  run time), nor do the catalogue routes for a service or query nobody uses.
   `GET /admin/api/credential-health` lists a
   `builtin:odata` entry once per attached service (`service`,
   `service_enabled`, `destination`, `user_context`, `state`: `resolvable` |
@@ -3972,8 +3982,12 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   of a delete): "Saved and active." / "Deleted and active.", a warning toast
   "Saved, but not active yet: click "Reload agents"." for a failed reload,
   the old "Click "Reload agents" to activate." when the answer says neither
-  (`agentChangeToast`); every other save on this page does not read the two
-  keys, so a failed reload there is not shown. It
+  (`changeToast`, `reloadState`, `reloadOutcomeOfHeaders`); the skill save
+  and delete and the orchestrator save use the same helper, and the import
+  toast ends in "Active.", "Not active yet: click "Reload agents"." (a
+  warning) or "Reload to activate." (warnings from the server still make it
+  an error toast). Every other save on this page does not read the two
+  keys. It
   offers `builtin:sharepoint` in destination mode only, with the views
   edited as JSON and the three pins sent through `DESTINATION_EXACT_KEYS`
   (as typed, never trimmed). A server stored on an auth mode this page does
@@ -4110,7 +4124,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     destination, service path or OData version of a service in use is asked
     about; a save is a GET plus a `PUT` with `expected_updated_at`.
   - A save, delete or import whose answer says `reload_failed` (JSON key, or
-    the `X-OData-Reload-Failed` header of a 204) shows a warning that stays
+    the `X-OData-Reload-Failed` header of a 204; agents, skills, the
+    orchestrator instructions, OData services, InA queries, the Settings
+    import) shows a warning that stays
     ("Saved, but not active yet": press Reload in Settings), through
     `BaseController.warnIfNotLive`; the two outcome keys are never sent back
     in a body
@@ -4532,14 +4548,16 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   resource, role, table or column (HANA schema generation unchanged, still 12);
   `NEXUS_LANDSCAPE` is not in the descriptor. Ran on a landscape for the Bedrock route
   (streamed calls are recorded with token counts); the OpenAI-style route is unit-tested only;
-  2.47.0 makes every successful agent create, update and delete through the admin API reload
-  the running registry and chat app of the app instance that served the request
+  2.47.0 makes every admin save the build reads reload the running registry and chat app of
+  the app instance that served the request: every successful agent create, update and delete
   (`_reload_after_agent_change`; before, only a changed data or review entry did, and a new
   agent picked in the web chat failed with `agent_unavailable` until an admin pressed
-  Reload), and the classic admin's agent toasts say whether the agent is active: no new
-  resource, environment variable, role, table or column (HANA schema generation unchanged,
-  still 12); skill saves, the orchestrator, the model change and the bundle imports reload
-  as before
+  Reload), every skill create, update and delete, the orchestrator instructions save, and an
+  HTTP bundle import that carries agents, skills or orchestrator instructions or removes an
+  agent or a skill (a workflow-only import still does not); both admin UIs say whether the
+  change is active (the classic admin's toasts; the UI5 admin's box for a failed reload). No
+  new resource, environment variable, role, table or column (HANA schema generation
+  unchanged, still 12); `scripts/import_bundle.py` still needs a Reload or restart after it
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets
