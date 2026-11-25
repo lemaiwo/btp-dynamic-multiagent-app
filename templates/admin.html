@@ -703,6 +703,36 @@ function toast(msg, kind = '') {
     setTimeout(() => { t.className = ''; }, 3500);
 }
 
+// A save of an agent, a skill, the orchestrator instructions or an import
+// reloads the running agents on the server, which answers the outcome:
+// `reloaded` / `reload_failed` in the JSON, or the X-OData-Reloaded /
+// X-OData-Reload-Failed headers of a 204. 'active', 'failed' or 'unknown'
+// (neither: no build running yet, nothing to reload, or an older server).
+function reloadState(outcome) {
+    if (outcome && outcome.reload_failed === true) return 'failed';
+    if (outcome && outcome.reloaded === true) return 'active';
+    return 'unknown';
+}
+
+// The outcome of a 204, which has no body.
+function reloadOutcomeOfHeaders(res) {
+    const header = (n) => (res.headers && res.headers.get && res.headers.get(n)) === 'true';
+    return { reloaded: header('X-OData-Reloaded'), reload_failed: header('X-OData-Reload-Failed') };
+}
+
+// "Saved and active.", a warning when the reload failed, the old advice when
+// the answer says neither.
+function changeToast(verb, outcome) {
+    const state = reloadState(outcome);
+    if (state === 'failed') {
+        toast(`${verb}, but not active yet: click "Reload agents".`, 'warning');
+    } else if (state === 'active') {
+        toast(`${verb} and active.`, 'success');
+    } else {
+        toast(`${verb}. Click "Reload agents" to activate.`, 'success');
+    }
+}
+
 // Render an error body as text. FastAPI returns `detail` as a string for the
 // HTTPExceptions we raise, but as a LIST OF OBJECTS ({loc, msg, ...}) for any
 // pydantic body-validation failure -- string-concatenating that yields
@@ -1311,7 +1341,7 @@ async function saveSkill() {
         return;
     }
     closeSkillModal();
-    toast('Saved. Click "Reload agents" to activate.', 'success');
+    changeToast('Saved', await res.json().catch(() => ({})));
     loadSkills();
     loadAgents();
 }
@@ -1320,7 +1350,7 @@ async function deleteSkillRow(id, name) {
     if (!confirm(`Delete skill "${name}"? It will be detached from all agents that use it.`)) return;
     const res = await api(`/skills/${id}`, {method: 'DELETE'});
     if (!res.ok) { toast('Delete failed', 'error'); return; }
-    toast('Deleted. Click "Reload agents" to activate.', 'success');
+    changeToast('Deleted', reloadOutcomeOfHeaders(res));
     loadSkills();
     loadAgents();
 }
@@ -2302,7 +2332,7 @@ async function saveAgent() {
         return;
     }
     closeAgentModal();
-    agentChangeToast('Saved', await res.json().catch(() => ({})));
+    changeToast('Saved', await res.json().catch(() => ({})));
     loadAgents();
 }
 
@@ -2310,26 +2340,8 @@ async function deleteAgentRow(id, name) {
     if (!confirm(`Delete agent "${name}"?`)) return;
     const res = await api(`/agents/${id}`, {method: 'DELETE'});
     if (!res.ok) { toast('Delete failed', 'error'); return; }
-    // The 204 has no body: the outcome is in two headers.
-    const header = (n) => (res.headers && res.headers.get && res.headers.get(n)) === 'true';
-    agentChangeToast('Deleted', {
-        reloaded: header('X-OData-Reloaded'),
-        reload_failed: header('X-OData-Reload-Failed'),
-    });
+    changeToast('Deleted', reloadOutcomeOfHeaders(res));
     loadAgents();
-}
-
-// An agent save or delete reloads the running agents on the server, which
-// answers the outcome (`reloaded` / `reload_failed`). Neither key (an older
-// server, or no build running yet) keeps the old advice.
-function agentChangeToast(verb, outcome) {
-    if (outcome && outcome.reload_failed === true) {
-        toast(`${verb}, but not active yet: click "Reload agents".`, 'warning');
-    } else if (outcome && outcome.reloaded === true) {
-        toast(`${verb} and active.`, 'success');
-    } else {
-        toast(`${verb}. Click "Reload agents" to activate.`, 'success');
-    }
 }
 
 async function loadModel() {
@@ -2365,7 +2377,7 @@ async function saveOrchestrator() {
     const instructions = document.getElementById('orch-instructions').value;
     const res = await api('/orchestrator', {method: 'PUT', body: JSON.stringify({instructions})});
     if (!res.ok) { toast('Save failed', 'error'); return; }
-    toast('Saved. Click "Reload agents" to activate.', 'success');
+    changeToast('Saved', await res.json().catch(() => ({})));
 }
 
 async function reloadRegistry() {
@@ -2418,8 +2430,12 @@ async function importConfig(evt) {
     const warned = (data.warnings || []).length
         ? ` ${data.warnings.length} warning(s): ${data.warnings.join(' ')}`
         : '';
-    toast(`Imported ${data.imported} agents, ${data.imported_skills || 0} skills (removed ${data.removed}). Reload to activate.${warned}`,
-          warned ? 'error' : 'success');
+    const state = reloadState(data);
+    const tail = state === 'active' ? 'Active.'
+        : state === 'failed' ? 'Not active yet: click "Reload agents".'
+        : 'Reload to activate.';
+    toast(`Imported ${data.imported} agents, ${data.imported_skills || 0} skills (removed ${data.removed}). ${tail}${warned}`,
+          warned ? 'error' : state === 'failed' ? 'warning' : 'success');
     loadSkills();
     loadAgents();
     loadOrchestrator();
