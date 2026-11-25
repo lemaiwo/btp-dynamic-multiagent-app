@@ -4286,6 +4286,12 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     record of the systems it was agreed for (`confirmedAll`,
     `hanaEntry.selectAllNewlyAllowed`): an answer to one question never
     counts for the other. `hanaEntry.qunit.ts`, `AgentHanaJourney.ts`
+  - Karma runs in a fixed desktop window (`karma.conf.js`, launcher
+    `ChromeHeadlessDesktop`, 1440x900): at headless Chrome's default 800x600
+    what fits in an `OverflowToolbar` depends on the machine's fonts, and on
+    the CI runner a toolbar button a journey presses was in the overflow menu;
+    one such OPA timeout also fails every journey after it (the app is never
+    torn down).
   - OPA convention: a `Select` is driven by `setSelectedKey` plus
     `fireChange` on the control (a `MultiComboBox` by `setSelectedKeys`),
     never by opening its picker: a picker opened by one journey was destroyed
