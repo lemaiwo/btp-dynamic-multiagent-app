@@ -3919,16 +3919,24 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   the instance may call the API this way) runs as the agent's
   `run_as_principal` like a scheduled run (`run_as`, credential preflight
   under that principal, `run_as` falling back to the base URL the request
-  bound when `PUBLIC_BASE_URL` / `A2A_PUBLIC_URL` are unset; no base URL at
+  bound when `PUBLIC_BASE_URL` / `A2A_PUBLIC_URL` are unset, which helps off
+  Cloud Foundry only: on CF the middleware binds nothing else; no base URL at
   all fails the run with `run_failed`), with NO bearer token bound
   (`_technical_identity`): `jwt` servers and `user_context` destinations /
   `builtin:odata` services refuse rather than receive the client's own
-  token. An agent without a run-as principal is the same 404 at the POST.
-  The row stays the client's (`created_by` the client id; all bindings and
+  token. **Opt-in per agent**: a technical caller needs `expose_api` ("Available
+  via API", the admin's existing consent to runs as the run-as principal) AND
+  a non-blank `run_as_principal` on top of everything a user's call needs
+  (`_technical_run_as`); otherwise the same 404 at the POST, before a slot is
+  taken or the body read. Both are read again when the run starts: withdrawn
+  in between, the run fails with `credential_required` and nothing runs.
+  `expose_api` plays no role for a user caller. **XSUAA only**: an OIDC
+  deployment's client token (`azp`; `is_client_token` reads only XSUAA claims) stays a
+  user caller. The row stays the client's (`created_by` the client id; all bindings and
   keys share it, so they can read each other's runs), its activity carries
   the note `RUN_AS_NOTE` (names nobody), and the one-run-per-(principal,
   agent) 409 does not apply to it (a fresh slot key per call), the instance
-  cap does. **Attachments are in
+  cap does (there is no separate sub-cap for technical slots). **Attachments are in
   memory for the run only**: the multipart body is read by the module's own
   reader (Starlette's spools a part over 1 MB to disk), never stored or
   logged, the activity gets `{name, media_type, size}` per file; the media
@@ -4586,8 +4594,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   grants the instance's own client `invoke` (top-level `authorities`; the deploy updates the
   XSUAA instance, and every binding and service key of it may then call the API), and such a
   caller's run is the agent's `run_as_principal`'s with no bearer token bound, never two
-  calls held off by the per-user 409, still under `INVOKE_MAX_CONCURRENT`; an agent without
-  a run-as principal is 404 to it. A user's call is unchanged. No new environment variable,
+  calls held off by the per-user 409, still under `INVOKE_MAX_CONCURRENT`; the agent must
+  also have `expose_api` and a run-as principal (both re-read when the run starts), else it is
+  404 to such a caller; XSUAA client tokens only. The admin UIs' invoke hint says so. A
+  user's call is unchanged (`expose_api` plays no role for it). No new environment variable,
   role, role collection, table or column (HANA schema generation unchanged, still 12)
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
@@ -4830,8 +4840,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
    written -> `GET /api/invoke/runs/{run_id}` answers result, the OData
    writes of the run (audit rows by `run_id`), text, activity and error to
    that caller only. An application client without a user (client
-   credentials) takes a slot of its own per call and runs under the agent's
-   `run_as_principal` with no bearer token bound
+   credentials) needs the agent's `expose_api` and `run_as_principal` too,
+   takes a slot of its own per call and runs under that `run_as_principal`
+   with no bearer token bound
 9. `POST /chat/api/conversations/{id}/messages` (the web chat, as the
    signed-in user): the conversation is locked idle→running -> uploads are
    read, sniffed and stored -> user and assistant rows -> the orchestrator
