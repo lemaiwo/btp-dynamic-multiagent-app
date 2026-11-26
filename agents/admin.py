@@ -145,6 +145,7 @@ from agents.db import (
     upsert_workflow,
     validate_api_slug,
     validate_odata_service,
+    workflow_runs_usage,
 )
 
 # --- deep agents ---
@@ -2625,7 +2626,10 @@ async def api_list_workflow_runs(
 ) -> list[dict[str, Any]]:
     async with SessionLocal() as session:
         rows = await list_workflow_runs(session, limit=limit, workflow_id=workflow_id)
-        return [r.to_dict() for r in rows]
+        # The token total of each run, summed from its step rows in one
+        # grouped statement for the whole list.
+        usage = await workflow_runs_usage(session, [r.id for r in rows])
+        return [{**r.to_dict(), "usage": usage.get(r.id)} for r in rows]
 
 
 @router.get("/api/workflow-runs/{run_id}", dependencies=[Depends(require_admin)])
@@ -2636,8 +2640,9 @@ async def api_get_workflow_run(run_id: str) -> dict[str, Any]:
             raise HTTPException(status_code=404, detail="Run not found")
         items = await list_item_runs(session, run_id)
         steps = await list_step_runs(session, run_id)
+        usage = await workflow_runs_usage(session, [run_id])
         return {
-            "run": row.to_dict(),
+            "run": {**row.to_dict(), "usage": usage.get(run_id)},
             "items": [i.to_dict() for i in items],
             "steps": [s.to_dict() for s in steps],
         }

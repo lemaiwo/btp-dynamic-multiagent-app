@@ -1457,6 +1457,40 @@ class WorkflowStep(Base):
         }
 
 
+def usage_answer(
+    input_tokens: int | None,
+    output_tokens: int | None,
+    cache_read_tokens: int | None,
+    requests: int | None,
+) -> dict[str, int] | None:
+    """The ``usage`` the admin run APIs answer, one shape for every run kind
+    (``job_runs``, ``workflow_step_runs`` and a workflow run's summed total):
+    ``None`` while nothing is recorded (``input_tokens`` NULL), else exactly
+    the five counts, ``total_tokens`` being input plus output."""
+    if input_tokens is None:
+        return None
+    inp = int(input_tokens)
+    out = int(output_tokens or 0)
+    return {
+        "input_tokens": inp,
+        "output_tokens": out,
+        "cache_read_tokens": int(cache_read_tokens or 0),
+        "total_tokens": inp + out,
+        "requests": int(requests or 0),
+    }
+
+
+def _write_usage(row: Any, usage: dict[str, int] | None) -> None:
+    """Set a run row's four usage columns from ``usage``; ``None`` leaves
+    them as they are (NULL on a new row)."""
+    if usage is None:
+        return
+    row.input_tokens = int(usage.get("input_tokens") or 0)
+    row.output_tokens = int(usage.get("output_tokens") or 0)
+    row.cache_read_tokens = int(usage.get("cache_read_tokens") or 0)
+    row.requests = int(usage.get("requests") or 0)
+
+
 class WorkflowRun(Base):
     """One execution of a workflow.
 
@@ -1581,6 +1615,20 @@ class WorkflowStepRun(Base):
     finished_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # What an agent step's run spent (its own RunUsage, delegations and deep
+    # sub-agents included). NULL for a deterministic step kind, a skipped or
+    # blocked step, one that never reached the model, and older rows. The
+    # workflow run's total is summed from these when read
+    # (``workflow_runs_usage``), never stored. HANA schema generation 13.
+    input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cache_read_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    requests: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    @property
+    def usage(self) -> dict[str, int] | None:
+        return usage_answer(self.input_tokens, self.output_tokens,
+                            self.cache_read_tokens, self.requests)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1595,6 +1643,7 @@ class WorkflowStepRun(Base):
             "error": self.error,
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "finished_at": self.finished_at.isoformat() if self.finished_at else None,
+            "usage": self.usage,
         }
 
 
@@ -1638,6 +1687,21 @@ class JobRun(Base):
     scheduler_schedule_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     scheduler_run_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     scheduler_host: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The run's token consumption (the whole run tree: delegated peers and
+    # deep sub-agents share the run's RunUsage), written once when the run
+    # ends. NULL: an older row, a run still in flight, or one that never
+    # reached the model. Nullable, so HANA adds them to a table with rows
+    # without a server_default (schema generation 13).
+    input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cache_read_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    requests: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    @property
+    def usage(self) -> dict[str, int] | None:
+        """The admin run API's ``usage`` (see ``usage_answer``)."""
+        return usage_answer(self.input_tokens, self.output_tokens,
+                            self.cache_read_tokens, self.requests)
 
     @property
     def report(self) -> dict[str, Any] | None:
@@ -1672,6 +1736,7 @@ class JobRun(Base):
             "error": self.error,
             "notified": bool(self.notified),
             "created_by": self.created_by,
+            "usage": self.usage,
         }
 
 
@@ -2190,6 +2255,15 @@ async def _create_and_migrate() -> None:
             conn, "orchestrator_config", "embeddings_enabled", "INTEGER NOT NULL DEFAULT 1"
         )
         await _ensure_column(conn, "orchestrator_config", "embedding_model", "VARCHAR(128)")
+        # A run's token consumption (2.49.0).
+        await _ensure_column(conn, "job_runs", "input_tokens", "INTEGER")
+        await _ensure_column(conn, "job_runs", "output_tokens", "INTEGER")
+        await _ensure_column(conn, "job_runs", "cache_read_tokens", "INTEGER")
+        await _ensure_column(conn, "job_runs", "requests", "INTEGER")
+        await _ensure_column(conn, "workflow_step_runs", "input_tokens", "INTEGER")
+        await _ensure_column(conn, "workflow_step_runs", "output_tokens", "INTEGER")
+        await _ensure_column(conn, "workflow_step_runs", "cache_read_tokens", "INTEGER")
+        await _ensure_column(conn, "workflow_step_runs", "requests", "INTEGER")
         await _backfill_ide_revisions(conn)
         await _resync_ide_revisions(conn)
         # create_all only creates indexes together with a new table; an
@@ -5012,15 +5086,56 @@ async def finish_step_run(
     status: str,
     output: str | None = None,
     error: str | None = None,
+    usage: dict[str, int] | None = None,
 ) -> None:
+    """Write a step's outcome. ``usage``: its token counts, or ``None`` to
+    leave the columns NULL (a deterministic step, nothing spent)."""
     row = await session.get(WorkflowStepRun, step_run_id)
     if row is None:
         return
     row.status = status
     row.output = output
     row.error = error
+    _write_usage(row, usage)
     row.finished_at = datetime.now(timezone.utc)
     await session.commit()
+
+
+# IN lists are sent in chunks of at most this many ids (HANA and Postgres
+# both take far more; this keeps one statement's bind list modest).
+_USAGE_ID_BATCH = 500
+
+
+async def workflow_runs_usage(
+    session: AsyncSession, run_ids: list[str]
+) -> dict[str, dict[str, int] | None]:
+    """The token total of each workflow run, summed from its step rows: one
+    grouped statement per ``_USAGE_ID_BATCH`` ids, never one per run.
+
+    Only steps with recorded usage count (``input_tokens IS NOT NULL``); a
+    run none of whose steps has any answers ``None``, as does an id that is
+    not a run. A live run answers what its finished steps used so far.
+    Integer columns only: no Text compare (HANA).
+    """
+    totals: dict[str, dict[str, int] | None] = dict.fromkeys(run_ids)
+    ids = list(dict.fromkeys(run_ids))
+    for start in range(0, len(ids), _USAGE_ID_BATCH):
+        chunk = ids[start:start + _USAGE_ID_BATCH]
+        rows = await session.execute(
+            select(
+                WorkflowStepRun.workflow_run_id,
+                func.sum(WorkflowStepRun.input_tokens),
+                func.sum(WorkflowStepRun.output_tokens),
+                func.sum(WorkflowStepRun.cache_read_tokens),
+                func.sum(WorkflowStepRun.requests),
+            )
+            .where(WorkflowStepRun.workflow_run_id.in_(chunk),
+                   WorkflowStepRun.input_tokens.is_not(None))
+            .group_by(WorkflowStepRun.workflow_run_id)
+        )
+        for run_id, inp, out, cache, requests in rows.all():
+            totals[run_id] = usage_answer(inp, out, cache, requests)
+    return totals
 
 
 async def get_workflow_run(session: AsyncSession, run_id: str) -> WorkflowRun | None:
@@ -5461,7 +5576,11 @@ async def finish_job_run(
     report: dict[str, Any] | None = None,
     error: str | None = None,
     activity: dict[str, Any] | None = None,
+    usage: dict[str, int] | None = None,
 ) -> None:
+    """Write a run's outcome. ``usage``: the run's token counts
+    (``input_tokens``, ``output_tokens``, ``cache_read_tokens``,
+    ``requests``), or ``None`` to leave the columns NULL."""
     row = await session.get(JobRun, run_id)
     if row is None:
         return
@@ -5471,6 +5590,7 @@ async def finish_job_run(
     row.error = error
     if activity is not None:
         row.activity_json = json.dumps(activity)
+    _write_usage(row, usage)
     row.finished_at = datetime.now(timezone.utc)
     await session.commit()
 

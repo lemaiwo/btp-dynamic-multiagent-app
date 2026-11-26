@@ -273,3 +273,10 @@ html.sapUiTheme-sap_horizon .odataFieldConfirm.sapMFlexBox {
     touch-action: none;
     cursor: grab;
 }
+
+/* Second line of a table cell (the Runs table's token split): the theme's
+   label colour, a step smaller than the value above it. */
+.agentAdminMutedText {
+    color: var(--sapContent_LabelColor);
+    font-size: 0.75rem;
+}

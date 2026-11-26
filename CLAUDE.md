@@ -3071,7 +3071,31 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   checks for an active run; at startup every `running` row is swept. The
   runners' `_finalize` writes the outcome in up to three attempts
   (`FINALIZE_RETRY_DELAYS`, 0.5 s and 1 s apart) and never raises; a cancel
-  during the wait ends the retries and the sweep closes the row
+  during the wait ends the retries and the sweep closes the row. **Token
+  usage**: both run sites (`job_runner._execute_run`, `invoke._execute` /
+  `_attempt`) pass one `RunUsage` as `usage=` to `specialist.run`
+  (pydantic-ai accumulates into it in place; delegated peers and deep
+  sub-agents run with `usage=ctx.usage`, so it is the whole run tree) and
+  hand `job_runner.usage_counts(...)` to `_finalize` on every outcome after
+  the model call (success, sign-in prompt, timeout, exception, cancel,
+  `no_result`; invoke's `_interrupted` too). The row's `input_tokens`,
+  `output_tokens`, `cache_read_tokens`, `requests` stay NULL for a run that
+  got no model answer (pydantic-ai counts a request only once it was
+  answered: a run whose only model request failed stores nothing);
+  `JobRun.to_dict()` answers `usage`: `null`, or
+  `{input_tokens, output_tokens, cache_read_tokens, total_tokens, requests}`
+  (`GET /admin/api/runs[/{id}]`; a live run answers `null` until it ends).
+  The invoke API's poll answer does not carry it (`tests/test_run_token_usage.py`).
+  A workflow's agent step does the same with its own `RunUsage`
+  (`workflow_runner._run_step`, stored by `finish_step_run(..., usage=)` on
+  success, failure, timeout and cancel); a deterministic step kind and a
+  skipped or blocked step store nothing. The run's total is never stored:
+  `workflow_runs_usage` sums the step rows with recorded usage, one grouped
+  statement per 500 run ids, so a live run shows what its finished steps
+  used. `GET /admin/api/workflow-runs` answers `usage` on every run, `GET
+  /admin/api/workflow-runs/{id}` on the run and on each step; the shape and
+  the `null` rule are `db.usage_answer`, shared with `JobRun`
+  (`tests/test_workflow_token_usage.py`)
 - `agents/ide/` — the backend of the **ABAP Assistant** (the UI's name; the
   code, `/ide/api`, the `developer` scope and the role collection
   `ABAP IDE Developer` keep the old naming): a staged chat that analyses,
@@ -4598,7 +4622,14 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   also have `expose_api` and a run-as principal (both re-read when the run starts), else it is
   404 to such a caller; XSUAA client tokens only. The admin UIs' invoke hint says so. A
   user's call is unchanged (`expose_api` plays no role for it). No new environment variable,
-  role, role collection, table or column (HANA schema generation unchanged, still 12)
+  role, role collection, table or column (HANA schema generation unchanged, still 12);
+  2.49.0 stores the token consumption of every agent run (scheduler, Run now, invoke API) on
+  its `job_runs` row and answers it as `usage` in the admin run API, and the same per agent
+  step on its `workflow_step_runs` row (a workflow run's total is summed from its step rows
+  when read, not stored): four nullable columns on each of the two tables (`input_tokens`,
+  `output_tokens`, `cache_read_tokens`, `requests`), HANA schema generation 13 (added to
+  the tables in place by the HDI deploy, nothing undeployed, no `HANA_HDI_ALLOW_DROP`); no
+  new resource, environment variable or role
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets

@@ -50,6 +50,14 @@
                         <ObjectNumber number="{run>/data/items_skipped}" unit="{i18n>itemsSkipped}" />
                     </HBox>
 
+                    <Label
+                        text="{i18n>colTokens}"
+                        visible="{ path: 'run>/data/usage', formatter: '.formatter.hasTokenUsage' }" />
+                    <Text
+                        id="workflowRunTokens"
+                        text="{ parts: ['i18n>runTokensDetail', 'i18n>runTokensDetailCached', 'i18n>runTokensRequestOne', 'i18n>runTokensRequests', 'run>/data/usage'], formatter: '.formatter.tokenDetail' }"
+                        visible="{ path: 'run>/data/usage', formatter: '.formatter.hasTokenUsage' }" />
+
                     <Label text="{i18n>colSummary}" />
                     <Text text="{run>/data/summary}" />
                 </f:SimpleForm>
@@ -142,6 +150,10 @@
                                     state="{ path: 'run>status', formatter: '.formatter.runStatusState' }"
                                     class="sapUiTinyMarginEnd" />
                                 <Text text="{run>agent_name}" />
+                                <Text
+                                    text="{ parts: ['i18n>runTokensStep', 'run>usage'], formatter: '.formatter.tokenStep' }"
+                                    visible="{ path: 'run>usage', formatter: '.formatter.hasTokenUsage' }"
+                                    class="workflowStepTokens agentAdminMutedText sapUiTinyMarginBegin" />
                             </HBox>
                             <Text text="{run>output}" class="workflowStepOutput sapUiTinyMarginTop" />
                             <MessageStrip
@@ -186,6 +198,10 @@
                                                 class="sapUiTinyMarginEnd" />
                                             <Text text="{run>agent_name}" class="sapUiTinyMarginEnd" />
                                             <Text text="{= ${run>branch_key} ? ${run>branch_key} : ${i18n>stepMainLine} }" />
+                                            <Text
+                                                text="{ parts: ['i18n>runTokensStep', 'run>usage'], formatter: '.formatter.tokenStep' }"
+                                                visible="{ path: 'run>usage', formatter: '.formatter.hasTokenUsage' }"
+                                                class="workflowStepTokens agentAdminMutedText sapUiTinyMarginBegin" />
                                         </HBox>
                                         <Text text="{run>output}" class="workflowStepOutput sapUiTinyMarginTop" />
                                         <MessageStrip

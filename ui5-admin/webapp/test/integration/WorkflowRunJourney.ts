@@ -6,6 +6,9 @@ import type Table from "sap/m/Table";
 import type List from "sap/m/List";
 import type Select from "sap/m/Select";
 import type HBox from "sap/m/HBox";
+import type VBox from "sap/m/VBox";
+import type Text from "sap/m/Text";
+import type ColumnListItem from "sap/m/ColumnListItem";
 import type ObjectStatus from "sap/m/ObjectStatus";
 import type Item from "sap/ui/core/Item";
 import type JSONModel from "sap/ui/model/json/JSONModel";
@@ -40,6 +43,12 @@ opaTest(
                 Opa5.assert.strictEqual(model.getProperty("/items/0/workflow_name"), "triage-inbox", "workflow name is bound");
                 Opa5.assert.strictEqual(model.getProperty("/items/0/status"), "success", "status is bound");
                 Opa5.assert.strictEqual(model.getProperty("/items/0/items_total"), 2, "item counts are bound");
+                // wf-run-1 used tokens, wf-run-2 (running, nothing yet) none.
+                const tokens = (row: number) =>
+                    ((table.getItems()[row] as ColumnListItem).getCells()[6] as VBox).getItems() as Text[];
+                Opa5.assert.strictEqual(tokens(0)[0].getText(false), "3,500", "the run's total tokens are listed");
+                Opa5.assert.strictEqual(tokens(0)[1].getText(false), "in 3,000 · out 500", "with the split below it");
+                Opa5.assert.strictEqual(tokens(1)[0].getText(false), "", "a run without usage: empty cell");
             }
         });
 
@@ -123,6 +132,32 @@ opaTest(
             },
             success: function () {
                 Opa5.assert.ok(true, "the pre-fan-out step's output text is rendered in the DOM too");
+            }
+        });
+
+        // step-2 (an agent step) used tokens; step-1 has usage null, so it
+        // renders no token text at all.
+        Then.waitFor({
+            check: function () {
+                return Array.from(document.querySelectorAll(".workflowStepTokens"))
+                    .some(function (el) { return (el.textContent ?? "") === "3,500 tokens (in 3,000 · out 500)"; });
+            },
+            success: function () {
+                Opa5.assert.strictEqual(
+                    document.querySelectorAll(".workflowStepTokens").length, 1,
+                    "only the step with usage shows tokens"
+                );
+            }
+        });
+
+        Then.waitFor({
+            id: "workflowRunTokens",
+            viewName: "WorkflowRunDetail",
+            success: function (element: UI5Element) {
+                Opa5.assert.strictEqual(
+                    (element as Text).getText(false), "3,500 total (3,000 in, 500 out) · 2 model requests",
+                    "the run header shows the run's token line, without a cached part"
+                );
             }
         });
 

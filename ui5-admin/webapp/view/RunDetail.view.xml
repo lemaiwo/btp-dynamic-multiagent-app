@@ -47,6 +47,14 @@
                     <Label text="{i18n>colDuration}" />
                     <Text text="{ parts: ['run>/data/started_at', 'run>/data/finished_at'], formatter: '.formatter.runDuration' }" />
 
+                    <Label
+                        text="{i18n>colTokens}"
+                        visible="{ path: 'run>/data/usage', formatter: '.formatter.hasTokenUsage' }" />
+                    <Text
+                        id="runTokens"
+                        text="{ parts: ['i18n>runTokensDetail', 'i18n>runTokensDetailCached', 'i18n>runTokensRequestOne', 'i18n>runTokensRequests', 'run>/data/usage'], formatter: '.formatter.tokenDetail' }"
+                        visible="{ path: 'run>/data/usage', formatter: '.formatter.hasTokenUsage' }" />
+
                     <Label text="{i18n>colSummary}" />
                     <Text text="{run>/data/summary}" />
                 </f:SimpleForm>
