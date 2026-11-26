@@ -41,7 +41,7 @@ os.environ.pop("VCAP_SERVICES", None)
 os.environ.pop("VCAP_APPLICATION", None)
 
 from agents import invoke, job_runner  # noqa: E402
-from agents.auth import current_jwt, current_principal  # noqa: E402
+from agents.auth import current_claims, current_jwt, current_principal  # noqa: E402
 from agents.db import (  # noqa: E402
     BITBUCKET_APPROVER_INVOKE_MESSAGE,
     AgentConfig,
@@ -138,13 +138,16 @@ def bound_app() -> FastAPI:
             return await inner(scope, receive, send)
         headers = dict(scope["headers"])
         user = headers.get(b"x-test-user", ALICE.encode()).decode()
+        raw_claims = headers.get(b"x-test-claims")
         p = current_principal.set(user)
         j = current_jwt.set(f"jwt-of-{user}")
+        c = current_claims.set(json.loads(raw_claims) if raw_claims else None)
         try:
             await inner(scope, receive, send)
         finally:
             current_principal.reset(p)
             current_jwt.reset(j)
+            current_claims.reset(c)
 
     return asgi  # type: ignore[return-value]
 
@@ -182,7 +185,7 @@ async def make_agent(name: str = "expense", slug: str = SLUG, **kw: Any) -> Agen
 
 
 def form(text: str | None = "Book this receipt", files: list[tuple] | None = None,
-         user: str = ALICE, **extra: str) -> dict[str, Any]:
+         user: str = ALICE, claims: dict | None = None, **extra: str) -> dict[str, Any]:
     """A multipart body built by hand: httpx sends a form without files as
     urlencoded, and the API takes multipart only."""
     boundary = "----invoke-test-boundary"
@@ -197,9 +200,11 @@ def form(text: str | None = "Book this receipt", files: list[tuple] | None = Non
             f'filename="{filename}"\r\nContent-Type: {ctype}\r\n\r\n'.encode("utf-8")
             + data + b"\r\n")
     chunks.append(f"--{boundary}--\r\n".encode())
-    return {"content": b"".join(chunks),
-            "headers": {"content-type": f"multipart/form-data; boundary={boundary}",
-                        "x-test-user": user}}
+    headers = {"content-type": f"multipart/form-data; boundary={boundary}",
+               "x-test-user": user}
+    if claims is not None:
+        headers["x-test-claims"] = json.dumps(claims)
+    return {"content": b"".join(chunks), "headers": headers}
 
 
 async def wait_done(client: AsyncClient, run_id: str, user: str = ALICE) -> dict:
@@ -1087,3 +1092,200 @@ async def test_a_run_that_times_out_after_the_result_keeps_it(client, monkeypatc
     answer = (await client.post(f"/api/invoke/{SLUG}?wait=5", **form())).json()
     assert (answer["status"], answer["error"]) == ("failed", "timeout")
     assert answer["result"] == {"expense_id": "4711", "status": "draft"}
+
+
+# ---------------------------------------------------------------------------
+# A technical caller: a client-credentials token, no user
+# ---------------------------------------------------------------------------
+CLIENT = "sb-invoke-client!t1"
+SVC = "svc-runner@example.com"
+CLIENT_CLAIMS = {"sub": CLIENT, "cid": CLIENT, "client_id": CLIENT,
+                 "grant_type": "client_credentials", "scope": ["invoke", "uaa.resource"]}
+USER_CLAIMS = {"sub": "u-alice", "user_uuid": "u-alice", "user_name": "alice",
+               "origin": "idp", "cid": CLIENT, "client_id": CLIENT,
+               "grant_type": "authorization_code", "scope": ["invoke"]}
+
+
+def as_client(**kw: Any) -> dict[str, Any]:
+    return form(user=CLIENT, claims=CLIENT_CLAIMS, **kw)
+
+
+def record_preflight(monkeypatch, usable: bool = True) -> list[str | None]:
+    checked: list[str | None] = []
+
+    async def fake(agent, principal=None):
+        checked.append(principal)
+        return usable
+
+    monkeypatch.setattr(job_runner, "_has_usable_credentials", fake)
+    return checked
+
+
+async def test_a_technical_caller_runs_as_the_agents_run_as_principal(client, monkeypatch):
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://hub.example.test")
+    checked = record_preflight(monkeypatch)
+    sp = Specialist(submits_valid)
+    use_specialist(monkeypatch, sp)
+    await make_agent(run_as_principal=SVC)
+    r = await client.post(f"/api/invoke/{SLUG}", **as_client())
+    assert r.status_code == 202
+    run_id = r.json()["run_id"]
+    answer = await wait_done(client, run_id, CLIENT)
+    assert answer["status"] == "completed" and answer["error"] is None
+    # The run-as identity, and NOT the client's token: nothing downstream
+    # can forward the app's own client token where a user's is expected.
+    assert (sp.seen_principal, sp.seen_jwt) == (SVC, None)
+    assert checked == [SVC]
+    # The caller owns the row and polls it; nobody else does.
+    async with SessionLocal() as s:
+        row = await s.get(JobRun, run_id)
+    assert (row.trigger, row.created_by) == ("invoke", CLIENT)
+    assert (await client.get(f"/api/invoke/runs/{run_id}")).status_code == 404
+    # The activity says it ran as the run-as identity, without naming it.
+    notes = [e for e in answer["activity"]["events"] if e["kind"] == "note"]
+    assert [n["detail"] for n in notes] == [invoke.RUN_AS_NOTE]
+    assert SVC not in json.dumps(answer)
+
+
+async def test_a_technical_caller_needs_the_run_as_sign_ins(client, monkeypatch):
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://hub.example.test")
+    checked = record_preflight(monkeypatch, usable=False)
+    sp = Specialist(submits_valid)
+    use_specialist(monkeypatch, sp)
+    await make_agent(run_as_principal=SVC)
+    r = await client.post(f"/api/invoke/{SLUG}", **as_client())
+    answer = await wait_done(client, r.json()["run_id"], CLIENT)
+    assert answer["status"] == "failed" and answer["error"] == "credential_required"
+    assert checked == [SVC] and sp.calls == []
+
+
+@pytest.mark.parametrize("run_as", [None, "", "   "])
+async def test_a_technical_caller_of_an_agent_without_run_as_is_404(client, monkeypatch,
+                                                                   run_as):
+    use_specialist(monkeypatch, Specialist(submits_valid))
+    await make_agent(run_as_principal=run_as)
+    read: list[int] = []
+    monkeypatch.setattr(invoke, "_read_form", lambda *a, **k: read.append(1))
+    r = await client.post(f"/api/invoke/{SLUG}", **as_client())
+    assert r.status_code == 404 and r.json() == {"detail": "No such agent"}
+    assert read == [] and invoke._active == {}
+    async with SessionLocal() as s:
+        assert (await s.execute(select(JobRun))).scalars().all() == []
+
+
+async def test_an_approving_agent_is_404_for_a_technical_caller_too(client, monkeypatch):
+    use_specialist(monkeypatch, Specialist(submits_valid))
+    async with SessionLocal() as s:
+        s.add(AgentConfig(name="expense", description="d", instructions="i",
+                          mcp_url=APPROVING["url"], auth_mode="destination",
+                          oauth_json=json.dumps(APPROVING["oauth"]), enabled=1,
+                          expose_chat=0, expose_invoke=1, api_slug=SLUG,
+                          run_as_principal=SVC))
+        await s.commit()
+    r = await client.post(f"/api/invoke/{SLUG}", **as_client())
+    assert r.status_code == 404 and r.json() == {"detail": "No such agent"}
+
+
+async def test_a_not_exposed_agent_is_404_for_a_technical_caller(client, monkeypatch):
+    use_specialist(monkeypatch, Specialist(submits_valid))
+    await make_agent(expose_invoke=False, run_as_principal=SVC)
+    r = await client.post(f"/api/invoke/{SLUG}", **as_client())
+    assert r.status_code == 404
+
+
+async def test_technical_calls_run_side_by_side_up_to_the_cap(client, monkeypatch):
+    """A client stands for many users: no one-run-at-a-time 409 for it, but
+    the instance cap holds, and every slot is given back."""
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://hub.example.test")
+    monkeypatch.setenv("INVOKE_MAX_CONCURRENT", "2")
+    record_preflight(monkeypatch)
+    sp = Specialist(blocks)
+    use_specialist(monkeypatch, sp)
+    await make_agent(run_as_principal=SVC)
+    first = await client.post(f"/api/invoke/{SLUG}", **as_client())
+    second = await client.post(f"/api/invoke/{SLUG}", **as_client())
+    assert (first.status_code, second.status_code) == (202, 202)
+    assert first.json()["run_id"] != second.json()["run_id"]
+    assert len(invoke._active) == 2
+    third = await client.post(f"/api/invoke/{SLUG}", **as_client())
+    assert third.status_code == 429
+    # A user is held off by the cap the same way.
+    assert (await client.post(f"/api/invoke/{SLUG}", **form())).status_code == 429
+    sp.release.set()
+    for r in (first, second):
+        assert (await wait_done(client, r.json()["run_id"], CLIENT))["status"] == "completed"
+    assert invoke._active == {}
+
+
+async def test_a_refused_technical_upload_gives_its_slot_back(client, monkeypatch):
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://hub.example.test")
+    use_specialist(monkeypatch, Specialist(submits_valid))
+    await make_agent(run_as_principal=SVC)
+    r = await client.post(f"/api/invoke/{SLUG}", **as_client(text=None))
+    assert r.status_code == 422 and invoke._active == {}
+
+
+async def test_a_technical_run_without_a_base_url_fails_with_a_code(client, monkeypatch):
+    monkeypatch.delenv("PUBLIC_BASE_URL", raising=False)
+    monkeypatch.delenv("A2A_PUBLIC_URL", raising=False)
+    record_preflight(monkeypatch)
+    sp = Specialist(submits_valid)
+    use_specialist(monkeypatch, sp)
+    await make_agent(run_as_principal=SVC)
+    r = await client.post(f"/api/invoke/{SLUG}?wait=5", **as_client())
+    assert r.status_code == 200
+    assert r.json()["status"] == "failed" and r.json()["error"] == "run_failed"
+    assert sp.calls == [] and invoke._active == {}
+
+
+async def test_a_users_call_is_unchanged_by_a_run_as_principal(client, monkeypatch):
+    """A user's token (with or without claims bound) keeps the caller's
+    identity, the per-user lock and the poll rule, run-as or not."""
+    monkeypatch.delenv("PUBLIC_BASE_URL", raising=False)
+    monkeypatch.delenv("A2A_PUBLIC_URL", raising=False)
+    checked = record_preflight(monkeypatch)
+    sp = Specialist(blocks)
+    use_specialist(monkeypatch, sp)
+    await make_agent(run_as_principal=SVC)
+    first = await client.post(f"/api/invoke/{SLUG}", **form(claims=USER_CLAIMS))
+    assert first.status_code == 202
+    busy = await client.post(f"/api/invoke/{SLUG}", **form(claims=USER_CLAIMS))
+    assert busy.status_code == 409 and busy.json()["run_id"] == first.json()["run_id"]
+    sp.release.set()
+    answer = await wait_done(client, first.json()["run_id"])
+    assert answer["status"] == "completed"
+    assert (sp.seen_principal, sp.seen_jwt) == (ALICE, f"jwt-of-{ALICE}")
+    assert checked == [ALICE]
+    assert not [e for e in answer["activity"]["events"] if e["kind"] == "note"]
+    assert (await client.get(f"/api/invoke/runs/{first.json()['run_id']}",
+                             headers={"x-test-user": CLIENT})).status_code == 404
+
+
+async def test_a_client_token_through_the_real_middleware(monkeypatch):
+    import app as app_module
+    from agents import auth
+
+    monkeypatch.delenv("PUBLIC_BASE_URL", raising=False)
+    monkeypatch.delenv("A2A_PUBLIC_URL", raising=False)
+    validator = _StubValidator({
+        "tok-client": CLIENT_CLAIMS,
+        "tok-client-no-invoke": CLIENT_CLAIMS | {"scope": ["uaa.resource"]},
+    })
+    monkeypatch.setattr(auth, "get_validator", lambda: validator)
+    checked = record_preflight(monkeypatch)
+    sp = Specialist(submits_valid)
+    use_specialist(monkeypatch, sp)
+    await make_agent(run_as_principal=SVC)
+    async with AsyncClient(transport=ASGITransport(app=app_module.app),
+                           base_url="http://test") as c:
+        body = form()
+        denied = await c.post(f"/api/invoke/{SLUG}", content=body["content"], headers={
+            **body["headers"], "Authorization": "Bearer tok-client-no-invoke"})
+        assert denied.status_code == 403
+        # Locally the middleware binds the request's own base URL, which the
+        # run-as identity then uses.
+        ok = await c.post(f"/api/invoke/{SLUG}?wait=5", content=body["content"], headers={
+            **body["headers"], "Authorization": "Bearer tok-client"})
+        assert ok.status_code == 200 and ok.json()["status"] == "completed"
+    assert (sp.seen_principal, sp.seen_jwt) == (SVC, None)
+    assert checked == [SVC]

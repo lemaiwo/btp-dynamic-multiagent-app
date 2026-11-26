@@ -22,12 +22,25 @@ demands it as well, the backend has a public CF route of its own):
   that started the run (404 for anybody else and for a run of another kind):
   ``{status, result, writes, text, activity, error}``.
 
-Identity. The run is the caller's: ``current_principal`` and ``current_jwt``
-come from the validated JWT the middleware bound, and the run's task is
-created inside the request, so it inherits both (contextvars are copied at
-task creation). No ``run_as`` and no ``run_as_principal``: a destination
-that propagates the user sees this user, and an OAuth server needs this
-user's token.
+Identity. For a user the run is the caller's: ``current_principal`` and
+``current_jwt`` come from the validated JWT the middleware bound, and the
+run's task is created inside the request, so it inherits both (contextvars
+are copied at task creation). No ``run_as`` and no ``run_as_principal``: a
+destination that propagates the user sees this user, and an OAuth server
+needs this user's token. A **technical caller** -- an application client
+with a client-credentials token of this XSUAA instance and no user
+(``is_client_token``; the instance grants its own client the ``invoke``
+scope as an authority), typically an app in another subaccount calling
+through a destination -- has no identity to run as: its principal is the
+client id, which holds no sign-in. Its run is the agent's
+``run_as_principal``'s, exactly as a scheduled run (``run_as``, credential
+preflight under that principal), with NO bearer token bound
+(``_technical_identity``): the client's own token is never forwarded where a
+user's is expected. An agent without a run-as principal is the same 404 at
+the POST. The row stays the caller's (``created_by`` the client id, so only
+that client polls it; every binding and service key of the instance shares
+that client id), and its activity carries ``RUN_AS_NOTE``, which names
+nobody.
 
 Attachments are held in memory for the run only: the multipart body is read
 here (``_read_form``) instead of by Starlette, whose parser spools a file
@@ -59,9 +72,11 @@ operation, the key SAP returned for a create, outcome) and nothing else.
 Rows and locks. A run is a ``job_runs`` row with ``trigger="invoke"`` and
 ``created_by`` the caller, ``timeout_seconds`` the run limit
 (``INVOKE_TIMEOUT_SECONDS``, default 300) plus a margin so the stale sweep
-agrees with the timeout here. One run per (principal, agent) at a time (409
-with the running id) and at most ``INVOKE_MAX_CONCURRENT`` per app instance
-(429); both are in memory, per process, as is the job runner's start lock.
+agrees with the timeout here. One run per (user, agent) at a time (409
+with the running id; not for a technical caller, which stands for many
+users) and at most ``INVOKE_MAX_CONCURRENT`` per app instance (429, for
+every caller); both are in memory, per process, as is the job runner's
+start lock.
 Invoke rows do not count as the scheduler's overlap lock (``active_job_run``).
 
 Errors to the caller are stable codes with fixed texts; an exception's text
@@ -77,9 +92,11 @@ import json
 import logging
 import math
 import os
+import uuid
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, AsyncIterator
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
@@ -88,7 +105,15 @@ from pydantic_ai.messages import BinaryContent, ModelResponse, TextPart
 from pydantic_ai.output import ToolOutput
 from sqlalchemy import select, update
 
-from agents.auth import current_principal, require_invoke
+from agents.auth import (
+    current_base_url,
+    current_claims,
+    current_jwt,
+    current_principal,
+    is_client_token,
+    require_invoke,
+    run_as,
+)
 from agents.db import (
     ACTIVE_RUN_STATUS,
     AgentConfig,
@@ -122,6 +147,7 @@ from agents.multipart_form import (
 from agents.multipart_form import clean_name as _clean_name
 from agents.multipart_form import count_pdf_pages as _count_pdf_pages
 from agents.nexus.context import calling_agent, nexus_run
+from agents.progress import ProgressUpdate
 from agents.registry import _make_progress_handler, registry
 from agents.run_activity import final_activity, live_activity, recording
 from agents.shared import run_usage_limits
@@ -169,6 +195,8 @@ MSG_PAGES_UNKNOWN = "The page count of a PDF could not be determined"
 MSG_BUSY = "A run of this agent for this user is already in progress"
 MSG_CAPACITY = "Too many invoke runs are in progress; try again later"
 MSG_UPLOAD_TIMEOUT = "The request body was not received in time"
+# The activity note of a technical caller's run; names no identity.
+RUN_AS_NOTE = "Ran as the agent's run-as identity (the caller is an application client)"
 
 # Codes a run row's `error` may start with (`<code>: <text>`); the poll
 # answer gives the code only, anything else is `run_failed`.
@@ -182,9 +210,12 @@ _UNDECLARED = ("", "application/octet-stream")
 
 # Background tasks are kept referenced (asyncio holds weak references only).
 _tasks: set[asyncio.Task] = set()
-# (principal, agent id) -> run id of the run in flight, or None while its
-# upload is being read. Per process.
-_active: dict[tuple[str, int], str | None] = {}
+# (principal, agent id, lane) -> run id of the run in flight, or None while
+# its upload is being read. Per process. ``lane`` is "" for a user, so one run
+# per (user, agent); a technical caller stands for many users and gets a
+# fresh lane per call, so only the instance cap (the dict's size) holds it.
+_SlotKey = tuple[str, int, str]
+_active: dict[_SlotKey, str | None] = {}
 _start_lock = asyncio.Lock()
 
 
@@ -448,7 +479,7 @@ async def _interrupted(run_id: str, state: _RunState) -> None:
     state.finalized = True
 
 
-def _run_done(run_id: str, key: tuple[str, int], state: _RunState,
+def _run_done(run_id: str, key: _SlotKey, state: _RunState,
               task: asyncio.Task) -> None:
     _tasks.discard(task)
     if _active.get(key) == run_id:
@@ -459,11 +490,13 @@ def _run_done(run_id: str, key: tuple[str, int], state: _RunState,
         closer.add_done_callback(_tasks.discard)
 
 
-async def _run(run_id: str, key: tuple[str, int], agent_id: int, text: str,
-               attachments: list[Attachment], state: _RunState) -> None:
+async def _run(run_id: str, key: _SlotKey, agent_id: int, text: str,
+               attachments: list[Attachment], state: _RunState,
+               technical: bool = False) -> None:
     try:
         with recording(run_id) as activity, nexus_run(run_id):
-            await _execute(run_id, activity, agent_id, key[0], text, attachments, state)
+            await _execute(run_id, activity, agent_id, key[0], text, attachments, state,
+                           technical)
     finally:
         if _active.get(key) == run_id:
             _active.pop(key, None)
@@ -472,7 +505,8 @@ async def _run(run_id: str, key: tuple[str, int], agent_id: int, text: str,
 
 
 async def _execute(run_id: str, activity: Any, agent_id: int, principal: str, text: str,
-                   attachments: list[Attachment], state: _RunState) -> None:
+                   attachments: list[Attachment], state: _RunState,
+                   technical: bool = False) -> None:
     """Run the specialist and record the outcome; never raises except a
     cancel, which is recorded first (the row must never stay `running`).
 
@@ -486,9 +520,12 @@ async def _execute(run_id: str, activity: Any, agent_id: int, principal: str, te
     try:
         for item in attachments:
             activity.record_attachment(item.name, item.media_type, item.size)
+        if technical:
+            activity.record(ProgressUpdate(agent="", kind="note", text=RUN_AS_NOTE))
         async with asyncio.timeout(limit) as deadline:
             try:
-                outcome = await _attempt(agent_id, principal, text, attachments, box)
+                outcome = await _attempt(agent_id, principal, text, attachments, box,
+                                         technical)
             except TimeoutError:
                 if deadline.expired():
                     raise
@@ -513,19 +550,52 @@ async def _execute(run_id: str, activity: Any, agent_id: int, principal: str, te
     state.finalized = True
 
 
+@asynccontextmanager
+async def _technical_identity(principal: str) -> AsyncIterator[None]:
+    """The identity of a technical caller's run: the agent's run-as principal
+    (``run_as``, as a scheduled run), and NO bearer token.
+
+    The token bound by the request is the application client's own
+    (client credentials of this XSUAA instance, no user). Left bound, a
+    ``jwt`` server would receive it as if it were a user's, and a
+    destination or ``builtin:odata`` service with ``user_context`` would
+    hand it to the destination service as the "user" instead of refusing.
+    Unbound, those refuse (as for a run started outside a request), and only
+    what the run-as principal holds itself (its stored OAuth sign-ins) or an
+    app-level credential is used. Bound and reset in the run's own task.
+    """
+    async with run_as(principal, base_url=current_base_url.get()):
+        token_marker = current_jwt.set(None)
+        claims_marker = current_claims.set(None)
+        try:
+            yield
+        finally:
+            current_jwt.reset(token_marker)
+            current_claims.reset(claims_marker)
+
+
 async def _attempt(agent_id: int, principal: str, text: str,
-                   attachments: list[Attachment], box: ResultBox) -> dict[str, Any]:
+                   attachments: list[Attachment], box: ResultBox,
+                   technical: bool = False) -> dict[str, Any]:
     """The run itself; answers the keyword arguments of the outcome.
 
     ``box`` is the caller's: a result accepted before a failure stays
-    readable there.
+    readable there. ``technical``: the caller is an application client, and
+    the run is the agent's run-as principal's, read from the row now (an
+    admin may have changed it since the POST).
     """
     async with SessionLocal() as session:
         agent = await session.get(AgentConfig, agent_id)
     if agent is None:
         return {"status": "failed", "error": "agent_missing: the agent no longer exists"}
+    identity = principal
+    if technical:
+        identity = (agent.run_as_principal or "").strip()
+        if not identity:
+            return {"status": "failed",
+                    "error": "credential_required: the agent has no run-as identity"}
     async with SessionLocal() as session:
-        blocker = await find_credential_blocker(session, {(principal, agent.name): agent})
+        blocker = await find_credential_blocker(session, {(identity, agent.name): agent})
     if blocker is not None:
         return {"status": "failed",
                 "error": ("credential_required: an MCP server of this agent or of a "
@@ -538,13 +608,14 @@ async def _attempt(agent_id: int, principal: str, text: str,
         *(BinaryContent(data=a.data, media_type=a.media_type) for a in attachments),
         text,
     ]
-    with calling_agent(agent.name):
-        result = await specialist.run(
-            prompt,
-            output_type=[result_output(box), str],
-            usage_limits=run_usage_limits(),
-            event_stream_handler=_make_progress_handler(agent.name),
-        )
+    async with (_technical_identity(identity) if technical else nullcontext()):
+        with calling_agent(agent.name):
+            result = await specialist.run(
+                prompt,
+                output_type=[result_output(box), str],
+                usage_limits=run_usage_limits(),
+                event_stream_handler=_make_progress_handler(agent.name),
+            )
     text = _final_text(result)
     report = {"text": text, "result": box.result}
     summary = (text or "")[:SUMMARY_CHARS]
@@ -616,6 +687,9 @@ async def invoke_agent(
     wait: float = Query(0, ge=0, le=MAX_WAIT_SECONDS),
 ) -> JSONResponse:
     principal = _caller()
+    # An application client without a user (client credentials): its run is
+    # the agent's run-as principal's, see the module docstring.
+    technical = is_client_token(current_claims.get())
     async with SessionLocal() as session:
         agent = await get_agent_by_slug(session, slug)
     if (agent is None or not agent.enabled or not agent.expose_invoke
@@ -623,14 +697,20 @@ async def invoke_agent(
             # A builtin:hana entry (with or without allow_select) reads the
             # database as a technical user: never from here, refused at
             # every save as well.
-            or has_hana_entry(agent.mcp_servers)):
+            or has_hana_entry(agent.mcp_servers)
+            # A technical caller has no identity of its own to run as: an
+            # agent without a run-as principal cannot be invoked by it. The
+            # same 404 (an agent configuration matter, decided before any
+            # upload is read).
+            or (technical and not (agent.run_as_principal or "").strip())):
         raise HTTPException(status_code=404, detail=NOT_FOUND)
 
     # The slot is taken BEFORE the body is read: a refused caller (a repeat
     # of the same user, or over the cap) has not had megabytes of upload read
     # into memory first. An upload in progress holds its slot (None until
-    # its run has an id) and counts toward INVOKE_MAX_CONCURRENT.
-    key = (principal, agent.id)
+    # its run has an id) and counts toward INVOKE_MAX_CONCURRENT. A technical
+    # caller's key is unique per call, so it is never a 409.
+    key: _SlotKey = (principal, agent.id, uuid.uuid4().hex if technical else "")
     async with _start_lock:
         if key in _active:
             return JSONResponse(status_code=409,
@@ -661,8 +741,9 @@ async def invoke_agent(
         _active[key] = run_id
         state = _RunState()
         # Created here, inside the request: the task copies the bound JWT and
-        # principal, which are the run's identity.
-        task = _spawn(_run(run_id, key, agent.id, text, attachments, state))
+        # principal, which are a user caller's run identity (a technical
+        # caller's run rebinds both inside the task).
+        task = _spawn(_run(run_id, key, agent.id, text, attachments, state, technical))
         started = True
     finally:
         if not started:
