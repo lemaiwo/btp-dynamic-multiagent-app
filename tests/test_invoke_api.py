@@ -1126,7 +1126,7 @@ async def test_a_technical_caller_runs_as_the_agents_run_as_principal(client, mo
     checked = record_preflight(monkeypatch)
     sp = Specialist(submits_valid)
     use_specialist(monkeypatch, sp)
-    await make_agent(run_as_principal=SVC)
+    await make_agent(run_as_principal=SVC, expose_api=True)
     r = await client.post(f"/api/invoke/{SLUG}", **as_client())
     assert r.status_code == 202
     run_id = r.json()["run_id"]
@@ -1152,7 +1152,7 @@ async def test_a_technical_caller_needs_the_run_as_sign_ins(client, monkeypatch)
     checked = record_preflight(monkeypatch, usable=False)
     sp = Specialist(submits_valid)
     use_specialist(monkeypatch, sp)
-    await make_agent(run_as_principal=SVC)
+    await make_agent(run_as_principal=SVC, expose_api=True)
     r = await client.post(f"/api/invoke/{SLUG}", **as_client())
     answer = await wait_done(client, r.json()["run_id"], CLIENT)
     assert answer["status"] == "failed" and answer["error"] == "credential_required"
@@ -1163,7 +1163,7 @@ async def test_a_technical_caller_needs_the_run_as_sign_ins(client, monkeypatch)
 async def test_a_technical_caller_of_an_agent_without_run_as_is_404(client, monkeypatch,
                                                                    run_as):
     use_specialist(monkeypatch, Specialist(submits_valid))
-    await make_agent(run_as_principal=run_as)
+    await make_agent(run_as_principal=run_as, expose_api=True)
     read: list[int] = []
     monkeypatch.setattr(invoke, "_read_form", lambda *a, **k: read.append(1))
     r = await client.post(f"/api/invoke/{SLUG}", **as_client())
@@ -1179,7 +1179,7 @@ async def test_an_approving_agent_is_404_for_a_technical_caller_too(client, monk
         s.add(AgentConfig(name="expense", description="d", instructions="i",
                           mcp_url=APPROVING["url"], auth_mode="destination",
                           oauth_json=json.dumps(APPROVING["oauth"]), enabled=1,
-                          expose_chat=0, expose_invoke=1, api_slug=SLUG,
+                          expose_chat=0, expose_invoke=1, api_slug=SLUG, expose_api=1,
                           run_as_principal=SVC))
         await s.commit()
     r = await client.post(f"/api/invoke/{SLUG}", **as_client())
@@ -1188,7 +1188,7 @@ async def test_an_approving_agent_is_404_for_a_technical_caller_too(client, monk
 
 async def test_a_not_exposed_agent_is_404_for_a_technical_caller(client, monkeypatch):
     use_specialist(monkeypatch, Specialist(submits_valid))
-    await make_agent(expose_invoke=False, run_as_principal=SVC)
+    await make_agent(expose_invoke=False, run_as_principal=SVC, expose_api=True)
     r = await client.post(f"/api/invoke/{SLUG}", **as_client())
     assert r.status_code == 404
 
@@ -1201,7 +1201,7 @@ async def test_technical_calls_run_side_by_side_up_to_the_cap(client, monkeypatc
     record_preflight(monkeypatch)
     sp = Specialist(blocks)
     use_specialist(monkeypatch, sp)
-    await make_agent(run_as_principal=SVC)
+    await make_agent(run_as_principal=SVC, expose_api=True)
     first = await client.post(f"/api/invoke/{SLUG}", **as_client())
     second = await client.post(f"/api/invoke/{SLUG}", **as_client())
     assert (first.status_code, second.status_code) == (202, 202)
@@ -1220,7 +1220,7 @@ async def test_technical_calls_run_side_by_side_up_to_the_cap(client, monkeypatc
 async def test_a_refused_technical_upload_gives_its_slot_back(client, monkeypatch):
     monkeypatch.setenv("PUBLIC_BASE_URL", "https://hub.example.test")
     use_specialist(monkeypatch, Specialist(submits_valid))
-    await make_agent(run_as_principal=SVC)
+    await make_agent(run_as_principal=SVC, expose_api=True)
     r = await client.post(f"/api/invoke/{SLUG}", **as_client(text=None))
     assert r.status_code == 422 and invoke._active == {}
 
@@ -1231,7 +1231,7 @@ async def test_a_technical_run_without_a_base_url_fails_with_a_code(client, monk
     record_preflight(monkeypatch)
     sp = Specialist(submits_valid)
     use_specialist(monkeypatch, sp)
-    await make_agent(run_as_principal=SVC)
+    await make_agent(run_as_principal=SVC, expose_api=True)
     r = await client.post(f"/api/invoke/{SLUG}?wait=5", **as_client())
     assert r.status_code == 200
     assert r.json()["status"] == "failed" and r.json()["error"] == "run_failed"
@@ -1246,7 +1246,8 @@ async def test_a_users_call_is_unchanged_by_a_run_as_principal(client, monkeypat
     checked = record_preflight(monkeypatch)
     sp = Specialist(blocks)
     use_specialist(monkeypatch, sp)
-    await make_agent(run_as_principal=SVC)
+    # expose_api is off: it plays no role for a user caller.
+    await make_agent(run_as_principal=SVC, expose_api=False)
     first = await client.post(f"/api/invoke/{SLUG}", **form(claims=USER_CLAIMS))
     assert first.status_code == 202
     busy = await client.post(f"/api/invoke/{SLUG}", **form(claims=USER_CLAIMS))
@@ -1275,7 +1276,7 @@ async def test_a_client_token_through_the_real_middleware(monkeypatch):
     checked = record_preflight(monkeypatch)
     sp = Specialist(submits_valid)
     use_specialist(monkeypatch, sp)
-    await make_agent(run_as_principal=SVC)
+    await make_agent(run_as_principal=SVC, expose_api=True)
     async with AsyncClient(transport=ASGITransport(app=app_module.app),
                            base_url="http://test") as c:
         body = form()
@@ -1289,3 +1290,92 @@ async def test_a_client_token_through_the_real_middleware(monkeypatch):
         assert ok.status_code == 200 and ok.json()["status"] == "completed"
     assert (sp.seen_principal, sp.seen_jwt) == (SVC, None)
     assert checked == [SVC]
+
+
+# ---------------------------------------------------------------------------
+# A technical caller needs the agent's consent to API runs (expose_api)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("expose_api", [False, True])
+async def test_a_technical_caller_needs_expose_api(client, monkeypatch, expose_api):
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://hub.example.test")
+    record_preflight(monkeypatch)
+    sp = Specialist(submits_valid)
+    use_specialist(monkeypatch, sp)
+    await make_agent(run_as_principal=SVC, expose_api=expose_api)
+    read: list[int] = []
+    if not expose_api:
+        monkeypatch.setattr(invoke, "_read_form", lambda *a, **k: read.append(1))
+    r = await client.post(f"/api/invoke/{SLUG}", **as_client())
+    if not expose_api:
+        assert r.status_code == 404 and r.json() == {"detail": "No such agent"}
+        assert read == [] and invoke._active == {}
+        async with SessionLocal() as s:
+            assert (await s.execute(select(JobRun))).scalars().all() == []
+        return
+    assert r.status_code == 202
+    answer = await wait_done(client, r.json()["run_id"], CLIENT)
+    assert answer["status"] == "completed" and sp.seen_principal == SVC
+
+
+async def test_a_users_call_does_not_need_expose_api(client, monkeypatch):
+    sp = Specialist(submits_valid)
+    use_specialist(monkeypatch, sp)
+    await make_agent(expose_api=False)
+    r = await client.post(f"/api/invoke/{SLUG}", **form(claims=USER_CLAIMS))
+    assert r.status_code == 202
+    assert (await wait_done(client, r.json()["run_id"]))["status"] == "completed"
+
+
+def change_agent_before_the_run(monkeypatch, **values: Any) -> None:
+    """The admin changes the agent after the POST was accepted and before
+    the run's first step: the run reads the row anew."""
+    real_spawn = invoke._spawn
+
+    def spawn(coro):
+        async def changed_then_run():
+            async with SessionLocal() as s:
+                row = (await s.execute(select(AgentConfig))).scalar_one()
+                for name, value in values.items():
+                    setattr(row, name, value)
+                await s.commit()
+            return await coro
+        return real_spawn(changed_then_run())
+
+    monkeypatch.setattr(invoke, "_spawn", spawn)
+
+
+@pytest.mark.parametrize("values", [
+    {"run_as_principal": None},
+    {"run_as_principal": "  "},
+    {"expose_api": 0},
+])
+async def test_consent_withdrawn_before_the_run_fails_it(client, monkeypatch, values):
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://hub.example.test")
+    checked = record_preflight(monkeypatch)
+    sp = Specialist(submits_valid)
+    use_specialist(monkeypatch, sp)
+    await make_agent(run_as_principal=SVC, expose_api=True)
+    change_agent_before_the_run(monkeypatch, **values)
+    r = await client.post(f"/api/invoke/{SLUG}", **as_client())
+    assert r.status_code == 202
+    answer = await wait_done(client, r.json()["run_id"], CLIENT)
+    assert answer["status"] == "failed" and answer["error"] == "credential_required"
+    assert sp.calls == [] and checked == [] and invoke._active == {}
+
+
+async def test_a_token_that_is_not_clearly_a_clients_stays_a_user(client, monkeypatch):
+    """No user claim, but no client_credentials grant and sub != cid: not
+    decided as a client, so the caller keeps its own identity and lock."""
+    sp = Specialist(blocks)
+    use_specialist(monkeypatch, sp)
+    await make_agent(run_as_principal=SVC, expose_api=True)
+    claims = {"sub": "some-subject", "cid": CLIENT, "client_id": CLIENT,
+              "scope": ["invoke"]}
+    first = await client.post(f"/api/invoke/{SLUG}", **form(claims=claims))
+    assert first.status_code == 202
+    busy = await client.post(f"/api/invoke/{SLUG}", **form(claims=claims))
+    assert busy.status_code == 409 and busy.json()["run_id"] == first.json()["run_id"]
+    sp.release.set()
+    answer = await wait_done(client, first.json()["run_id"])
+    assert answer["status"] == "completed"
+    assert (sp.seen_principal, sp.seen_jwt) == (ALICE, f"jwt-of-{ALICE}")

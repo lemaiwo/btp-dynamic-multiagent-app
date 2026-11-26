@@ -36,8 +36,13 @@ client id, which holds no sign-in. Its run is the agent's
 ``run_as_principal``'s, exactly as a scheduled run (``run_as``, credential
 preflight under that principal), with NO bearer token bound
 (``_technical_identity``): the client's own token is never forwarded where a
-user's is expected. An agent without a run-as principal is the same 404 at
-the POST. The row stays the caller's (``created_by`` the client id, so only
+user's is expected. The agent must also consent to API runs as that
+principal: ``expose_api`` AND a non-blank ``run_as_principal`` on top of
+everything a user's call needs (``_technical_run_as``); otherwise the same
+404 at the POST, and a consent withdrawn after the POST fails the run with
+``credential_required`` before anything runs. ``expose_api`` plays no role
+for a user. Only XSUAA client tokens qualify (an OIDC client token stays a
+user caller). The row stays the caller's (``created_by`` the client id, so only
 that client polls it; every binding and service key of the instance shares
 that client id), and its activity carries ``RUN_AS_NOTE``, which names
 nobody.
@@ -550,6 +555,21 @@ async def _execute(run_id: str, activity: Any, agent_id: int, principal: str, te
     state.finalized = True
 
 
+def _technical_run_as(agent: AgentConfig) -> str | None:
+    """The principal a technical caller's run of ``agent`` executes as, or
+    ``None`` when the agent does not allow it.
+
+    Both halves are the admin's existing consent to runs as the run-as
+    principal (what the scheduler endpoint asks for): ``expose_api``
+    ("available via API") and a non-blank ``run_as_principal``.
+    ``expose_invoke`` alone consents to users calling as themselves, not to
+    an application client borrowing that identity.
+    """
+    if not agent.expose_api:
+        return None
+    return (agent.run_as_principal or "").strip() or None
+
+
 @asynccontextmanager
 async def _technical_identity(principal: str) -> AsyncIterator[None]:
     """The identity of a technical caller's run: the agent's run-as principal
@@ -590,10 +610,14 @@ async def _attempt(agent_id: int, principal: str, text: str,
         return {"status": "failed", "error": "agent_missing: the agent no longer exists"}
     identity = principal
     if technical:
-        identity = (agent.run_as_principal or "").strip()
+        # The POST's gate again, on the row as it is now: an admin who
+        # withdrew the consent (expose_api) or the run-as identity after the
+        # POST stops the run before anything runs as that identity.
+        identity = _technical_run_as(agent) or ""
         if not identity:
             return {"status": "failed",
-                    "error": "credential_required: the agent has no run-as identity"}
+                    "error": ("credential_required: the agent does not allow runs as "
+                              "its run-as identity")}
     async with SessionLocal() as session:
         blocker = await find_credential_blocker(session, {(identity, agent.name): agent})
     if blocker is not None:
@@ -699,10 +723,11 @@ async def invoke_agent(
             # every save as well.
             or has_hana_entry(agent.mcp_servers)
             # A technical caller has no identity of its own to run as: an
-            # agent without a run-as principal cannot be invoked by it. The
-            # same 404 (an agent configuration matter, decided before any
-            # upload is read).
-            or (technical and not (agent.run_as_principal or "").strip())):
+            # agent that does not allow API runs as its run-as principal
+            # (expose_api AND a run-as principal) cannot be invoked by it.
+            # The same 404 (an agent configuration matter, decided before
+            # any slot is taken or upload read).
+            or (technical and _technical_run_as(agent) is None)):
         raise HTTPException(status_code=404, detail=NOT_FOUND)
 
     # The slot is taken BEFORE the body is read: a refused caller (a repeat
