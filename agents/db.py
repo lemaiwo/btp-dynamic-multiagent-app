@@ -665,7 +665,9 @@ class AgentConfig(Base):
     # and ephemeral sub-agents, all opt-in. Null means the defaults (off).
     deep_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     # --- invoke API (agents/invoke.py) --- independent of expose_chat and
-    # expose_api: POST /api/invoke/{api_slug} runs the agent as the caller.
+    # expose_api: POST /api/invoke/{api_slug} runs the agent as the calling
+    # user. An application client without a user may call it only when
+    # expose_api is on and run_as_principal is set too (it then runs as that).
     expose_invoke: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
     )

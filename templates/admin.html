@@ -531,7 +531,9 @@
                 <p class="hint" id="agent-endpoint-hint">Endpoint: <code>POST /api/agents/&lt;slug&gt;/run</code></p>
                 <label><input type="checkbox" id="agent-expose-invoke" onchange="updateEndpointHint()"> Expose to the invoke API</label>
                 <p class="hint" id="agent-invoke-hint">Endpoint: <code>POST /api/invoke/&lt;slug&gt;</code>
-                    (uses the API slug; the caller's own identity, <code>invoke</code> scope)</p>
+                    (uses the API slug; the caller's own identity, <code>invoke</code> scope;
+                    with "Available via API" and a run-as user as well, application clients of this
+                    app's XSUAA instance may call it too and run as the run-as user)</p>
                 <label>Result schema (JSON) <span style="color:var(--muted);font-weight:normal">(optional — the object <code>submit_result</code> must match)</span>
                     <textarea id="agent-result-schema" rows="5"
                               placeholder='{"type": "object", "properties": {}}'></textarea>
@@ -2154,7 +2156,9 @@ function updateEndpointHint() {
     const invokeHint = document.getElementById('agent-invoke-hint');
     if (invokeHint) {
         invokeHint.innerHTML = 'Endpoint: <code>POST /api/invoke/' + shown + '</code> '
-            + '(uses the API slug; the caller\'s own identity, <code>invoke</code> scope)';
+            + '(uses the API slug; the caller\'s own identity, <code>invoke</code> scope; '
+            + 'with "Available via API" and a run-as user as well, application clients of this '
+            + 'app\'s XSUAA instance may call it too and run as the run-as user)';
     }
     // Rows were added or removed, or the API switch moved: which row holds
     // the one builtin:odata entry and its job-run warning follow both.

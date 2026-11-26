@@ -159,6 +159,32 @@ _TOKEN_IDENTITY_CLAIMS = (
 _TOKEN_ANCHOR_CLAIMS = ("jti", "user_uuid", "sub")
 
 
+# Claims only a user's token carries; any one of them makes it a user's.
+_USER_CLAIMS = ("user_name", "user_uuid", "email")
+
+
+def is_client_token(claims: Any) -> bool:
+    """Whether validated ``claims`` are an OAuth client's own token, no user.
+
+    What XSUAA issues for ``grant_type=client_credentials`` (a binding or a
+    service key of the instance): no ``user_name``, ``user_uuid`` or
+    ``email``, and the client as the subject (``sub`` equals ``cid`` or
+    ``client_id``) or the grant type saying so. Its principal
+    (``_principal_claim``) is then the client id, which names no person and
+    holds no per-user sign-in, so a caller like that cannot run "as itself"
+    where a user would (``agents/invoke.py``). Anything that is not clearly
+    such a token is answered ``False``: the caller keeps its own identity.
+    """
+    if not isinstance(claims, dict) or not claims:
+        return False
+    if any(claims.get(name) for name in _USER_CLAIMS):
+        return False
+    if claims.get("grant_type") == "client_credentials":
+        return True
+    sub = claims.get("sub")
+    return bool(sub) and any(sub == claims.get(name) for name in ("cid", "client_id"))
+
+
 def bound_token_principal() -> str | None:
     """The principal of the token bound to this context, or ``None``.
 
@@ -494,7 +520,9 @@ def require_a2a(request: Request) -> dict[str, Any]:
 
 def require_invoke(request: Request) -> dict[str, Any]:
     """Ensure the caller holds the `<xsappname>.invoke` scope (the invoke
-    API, `agents/invoke.py`, which runs an agent as the caller).
+    API, `agents/invoke.py`, which runs an agent as the calling user, or as
+    the agent's run-as principal for an application client: the instance's
+    own client is granted the scope as an authority).
 
     The approuter enforces the same scope on its `/api/invoke` route; the
     backend has a public CF route of its own, so the check lives here too.
@@ -537,7 +565,7 @@ def public_base_url() -> str | None:
 
 
 @asynccontextmanager
-async def run_as(principal: str) -> AsyncIterator[None]:
+async def run_as(principal: str, *, base_url: str | None = None) -> AsyncIterator[None]:
     """Bind a non-interactive identity for a scheduled or API-triggered run.
 
     Binds the principal and the base URL, and nothing else: ``current_jwt``
@@ -567,8 +595,12 @@ async def run_as(principal: str) -> AsyncIterator[None]:
 
     current_base_url must be set for PerUserOAuth2Auth to resolve its DCR
     client, and no request exists to derive it from — hence public_base_url().
+    ``base_url`` is the fallback for a caller that does run inside a request
+    (the invoke API passes the one the middleware bound, which on Cloud
+    Foundry is that same resolver and locally the request's own host);
+    ``public_base_url()`` wins whenever it is set.
     """
-    base_url = public_base_url()
+    base_url = public_base_url() or (base_url or "").strip().rstrip("/") or None
     if not base_url:
         raise RuntimeError(
             "PUBLIC_BASE_URL (or A2A_PUBLIC_URL) must be set for "
