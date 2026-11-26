@@ -246,7 +246,8 @@ export default class FakeBackend {
         }];
         // Newest first, as the server lists them. run-1 (finished, with a
         // report) stays first: RunReportJourney opens the first row. run-2
-        // is still running, for the auto-refresh journeys; run-3 belongs to
+        // is still running, for the auto-refresh journeys (run-1 has token
+        // usage, run-2 has none yet); run-3 belongs to
         // the other agent, so a per-agent filter can be told from no filter.
         this.runs = [
             {
@@ -254,13 +255,17 @@ export default class FakeBackend {
                 status: "success", started_at: "2026-08-24T10:00:00",
                 finished_at: "2026-08-24T10:01:30", summary: "All good", error: null,
                 notified: false, created_by: "tester",
-                report: { body_md: "# Report\n\n| a | b |\n|---|---|\n| 1 | 2 |" }
+                report: { body_md: "# Report\n\n| a | b |\n|---|---|\n| 1 | 2 |" },
+                usage: {
+                    input_tokens: 10000, output_tokens: 2345, cache_read_tokens: 1200,
+                    total_tokens: 12345, requests: 7
+                }
             },
             {
                 id: "run-2", agent_id: 100, agent_name: "btp-agent", trigger: "schedule",
                 status: "running", started_at: "2026-08-24T09:00:00",
                 finished_at: null, summary: null, error: null,
-                notified: false, created_by: "scheduler", report: null
+                notified: false, created_by: "scheduler", report: null, usage: null
             },
             {
                 id: "run-3", agent_id: 101, agent_name: "gmail-agent", trigger: "manual",
@@ -304,7 +309,11 @@ export default class FakeBackend {
                 trigger: "manual", status: "success",
                 started_at: "2026-08-24T10:00:00", finished_at: "2026-08-24T10:05:00",
                 items_total: 2, items_succeeded: 1, items_failed: 0, items_skipped: 1,
-                summary: "Processed 2 items.", error: null, created_by: "tester"
+                summary: "Processed 2 items.", error: null, created_by: "tester",
+                usage: {
+                    input_tokens: 3000, output_tokens: 500, cache_read_tokens: 0,
+                    total_tokens: 3500, requests: 2
+                }
             },
             items: [
                 {
@@ -323,13 +332,20 @@ export default class FakeBackend {
                     id: "step-1", workflow_run_id: "wf-run-1", item_run_id: null, branch_key: null,
                     position: 1, agent_name: "gmail-agent", status: "success",
                     output: "Found 2 items.", error: null,
-                    started_at: "2026-08-24T10:00:00", finished_at: "2026-08-24T10:00:05"
+                    started_at: "2026-08-24T10:00:00", finished_at: "2026-08-24T10:00:05",
+                    // No model usage, as a deterministic step (condition,
+                    // transform, http, python) or an old step answers.
+                    usage: null
                 },
                 {
                     id: "step-2", workflow_run_id: "wf-run-1", item_run_id: "item-1",
                     branch_key: "billing", position: 1, agent_name: "btp-agent", status: "success",
                     output: "Drafted a billing reply.", error: null,
-                    started_at: "2026-08-24T10:00:05", finished_at: "2026-08-24T10:02:00"
+                    started_at: "2026-08-24T10:00:05", finished_at: "2026-08-24T10:02:00",
+                    usage: {
+                        input_tokens: 3000, output_tokens: 500, cache_read_tokens: 0,
+                        total_tokens: 3500, requests: 2
+                    }
                 }
             ]
         }, {
@@ -338,7 +354,7 @@ export default class FakeBackend {
                 trigger: "schedule", status: "running",
                 started_at: "2026-08-25T08:00:00", finished_at: null,
                 items_total: 0, items_succeeded: 0, items_failed: 0, items_skipped: 0,
-                summary: null, error: null, created_by: "scheduler"
+                summary: null, error: null, created_by: "scheduler", usage: null
             },
             items: [],
             steps: []

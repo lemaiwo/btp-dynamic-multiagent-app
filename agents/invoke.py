@@ -99,7 +99,7 @@ import math
 import os
 import uuid
 from contextlib import asynccontextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 
@@ -108,6 +108,7 @@ from fastapi.responses import JSONResponse
 from pydantic_ai import ModelRetry
 from pydantic_ai.messages import BinaryContent, ModelResponse, TextPart
 from pydantic_ai.output import ToolOutput
+from pydantic_ai.usage import RunUsage
 from sqlalchemy import select, update
 
 from agents.auth import (
@@ -140,7 +141,7 @@ from agents.invoke_config import (
     parse_limits,
 )
 from agents.invoke_config import validate as validate_result
-from agents.job_runner import _finalize, _sweep_stale, find_credential_blocker
+from agents.job_runner import _finalize, _sweep_stale, find_credential_blocker, usage_counts
 from agents.multipart_form import (
     MAX_PDF_STREAMS,
     PDF_INFLATE_BUDGET,
@@ -435,9 +436,12 @@ _spawn = asyncio.create_task
 class _RunState:
     """Whether the run's outcome was written: if not when the task ends
     (cancelled before its first step, or something escaped), the done
-    callback writes ``interrupted`` so the row never stays ``running``."""
+    callback writes ``interrupted`` so the row never stays ``running``.
+    ``usage`` is the run's token counter (filled in place by pydantic-ai),
+    here so a cancel records what was spent up to it."""
 
     finalized: bool = False
+    usage: RunUsage = field(default_factory=RunUsage)
 
 
 async def cancel_all_invoke_runs() -> None:
@@ -470,6 +474,7 @@ async def _interrupted(run_id: str, state: _RunState) -> None:
     }
     if activity is not None:
         values["activity_json"] = json.dumps(activity)
+    values.update(usage_counts(state.usage) or {})
     try:
         async with SessionLocal() as session:
             await session.execute(
@@ -530,7 +535,7 @@ async def _execute(run_id: str, activity: Any, agent_id: int, principal: str, te
         async with asyncio.timeout(limit) as deadline:
             try:
                 outcome = await _attempt(agent_id, principal, text, attachments, box,
-                                         technical)
+                                         technical, state.usage)
             except TimeoutError:
                 if deadline.expired():
                     raise
@@ -551,6 +556,9 @@ async def _execute(run_id: str, activity: Any, agent_id: int, principal: str, te
         # refused a later request, the deadline passed): the caller still gets
         # it, with the failure; `writes` are read from the audit log anyway.
         outcome["report"] = {"text": None, "result": box.result}
+    # Every outcome: a run that never reached the model has no requests,
+    # and usage_counts answers None for it (the row keeps NULL).
+    outcome["usage"] = usage_counts(state.usage)
     await _finalize(run_id, **outcome)
     state.finalized = True
 
@@ -596,7 +604,8 @@ async def _technical_identity(principal: str) -> AsyncIterator[None]:
 
 async def _attempt(agent_id: int, principal: str, text: str,
                    attachments: list[Attachment], box: ResultBox,
-                   technical: bool = False) -> dict[str, Any]:
+                   technical: bool = False,
+                   usage: RunUsage | None = None) -> dict[str, Any]:
     """The run itself; answers the keyword arguments of the outcome.
 
     ``box`` is the caller's: a result accepted before a failure stays
@@ -638,6 +647,7 @@ async def _attempt(agent_id: int, principal: str, text: str,
                 prompt,
                 output_type=[result_output(box), str],
                 usage_limits=run_usage_limits(),
+                usage=usage,
                 event_stream_handler=_make_progress_handler(agent.name),
             )
     text = _final_text(result)

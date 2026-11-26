@@ -19,6 +19,7 @@
                     <Column><Text text="{i18n>colTrigger}" /></Column>
                     <Column><Text text="{i18n>colStarted}" /></Column>
                     <Column><Text text="{i18n>colDuration}" /></Column>
+                    <Column id="runsTokensColumn" hAlign="End"><Text text="{i18n>colTokens}" /></Column>
                     <Column><Text text="{i18n>colSummary}" /></Column>
                 </columns>
                 <items>
@@ -31,6 +32,13 @@
                             <Text text="{runs>trigger}" />
                             <Text text="{ path: 'runs>started_at', formatter: '.formatter.timestamp' }" />
                             <Text text="{ parts: ['runs>started_at', 'runs>finished_at'], formatter: '.formatter.runDuration' }" />
+                            <VBox alignItems="End">
+                                <Text text="{ path: 'runs>usage', formatter: '.formatter.tokenTotal' }" />
+                                <Text
+                                    text="{ parts: ['i18n>runTokensBreakdown', 'runs>usage'], formatter: '.formatter.tokenBreakdown' }"
+                                    visible="{ path: 'runs>usage', formatter: '.formatter.hasTokenUsage' }"
+                                    class="agentAdminMutedText" />
+                            </VBox>
                             <Text text="{ parts: ['runs>summary', 'runs>error'], formatter: '.formatter.runSummary' }" maxLines="2" />
                         </cells>
                     </ColumnListItem>

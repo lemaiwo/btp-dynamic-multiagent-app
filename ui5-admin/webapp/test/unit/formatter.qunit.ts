@@ -118,3 +118,60 @@ QUnit.test("an activity time shows the time of day, never 'null'", function (ass
         new Date("2026-10-01T21:11:35+00:00").toLocaleTimeString()
     );
 });
+
+QUnit.module("formatter: a job run's token usage");
+
+const USAGE = {
+    input_tokens: 10000, output_tokens: 2345, cache_read_tokens: 1200,
+    total_tokens: 12345, requests: 7
+};
+const PLAIN = "{0} total ({1} in, {2} out) · {3}";
+const CACHED = "{0} total ({1} in, {2} out, {3} cached) · {4}";
+const ONE = "{0} model request";
+const MANY = "{0} model requests";
+
+QUnit.test("no usage renders empty and hides the detail row", function (assert) {
+    for (const value of [null, undefined, "12345", 12345, [], {}]) {
+        assert.strictEqual(formatter.tokenTotal(value), "", `total of ${JSON.stringify(value)}`);
+        assert.strictEqual(formatter.tokenBreakdown("in {0} · out {1}", value), "");
+        assert.strictEqual(formatter.tokenDetail(PLAIN, CACHED, ONE, MANY, value), "");
+        assert.notOk(formatter.hasTokenUsage(value));
+    }
+});
+
+QUnit.test("a count that is not a finite, non-negative number is no usage", function (assert) {
+    for (const bad of [NaN, Infinity, -1, "5", null]) {
+        const usage = { ...USAGE, output_tokens: bad };
+        assert.strictEqual(formatter.tokenTotal(usage), "", `output_tokens ${String(bad)}`);
+        assert.notOk(formatter.hasTokenUsage(usage));
+    }
+});
+
+QUnit.test("large numbers are grouped by the locale", function (assert) {
+    assert.ok(formatter.hasTokenUsage(USAGE));
+    assert.strictEqual(formatter.tokenTotal(USAGE), "12,345");
+    assert.strictEqual(formatter.tokenTotal({ ...USAGE, total_tokens: 1234567890 }), "1,234,567,890");
+    assert.strictEqual(formatter.tokenBreakdown("in {0} · out {1}", USAGE), "in 10,000 · out 2,345");
+    assert.strictEqual(
+        formatter.tokenDetail(PLAIN, CACHED, ONE, MANY, USAGE),
+        "12,345 total (10,000 in, 2,345 out, 1,200 cached) · 7 model requests"
+    );
+});
+
+QUnit.test("zero tokens still show, the cached part only when something was cached", function (assert) {
+    const zero = { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, total_tokens: 0, requests: 0 };
+    assert.ok(formatter.hasTokenUsage(zero), "a run that used none is still a run with usage");
+    assert.strictEqual(formatter.tokenTotal(zero), "0");
+    assert.strictEqual(formatter.tokenDetail(PLAIN, CACHED, ONE, MANY, zero), "0 total (0 in, 0 out) · 0 model requests");
+    assert.strictEqual(
+        formatter.tokenDetail(PLAIN, CACHED, ONE, MANY, { ...USAGE, cache_read_tokens: 0, requests: 1 }),
+        "12,345 total (10,000 in, 2,345 out) · 1 model request"
+    );
+});
+
+QUnit.test("a workflow step's tokens: total with the in/out split, empty without usage", function (assert) {
+    const STEP = "{0} tokens (in {1} · out {2})";
+    assert.strictEqual(formatter.tokenStep(STEP, USAGE), "12,345 tokens (in 10,000 · out 2,345)");
+    assert.strictEqual(formatter.tokenStep(STEP, null), "", "a deterministic step has no usage");
+    assert.strictEqual(formatter.tokenStep(STEP, { ...USAGE, input_tokens: NaN }), "", "a bad count is no usage");
+});

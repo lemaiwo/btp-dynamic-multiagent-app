@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Any
+
+from pydantic_ai.usage import RunUsage
 
 from agents.auth import run_as
 from agents.db import (
@@ -254,6 +257,31 @@ async def _sweep_stale() -> None:
                        type(exc).__name__)
 
 
+def usage_counts(usage: Any) -> dict[str, int] | None:
+    """The counts of a run's ``RunUsage`` for ``finish_job_run``, or ``None``.
+
+    ``None`` when the run made no model request (it failed before the model,
+    or the model was never asked): there is nothing to record, and the row
+    answers ``usage: null``. Never raises: reading the usage must not cost a
+    run its outcome, so anything unreadable is logged by class and dropped.
+    """
+    if usage is None:
+        return None
+    try:
+        requests = int(usage.requests)
+        if requests <= 0:
+            return None
+        return {
+            "input_tokens": int(usage.input_tokens),
+            "output_tokens": int(usage.output_tokens),
+            "cache_read_tokens": int(usage.cache_read_tokens),
+            "requests": requests,
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Run usage not stored (%s)", type(exc).__name__)
+        return None
+
+
 async def _finalize(run_id: str, **kwargs) -> None:
     """Best-effort finish_job_run, retried: never raises (but cancellation).
 
@@ -313,6 +341,11 @@ async def _execute_run(run_id: str, agent_id: int) -> None:
     unwinds normally.
     """
     agent: AgentConfig | None = None
+    # Filled in place by pydantic-ai (Agent.run(usage=...)), by delegated
+    # peers and deep sub-agents too (they run with usage=ctx.usage), so it
+    # holds what the run tree spent up to wherever the run ended: a
+    # timeout, an exception or a cancel keeps the counts so far.
+    usage = RunUsage()
     try:
         async with SessionLocal() as session:
             agent = await session.get(AgentConfig, agent_id)
@@ -364,6 +397,7 @@ async def _execute_run(run_id: str, agent_id: int) -> None:
                         agent.run_prompt or DEFAULT_RUN_PROMPT,
                         output_type=RunReport,
                         usage_limits=run_usage_limits(),
+                        usage=usage,
                         # The agent's own tool calls; delegations and deep
                         # sub-agents report theirs through the same sink.
                         event_stream_handler=_make_progress_handler(agent.name),
@@ -388,6 +422,7 @@ async def _execute_run(run_id: str, agent_id: int) -> None:
                     "(or one of its peers) interactively before scheduled runs "
                     "can work."
                 ),
+                usage=usage_counts(usage),
             )
             return
         await _finalize(
@@ -395,6 +430,7 @@ async def _execute_run(run_id: str, agent_id: int) -> None:
             status="success",
             summary=report.summary,
             report=report.model_dump(mode="json"),
+            usage=usage_counts(usage),
         )
     except asyncio.TimeoutError:
         # `agent` can still be None here (e.g. the initial session.get itself
@@ -410,11 +446,13 @@ async def _execute_run(run_id: str, agent_id: int) -> None:
         await _finalize(
             run_id, status="failed",
             error=f"Run exceeded {timeout_desc}.",
+            usage=usage_counts(usage),
         )
     except asyncio.CancelledError:
         await _finalize(
             run_id, status="interrupted",
             error="Run was cancelled (app shutting down).",
+            usage=usage_counts(usage),
         )
         raise
     except Exception as e:  # noqa: BLE001
@@ -422,4 +460,5 @@ async def _execute_run(run_id: str, agent_id: int) -> None:
             "Run %s of agent %s failed",
             run_id, agent.name if agent is not None else agent_id,
         )
-        await _finalize(run_id, status="failed", error=describe_exception(e))
+        await _finalize(run_id, status="failed", error=describe_exception(e),
+                        usage=usage_counts(usage))

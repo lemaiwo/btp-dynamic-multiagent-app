@@ -19,6 +19,7 @@ from contextvars import ContextVar
 from types import SimpleNamespace
 
 from pydantic import BaseModel, Field
+from pydantic_ai.usage import RunUsage
 
 from agents import job_runner
 from agents.auth import run_as
@@ -619,9 +620,14 @@ async def _run_step(
             branch_key=step.branch_key, position=step.position,
             agent_name=step.agent_name,
         )
+    # This step's own counter, filled in place by pydantic-ai (delegations
+    # and deep sub-agents share it): stored on the step row on every outcome
+    # after the model call; usage_counts answers None for 0 requests.
+    usage = RunUsage()
     try:
         kwargs = {"output_type": output_type} if output_type is not None else {}
         kwargs["usage_limits"] = run_usage_limits()
+        kwargs["usage"] = usage
         async with run_as(effective_principal(agent_row, workflow)):
             with calling_agent(step.agent_name):
                 result = await asyncio.wait_for(
@@ -634,20 +640,22 @@ async def _run_step(
             f"{step.step_timeout_seconds}s timeout."
         )
         async with SessionLocal() as session:
-            await finish_step_run(session, step_run.id, status="failed", error=message)
+            await finish_step_run(session, step_run.id, status="failed", error=message,
+                                  usage=job_runner.usage_counts(usage))
         raise _WorkflowError(message) from None
     except asyncio.CancelledError:
         async with SessionLocal() as session:
             await finish_step_run(
                 session, step_run.id, status="interrupted",
-                error=_cancel_message(),
+                error=_cancel_message(), usage=job_runner.usage_counts(usage),
             )
         raise
     except Exception as e:  # noqa: BLE001
         message = f"Step {step.position} ({step.agent_name}) failed: {describe_exception(e)}"
         logger.exception("Workflow run %s step %s failed", run_id, step.position)
         async with SessionLocal() as session:
-            await finish_step_run(session, step_run.id, status="failed", error=message)
+            await finish_step_run(session, step_run.id, status="failed", error=message,
+                                  usage=job_runner.usage_counts(usage))
         raise _WorkflowError(message) from None
 
     output = result.output
@@ -656,6 +664,7 @@ async def _run_step(
             await finish_step_run(
                 session, step_run.id, status="success",
                 output=output if isinstance(output, str) else repr(output),
+                usage=job_runner.usage_counts(usage),
             )
     except Exception as e:  # noqa: BLE001
         # The agent did its work, but the record of it could not be written.
@@ -670,7 +679,8 @@ async def _run_step(
         logger.exception("Workflow run %s step %s: success write failed", run_id, step.position)
         try:
             async with SessionLocal() as session:
-                await finish_step_run(session, step_run.id, status="failed", error=message)
+                await finish_step_run(session, step_run.id, status="failed", error=message,
+                                      usage=job_runner.usage_counts(usage))
         except Exception:  # noqa: BLE001
             logger.exception(
                 "Workflow run %s step %s: could not mark the step failed either",

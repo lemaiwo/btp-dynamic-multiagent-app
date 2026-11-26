@@ -402,6 +402,16 @@ export type RunStatus =
     | "interrupted"
     | "degraded";
 
+/** The tokens a finished run consumed, summed over its whole run tree. */
+export interface RunUsage {
+    input_tokens: number;
+    output_tokens: number;
+    cache_read_tokens: number;
+    total_tokens: number;
+    /** Model requests the run made. */
+    requests: number;
+}
+
 export interface JobRun {
     id: string;
     agent_id: number;
@@ -414,6 +424,9 @@ export interface JobRun {
     error: string | null;
     notified: boolean;
     created_by: string | null;
+    /** null for a run that is still running, predates token counting, or
+     * never reached the model. Absent from an older backend. */
+    usage?: RunUsage | null;
 }
 
 /** One step of what a job run did; mirrors `agents/run_activity.py`.
@@ -719,6 +732,9 @@ export interface WorkflowRun {
     summary: string | null;
     error: string | null;
     created_by: string | null;
+    /** Summed over the run's steps; a running run answers what it has used
+     * so far. null for an old run or one whose steps never reached a model. */
+    usage?: RunUsage | null;
 }
 
 /** Statuses `agents/workflow_runner.py` assigns to a `WorkflowItemRun`.
@@ -756,6 +772,9 @@ export interface WorkflowStepRun {
     error: string | null;
     started_at: string | null;
     finished_at: string | null;
+    /** null for the deterministic step kinds (condition, transform, http,
+     * python), a skipped or blocked step and an old run. */
+    usage?: RunUsage | null;
 }
 
 /** GET /admin/api/workflow-runs/{run_id}: the run plus every item and step

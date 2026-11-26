@@ -4292,6 +4292,145 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
             finally:
                 os.unlink(detail_runs_harness_path)
 
+            # --- run token usage --- the Job Runs table's Tokens column and the
+            # run detail's token line: the total with grouping and the in/out
+            # split as a title for a run with usage, empty for null and for a
+            # usage that is not the promised object of finite counts.
+            run_tokens_harness = r"""
+'use strict';
+const assert = require('node:assert');
+const { JSDOM } = require('jsdom');
+
+const dom = new JSDOM(`<!doctype html><html><body>
+  <div id="toast"></div>
+  <div id="runs-list"></div>
+  <div id="run-detail"></div>
+  <table><tbody id="workflow-runs-tbody"></tbody></table>
+  <div id="workflow-run-detail"></div>
+</body></html>`);
+global.window = dom.window;
+global.document = dom.window.document;
+
+""" + js_no_autoinvoke + r"""
+
+const USAGE = { input_tokens: 10000, output_tokens: 2345, cache_read_tokens: 1200,
+                total_tokens: 12345, requests: 7 };
+const runs = [
+    { id: 'r-1', agent_name: 'a', status: 'success', trigger: 'manual',
+      started_at: null, summary: 'ok', error: null, usage: USAGE },
+    { id: 'r-2', agent_name: 'a', status: 'running', trigger: 'manual',
+      started_at: null, summary: null, error: null, usage: null },
+    { id: 'r-3', agent_name: 'a', status: 'success', trigger: 'manual',
+      started_at: null, summary: null, error: null,
+      usage: { ...USAGE, total_tokens: '<b>1</b>' } },
+    { id: 'r-4', agent_name: 'a', status: 'success', trigger: 'manual',
+      started_at: null, summary: null, error: null, usage: '12345' },
+];
+let answer = runs;
+global.fetch = async () => ({ ok: true, json: async () => answer });
+const byId = id => document.getElementById(id);
+
+async function main() {
+    await loadRuns();
+    const heads = [...byId('runs-list').querySelectorAll('th')].map(th => th.textContent);
+    assert.deepStrictEqual(heads, ['Agent', 'Status', 'Started', 'Trigger', 'Tokens', 'Summary']);
+    const cells = [...byId('runs-list').querySelectorAll('td.run-tokens')];
+    assert.strictEqual(cells.length, 4);
+    assert.strictEqual(cells[0].textContent, (12345).toLocaleString(), 'grouped total');
+    assert.strictEqual(cells[0].title,
+        `in ${(10000).toLocaleString()} · out ${(2345).toLocaleString()}`, 'in/out as the title');
+    for (const i of [1, 2, 3]) {
+        assert.strictEqual(cells[i].textContent, '', `run ${i + 1}: no usage, empty cell`);
+        assert.strictEqual(cells[i].title, '', `run ${i + 1}: no title`);
+    }
+    assert.ok(!byId('runs-list').querySelector('b'), 'a non-number count is never rendered');
+
+    answer = { ...runs[0], report: null };
+    await showRun('r-1');
+    const line = byId('run-detail').querySelector('.run-tokens');
+    assert.ok(line, 'the detail shows a token line');
+    assert.strictEqual(line.textContent, `Tokens: ${(12345).toLocaleString()} total (`
+        + `${(10000).toLocaleString()} in, ${(2345).toLocaleString()} out, `
+        + `${(1200).toLocaleString()} cached) · 7 model requests`);
+
+    answer = { ...runs[0], report: null, usage: { ...USAGE, cache_read_tokens: 0, requests: 1 } };
+    await showRun('r-1');
+    assert.strictEqual(byId('run-detail').querySelector('.run-tokens').textContent,
+        `Tokens: ${(12345).toLocaleString()} total (${(10000).toLocaleString()} in, `
+        + `${(2345).toLocaleString()} out) · 1 model request`, 'no cached part when nothing was cached');
+
+    answer = { ...runs[1], report: null };
+    await showRun('r-2');
+    assert.ok(!byId('run-detail').querySelector('.run-tokens'), 'no token line without usage');
+
+    // Workflow runs: the same column in the list, the header line and a
+    // value per step (empty for a step with usage null).
+    answer = [
+        { id: 'w-1', workflow_name: 'wf', status: 'success', trigger: 'manual', started_at: null,
+          items_total: 1, items_succeeded: 1, items_failed: 0, items_skipped: 0, usage: USAGE },
+        { id: 'w-2', workflow_name: 'wf', status: 'running', trigger: 'manual', started_at: null,
+          items_total: 0, items_succeeded: 0, items_failed: 0, items_skipped: 0, usage: null },
+        { id: 'w-3', workflow_name: 'wf', status: 'success', trigger: 'manual', started_at: null,
+          items_total: 0, items_succeeded: 0, items_failed: 0, items_skipped: 0,
+          usage: { ...USAGE, requests: Infinity } },
+    ];
+    await loadWorkflowRuns();
+    const wfCells = [...byId('workflow-runs-tbody').querySelectorAll('td.run-tokens')];
+    assert.strictEqual(wfCells.length, 3);
+    assert.strictEqual(wfCells[0].textContent, (12345).toLocaleString(), 'workflow run total');
+    assert.strictEqual(wfCells[0].title,
+        `in ${(10000).toLocaleString()} · out ${(2345).toLocaleString()}`);
+    assert.strictEqual(wfCells[1].textContent, '', 'no usage: empty');
+    assert.strictEqual(wfCells[2].textContent, '', 'a non-finite count: empty');
+
+    const STEP_USAGE = { input_tokens: 3000, output_tokens: 500, cache_read_tokens: 0,
+                         total_tokens: 3500, requests: 2 };
+    answer = {
+        run: { id: 'w-1', workflow_name: 'wf', status: 'success', trigger: 'manual',
+               started_at: null, finished_at: null, summary: null, error: null, usage: STEP_USAGE },
+        items: [],
+        steps: [
+            { id: 's-1', item_run_id: null, branch_key: null, position: 1, agent_name: 'reader',
+              status: 'success', output: 'x', error: null, usage: STEP_USAGE },
+            { id: 's-2', item_run_id: null, branch_key: null, position: 2, agent_name: 'transform#2',
+              status: 'success', output: 'y', error: null, usage: null },
+        ],
+    };
+    await showWorkflowRun('w-1');
+    const wfLine = byId('workflow-run-detail').querySelector('p.run-tokens');
+    assert.ok(wfLine, 'the workflow run detail shows a token line');
+    assert.strictEqual(wfLine.textContent, `Tokens: ${(3500).toLocaleString()} total (`
+        + `${(3000).toLocaleString()} in, 500 out) · 2 model requests`);
+    const stepCells = [...byId('workflow-run-detail').querySelectorAll('td.step-tokens')];
+    assert.strictEqual(stepCells.length, 2);
+    assert.strictEqual(stepCells[0].textContent, (3500).toLocaleString(), 'agent step total');
+    assert.strictEqual(stepCells[0].title, `in ${(3000).toLocaleString()} · out 500`);
+    assert.strictEqual(stepCells[1].textContent, '', 'deterministic step: empty');
+
+    answer = { ...answer, run: { ...answer.run, usage: null } };
+    await showWorkflowRun('w-1');
+    assert.ok(!byId('workflow-run-detail').querySelector('p.run-tokens'), 'no line without usage');
+
+    console.log('run token usage scenario passed');
+}
+
+main().catch(err => { console.error(err); process.exitCode = 1; });
+"""
+            with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, dir=ROOT) as f:
+                f.write(run_tokens_harness)
+                run_tokens_harness_path = f.name
+            try:
+                result = subprocess.run(
+                    ["node", run_tokens_harness_path], capture_output=True, text=True, timeout=30,
+                )
+                check(
+                    "loadRuns()/showRun() and the workflow runs show tokens, empty without usage",
+                    result.returncode == 0,
+                    (result.stdout + result.stderr).strip()[:800],
+                )
+            finally:
+                os.unlink(run_tokens_harness_path)
+
             # --- run detail auto-refresh --- the poller under jsdom with hand
             # driven timers: starts for a live run, stops on a terminal
             # payload, on an unticked box and on close; Refresh re-fetches;

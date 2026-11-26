@@ -1,6 +1,8 @@
 import { ValueState } from "sap/ui/core/library";
+import NumberFormat from "sap/ui/core/format/NumberFormat";
+import formatMessage from "sap/base/strings/formatMessage";
 import type {
-    McpServer, RunStatus, TokenState, WorkflowItemStatus, WorkflowRunStatus
+    McpServer, RunStatus, RunUsage, TokenState, WorkflowItemStatus, WorkflowRunStatus
 } from "../service/types";
 
 import oauthConfig from "./oauthConfig";
@@ -62,6 +64,33 @@ const TODO_STATES: Record<string, ValueState> = {
     in_progress: ValueState.Information,
     pending: ValueState.None
 };
+
+const USAGE_KEYS: (keyof RunUsage)[] = [
+    "input_tokens", "output_tokens", "cache_read_tokens", "total_tokens", "requests"
+];
+
+/**
+ * A run's `usage` when it is the object the server promises: every count a
+ * finite, non-negative number. Anything else (null, an older backend that
+ * sends nothing, a malformed value) is "no usage", so the cell stays empty
+ * rather than showing NaN or a half-filled line.
+ */
+function readUsage(value: unknown): RunUsage | null {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+        return null;
+    }
+    const source = value as Record<string, unknown>;
+    const ok = USAGE_KEYS.every((key) => {
+        const count = source[key];
+        return typeof count === "number" && Number.isFinite(count) && count >= 0;
+    });
+    return ok ? value as RunUsage : null;
+}
+
+/** A token count with the locale's grouping (`12,345` in English). */
+function tokenCount(count: number): string {
+    return NumberFormat.getIntegerInstance({ groupingEnabled: true }).format(count);
+}
 
 export default {
 
@@ -164,6 +193,68 @@ export default {
             return url.toLowerCase().startsWith("builtin:") ? url : "1 MCP server";
         }
         return `${servers.length} MCP servers`;
+    },
+
+    /** Whether a run has token usage to show; false for null or a value
+     * that is not the promised object. */
+    hasTokenUsage(usage: unknown): boolean {
+        return readUsage(usage) !== null;
+    },
+
+    /** The total tokens of a run, locale-grouped; empty without usage. */
+    tokenTotal(usage: unknown): string {
+        const read = readUsage(usage);
+        return read ? tokenCount(read.total_tokens) : "";
+    },
+
+    /** Input and output tokens through the i18n `pattern` (`{0}` in, `{1}`
+     * out); empty without usage. The pattern is a binding part so the
+     * function stays pure and the text stays in the bundle. */
+    tokenBreakdown(pattern: string, usage: unknown): string {
+        const read = readUsage(usage);
+        if (!read || !pattern) {
+            return "";
+        }
+        return formatMessage(pattern, [tokenCount(read.input_tokens), tokenCount(read.output_tokens)]);
+    },
+
+    /** One step's tokens through the i18n `pattern` (`{0}` total, `{1}` in,
+     * `{2}` out); empty without usage. */
+    tokenStep(pattern: string, usage: unknown): string {
+        const read = readUsage(usage);
+        if (!read || !pattern) {
+            return "";
+        }
+        return formatMessage(pattern, [
+            tokenCount(read.total_tokens), tokenCount(read.input_tokens), tokenCount(read.output_tokens)
+        ]);
+    },
+
+    /**
+     * The run detail's token line: total, in, out, cached (only when any
+     * were read from cache) and the number of model requests. Each pattern
+     * is an i18n text passed as a binding part: `plain` is `{0}` total,
+     * `{1}` in, `{2}` out, `{3}` the requests text; `cached` adds the cached
+     * count as `{3}` and the requests text as `{4}`; `requestOne` and
+     * `requestMany` take the request count as `{0}`. Empty without usage.
+     */
+    tokenDetail(
+        plain: string, cached: string, requestOne: string, requestMany: string, usage: unknown
+    ): string {
+        const read = readUsage(usage);
+        if (!read || !plain || !cached || !requestOne || !requestMany) {
+            return "";
+        }
+        const requests = formatMessage(
+            read.requests === 1 ? requestOne : requestMany, [tokenCount(read.requests)]
+        );
+        const total = tokenCount(read.total_tokens);
+        const input = tokenCount(read.input_tokens);
+        const output = tokenCount(read.output_tokens);
+        if (read.cache_read_tokens > 0) {
+            return formatMessage(cached, [total, input, output, tokenCount(read.cache_read_tokens), requests]);
+        }
+        return formatMessage(plain, [total, input, output, requests]);
     },
 
     /** Renders a workflow item's selected branches as a comma list. Empty
