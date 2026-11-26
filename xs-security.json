@@ -15,6 +15,7 @@
       "urn:ietf:params:oauth:grant-type:jwt-bearer"
     ]
   },
+  "authorities": ["$XSAPPNAME.invoke"],
   "scopes": [
     {
       "name": "$XSAPPNAME.user",
@@ -35,7 +36,7 @@
     },
     {
       "name": "$XSAPPNAME.invoke",
-      "description": "Invoke an agent with attachments on behalf of the signed-in user (invoke API)"
+      "description": "Invoke an agent with attachments on behalf of the signed-in user, or as an application client of this instance (invoke API)"
     },
     {
       "name": "$XSAPPNAME.JOBSCHEDULER",
