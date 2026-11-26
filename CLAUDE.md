@@ -3911,7 +3911,24 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `agent_not_built`, `credential_required`, `run_failed`), the masked
   exception text stays on the row for admins. **Identity is the caller's**:
   `current_principal` AND `current_jwt` from the validated JWT, inherited by
-  the run's task; no `run_as`, no `run_as_principal`. **Attachments are in
+  the run's task; no `run_as`, no `run_as_principal`. **A technical caller**
+  (since 2.48.0: an application client with a client-credentials token of
+  this XSUAA instance and no user, `agents.auth.is_client_token`; the
+  instance grants its own client `invoke` through the top-level
+  `authorities` of `xs-security.json`, so EVERY binding and service key of
+  the instance may call the API this way) runs as the agent's
+  `run_as_principal` like a scheduled run (`run_as`, credential preflight
+  under that principal, `run_as` falling back to the base URL the request
+  bound when `PUBLIC_BASE_URL` / `A2A_PUBLIC_URL` are unset; no base URL at
+  all fails the run with `run_failed`), with NO bearer token bound
+  (`_technical_identity`): `jwt` servers and `user_context` destinations /
+  `builtin:odata` services refuse rather than receive the client's own
+  token. An agent without a run-as principal is the same 404 at the POST.
+  The row stays the client's (`created_by` the client id; all bindings and
+  keys share it, so they can read each other's runs), its activity carries
+  the note `RUN_AS_NOTE` (names nobody), and the one-run-per-(principal,
+  agent) 409 does not apply to it (a fresh slot key per call), the instance
+  cap does. **Attachments are in
   memory for the run only**: the multipart body is read by the module's own
   reader (Starlette's spools a part over 1 MB to disk), never stored or
   logged, the activity gets `{name, media_type, size}` per file; the media
@@ -3961,7 +3978,8 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `agents/odata/tools.py` prefers over pydantic-ai's `ctx.run_id`: so the
   audit row of a job or invoke run carries the `job_runs` id (workflow runs
   do not call `recording`, chat runs keep pydantic-ai's id).
-  `tests/test_invoke_api.py`, `tests/test_invoke_limits.py`
+  `tests/test_invoke_api.py`, `tests/test_invoke_limits.py`,
+  `tests/test_auth_client_token.py`
 - `agents/invoke_config.py` — the one reading of an agent's invoke settings,
   standard library only, called by storage and the invoke API alike:
   `invoke_limits_json` (`media_types` among the three sniffable ones,
@@ -4563,7 +4581,14 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   agent or a skill (a workflow-only import still does not); both admin UIs say whether the
   change is active (the classic admin's toasts; the UI5 admin's box for a failed reload). No
   new resource, environment variable, role, table or column (HANA schema generation
-  unchanged, still 12); `scripts/import_bundle.py` still needs a Reload or restart after it
+  unchanged, still 12); `scripts/import_bundle.py` still needs a Reload or restart after it;
+  2.48.0 lets an application client call the invoke API without a user: `xs-security.json`
+  grants the instance's own client `invoke` (top-level `authorities`; the deploy updates the
+  XSUAA instance, and every binding and service key of it may then call the API), and such a
+  caller's run is the agent's `run_as_principal`'s with no bearer token bound, never two
+  calls held off by the per-user 409, still under `INVOKE_MAX_CONCURRENT`; an agent without
+  a run-as principal is 404 to it. A user's call is unchanged. No new environment variable,
+  role, role collection, table or column (HANA schema generation unchanged, still 12)
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets
@@ -4742,7 +4767,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   one is still named `ABAP IDE Developer`; its descriptions say ABAP
   Assistant; `AgentInvoker` / `Agent Invoker` grants `invoke` ONLY, not the
   chat), plus the `JOBSCHEDULER` scope granted as authority to the
-  `agent-jobscheduler` instance (no role). Its `redirect-uris` are
+  `agent-jobscheduler` instance (no role), and (2.48.0) the top-level
+  `authorities: ["$XSAPPNAME.invoke"]`: a client-credentials token of any
+  binding or service key of this instance carries `invoke` and may call the
+  invoke API as a technical caller (`tests/test_xs_security_invoke.py`). Its `redirect-uris` are
   landscape-wide wildcards (`https://*.cfapps.<region>.hana.ondemand.com/**`);
   a landscape should pin them to its approuter route(s) in the `.mtaext`
 - `approuter/xs-app.json` — `/admin` requires admin scope, `/a2a`
@@ -4801,7 +4829,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
    `BinaryContent` and `submit_result` as the run's output tool -> the outcome is
    written -> `GET /api/invoke/runs/{run_id}` answers result, the OData
    writes of the run (audit rows by `run_id`), text, activity and error to
-   that caller only
+   that caller only. An application client without a user (client
+   credentials) takes a slot of its own per call and runs under the agent's
+   `run_as_principal` with no bearer token bound
 9. `POST /chat/api/conversations/{id}/messages` (the web chat, as the
    signed-in user): the conversation is locked idle→running -> uploads are
    read, sniffed and stored -> user and assistant rows -> the orchestrator
