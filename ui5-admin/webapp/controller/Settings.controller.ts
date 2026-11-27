@@ -10,6 +10,7 @@ import bitbucketEntry from "../model/bitbucketEntry";
 import type { ImportPayload, ImportResult } from "../service/types";
 import type { Router$RouteMatchedEvent } from "sap/ui/core/routing/Router";
 import Embeddings from "./settings/Embeddings";
+import ModelPrices from "./settings/ModelPrices";
 import ModelProviders from "./settings/ModelProviders";
 import type Event from "sap/ui/base/Event";
 
@@ -39,6 +40,9 @@ export default class Settings extends BaseController {
     /** The "Model providers" panel. */
     private modelProviders!: ModelProviders;
 
+    /** The "Model prices" panel. */
+    private modelPrices!: ModelPrices;
+
     /** An import is being asked about or sent: no second one meanwhile. */
     private importing = false;
 
@@ -64,10 +68,17 @@ export default class Settings extends BaseController {
         });
         this.setModel(this.modelProviders.model, "mp");
 
+        this.modelPrices = new ModelPrices({
+            service: () => this.getAdminService(),
+            text: (key, args) => this.text(key, args)
+        });
+        this.setModel(this.modelPrices.model, "prices");
+
         this.getRouter().getRoute("settings")?.attachPatternMatched(() => {
             void this.load();
             void this.modelProviders.load();
             void this.embeddings.show();
+            void this.modelPrices.load();
         });
         // Another page, by a route or by an address that matches none
         // (`bypassed`): the embeddings panel stops polling.
@@ -155,6 +166,24 @@ export default class Settings extends BaseController {
         if (saved) {
             MessageToast.show(this.text("modelSaved"));
         }
+    }
+
+    // --- model prices (controller/settings/ModelPrices.ts) ---
+
+    public onAddModelPrice(): void {
+        this.modelPrices.addRow();
+    }
+
+    public onRemoveModelPrice(event: Event): void {
+        this.modelPrices.removeRow(event);
+    }
+
+    public onSaveModelPrices(): void {
+        void this.modelPrices.save();
+    }
+
+    public onRetryModelPrices(): void {
+        void this.modelPrices.load();
     }
 
     // --- data catalogue embeddings (controller/settings/Embeddings.ts) ---

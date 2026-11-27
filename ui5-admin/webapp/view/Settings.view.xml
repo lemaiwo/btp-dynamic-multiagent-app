@@ -148,6 +148,117 @@
                 </f:SimpleForm>
             </Panel>
 
+            <!-- Model prices (cost in euros): controller/settings/ModelPrices.ts
+                 keeps the `prices` model. Rates stay text end to end. -->
+            <Panel
+                id="modelPricesPanel"
+                headerText="{i18n>mpcPanelTitle}"
+                expandable="false"
+                busy="{prices>/loading}"
+                busyIndicatorDelay="200"
+                class="sapUiSmallMarginTop">
+                <Text id="mpcHint" text="{i18n>mpcHint}" class="sapUiTinyMarginBottom" />
+                <MessageStrip
+                    id="mpcLoadError"
+                    type="Error"
+                    showIcon="true"
+                    visible="{= !!${prices>/loadError} }"
+                    text="{prices>/loadError}"
+                    class="sapUiTinyMarginTopBottom">
+                    <link>
+                        <Link id="mpcRetry" text="{i18n>mpcRetry}" press=".onRetryModelPrices" />
+                    </link>
+                </MessageStrip>
+                <VBox id="mpcContent" visible="{prices>/loaded}">
+                    <f:SimpleForm layout="ResponsiveGridLayout" editable="true">
+                        <Label id="mpcCuPriceLabel" text="{i18n>mpcCuPriceLabel}" labelFor="mpcCuPrice" />
+                        <Input
+                            id="mpcCuPrice"
+                            value="{prices>/form/cuPrice}"
+                            placeholder="{i18n>mpcCuPricePlaceholder}"
+                            valueState="{prices>/cuState}"
+                            valueStateText="{prices>/cuStateText}"
+                            width="12rem" />
+                    </f:SimpleForm>
+                    <Table
+                        id="mpcTable"
+                        items="{ path: 'prices>/form/rows', templateShareable: false }"
+                        noDataText="{i18n>mpcNoRows}"
+                        ariaLabelledBy="mpcTableTitle">
+                        <headerToolbar>
+                            <Toolbar>
+                                <Title id="mpcTableTitle" text="{i18n>mpcTableTitle}" level="H3" />
+                                <ToolbarSpacer />
+                                <Button
+                                    id="mpcAddButton"
+                                    text="{i18n>mpcAdd}"
+                                    icon="sap-icon://add"
+                                    enabled="{= !${prices>/busy} }"
+                                    press=".onAddModelPrice" />
+                            </Toolbar>
+                        </headerToolbar>
+                        <columns>
+                            <Column><Text id="mpcColModel" text="{i18n>mpcColModel}" /></Column>
+                            <Column><Text id="mpcColInput" text="{i18n>mpcColInput}" /></Column>
+                            <Column><Text id="mpcColCached" text="{i18n>mpcColCached}" /></Column>
+                            <Column><Text id="mpcColOutput" text="{i18n>mpcColOutput}" /></Column>
+                            <Column><Text id="mpcColStatus" text="{i18n>mpcColStatus}" /></Column>
+                            <Column width="4rem" hAlign="End"><Text id="mpcColRemove" text="" /></Column>
+                        </columns>
+                        <items>
+                            <ColumnListItem>
+                                <Input
+                                    value="{prices>model}"
+                                    editable="{= !${prices>unpriced} }"
+                                    ariaLabelledBy="mpcColModel"
+                                    valueState="{prices>modelState}"
+                                    valueStateText="{prices>modelStateText}" />
+                                <Input
+                                    value="{prices>input}"
+                                    ariaLabelledBy="mpcColInput"
+                                    valueState="{prices>inputState}"
+                                    valueStateText="{prices>inputStateText}" />
+                                <Input
+                                    value="{prices>cached}"
+                                    placeholder="{i18n>mpcCachedPlaceholder}"
+                                    ariaLabelledBy="mpcColCached"
+                                    valueState="{prices>cachedState}"
+                                    valueStateText="{prices>cachedStateText}" />
+                                <Input
+                                    value="{prices>output}"
+                                    ariaLabelledBy="mpcColOutput"
+                                    valueState="{prices>outputState}"
+                                    valueStateText="{prices>outputStateText}" />
+                                <ObjectStatus
+                                    text="{i18n>mpcNoPrice}"
+                                    state="Warning"
+                                    visible="{prices>unpriced}" />
+                                <Button
+                                    icon="sap-icon://delete"
+                                    type="Transparent"
+                                    tooltip="{i18n>mpcRemove}"
+                                    enabled="{= !${prices>/busy} }"
+                                    press=".onRemoveModelPrice" />
+                            </ColumnListItem>
+                        </items>
+                    </Table>
+                    <HBox class="sapUiSmallMarginTop" alignItems="Center">
+                        <Button
+                            id="mpcSaveButton"
+                            text="{i18n>mpcSave}"
+                            type="Emphasized"
+                            enabled="{= !${prices>/busy} }"
+                            press=".onSaveModelPrices" />
+                        <ObjectStatus
+                            id="mpcUnsaved"
+                            text="{i18n>mpcUnsaved}"
+                            state="Information"
+                            visible="{prices>/dirty}"
+                            class="sapUiSmallMarginBegin" />
+                    </HBox>
+                </VBox>
+            </Panel>
+
             <Panel headerText="{i18n>orchestratorInstructions}" expandable="false" class="sapUiSmallMarginTop">
                 <f:SimpleForm layout="ResponsiveGridLayout" editable="true">
                     <Label text="{i18n>orchestratorInstructions}" labelFor="orchestratorInstructions" />

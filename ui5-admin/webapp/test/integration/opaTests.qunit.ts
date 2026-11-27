@@ -31,6 +31,7 @@ import "./RunAutoRefreshJourney";
 import "./ReloadJourney";
 import "./EmbeddingsJourney";
 import "./ModelProvidersJourney";
+import "./ModelPricesJourney";
 import "./ImportJourney";
 import "./SessionExpiredJourney";
 import "./WorkflowJourney";
