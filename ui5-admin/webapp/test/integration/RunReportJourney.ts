@@ -32,6 +32,8 @@ opaTest("opening a run renders its markdown report", function (Given: Common, Wh
             Opa5.assert.strictEqual(tokensCell(0)[1].getText(false), "in 10,000 · out 2,345", "and the split below it");
             Opa5.assert.strictEqual(tokensCell(1)[0].getText(false), "", "run-2 has no usage: empty cell");
             Opa5.assert.notOk(tokensCell(1)[1].getVisible(), "and no split line");
+            Opa5.assert.strictEqual(tokensCell(0)[2].getText(false), "≈ € 0.04", "run-1 shows its estimated cost");
+            Opa5.assert.notOk(tokensCell(1)[2].getVisible(), "run-2 has no cost: no cost line");
         }
     });
 
@@ -71,6 +73,8 @@ opaTest("opening a run renders its markdown report", function (Given: Common, Wh
             );
         }
     });
+
+    Then.iSeeTheRunCost("runCost", "RunDetail", "≈ € 0.04");
 
     Then.iStopTheApp();
 });

@@ -38,6 +38,11 @@
                                     text="{ parts: ['i18n>runTokensBreakdown', 'runs>usage'], formatter: '.formatter.tokenBreakdown' }"
                                     visible="{ path: 'runs>usage', formatter: '.formatter.hasTokenUsage' }"
                                     class="agentAdminMutedText" />
+                                <Text
+                                    text="{ parts: ['i18n>runCost', 'i18n>runCostSmall', 'i18n>runCostPartly', 'runs>cost'], formatter: '.formatter.costText' }"
+                                    tooltip="{i18n>runCostHint}"
+                                    visible="{ path: 'runs>cost', formatter: '.formatter.hasCost' }"
+                                    class="agentAdminMutedText" />
                             </VBox>
                             <Text text="{ parts: ['runs>summary', 'runs>error'], formatter: '.formatter.runSummary' }" maxLines="2" />
                         </cells>

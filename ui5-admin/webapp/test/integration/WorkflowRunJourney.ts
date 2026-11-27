@@ -49,6 +49,10 @@ opaTest(
                 Opa5.assert.strictEqual(tokens(0)[0].getText(false), "3,500", "the run's total tokens are listed");
                 Opa5.assert.strictEqual(tokens(0)[1].getText(false), "in 3,000 · out 500", "with the split below it");
                 Opa5.assert.strictEqual(tokens(1)[0].getText(false), "", "a run without usage: empty cell");
+                Opa5.assert.strictEqual(
+                    tokens(0)[2].getText(false), "≈ € 0.01 (partly priced)", "the run's cost, partly priced"
+                );
+                Opa5.assert.notOk(tokens(1)[2].getVisible(), "a run without cost: no cost line");
             }
         });
 
@@ -150,6 +154,20 @@ opaTest(
             }
         });
 
+        // step-2's cost is below a cent: it must not read as zero.
+        Then.waitFor({
+            check: function () {
+                return Array.from(document.querySelectorAll(".workflowStepCost"))
+                    .some(function (el) { return (el.textContent ?? "") === "< € 0.01"; });
+            },
+            success: function () {
+                Opa5.assert.strictEqual(
+                    document.querySelectorAll(".workflowStepCost").length, 1,
+                    "only the step with a cost shows one"
+                );
+            }
+        });
+
         Then.waitFor({
             id: "workflowRunTokens",
             viewName: "WorkflowRunDetail",
@@ -160,6 +178,8 @@ opaTest(
                 );
             }
         });
+
+        Then.iSeeTheRunCost("workflowRunCost", "WorkflowRunDetail", "≈ € 0.01 (partly priced)");
 
         Then.iStopTheApp();
     }

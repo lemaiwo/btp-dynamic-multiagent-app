@@ -1,6 +1,8 @@
 import Opa5 from "sap/ui/test/Opa5";
 import ElementRegistry from "sap/ui/core/ElementRegistry";
 import type Dialog from "sap/m/Dialog";
+import type Text from "sap/m/Text";
+import type UI5Element from "sap/ui/core/Element";
 import FakeBackend, { type FailNext } from "../FakeBackend";
 
 export const backend = new FakeBackend();
@@ -31,6 +33,21 @@ export default class Common extends Opa5 {
         this.iStartMyUIComponent({
             componentConfig: { name: "com.agent.admin", async: true },
             hash
+        });
+    }
+
+    /** The estimated cost line of a run detail page (`runCost`,
+     * `workflowRunCost`) reads `text`, with the estimate hint as tooltip. */
+    public iSeeTheRunCost(id: string, viewName: string, text: string): void {
+        this.waitFor({
+            id,
+            viewName,
+            success: function (element: UI5Element) {
+                const control = element as Text;
+                Opa5.assert.strictEqual(control.getText(false), text, `${id} shows the estimated cost`);
+                Opa5.assert.ok(control.getVisible(), `${id} is visible`);
+                Opa5.assert.ok(String(control.getTooltip() ?? "").indexOf("Estimate") === 0, "with the estimate hint");
+            }
         });
     }
 

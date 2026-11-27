@@ -175,3 +175,52 @@ QUnit.test("a workflow step's tokens: total with the in/out split, empty without
     assert.strictEqual(formatter.tokenStep(STEP, null), "", "a deterministic step has no usage");
     assert.strictEqual(formatter.tokenStep(STEP, { ...USAGE, input_tokens: NaN }), "", "a bad count is no usage");
 });
+
+QUnit.module("formatter: a run's estimated cost in euros");
+
+const COST = "≈ € {0}";
+const COST_SMALL = "< € 0.01";
+const COST_PARTLY = "{0} (partly priced)";
+const PRICED = { amount: 0.0421, currency: "EUR", complete: true };
+
+QUnit.test("a priced run shows the amount with two decimals", function (assert) {
+    assert.ok(formatter.hasCost(PRICED));
+    assert.strictEqual(formatter.costText(COST, COST_SMALL, COST_PARTLY, PRICED), "≈ € 0.04");
+    assert.strictEqual(
+        formatter.costText(COST, COST_SMALL, COST_PARTLY, { ...PRICED, amount: 1234.567 }), "≈ € 1,234.57",
+        "grouped and rounded by the locale"
+    );
+});
+
+QUnit.test("an amount below a cent never reads as zero; a real zero does", function (assert) {
+    assert.strictEqual(formatter.costText(COST, COST_SMALL, COST_PARTLY, { ...PRICED, amount: 0.003 }), "< € 0.01");
+    assert.strictEqual(formatter.costText(COST, COST_SMALL, COST_PARTLY, { ...PRICED, amount: 0 }), "≈ € 0.00");
+});
+
+QUnit.test("a run with an unpriced model says partly priced", function (assert) {
+    assert.strictEqual(
+        formatter.costText(COST, COST_SMALL, COST_PARTLY, { ...PRICED, complete: false }), "≈ € 0.04 (partly priced)"
+    );
+    assert.strictEqual(
+        formatter.costText(COST, COST_SMALL, COST_PARTLY, { amount: 0, currency: "EUR", complete: false }),
+        "≈ € 0.00 (partly priced)", "no model priced: never a bare zero"
+    );
+    assert.strictEqual(
+        formatter.costText(COST, COST_SMALL, COST_PARTLY, { amount: 0.003, currency: "EUR", complete: false }),
+        "< € 0.01 (partly priced)"
+    );
+});
+
+QUnit.test("no cost or a malformed one shows nothing", function (assert) {
+    const bad: unknown[] = [
+        null, undefined, {}, [], "0.04", 0.04,
+        { ...PRICED, amount: NaN }, { ...PRICED, amount: Infinity }, { ...PRICED, amount: -1 },
+        { ...PRICED, amount: "0.04" }, { ...PRICED, currency: "USD" }, { ...PRICED, currency: undefined },
+        { ...PRICED, complete: "true" }, { ...PRICED, complete: 1 }, { amount: 0.04, currency: "EUR" }
+    ];
+    for (const value of bad) {
+        assert.strictEqual(formatter.costText(COST, COST_SMALL, COST_PARTLY, value), "", JSON.stringify(value) ?? "undefined");
+        assert.notOk(formatter.hasCost(value));
+    }
+    assert.strictEqual(formatter.costText("", COST_SMALL, COST_PARTLY, PRICED), "", "no pattern: nothing");
+});
