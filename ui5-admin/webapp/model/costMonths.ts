@@ -9,8 +9,10 @@ import type { CostActual, CostEstimate, CostMonth, CostMonths } from "../service
  * so this module holds no wording; amounts go through `NumberFormat`.
  *
  * Rules: EUR per capacity unit only when there are units; the difference
- * (billed minus estimated) only when both figures exist and are in the same
- * currency; a status code is shown only when it has the form of an
+ * (billed minus estimated) only when both figures exist, are in the same
+ * currency and the estimate is fully priced (a partly priced one is a floor);
+ * an amount above 0 that would show as 0.00 is "< € 0.01", as in the run
+ * views; a status code is shown only when it has the form of an
  * identifier; a value that is not the promised number is a dash.
  */
 
@@ -85,8 +87,19 @@ const unitPrice = NumberFormat.getFloatInstance({ minFractionDigits: 2, maxFract
 const unitCount = NumberFormat.getFloatInstance({ minFractionDigits: 0, maxFractionDigits: 2, groupingEnabled: true });
 const monthName = DateFormat.getDateInstance({ format: "yMMMM", UTC: true });
 
-/** An amount with its currency: "€ 12.34" for EUR, "USD 12.34" otherwise. */
+/** Below this an amount would show as 0.00 although it is not zero (the run views' rule). */
+const SMALLEST_SHOWN = 0.005;
+
+function isSmall(amount: number): boolean {
+    return amount > 0 && amount < SMALLEST_SHOWN;
+}
+
+/** An amount with its currency: "€ 12.34" for EUR, "USD 12.34" otherwise;
+ * "< € 0.01" for an amount that two decimals would show as zero. */
 function moneyText(text: TextOf, amount: number, currency: string, format = money): string {
+    if (format === money && isSmall(amount)) {
+        return text("cmLessThan", [moneyText(text, 0.01, currency)]);
+    }
     const shown = format.format(amount);
     return currency === "EUR" ? text("cmMoney", [shown]) : text("cmMoneyOther", [currency, shown]);
 }
@@ -114,7 +127,8 @@ function monthNote(text: TextOf, usage: string, status: string): string {
 }
 
 function differenceText(text: TextOf, actual: CostActual | null, estimate: CostEstimate | null): string {
-    if (!actual || !estimate || actual.currency !== estimate.currency) {
+    if (!actual || !estimate || actual.currency !== estimate.currency || estimate.complete !== true) {
+        // A partly priced estimate is a floor: billed minus a floor says nothing.
         return text("cmNone");
     }
     // In cents, so 10.02 - 10.02 is zero and not a sign of a rounding error.
@@ -138,7 +152,9 @@ function row(text: TextOf, usage: string, month: CostMonth, index: number): Cost
     const none = text("cmNone");
     let estimated = none;
     if (estimate) {
-        estimated = text("cmEstimate", [moneyText(text, estimate.amount, estimate.currency)]);
+        const shown = moneyText(text, estimate.amount, estimate.currency);
+        // "< € 0.01" stands alone, as in the run views.
+        estimated = isSmall(estimate.amount) ? shown : text("cmEstimate", [shown]);
         if (estimate.complete !== true) {
             estimated = text("cmPartly", [estimated]);
         }

@@ -71,7 +71,7 @@ opaTest("with the bill: month, billed, units, EUR per unit, estimate and differe
         Opa5.assert.deepEqual(rowOf(table, 0),
             ["November 2026", "not final", "€ 12.00", "8", "€ 1.50", "≈ € 10.02", "+ € 1.98"]);
         Opa5.assert.deepEqual(rowOf(table, 1),
-            ["October 2026", "", "€ 7.50", "5", "€ 1.50", "≈ € 6.00 (partly priced)", "+ € 1.50"]);
+            ["October 2026", "", "€ 7.50", "5", "€ 1.50", "≈ € 6.00 (partly priced)", "—"]);
         Opa5.assert.deepEqual(rowOf(table, 2),
             ["September 2026", "No AI Core charge reported for this month", "—", "—", "—", "—", "—"]);
         Opa5.assert.deepEqual(rowOf(table, 3).slice(0, 7),
@@ -112,7 +112,7 @@ opaTest("without the usage service: one line says what to set up, estimates only
     iPress(When, "cmRefresh");
 
     iSeeTheStrip(Then, "cmServiceLine", "the service is off", (strip) => {
-        Opa5.assert.ok(strip.getText().indexOf("destination BTP_USAGE") !== -1, strip.getText());
+        Opa5.assert.ok(strip.getText().indexOf("default BTP_USAGE") !== -1, strip.getText());
         Opa5.assert.ok(strip.getText().indexOf("Estimates only") !== -1);
         Opa5.assert.strictEqual(strip.getType(), "Information");
     });

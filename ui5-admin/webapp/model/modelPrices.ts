@@ -175,7 +175,8 @@ function modelProblem(name: string, earlier: string[]): string {
     if (blank(name)) {
         return "mpcErrModelBlank";
     }
-    if (name !== name.trim()) {
+    // The server's rule: no edge whitespace, in Unicode NFC (deployment names are NFC).
+    if (name !== name.trim() || name.normalize("NFC") !== name) {
         return "mpcErrModelEdge";
     }
     if (name.length > MAX_MODEL_CHARS || hasControl(name)) {

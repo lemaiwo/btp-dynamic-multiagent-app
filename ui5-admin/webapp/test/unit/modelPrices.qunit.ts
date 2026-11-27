@@ -5,6 +5,7 @@ import type { PriceRowForm, PricesForm } from "com/agent/admin/model/modelPrices
 import AdminService, { AdminError } from "com/agent/admin/service/AdminService";
 import type { ModelPrices } from "com/agent/admin/service/costTypes";
 import FakeBackend from "com/agent/admin/test/integration/FakeBackend";
+import ModelPricesPanel from "com/agent/admin/controller/settings/ModelPrices";
 import { AMOUNT_RULE, DUPLICATE_MODEL, STALE } from "com/agent/admin/test/integration/FakeModelPrices";
 
 // The logic of the "Model prices" panel of the Settings page, the two calls
@@ -112,7 +113,9 @@ QUnit.test("validate: fixed texts that never quote a value", function (assert) {
         row({ model: "x".repeat(MAX_MODEL_CHARS + 1), input: "1", output: "2" }),
         row({ model: "tab\tname", input: "1", output: "2" }),
         row({ model: "gpt-4o", input: "", output: "", unpriced: true }),
-        newRow()
+        newRow(),
+        row({ model: "cafe\u0301", input: "1", output: "2" }),
+        row({ model: "caf\u00e9", input: "1", output: "2" })
     ], "-3"));
     const seen = problems.map((p) => `${p.row}:${p.field}:${p.text.key}`);
     assert.deepEqual(seen, [
@@ -126,8 +129,9 @@ QUnit.test("validate: fixed texts that never quote a value", function (assert) {
         "4:input:mpcErrRequired",
         "4:output:mpcErrRequired",
         "5:model:mpcErrModelText",
-        "6:model:mpcErrModelText"
-    ], "the unpriced row and the empty new row are left out, not refused");
+        "6:model:mpcErrModelText",
+        "9:model:mpcErrModelEdge"
+    ], "the unpriced row and the empty new row are left out, not refused; a decomposed name is refused like edge blanks, the composed one passes");
     problems.forEach((p) => assert.notOk(p.text.args && p.text.args.length, "no argument: nothing of the input"));
     assert.deepEqual(validate(fromAnswer(answer())), [], "the stored table passes");
     assert.deepEqual(validate(form([], "")), [], "no CU price is allowed");
@@ -200,4 +204,26 @@ QUnit.test("the refusals name the field and never the value", async function (th
     const first = await refusal(() => service.setModelPrices({ expected_updated_at: null, capacity_unit_price: null,
         prices: [] }));
     assert.strictEqual(first.status, 409, "null on a table that was saved is stale");
+});
+
+QUnit.module("modelPrices: the panel's reads");
+
+QUnit.test("an older read that answers last is dropped: the stamp stays the newest", async function (assert) {
+    const pending: Array<(value: ModelPrices) => void> = [];
+    const host = {
+        service: () => ({
+            getModelPrices: () => new Promise<ModelPrices>((resolve) => pending.push(resolve))
+        }) as unknown as AdminService,
+        text: (key: string) => key
+    };
+    const panel = new ModelPricesPanel(host);
+    const older = panel.load();
+    const newer = panel.load();
+    pending[1](answer({ updated_at: "2026-11-21T10:00:00+00:00" }));
+    await newer;
+    pending[0](answer({ updated_at: "2026-11-20T10:00:00+00:00" }));
+    await older;
+    assert.strictEqual(panel.model.getProperty("/form/stamp"), "2026-11-21T10:00:00+00:00", "the newer read's stamp");
+    assert.strictEqual(panel.model.getProperty("/loading"), false);
+    panel.model.destroy();
 });

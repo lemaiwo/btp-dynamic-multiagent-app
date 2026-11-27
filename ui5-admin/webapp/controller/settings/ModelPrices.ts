@@ -49,6 +49,9 @@ export default class ModelPrices {
     /** The form of the last answer, to tell unsaved changes. */
     private stored: PricesForm = { cuPrice: "", rows: [], stamp: null };
 
+    /** Counts the reads and saves: only the newest answer is applied. */
+    private sequence = 0;
+
     public constructor(private readonly host: ModelPricesHost) {
         // An edit clears the mark of that field and recomputes "unsaved".
         this.model.attachPropertyChange((event: Model$PropertyChangeEvent) => {
@@ -93,11 +96,20 @@ export default class ModelPrices {
 
     /** The page is shown: read the table. */
     public async load(): Promise<void> {
+        const mine = ++this.sequence;
         this.model.setProperty("/loading", true);
         try {
-            this.apply(await this.host.service().getModelPrices());
+            const answer = await this.host.service().getModelPrices();
+            // An older read answered last must not bring back an older stamp.
+            if (mine !== this.sequence) {
+                return;
+            }
+            this.apply(answer);
             this.model.setProperty("/loadError", "");
         } catch (error) {
+            if (mine !== this.sequence) {
+                return;
+            }
             const kind = ErrorHandler.classify(error);
             if (kind === "session" || kind === "forbidden") {
                 ErrorHandler.handle(error);
@@ -108,7 +120,9 @@ export default class ModelPrices {
             this.model.setProperty("/loadError", reason
                 ? this.host.text("mpcLoadFailed", [reason]) : this.host.text("mpcLoadFailedPlain"));
         } finally {
-            this.model.setProperty("/loading", false);
+            if (mine === this.sequence) {
+                this.model.setProperty("/loading", false);
+            }
         }
     }
 
@@ -190,6 +204,9 @@ export default class ModelPrices {
         this.model.setProperty("/busy", true);
         try {
             const answer = await this.host.service().setModelPrices(prices.toPayload(form));
+            // The saved table is the newest: a read still in flight is older.
+            ++this.sequence;
+            this.model.setProperty("/loading", false);
             this.apply(answer);
             MessageToast.show(this.host.text("mpcSaved"));
         } catch (error) {

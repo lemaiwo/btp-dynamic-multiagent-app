@@ -88,9 +88,30 @@ QUnit.test("estimate: partly priced, and a dash when there is none", async funct
         month({ estimated: null })
     ]), text);
     assert.strictEqual(partly.estimated, "≈ € 10.02 (partly priced)");
-    assert.strictEqual(partly.difference, "+ € 2.32", "both figures exist");
+    assert.strictEqual(partly.difference, "—", "a partly priced estimate is a floor: no difference");
     assert.strictEqual(none.estimated, "—");
     assert.strictEqual(none.difference, "—");
+});
+
+QUnit.test("an amount above zero that would show as 0.00 is \"< € 0.01\", as in the run views", async function (assert) {
+    const text = await textOf();
+    const [small, edge, zero, other] = rows(answer([
+        month({ actual: { amount: 0.004, currency: "EUR", capacity_units: 1, estimated: false },
+            estimated: { amount: 0.0049, currency: "EUR", complete: true } }),
+        month({ actual: { amount: 0.005, currency: "EUR", capacity_units: 1, estimated: false },
+            estimated: { amount: 0.001, currency: "EUR", complete: false } }),
+        month({ actual: { amount: 0, currency: "EUR", capacity_units: 0, estimated: false },
+            estimated: { amount: 0, currency: "EUR", complete: true } }),
+        month({ actual: { amount: 0.001, currency: "USD", capacity_units: 1, estimated: false } })
+    ]), text);
+    assert.strictEqual(small.billed, "< € 0.01");
+    assert.strictEqual(small.estimated, "< € 0.01", "no \"≈\" in front, as in the run views");
+    assert.strictEqual(small.difference, "€ 0.00", "the difference is in cents");
+    assert.strictEqual(edge.billed, "€ 0.01", "0.005 rounds to a cent");
+    assert.strictEqual(edge.estimated, "< € 0.01 (partly priced)");
+    assert.strictEqual(zero.billed, "€ 0.00", "zero is zero");
+    assert.strictEqual(zero.estimated, "≈ € 0.00");
+    assert.strictEqual(other.billed, "< USD 0.01");
 });
 
 QUnit.test("difference: below the estimate, equal, and grouped amounts", async function (assert) {
@@ -186,6 +207,8 @@ QUnit.test("every text the panel can show is in the i18n bundle", async function
     rows(answer([
         month({ month: "2026-11", actual: { amount: 1, currency: "EUR", capacity_units: 2, estimated: true } }),
         month({ estimated: { amount: 1, currency: "EUR", complete: false } }),
+        month({ actual: { amount: 0.001, currency: "EUR", capacity_units: 1, estimated: false },
+            estimated: { amount: 0.001, currency: "EUR", complete: true } }),
         month({ actual: { amount: 1, currency: "EUR", capacity_units: 2, estimated: false } }),
         month({ actual: { amount: 10.02, currency: "EUR", capacity_units: 0, estimated: false } }),
         month({ actual: { amount: 1, currency: "USD", capacity_units: 1, estimated: false } }),
