@@ -411,6 +411,8 @@ console.log('\n== the drawer view model ==');
   check('attachments with size text and the excluded flag', vm.history.attachments.length === 2 && vm.history.attachments[0].sizeText === '2 KB' && vm.history.attachments[0].excluded === false && vm.history.attachments[1].excluded === true && vm.history.attachments[1].sizeText === '1 MB');
   check('tools grouped by kind in a fixed order, the delegate target named', eq(vm.tools.map((g) => g.kind), ['document', 'deep', 'delegate']) && vm.tools[0].items.length === 2 && vm.tools[2].items[0].label === 'delegate_to_btp_admin → btp-admin' && vm.tools[2].items[0].agent === 'btp-admin');
   check('usage: total and detail', vm.usage.totalText === '5,266 tokens' && vm.usage.detail === '4,390 in / 876 out · 7 requests over 2 turns');
+  const withCost = (cost) => contextViewModel({ ...SAMPLE_CONTEXT, usage: { ...SAMPLE_CONTEXT.usage, cost } }).usage.costText;
+  check('cost text: amount, below a cent, partly priced, none/odd -> null', withCost({ amount: 0.1234, currency: 'EUR', complete: true }) === '\u2248 \u20ac 0.12' && withCost({ amount: 0.004, currency: 'EUR', complete: true }) === '< \u20ac 0.01' && withCost({ amount: 0.1234, currency: 'EUR', complete: false }) === '\u2248 \u20ac 0.12 (partly priced)' && withCost(undefined) === null && withCost(null) === null && withCost({ amount: '1', currency: 'EUR', complete: true }) === null && withCost({ amount: 1, currency: 'USD', complete: true }) === null && withCost({ amount: -1, currency: 'EUR', complete: true }) === null);
   const own = contextViewModel({ ...SAMPLE_CONTEXT, agent: { kind: 'admin', name: 'sap-data' }, tools: [
     { kind: 'document', name: 'create_word_document' },
     { kind: 'data_catalog', name: 'find_data_source', agent: 'sap-data' },
@@ -435,6 +437,10 @@ console.log('\n== the drawer body (text nodes only) ==');
   renderContextBody(body, { ...SAMPLE_CONTEXT, agent: { ...SAMPLE_CONTEXT.agent, name: '<b>evil</b>' } }, { onToggle: async (id, ex) => { calls.push([id, ex]); return ex; } });
   const heads = [...body.querySelectorAll('.ctx-section > h3')].map((h) => h.textContent);
   check('five sections in order', eq(heads, ['Who answers', 'Instructions & skills', 'History', 'Tools this turn', 'Usage so far']));
+  check('no cost row without a cost', !body.textContent.includes('Estimated cost') && !body.querySelector('.ctx-hint'));
+  const bodyCost = document.createElement('div');
+  renderContextBody(bodyCost, { ...SAMPLE_CONTEXT, usage: { ...SAMPLE_CONTEXT.usage, cost: { amount: 0.1234, currency: 'EUR', complete: true } } }, {});
+  check('cost row and estimate hint in Usage so far', bodyCost.querySelector('#ctx-usage').parentElement.textContent.includes('Estimated cost') && bodyCost.querySelector('#ctx-usage').parentElement.textContent.includes('\u2248 \u20ac 0.12') && bodyCost.querySelector('.ctx-hint').textContent === "An estimate at today's model prices, not the bill.");
   check('server text is a text node, never markup', body.querySelector('b') === null && body.textContent.includes('<b>evil</b>'));
   check('the fill bar is a meter at 12', body.querySelector('.fill-bar[role="meter"]').getAttribute('aria-valuenow') === '12' && body.querySelector('.fill-text').textContent.startsWith('12% · ~15.3k of 128k tokens'));
   const rows = [...body.querySelectorAll('.ctx-table tbody tr')];

@@ -206,10 +206,13 @@ export function renderContextBody(body, ctx, { onToggle } = {}) {
 
   // 5. Usage so far
   const usage = section('Usage so far', 'ctx-usage');
-  usage.appendChild(dl([
+  const usageRows = [
     ['Total', vm.usage.totalText],
     ['Detail', vm.usage.detail],
-  ]));
+  ];
+  if (vm.usage.costText) usageRows.push(['Estimated cost', vm.usage.costText]);
+  usage.appendChild(dl(usageRows));
+  if (vm.usage.costText) usage.appendChild(el('p', 'ctx-muted small ctx-hint', "An estimate at today's model prices, not the bill."));
   body.appendChild(usage);
   return vm;
 }
