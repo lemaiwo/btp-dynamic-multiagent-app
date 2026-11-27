@@ -1,6 +1,7 @@
 import opaTest from "sap/ui/test/opaQunit";
 import Opa5 from "sap/ui/test/Opa5";
 import Press from "sap/ui/test/actions/Press";
+import EnterText from "sap/ui/test/actions/EnterText";
 import InstanceManager from "sap/m/InstanceManager";
 import type Table from "sap/m/Table";
 import type ColumnListItem from "sap/m/ColumnListItem";
@@ -86,6 +87,12 @@ opaTest("with the bill: month, billed, units, EUR per unit, estimate and differe
         success: (strip: UI5Element) => Opa5.assert.notOk((strip as MessageStrip).getVisible(), "no service line when it answered")
     });
     Then.waitFor({
+        id: "cmNoCuPrice",
+        viewName: VIEW,
+        visible: false,
+        success: (strip: UI5Element) => Opa5.assert.notOk((strip as MessageStrip).getVisible(), "a CU price is set: no hint")
+    });
+    Then.waitFor({
         id: "cmHint",
         viewName: VIEW,
         success: (hint: UI5Element) => Opa5.assert.ok((hint as Text).getText(false).indexOf("other consumers of the AI Core instance") !== -1)
@@ -160,6 +167,22 @@ opaTest("a failed read is a strip in the panel with a retry, never a dialog", fu
         viewName: VIEW,
         visible: false,
         success: (strip: UI5Element) => Opa5.assert.notOk((strip as MessageStrip).getVisible(), "the strip is gone")
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("without a price per capacity unit the panel says where to set one", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("settings");
+    iSeeTheTable(Then, "six months", (table) => table.getItems().length === 6, () => Opa5.assert.ok(true));
+
+    When.waitFor({ id: "mpcCuPrice", viewName: VIEW, actions: new EnterText({ text: "", clearTextFirst: true }) });
+    iPress(When, "mpcSaveButton");
+
+    iSeeTheStrip(Then, "cmNoCuPrice", "no CU price", (strip) => {
+        Opa5.assert.strictEqual(strip.getText(), "Set a price per capacity unit under Model prices to see estimates.");
+        Opa5.assert.strictEqual(strip.getType(), "Information");
+        Opa5.assert.strictEqual(backend.modelPrices.cuPrice, null, "saved without a CU price");
     });
 
     Then.iStopTheApp();

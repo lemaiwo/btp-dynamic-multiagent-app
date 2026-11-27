@@ -39,7 +39,7 @@
                                     visible="{ path: 'runs>usage', formatter: '.formatter.hasTokenUsage' }"
                                     class="agentAdminMutedText" />
                                 <Text
-                                    text="{ parts: ['i18n>runCost', 'i18n>runCostSmall', 'i18n>runCostPartly', 'runs>cost'], formatter: '.formatter.costText' }"
+                                    text="{ parts: ['i18n>runCost', 'i18n>runCostSmall', 'i18n>runCostPartly', 'i18n>runCostUnpriced', 'runs>cost'], formatter: '.formatter.costText' }"
                                     tooltip="{i18n>runCostHint}"
                                     visible="{ path: 'runs>cost', formatter: '.formatter.hasCost' }"
                                     class="agentAdminMutedText" />

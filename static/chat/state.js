@@ -481,10 +481,13 @@ export function contextViewModel(ctx) {
 }
 
 // `cost` is null (no price set) or {amount, currency: "EUR", complete}; anything else shows nothing.
+// {amount: 0, complete: false} (no model of the turn has a price) reads "no price for this model".
 export function costLabel(cost) {
   if (!cost || typeof cost !== 'object' || Array.isArray(cost)) return null;
   if (typeof cost.amount !== 'number' || !Number.isFinite(cost.amount) || cost.amount < 0) return null;
   if (cost.currency !== 'EUR' || typeof cost.complete !== 'boolean') return null;
+  // Nothing of the turn was priced: an amount of 0 would read as "it cost nothing".
+  if (!cost.complete && cost.amount === 0) return 'no price for this model';
   const fmt = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'EUR', currencyDisplay: 'narrowSymbol' });
   const money = cost.amount > 0 && cost.amount < 0.005 ? '< \u20ac 0.01' : `\u2248 \u20ac ${fmt.format(cost.amount).replace(/[^0-9.,]/g, '')}`;
   return cost.complete ? money : `${money} (partly priced)`;

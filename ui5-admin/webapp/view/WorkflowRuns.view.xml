@@ -46,7 +46,7 @@
                                     visible="{ path: 'workflowRuns>usage', formatter: '.formatter.hasTokenUsage' }"
                                     class="agentAdminMutedText" />
                                 <Text
-                                    text="{ parts: ['i18n>runCost', 'i18n>runCostSmall', 'i18n>runCostPartly', 'workflowRuns>cost'], formatter: '.formatter.costText' }"
+                                    text="{ parts: ['i18n>runCost', 'i18n>runCostSmall', 'i18n>runCostPartly', 'i18n>runCostUnpriced', 'workflowRuns>cost'], formatter: '.formatter.costText' }"
                                     tooltip="{i18n>runCostHint}"
                                     visible="{ path: 'workflowRuns>cost', formatter: '.formatter.hasCost' }"
                                     class="agentAdminMutedText" />

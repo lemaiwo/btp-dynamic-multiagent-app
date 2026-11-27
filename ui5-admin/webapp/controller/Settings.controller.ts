@@ -73,16 +73,18 @@ export default class Settings extends BaseController {
         });
         this.setModel(this.modelProviders.model, "mp");
 
-        this.modelPrices = new ModelPrices({
-            service: () => this.getAdminService(),
-            text: (key, args) => this.text(key, args)
-        });
-        this.setModel(this.modelPrices.model, "prices");
-
         this.costMonths = new CostMonths({
             service: () => this.getAdminService(),
             text: (key, args) => this.text(key, args)
         });
+
+        this.modelPrices = new ModelPrices({
+            service: () => this.getAdminService(),
+            text: (key, args) => this.text(key, args),
+            // The months' estimates are computed at the saved prices: read them again.
+            saved: () => void this.costMonths.load()
+        });
+        this.setModel(this.modelPrices.model, "prices");
         this.setModel(this.costMonths.model, "cost");
 
         this.getRouter().getRoute("settings")?.attachPatternMatched(() => {

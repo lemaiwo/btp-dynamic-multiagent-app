@@ -14,7 +14,7 @@ import { createContextDrawer } from './render/contextDrawer.js';
 import { createViewer } from './render/viewer.js';
 import { pickerGroups, agentNameOf, refOffered, isAdvanced } from './myagents.js';
 import { initTheme, setTheme, onSkinChange, THEMES } from './theme.js';
-import { titleFromText, formatTokens, formatPct, fillLevel, contextIndicatorText, normalizeAccess, rememberedAccess, rememberAccess } from './util.js';
+import { titleFromText, formatTokens, usageChipTitle, formatPct, fillLevel, contextIndicatorText, normalizeAccess, rememberedAccess, rememberAccess } from './util.js';
 import { excludedFileIds } from './state.js';
 
 const store = createStore({ ...initialState, catalog: null, myAgents: [], draftAgentRef: null, view: 'chat' });
@@ -814,8 +814,7 @@ function reflectUsage(usage) {
     return;
   }
   const text = `${formatTokens(total)} tokens`;
-  const turns = Number(usage.turns) || 0;
-  const title = `${formatTokens(usage.input_tokens || 0)} in / ${formatTokens(usage.output_tokens || 0)} out · ${Number(usage.requests) || 0} requests over ${turns === 1 ? '1 turn' : `${turns} turns`}`;
+  const title = usageChipTitle(usage);
   if (usageChip.textContent !== text) usageChip.textContent = text;
   if (usageChip.title !== title) { usageChip.title = title; usageChip.setAttribute('aria-label', `Conversation usage: ${text}, ${title}`); }
   usageChip.hidden = false;
