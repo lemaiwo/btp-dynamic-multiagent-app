@@ -4328,3 +4328,8 @@ router.include_router(_ina_router)
 from agents.model_provider_routes import router as _model_providers_router  # noqa: E402
 
 router.include_router(_model_providers_router)
+
+# The cost in euros: the model price table (/admin/api/model-prices).
+from agents.cost_routes import router as _cost_router  # noqa: E402
+
+router.include_router(_cost_router)

@@ -1,4 +1,5 @@
-"""Retention of the model usage ledger (``model_usage``, cost in euros).
+"""Retention and reads of the model usage ledger (``model_usage``, cost in
+euros).
 
 The ledger outlives runs and conversations on purpose (monthly sums), so it
 has its own clock: ``MODEL_USAGE_RETENTION_DAYS`` (default 400, ``0`` keeps
@@ -10,7 +11,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agents.db import ModelUsage
@@ -39,3 +40,11 @@ async def purge_model_usage(session: AsyncSession, days: int) -> int:
     )
     await session.commit()
     return int(result.rowcount or 0)
+
+
+async def seen_models(session: AsyncSession, limit: int = 500) -> list[str]:
+    """The distinct model names the ledger holds, at most ``limit`` of them
+    (the price table's "models without a rate": bounded, not paged).
+    ``model`` is a ``String`` column, so ``DISTINCT`` runs on HANA too."""
+    result = await session.execute(select(ModelUsage.model).distinct().limit(limit))
+    return [name for (name,) in result.all()]

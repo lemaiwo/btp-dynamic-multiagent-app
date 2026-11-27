@@ -44,6 +44,7 @@ from agents.db import (  # noqa: E402
     McpOAuthClient,
     McpOAuthState,
     McpOAuthToken,
+    ModelPrice,
     ODataService,
     OrchestratorConfig,
     SkillConfig,
@@ -151,6 +152,7 @@ async def test_the_default_is_a_dry_run_that_names_and_counts(dbs, capsys, caplo
         "only in target 3 (local-wf-0, local-wf-1, local-wf-2)",
         "  odata_services: insert 1 (stock), replace 0, unchanged 0, only in target 0",
         "  ina_queries: insert 0, replace 0, unchanged 0, only in target 0",
+        "  model_prices: insert 0, replace 0, unchanged 0, only in target 0",
         "  ide_conventions: insert 1 (DEV), replace 0, unchanged 0, only in target 0, "
         "audited 1 (DEV)",
         "  mcp_oauth_clients: insert 1, replace 0, unchanged 0, only in target 0",
@@ -170,6 +172,7 @@ def test_what_is_copied_and_what_is_not():
     assert set(copy_script.COPIED) == {
         "agent_configs", "skill_configs", "orchestrator_config", "workflows",
         "workflow_branches", "workflow_steps", "odata_services", "ina_queries",
+        "model_prices",
         "ide_conventions", "mcp_oauth_clients", "mcp_oauth_tokens",
     }
     assert set(copy_script.NOT_COPIED) == set(Base.metadata.tables) - set(copy_script.COPIED)
@@ -254,6 +257,39 @@ async def test_a_registered_ina_query_goes_with_a_database_switch(dbs, capsys):
     assert (await run(capsys))[1].count("ina_queries: insert 0, replace 0, unchanged 1") == 1
 
 
+async def test_the_model_price_table_goes_with_a_database_switch(dbs, capsys):
+    """``model_prices`` is configuration (cost in euros): every rate arrives
+    as it was, matched by model; the CU price rides on the orchestrator row;
+    a second run changes nothing."""
+    source, target = dbs
+    stamp = datetime(2026, 11, 20, 9, 0, tzinfo=timezone.utc)
+    async with source.sessions() as s:
+        s.add(ModelPrice(model="gpt-4o", input_rate=500_000_000, output_rate=2_000_000_000,
+                         cache_read_rate=50_000_000, updated_at=stamp))
+        s.add(ModelPrice(model="anthropic--claude-4-sonnet", input_rate=1_000_000_000,
+                         output_rate=4_000_000_000, cache_read_rate=None, updated_at=stamp))
+        settings = await s.get(OrchestratorConfig, 1)
+        settings.capacity_unit_price = 7_500_000_000
+        settings.prices_updated_at = stamp
+        await s.commit()
+    async with target.sessions() as s:
+        s.add(ModelPrice(model="gpt-4o", input_rate=1, output_rate=1, updated_at=stamp))
+        await s.commit()
+    code, out, _ = await run(capsys)
+    assert code == 0
+    assert ("  model_prices: insert 1 (anthropic--claude-4-sonnet), replace 1 (gpt-4o), "
+            "unchanged 0, only in target 0") in out.splitlines()
+    assert (await run(capsys, "--apply"))[0] == 0
+    copied = {p.model: (p.input_rate, p.output_rate, p.cache_read_rate)
+              for p in await target.all(ModelPrice)}
+    assert copied == {"gpt-4o": (500_000_000, 2_000_000_000, 50_000_000),
+                      "anthropic--claude-4-sonnet": (1_000_000_000, 4_000_000_000, None)}
+    (settings,) = await target.all(OrchestratorConfig)
+    assert settings.capacity_unit_price == 7_500_000_000
+    assert settings.prices_updated_at.replace(tzinfo=timezone.utc) == stamp
+    assert (await run(capsys))[1].count("model_prices: insert 0, replace 0, unchanged 2") == 1
+
+
 async def test_ids_are_the_targets_and_children_follow_their_workflow(dbs, capsys):
     source, target = dbs
     assert (await run(capsys, "--apply"))[0] == 0
@@ -282,7 +318,7 @@ async def test_a_second_run_changes_nothing(dbs, capsys):
         code, out, _ = await run(capsys, *extra)
         assert code == 0
         lines = [line for line in out.splitlines() if ": insert " in line]
-        assert len(lines) == len(copy_script.SPECS) + len(copy_script.CHILDREN) == 11
+        assert len(lines) == len(copy_script.SPECS) + len(copy_script.CHILDREN) == 12
         assert all("insert 0, replace 0" in line for line in lines), out
     assert {a.name: a.updated_at for a in await target.all(AgentConfig)} == stamps
 

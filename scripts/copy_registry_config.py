@@ -11,7 +11,8 @@ It copies configuration, not history:
 
 * copied -- ``agent_configs`` (every column), ``skill_configs``, the
   orchestrator row, ``workflows`` with their branches and steps,
-  ``odata_services``, ``ina_queries``, ``ide_conventions``,
+  ``odata_services``, ``ina_queries``, ``model_prices`` (the admin's rates;
+  the CU price is a column of the orchestrator row), ``ide_conventions``,
   ``mcp_oauth_clients``, ``mcp_oauth_tokens``;
 * not copied -- job and workflow runs, the OData and IDE audit logs, IDE
   sessions and everything below them, pending OAuth flow states.
@@ -170,6 +171,7 @@ SPECS = (
     Spec("workflows", ("name",)),
     Spec("odata_services", ("name",)),
     Spec("ina_queries", ("name",)),
+    Spec("model_prices", ("model",)),
     Spec("ide_conventions", ("target",)),
     Spec("mcp_oauth_clients", ("server_key",), named=False),
     Spec("mcp_oauth_tokens", ("user_id", "server_key"), named=False),
