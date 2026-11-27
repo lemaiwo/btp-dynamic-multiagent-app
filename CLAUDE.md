@@ -179,7 +179,7 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   with `prices_updated_at`, both nullable and added last; `replace_model_usage`
   (delete the rows of one `(source, ref_id)`, insert the new ones, no commit; a model
   with 0 requests is skipped) and `write_model_usage_separately` (the same in a
-  transaction of its own that never raises). See `agents/model_usage.py` below
+  transaction of its own that never raises). See `agents/model_usage.py` below.
   **On HANA the models are the only DDL: a new NOT NULL column needs a
   `server_default`** (HDI adds it to a table that holds rows;
   `tests/test_hana_hdi.py` pins the NOT NULL columns without one that exist
@@ -2646,9 +2646,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   chat conversation, and the billed AI Core cost per month next to it.
   - `model_usage.py` — the collector, standard library only: `UsageCollector`,
     `collecting()` (a ContextVar set and reset in the same task), `current()`, `add()`
-    (does nothing without a bound collector; a blank or non-string model name, an
-    unreadable usage or negative counts are dropped with one WARNING naming the class;
-    a name is cut to 128 characters; never raises). **What is counted is an answered
+    (does nothing without a bound collector; a blank or non-string model name is dropped
+    silently, an unreadable usage or negative counts with one WARNING naming the class;
+    a name is stripped and cut to 128 characters; never raises). **What is counted is an answered
     request**: `NexusLoggedModel.request` adds the response's own usage after the call
     returned, and `request_stream` only when the stream context manager exits normally
     (a consumer that raises or is cancelled records nothing), with the register on or off
@@ -2715,18 +2715,20 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     BTP destination: `BTP_USAGE` by default (the destination name is a code default,
     `USAGE_DESTINATION` overrides it); **off when the destination does not exist**
     (`usage_service: off`, no other call), and `no_subaccount` when the subaccount id is
-    unknown: `USAGE_SUBACCOUNT_ID`, else `credentials.subaccountid` of the XSUAA binding.
+    unknown: `USAGE_SUBACCOUNT_ID` when set (blank counts as unset; a value that does not
+    have the form of an id is `no_subaccount`, never a fallback), else
+    `credentials.subaccountid` of the XSUAA binding.
     **The credential reads the whole global account** (the API ignores a `subaccountId`
     parameter), so the filter is the module's: a row is read at all only when its
     `subaccountId` equals this subaccount exactly and its `serviceId` is `ai-core`, and
-    only such rows ever leave the module (a global-account row has `subaccountId: ""`;
-    a blank configured id is refused). Per month it sums `cost` and the `capacity_units`
+    only such rows ever leave the module (a global-account row has `subaccountId: ""`,
+    which no accepted id equals). Per month it sums `cost` and the `capacity_units`
     usage as `Decimal`, one currency per month. Fixed codes in `usage_service`: `ok`,
     `off`, `no_subaccount`, `destination_error`, `unauthorized`, `usage_unavailable`,
     `too_large`, `not_json`, `unreadable`; any unexpected error is `usage_unavailable`,
     logged by class. Transport: `https` destination only, no redirect, `trust_env` off,
-    the destination's `Cookie` / `Host` / `Content-*` headers and `URL.queries.*` not
-    sent, one 20 s deadline, a 4 MB read cap (the body of an error status is never read),
+    the destination's `content-length`, `content-type`, `transfer-encoding`, `host` and
+    `cookie` headers (any case) and `URL.queries.*` not sent, one 20 s deadline, a 4 MB read cap (the body of an error status is never read),
     a 401 / 403 drops the cached destination; httpx's request line is kept out of the log
     by the filter of `agents/bitbucket_tools.py`. **Cache**: per process, 6 h for an `ok`
     answer, 5 min for any other, at most 32 keys; a change in the destination shows up
@@ -2737,9 +2739,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     `test_model_prices.py`, `test_model_price_routes.py`, `test_cost_answers.py`,
     `test_btp_usage.py`, `test_cost_months_route.py`, `test_hana_hdi.py` (generation 14);
     the recorded answer is `tests/fixtures/btp_usage/` (synthetic values, real structure).
+    **Seen on the real API** (the probe's recording, 2026-11-27): the month still open is
+    flagged `estimated` by the API (`estimated: true` on its rows).
   - **Not verified**: the reader has not run against the real usage API from the app
-    (only the recorded answer of a probe, as a fixture); the amount of a month still open
-    is flagged `estimated` by the API; the opt-in PostgreSQL and HANA suites were not run
+    (only the recorded answer of a probe, as a fixture); the opt-in PostgreSQL and HANA suites were not run
     for this release (the suite's HANA statement compile check ran over every statement);
     the HDI deploy of generation 14 on a landscape has not run. Known limits: an
     estimate prices the models the app saw, not other consumers of the same AI Core; a
@@ -4471,8 +4474,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     "Estimated cost" under Tokens on both detail pages and a line on each workflow step
     row (i18n `runCost*`, `colCost`). Two panels of the Settings page, "Model prices"
     (the table of `GET`/`PUT /admin/api/model-prices`) and "AI Core cost" (the estimate
-    against the billed cost per month of `GET /admin/api/cost/months`), are fed by
-    those routes (`agents/cost_routes.py`); see the cost entry above
+    against the billed cost per month of `GET /admin/api/cost/months`; `< € 0.01` for an
+    amount that two decimals would show as zero, and no difference against a partly
+    priced estimate, which is a floor: `model/costMonths.ts`), are fed by those routes
+    (`agents/cost_routes.py`); see the cost entry above
   - Karma runs in a fixed desktop window (`karma.conf.js`, launcher
     `ChromeHeadlessDesktop`, 1440x900): at headless Chrome's default 800x600
     what fits in an `OverflowToolbar` depends on the machine's fonts, and on
