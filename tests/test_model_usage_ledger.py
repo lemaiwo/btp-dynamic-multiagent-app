@@ -409,3 +409,58 @@ async def test_interrupted_after_finalize_leaves_the_stored_ledger_alone():
     await invoke._interrupted(run_id, _state_with_spend("model-z"))
     assert (await _row(run_id)).status == "success"
     assert await _ledger(run_id) == _as_stored(LEDGER)
+
+
+# ---------------------------------------------------------------------------
+# A failing ledger write never loses the run's outcome
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def ledger_fails(monkeypatch):
+    """Every ledger write raises, as a failing DELETE or INSERT would."""
+    import agents.db as db
+
+    calls: list[str] = []
+
+    async def boom(session, **kw):
+        calls.append(kw["ref_id"])
+        raise RuntimeError("ledger down")
+
+    monkeypatch.setattr(db, "replace_model_usage", boom)
+    return calls
+
+
+async def test_finish_job_run_keeps_the_outcome_when_the_ledger_fails(ledger_fails):
+    run_id = await _new_run(await _job_agent())
+    async with SessionLocal() as s:
+        await finish_job_run(s, run_id, status="success", summary="ok",
+                             usage={"input_tokens": 1, "output_tokens": 1, "requests": 1},
+                             model_usage=LEDGER)
+    row = await _row(run_id)
+    assert ledger_fails == [run_id]
+    assert (row.status, row.summary, row.requests) == ("success", "ok", 1)
+    assert row.finished_at is not None
+    assert await _ledger(run_id) == []
+
+
+async def test_a_job_run_completes_once_when_the_ledger_fails(monkeypatch, ledger_fails):
+    run_id = await _run_job(monkeypatch, JobSpecialist())
+    row = await _row(run_id)
+    assert row.status == "success" and row.requests == 3
+    # One outcome write, not retried: the ledger failure never reached _finalize.
+    assert ledger_fails == [run_id]
+
+
+async def test_an_invoke_run_completes_when_the_ledger_fails(monkeypatch, ledger_fails):
+    answer, run_id = await _invoke(_submits, monkeypatch)
+    assert answer["status"] == "completed"
+    assert (await _row(run_id)).status == "success"
+    assert ledger_fails == [run_id]
+
+
+async def test_interrupted_keeps_the_cancel_when_the_ledger_fails(ledger_fails):
+    agent = await make_agent()
+    run_id = await _new_run(agent)
+    await invoke._interrupted(run_id, _state_with_spend())
+    row = await _row(run_id)
+    assert row.status == "interrupted" and row.finished_at is not None
+    assert ledger_fails == [run_id]

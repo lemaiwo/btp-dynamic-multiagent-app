@@ -132,7 +132,7 @@ from agents.db import (
     get_agent_by_slug,
     get_job_run,
     has_hana_entry,
-    replace_model_usage,
+    write_model_usage_separately,
 )
 from agents.errors import describe_exception
 from agents.invoke_config import (
@@ -486,13 +486,15 @@ async def _interrupted(run_id: str, state: _RunState) -> None:
                 .where(JobRun.id == run_id, JobRun.status == ACTIVE_RUN_STATUS)
                 .values(**values)
             )
-            # The ledger only when this write closed the row: after a
-            # committed _finalize the rows it stored stay as they are.
-            if result.rowcount == 1:
-                await replace_model_usage(
+            closed = result.rowcount == 1
+            await session.commit()
+            # The ledger only when this write closed the row (after a
+            # committed _finalize the rows it stored stay as they are), and
+            # in a transaction of its own: it never loses the cancel.
+            if closed:
+                await write_model_usage_separately(
                     session, source="job", ref_id=run_id, parent_id=None,
                     rows=state.collector.rows(), at=values["finished_at"])
-            await session.commit()
     except Exception as exc:  # noqa: BLE001
         logger.warning("Invoke run %s: recording the cancel failed (%s); the stale "
                        "sweep closes the row", run_id, type(exc).__name__)

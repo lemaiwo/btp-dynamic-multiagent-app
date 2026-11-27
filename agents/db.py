@@ -5718,7 +5718,9 @@ async def finish_job_run(
     (``input_tokens``, ``output_tokens``, ``cache_read_tokens``,
     ``requests``), or ``None`` to leave the columns NULL. ``model_usage``:
     the same split per model (``agents.model_usage``), written to the ledger
-    in the same commit, replacing the run's rows; ``None`` leaves them."""
+    after the outcome's commit in a transaction of its own (a ledger failure
+    is logged, the outcome stays), replacing the run's rows; ``None`` leaves
+    them."""
     row = await session.get(JobRun, run_id)
     if row is None:
         return
@@ -5729,10 +5731,15 @@ async def finish_job_run(
     if activity is not None:
         row.activity_json = json.dumps(activity)
     _write_usage(row, usage)
-    row.finished_at = datetime.now(timezone.utc)
-    await replace_model_usage(session, source="job", ref_id=run_id, parent_id=None,
-                              rows=model_usage, at=row.finished_at)
+    finished_at = datetime.now(timezone.utc)
+    row.finished_at = finished_at
     await session.commit()
+    # After the outcome's commit, in a transaction of its own: a ledger
+    # failure is logged and never undoes (or retries) the outcome.
+    await write_model_usage_separately(
+        session, source="job", ref_id=run_id, parent_id=None,
+        rows=model_usage, at=finished_at,
+    )
 
 
 async def get_job_run(session: AsyncSession, run_id: str) -> JobRun | None:
