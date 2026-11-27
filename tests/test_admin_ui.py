@@ -4411,6 +4411,36 @@ async function main() {
     await showWorkflowRun('w-1');
     assert.ok(!byId('workflow-run-detail').querySelector('p.run-tokens'), 'no line without usage');
 
+    // Estimated cost under the tokens.
+    const C = (amount, complete = true) => ({ amount, currency: 'EUR', complete });
+    answer = [
+        { ...runs[0], id: 'c-1', cost: C(0.0421) },
+        { ...runs[0], id: 'c-2', cost: C(0.003) },
+        { ...runs[0], id: 'c-3', cost: C(0.0421, false) },
+        { ...runs[0], id: 'c-4', cost: null },
+        { ...runs[0], id: 'c-5', cost: { amount: '<b>1</b>', currency: 'EUR', complete: true } },
+    ];
+    await loadRuns();
+    const cc = [...byId('runs-list').querySelectorAll('td.run-tokens')]
+        .map(td => td.querySelector('.run-cost'));
+    assert.strictEqual(cc[0].textContent, '≈ € 0.04');
+    assert.strictEqual(cc[1].textContent, '< € 0.01');
+    assert.strictEqual(cc[2].textContent, '≈ € 0.04 (partly priced)');
+    assert.strictEqual(cc[3], null, 'null cost shows nothing');
+    assert.strictEqual(cc[4], null, 'malformed cost shows nothing');
+    assert.ok(!byId('runs-list').querySelector('b'));
+    answer = { ...runs[0], report: null, cost: C(0.0421) };
+    await showRun('r-1');
+    assert.strictEqual(byId('run-detail').querySelector('p.run-cost').textContent,
+        'Estimated cost: ≈ € 0.04');
+    answer = { ...runs[0], report: null, cost: null };
+    await showRun('r-1');
+    assert.ok(!byId('run-detail').querySelector('.run-cost'));
+    answer = [{ id: 'w-9', workflow_name: 'wf', status: 'success', trigger: 'manual', started_at: null,
+          items_total: 0, items_succeeded: 0, items_failed: 0, items_skipped: 0, usage: USAGE, cost: C(1.5) }];
+    await loadWorkflowRuns();
+    assert.strictEqual(byId('workflow-runs-tbody').querySelector('.run-cost').textContent, '≈ € 1.50');
+
     console.log('run token usage scenario passed');
 }
 
