@@ -244,6 +244,7 @@
                             </ColumnListItem>
                         </items>
                     </Table>
+                    <Text id="mpcUnpricedHint" text="{i18n>mpcUnpricedHint}" class="sapUiTinyMarginTop" />
                     <HBox class="sapUiSmallMarginTop" alignItems="Center">
                         <Button
                             id="mpcSaveButton"
@@ -286,6 +287,13 @@
                     showIcon="true"
                     visible="{= !!${cost>/line} &amp;&amp; !${cost>/loadError} }"
                     text="{cost>/line}"
+                    class="sapUiTinyMarginTopBottom" />
+                <MessageStrip
+                    id="cmNoCuPrice"
+                    type="Information"
+                    showIcon="true"
+                    visible="{= ${prices>/loaded} &amp;&amp; !${prices>/cuPriceSet} }"
+                    text="{i18n>cmNoCuPrice}"
                     class="sapUiTinyMarginTopBottom" />
                 <Table
                     id="cmTable"

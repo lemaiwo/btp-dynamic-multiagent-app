@@ -7,7 +7,7 @@ import { renderMarkdown } from './markdown.js';
 import { fileCards } from './files.js';
 import { activityStrip } from './activity.js';
 import { usagePart } from '../state.js';
-import { formatElapsed, formatTokens } from '../util.js';
+import { countText, formatElapsed, formatTokens } from '../util.js';
 
 // While a turn streams, the text the model wrote before a tool call and the
 // text after it are two parts; shown as one string they ran into each other
@@ -123,7 +123,7 @@ export function usageLine(usage) {
     const req = n ? ` (${n === 1 ? '1 request' : `${n} requests`})` : '';
     return `${a.agent || a.id || 'agent'} ${formatTokens(a.input_tokens || 0)} in / ${formatTokens(a.output_tokens || 0)} out${req}`;
   });
-  const total = `Total ${formatTokens(usage.total_tokens || 0)} tokens` + (usage.requests ? ` · ${usage.requests} requests` : '') + (usage.cache_read_tokens ? ` · ${formatTokens(usage.cache_read_tokens)} cached` : '');
+  const total = `Total ${formatTokens(usage.total_tokens || 0)} tokens` + (usage.requests ? ` · ${countText(usage.requests, 'request', 'requests')}` : '') + (usage.cache_read_tokens ? ` · ${formatTokens(usage.cache_read_tokens)} cached` : '');
   el.title = [...lines, total].join('\n');
   el.setAttribute('aria-label', `Usage: ${el.textContent}. ${lines.join('; ')}`);
   return el;

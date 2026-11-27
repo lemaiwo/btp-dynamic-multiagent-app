@@ -14,6 +14,8 @@ import type { ModelPrices as PricesAnswer } from "../../service/costTypes";
 export interface ModelPricesHost {
     service(): AdminService;
     text(key: string, args?: string[]): string;
+    /** The prices were saved: figures computed from them elsewhere are stale. */
+    saved?(): void;
 }
 
 /** A row as the `prices` model holds it: the form plus the value state of each field. */
@@ -69,7 +71,7 @@ export default class ModelPrices {
 
     private static emptyState(): Record<string, unknown> {
         return {
-            loaded: false, loading: false, busy: false, dirty: false, loadError: "", currency: "EUR",
+            loaded: false, loading: false, busy: false, dirty: false, loadError: "", currency: "EUR", cuPriceSet: true,
             cuState: "None", cuStateText: "", form: { cuPrice: "", rows: [], stamp: null }
         };
     }
@@ -133,6 +135,8 @@ export default class ModelPrices {
         this.model.setProperty("/cuState", "None");
         this.model.setProperty("/cuStateText", "");
         this.model.setProperty("/form", { cuPrice: form.cuPrice, stamp: form.stamp, rows: form.rows.map(ModelPrices.view) });
+        // The saved CU price, not the typed one: without it no estimate can be computed.
+        this.model.setProperty("/cuPriceSet", this.stored.cuPrice.trim() !== "");
         this.model.setProperty("/dirty", false);
         this.model.setProperty("/loaded", true);
     }
@@ -209,6 +213,7 @@ export default class ModelPrices {
             this.model.setProperty("/loading", false);
             this.apply(answer);
             MessageToast.show(this.host.text("mpcSaved"));
+            this.host.saved?.();
         } catch (error) {
             this.refused(error, sent);
         } finally {

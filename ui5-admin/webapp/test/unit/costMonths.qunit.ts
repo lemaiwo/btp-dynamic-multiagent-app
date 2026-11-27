@@ -93,6 +93,17 @@ QUnit.test("estimate: partly priced, and a dash when there is none", async funct
     assert.strictEqual(none.difference, "—");
 });
 
+QUnit.test("estimate: nothing priced is a text, never an amount", async function (assert) {
+    const text = await textOf();
+    const [unpriced, zero] = rows(answer([
+        month({ estimated: { amount: 0, currency: "EUR", complete: false } }),
+        month({ estimated: { amount: 0, currency: "EUR", complete: true } })
+    ]), text);
+    assert.strictEqual(unpriced.estimated, "no price for this model");
+    assert.strictEqual(unpriced.difference, "—");
+    assert.strictEqual(zero.estimated, "≈ € 0.00", "a fully priced zero is zero");
+});
+
 QUnit.test("an amount above zero that would show as 0.00 is \"< € 0.01\", as in the run views", async function (assert) {
     const text = await textOf();
     const [small, edge, zero, other] = rows(answer([

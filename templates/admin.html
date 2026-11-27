@@ -2494,6 +2494,8 @@ function runCost(cost) {
 function runCostText(cost) {
     const c = runCost(cost);
     if (!c) return '';
+    // Nothing of the run was priced: an amount of 0 would read as "it cost nothing".
+    if (!c.complete && c.amount === 0) return 'no price for this model';
     // Half up to cents, as the other UIs show it (toFixed alone shows 0.045 as 0.04;
     // toPrecision first so 1.005 * 100 = 100.49999... still rounds up).
     const cents = Math.round(Number((c.amount * 100).toPrecision(12))) / 100;

@@ -287,13 +287,18 @@ export default {
      * as a binding part: `pattern` takes the amount as `{0}` (two decimals,
      * locale-grouped), `small` is the text for an amount above zero that
      * would round to 0.00, and `partly` wraps either as `{0}` when a model
-     * of the run has no price (`complete: false`; a zero then is a floor,
-     * never "free"). Empty without a readable cost.
+     * of the run has no price (`complete: false`). When nothing of the run
+     * was priced (`complete: false` and amount 0) the text is `unpriced`
+     * alone, with no amount: a zero would read as "it cost nothing".
+     * Empty without a readable cost.
      */
-    costText(pattern: string, small: string, partly: string, cost: unknown): string {
+    costText(pattern: string, small: string, partly: string, unpriced: string, cost: unknown): string {
         const read = readCost(cost);
-        if (!read || !pattern || !small || !partly) {
+        if (!read || !pattern || !small || !partly || !unpriced) {
             return "";
+        }
+        if (!read.complete && read.amount === 0) {
+            return unpriced;
         }
         const text = read.amount > 0 && read.amount < SMALLEST_SHOWN
             ? small

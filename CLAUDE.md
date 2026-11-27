@@ -3720,7 +3720,8 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     assistant message without ledger rows (before 2.50.0), its stored `usage` part counts
     under the part's model (no model name: unpriced, `complete: false`); the web chat shows
     it as an "Estimated cost" row of the context drawer with a hint
-    (`static/chat/state.js` `costLabel`, `render/contextDrawer.js`)
+    (`static/chat/state.js` `costLabel`, `render/contextDrawer.js`; `no price for this
+    model` instead of an amount when `complete` is false and the amount 0)
   - CSRF: the middleware's Origin check (`app.py`) covers `/chat/api` as well
     as `/admin`; the client sends `X-Requested-With: XMLHttpRequest` on every
     call. Tests: `tests/test_webchat_api.py`, `tests/test_webchat_docgen.py`,
@@ -4222,7 +4223,8 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   are refused before the save. The runs list, the workflow runs list, both run details
   and the workflow step rows show the answer's `cost` as an estimate under the token
   counts (`runCost`, `runCostText`, `runCostHtml`: `≈ € 0.04`, `< € 0.01` below a cent,
-  `(partly priced)` when `complete` is false; nothing for `null`); `tests/test_admin_ui.py`
+  `(partly priced)` when `complete` is false, `no price for this model` in place of an
+  amount when `complete` is false and the amount 0; nothing for `null`); `tests/test_admin_ui.py`
 - `ui5-admin/` — SAPUI5 (TypeScript) rebuild of the admin UI, deployed to the
   BTP HTML5 Application Repository and served at `/ui5admin`. Runs **alongside**
   `templates/admin.html`, which is still the supported admin at `/admin`. All HTTP goes through `webapp/service/AdminService.ts`, which sends
@@ -4469,7 +4471,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     counts for the other. `hanaEntry.qunit.ts`, `AgentHanaJourney.ts`
   - Cost under the token counts (`model/formatter.ts` `costText` / `hasCost`: the
     answer's `cost` read by positive recognition, `≈ € 0.04`, `< € 0.01` below a cent,
-    `(partly priced)` when `complete` is false, nothing for `null` or a malformed value):
+    `(partly priced)` when `complete` is false, `no price for this model` in place of an
+    amount when `complete` is false and the amount 0 (`runCostUnpriced`; the same rule in
+    the AI Core cost panel's estimate column), nothing for `null` or a malformed value):
     a muted line in the Tokens column of the Runs and Workflow runs lists, a form row
     "Estimated cost" under Tokens on both detail pages and a line on each workflow step
     row (i18n `runCost*`, `colCost`). Two panels of the Settings page, "Model prices"

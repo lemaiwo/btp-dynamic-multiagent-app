@@ -6,6 +6,7 @@ import type Dialog from "sap/m/Dialog";
 import type Input from "sap/m/Input";
 import type Table from "sap/m/Table";
 import type ObjectStatus from "sap/m/ObjectStatus";
+import type Text from "sap/m/Text";
 import type ColumnListItem from "sap/m/ColumnListItem";
 import type UI5Element from "sap/ui/core/Element";
 import type Control from "sap/ui/core/Control";
@@ -123,6 +124,12 @@ opaTest("the panel shows the CU price, the stored rate and the model without a p
         viewName: VIEW,
         success: (input: UI5Element) => Opa5.assert.strictEqual((input as Input).getValue(), "7.5")
     });
+    Then.waitFor({
+        id: "mpcUnpricedHint",
+        viewName: VIEW,
+        success: (hint: UI5Element) => Opa5.assert.strictEqual((hint as Text).getText(false),
+            'Rows without rates are not saved; the model stays listed as "No price".')
+    });
 
     Then.iStopTheApp();
 });
@@ -156,6 +163,11 @@ opaTest("rates for the unpriced model and a new CU price are saved as typed; the
             }, "the stamp it was read with, the rates as typed, as strings");
         },
         errorMessage: "No toast after the save"
+    });
+    Then.waitFor({
+        check: () => backend.countRequests("GET cost/months") === 2,
+        success: () => Opa5.assert.ok(true, "the AI Core cost panel read its months again after the save"),
+        errorMessage: "The AI Core cost panel did not reload after the save"
     });
     iSeeTheTable(Then, "no unpriced row", (table) => table.getItems().length === 2 && !noPrice(table, 1), (table) => {
         Opa5.assert.deepEqual(models(table), ["claude-sonnet-4-5", "gpt-4o"]);

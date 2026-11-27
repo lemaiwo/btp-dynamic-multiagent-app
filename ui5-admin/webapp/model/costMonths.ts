@@ -151,7 +151,10 @@ function row(text: TextOf, usage: string, month: CostMonth, index: number): Cost
     const note = [open ? text("cmNotFinal") : "", monthNote(text, usage, status)].filter(Boolean).join(" · ");
     const none = text("cmNone");
     let estimated = none;
-    if (estimate) {
+    if (estimate && estimate.complete !== true && estimate.amount === 0) {
+        // Nothing of the month was priced: an amount of 0 would read as "it cost nothing".
+        estimated = text("cmUnpriced");
+    } else if (estimate) {
         const shown = moneyText(text, estimate.amount, estimate.currency);
         // "< € 0.01" stands alone, as in the run views.
         estimated = isSmall(estimate.amount) ? shown : text("cmEstimate", [shown]);

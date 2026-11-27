@@ -47,6 +47,18 @@ export function formatTokens(n) {
   return `${(whole / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`;
 }
 
+/** 1 -> "1 request", 3 -> "3 requests" (whole, non-negative counts; anything else counts as 0). */
+export function countText(n, one, many) {
+  const v = Number.isFinite(Number(n)) && Number(n) >= 0 ? Math.round(Number(n)) : 0;
+  return `${v.toLocaleString('en-US')} ${v === 1 ? one : many}`;
+}
+
+/** The title of the header's conversation total: "1,240 in / 380 out · 1 request over 1 turn". */
+export function usageChipTitle(usage) {
+  const u = usage || {};
+  return `${formatTokens(u.input_tokens || 0)} in / ${formatTokens(u.output_tokens || 0)} out \u00b7 ${countText(u.requests, 'request', 'requests')} over ${countText(u.turns, 'turn', 'turns')}`;
+}
+
 export const DATE_GROUPS = ['Today', 'Yesterday', 'Previous 7 days', 'Older'];
 
 function startOfDay(d) {

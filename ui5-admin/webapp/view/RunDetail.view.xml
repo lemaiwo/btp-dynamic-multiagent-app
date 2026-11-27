@@ -59,7 +59,7 @@
                         visible="{ path: 'run>/data/cost', formatter: '.formatter.hasCost' }" />
                     <Text
                         id="runCost"
-                        text="{ parts: ['i18n>runCost', 'i18n>runCostSmall', 'i18n>runCostPartly', 'run>/data/cost'], formatter: '.formatter.costText' }"
+                        text="{ parts: ['i18n>runCost', 'i18n>runCostSmall', 'i18n>runCostPartly', 'i18n>runCostUnpriced', 'run>/data/cost'], formatter: '.formatter.costText' }"
                         tooltip="{i18n>runCostHint}"
                         visible="{ path: 'run>/data/cost', formatter: '.formatter.hasCost' }" />
 
