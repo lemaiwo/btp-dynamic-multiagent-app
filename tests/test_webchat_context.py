@@ -357,7 +357,8 @@ async def test_the_context_of_a_personal_agent(client, monkeypatch, real_agents_
     ]
     assert out["usage"]["turns"] == 1 and out["usage"]["requests"] == 1
     assert set(out["usage"]) == {"input_tokens", "output_tokens", "total_tokens",
-                                 "requests", "turns"}
+                                 "requests", "turns", "cost"}
+    assert out["usage"]["cost"] is None  # no CU price set
 
 
 async def test_admin_text_is_shown_to_an_admin_only(client, roles):
