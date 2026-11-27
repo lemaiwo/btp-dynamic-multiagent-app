@@ -40,6 +40,7 @@ from fastapi import FastAPI  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
 from sqlalchemy import literal_column, select  # noqa: E402
 
+from agents import model_usage_store  # noqa: E402
 from agents.a2a import router as a2a_router  # noqa: E402
 from agents.admin import router as admin_router  # noqa: E402
 from agents.admin import seed_from_file_if_empty  # noqa: E402
@@ -249,6 +250,15 @@ async def _purge_ide_sessions() -> int:
         "chat conversations purged",
         webchat_store.CHAT_RETENTION_DAYS >= 1,
         lambda s: webchat_store.purge_older_than(s, webchat_store.CHAT_RETENTION_DAYS),
+    )
+    # The model usage ledger (cost in euros) outlives runs and conversations
+    # on purpose (monthly sums); its own clock, 0 keeps it.
+    await _pass(
+        "model usage rows purged",
+        model_usage_store.MODEL_USAGE_RETENTION_DAYS >= 1,
+        lambda s: model_usage_store.purge_model_usage(
+            s, model_usage_store.MODEL_USAGE_RETENTION_DAYS
+        ),
     )
     return purged
 
