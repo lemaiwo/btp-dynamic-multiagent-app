@@ -113,8 +113,8 @@ _transport: httpx.AsyncBaseTransport | None = None
 @dataclass
 class UsageAnswer:
     """``state`` one of :data:`STATES`; ``months`` only for ``ok``:
-    ``{"YYYY-MM": {amount, currency, capacity_units, estimated}}``, only months that have an AI Core row of this
-    subaccount."""
+    ``{"YYYY-MM": {amount, currency, capacity_units, estimated}}``, only months that
+    have an AI Core row of this subaccount."""
 
     state: str
     months: dict[str, dict] = field(default_factory=dict)
