@@ -16,7 +16,7 @@ import type {
 import type {
     ModelProviderName, ModelProviderSave, ModelProviderTestResult, ModelProvidersSaved, ModelProvidersStatus
 } from "./modelProviderTypes";
-import type { ModelPrices, ModelPricesSave } from "./costTypes";
+import type { CostMonths, ModelPrices, ModelPricesSave } from "./costTypes";
 
 /**
  * A non-2xx response from the admin API.
@@ -588,5 +588,15 @@ export default class AdminService {
             }))
         };
         return this.request<ModelPrices>("model-prices", { method: "PUT", ...AdminService.json(sent) });
+    }
+
+    // --- AI Core cost per month ---
+
+    /**
+     * The actual AI Core cost per UTC month next to this app's estimate,
+     * newest first (`/admin/api/cost/months`). `months` is 1 to 12.
+     */
+    public getCostMonths(months = 6): Promise<CostMonths> {
+        return this.request<CostMonths>(`cost/months?months=${encodeURIComponent(String(months))}`);
     }
 }

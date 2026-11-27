@@ -27,6 +27,7 @@ sap.ui.define(function () {
             "unit/embeddingsSettings": { title: "Unit: embeddingsSettings, the data catalogue embeddings of the Settings page" },
             "unit/modelProviders": { title: "Unit: modelProviders, the direct model providers of the Settings page" },
             "unit/modelPrices": { title: "Unit: modelPrices, the model prices of the Settings page" },
+            "unit/costMonths": { title: "Unit: costMonths, the AI Core cost per month of the Settings page" },
             "unit/inaQueries": { title: "Unit: inaQueries, the analytical queries pages" },
             "unit/odataEntry": { title: "Unit: odataEntry, the agent's OData services entry" },
             "unit/inaEntry": { title: "Unit: inaEntry, the agent's analytical queries entry" },

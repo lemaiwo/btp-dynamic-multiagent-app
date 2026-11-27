@@ -4,6 +4,7 @@ import type {
     ODataServiceInput, ODataServiceSummary, ODataTestResult, ODataUsedBy, Skill, WorkflowDetail, WorkflowRunDetail
 } from "com/agent/admin/service/types";
 import { DEEP_DEFAULTS } from "com/agent/admin/service/types";
+import FakeCostMonths from "./FakeCostMonths";
 import FakeDataCatalog from "./FakeDataCatalog";
 import FakeEmbeddings from "./FakeEmbeddings";
 import FakeIna from "./FakeIna";
@@ -59,6 +60,8 @@ export default class FakeBackend {
     public modelProviders = new FakeModelProviders();
     /** The `model-prices` route: the CU price, the rate per model and the stamp (409 when stale). */
     public modelPrices = new FakeModelPrices();
+    /** The `cost/months` route: the bill and the estimate per month (`usageService` sets the state). */
+    public costMonths = new FakeCostMonths();
     /**
      * --- hana --- A refusal of the next agent save at
      * `mcp_servers[server]` naming `oauth.systems[system].<field>`, as
@@ -176,6 +179,7 @@ export default class FakeBackend {
         this.ina.reset();
         this.modelProviders.reset();
         this.modelPrices.reset();
+        this.costMonths.reset();
         this.hanaRefuseNext = null;
         this.requests = [];
         this.bodies = {};
@@ -1817,6 +1821,10 @@ export default class FakeBackend {
         const prices = this.modelPrices.handle(path, method, body, (b, s, h) => this.json(b, s, h));
         if (prices) {
             return prices;
+        }
+        const cost = this.costMonths.handle(path, method, query, (b, s, h) => this.json(b, s, h));
+        if (cost) {
+            return cost;
         }
         const ina = this.ina.handle(path, method, body, (b, s, h) => this.json(b, s, h), this.reloadKeys());
         if (ina) {

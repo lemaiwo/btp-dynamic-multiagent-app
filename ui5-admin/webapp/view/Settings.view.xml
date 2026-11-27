@@ -179,6 +179,8 @@
                             valueState="{prices>/cuState}"
                             valueStateText="{prices>/cuStateText}"
                             width="12rem" />
+                        <Label text="" />
+                        <Text id="mpcCuPriceHint" text="{i18n>mpcCuPriceHint}" />
                     </f:SimpleForm>
                     <Table
                         id="mpcTable"
@@ -257,6 +259,89 @@
                             class="sapUiSmallMarginBegin" />
                     </HBox>
                 </VBox>
+            </Panel>
+
+            <Panel
+                id="costMonthsPanel"
+                headerText="{i18n>cmPanelTitle}"
+                expandable="false"
+                busy="{cost>/loading}"
+                busyIndicatorDelay="200"
+                class="sapUiSmallMarginTop">
+                <Text id="cmHint" text="{i18n>cmHint}" class="sapUiTinyMarginBottom" />
+                <MessageStrip
+                    id="cmLoadError"
+                    type="Error"
+                    showIcon="true"
+                    visible="{= !!${cost>/loadError} }"
+                    text="{cost>/loadError}"
+                    class="sapUiTinyMarginTopBottom">
+                    <link>
+                        <Link id="cmRetry" text="{i18n>cmRetry}" press=".onRefreshCostMonths" />
+                    </link>
+                </MessageStrip>
+                <MessageStrip
+                    id="cmServiceLine"
+                    type="{cost>/lineType}"
+                    showIcon="true"
+                    visible="{= !!${cost>/line} &amp;&amp; !${cost>/loadError} }"
+                    text="{cost>/line}"
+                    class="sapUiTinyMarginTopBottom" />
+                <Table
+                    id="cmTable"
+                    visible="{cost>/loaded}"
+                    items="{ path: 'cost>/rows', templateShareable: false }"
+                    noDataText="{i18n>cmNoRows}"
+                    ariaLabelledBy="cmTableTitle">
+                    <headerToolbar>
+                        <OverflowToolbar>
+                            <Title id="cmTableTitle" text="{i18n>cmTableTitle}" level="H3" />
+                            <ToolbarSpacer />
+                            <SegmentedButton
+                                id="cmMonths"
+                                selectedKey="{cost>/months}"
+                                tooltip="{i18n>cmMonthsTooltip}"
+                                selectionChange=".onCostMonthsChange">
+                                <items>
+                                    <SegmentedButtonItem key="3" text="{i18n>cmMonths3}" />
+                                    <SegmentedButtonItem key="6" text="{i18n>cmMonths6}" />
+                                    <SegmentedButtonItem key="12" text="{i18n>cmMonths12}" />
+                                </items>
+                                <layoutData>
+                                    <OverflowToolbarLayoutData priority="NeverOverflow" />
+                                </layoutData>
+                            </SegmentedButton>
+                            <Button
+                                id="cmRefresh"
+                                text="{i18n>cmRefresh}"
+                                icon="sap-icon://refresh"
+                                enabled="{= !${cost>/loading} }"
+                                press=".onRefreshCostMonths">
+                                <layoutData>
+                                    <OverflowToolbarLayoutData priority="NeverOverflow" />
+                                </layoutData>
+                            </Button>
+                        </OverflowToolbar>
+                    </headerToolbar>
+                    <columns>
+                        <Column><Text id="cmColMonth" text="{i18n>cmColMonth}" /></Column>
+                        <Column hAlign="End"><Text id="cmColBilled" text="{i18n>cmColBilled}" /></Column>
+                        <Column hAlign="End" minScreenWidth="Tablet" demandPopin="true"><Text id="cmColUnits" text="{i18n>cmColUnits}" /></Column>
+                        <Column hAlign="End" minScreenWidth="Tablet" demandPopin="true"><Text id="cmColPerUnit" text="{i18n>cmColPerUnit}" /></Column>
+                        <Column hAlign="End"><Text id="cmColEstimated" text="{i18n>cmColEstimated}" /></Column>
+                        <Column hAlign="End" minScreenWidth="Tablet" demandPopin="true"><Text id="cmColDifference" text="{i18n>cmColDifference}" /></Column>
+                    </columns>
+                    <items>
+                        <ColumnListItem>
+                            <ObjectIdentifier title="{cost>month}" text="{cost>note}" />
+                            <Text text="{cost>billed}" />
+                            <Text text="{cost>units}" />
+                            <Text text="{cost>perUnit}" />
+                            <Text text="{cost>estimated}" />
+                            <Text text="{cost>difference}" />
+                        </ColumnListItem>
+                    </items>
+                </Table>
             </Panel>
 
             <Panel headerText="{i18n>orchestratorInstructions}" expandable="false" class="sapUiSmallMarginTop">

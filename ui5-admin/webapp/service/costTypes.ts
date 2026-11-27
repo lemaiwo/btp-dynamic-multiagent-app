@@ -39,3 +39,57 @@ export interface ModelPricesSave {
     capacity_unit_price: string | null;
     prices: ModelPriceRow[];
 }
+
+/**
+ * `actual` of one month of `GET cost/months`: what the usage service billed
+ * for SAP AI Core in this subaccount. `estimated` is SAP's own flag: the
+ * month is still open, so the figure is not final.
+ */
+export interface CostActual {
+    amount: number;
+    currency: string;
+    capacity_units: number;
+    estimated: boolean;
+}
+
+/** `estimated` of one month: the ledger priced with the price table. */
+export interface CostEstimate {
+    amount: number;
+    currency: string;
+    /** `false`: a model of the month has no rate, so the amount is a floor. */
+    complete: boolean;
+}
+
+/** One model of a month, tokens summed over all sources. */
+export interface CostModelRow {
+    model: string;
+    input_tokens: number;
+    output_tokens: number;
+    cache_read_tokens: number;
+    requests: number;
+    amount: number | null;
+}
+
+/** One UTC month of `GET cost/months`. */
+export interface CostMonth {
+    /** `YYYY-MM`. */
+    month: string;
+    actual: CostActual | null;
+    /** `ok`, `no_data`, `unreadable` or the state of the usage service. */
+    actual_status: string;
+    estimated: CostEstimate | null;
+    by_source: Record<string, number | null>;
+    by_model: CostModelRow[];
+}
+
+/**
+ * `GET cost/months?months=1..12`: newest month first, the current one
+ * included. `usage_service` is `ok`, `off` (no destination), `no_subaccount`,
+ * `destination_error`, `unauthorized`, `usage_unavailable`, `too_large`,
+ * `not_json` or `unreadable`.
+ */
+export interface CostMonths {
+    usage_service: string;
+    currency: string;
+    months: CostMonth[];
+}
