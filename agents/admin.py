@@ -162,8 +162,8 @@ from agents.ina.models import QUERY_NAME_RE, check_query_names, validate_ina_que
 from agents.invoke_config import check_result_schema, clean_limits
 from agents.jira_tools import BUILTIN_JIRA_URL
 from agents.mail_render import MailTheme
+from agents.model_prices import costs_for
 from agents.model_prices import load as load_prices
-from agents.model_usage_store import costs_for
 from agents.odata import BUILTIN_ODATA_URL
 from agents.odata.models import MAX_DEFINITION_BYTES, SERVICE_NAME_RE
 from agents.outlook_tools import BUILTIN_OUTLOOK_URL

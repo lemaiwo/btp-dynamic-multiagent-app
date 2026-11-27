@@ -98,6 +98,80 @@ async def test_the_register_on_branch_records_too(monkeypatch):
     assert queued  # the register path really ran
 
 
+def _register(monkeypatch, on: bool) -> None:
+    if on:
+        monkeypatch.setattr(state, "enabled", lambda: True)
+        monkeypatch.setattr(sender, "enqueue", lambda *a, **k: None)
+
+
+@pytest.mark.parametrize("register_on", [False, True])
+async def test_a_stream_read_to_its_end_equals_the_runs_usage(monkeypatch, register_on):
+    """pydantic-ai 1.72 drains the stream on a normal exit and counts the
+    request when the wrapped ``request_stream`` exits: the collector then holds
+    exactly what ``RunUsage`` holds."""
+    _register(monkeypatch, register_on)
+    spec = Agent(NexusLoggedModel(TestModel(), "model-s"))
+    with model_usage.collecting() as c:
+        async with spec.run_stream("hi") as s:
+            await s.get_output()
+        total = s.usage()
+    [row] = c.rows()
+    assert row["requests"] == total.requests == 1
+    assert row["input_tokens"] == total.input_tokens
+    assert row["output_tokens"] == total.output_tokens
+    assert row["cache_read_tokens"] == total.cache_read_tokens
+
+
+@pytest.mark.parametrize("register_on", [False, True])
+async def test_a_stream_whose_consumer_raises_records_nothing(monkeypatch, register_on):
+    _register(monkeypatch, register_on)
+    spec = Agent(NexusLoggedModel(TestModel(), "model-s"))
+    with model_usage.collecting() as c:
+        with pytest.raises(RuntimeError):
+            async with spec.run_stream("hi"):
+                raise RuntimeError("consumer failed")
+    assert c.rows() == []
+
+
+@pytest.mark.parametrize("register_on", [False, True])
+async def test_a_stream_whose_consumer_is_cancelled_records_nothing(monkeypatch, register_on):
+    import asyncio
+
+    _register(monkeypatch, register_on)
+    spec = Agent(NexusLoggedModel(TestModel(), "model-s"))
+    inside = asyncio.Event()
+
+    async def consume() -> None:
+        async with spec.run_stream("hi"):
+            inside.set()
+            await asyncio.Event().wait()  # never set: only the cancel ends it
+
+    with model_usage.collecting() as c:
+        task = asyncio.create_task(consume())
+        await asyncio.wait_for(inside.wait(), 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert c.rows() == []
+
+
+async def test_a_register_logging_raise_cannot_skip_the_add(monkeypatch):
+    from agents.nexus import logged_model
+
+    _register(monkeypatch, True)
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("register logging failed")
+
+    monkeypatch.setattr(logged_model, "_finish_stream", broken)
+    spec = Agent(NexusLoggedModel(TestModel(), "model-s"))
+    with model_usage.collecting() as c:
+        with pytest.raises(RuntimeError):
+            async with spec.run_stream("hi") as s:
+                await s.get_output()
+    assert [r["requests"] for r in c.rows()] == [1]
+
+
 @pytest.mark.parametrize("register_on", [False, True])
 async def test_a_request_that_raises_records_nothing(monkeypatch, register_on):
     if register_on:

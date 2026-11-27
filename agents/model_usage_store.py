@@ -10,15 +10,12 @@ names the variable only).
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Literal
+from typing import Any
 
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agents.db import ModelUsage
-
-if TYPE_CHECKING:  # model_prices imports this module (seen_models)
-    from agents.model_prices import PriceBook
 from agents.ide.store import env_int
 
 MODEL_USAGE_RETENTION_DAYS = env_int("MODEL_USAGE_RETENTION_DAYS", 400, minimum=0)
@@ -50,7 +47,8 @@ async def seen_models(session: AsyncSession, limit: int = 500) -> list[str]:
     """The distinct model names the ledger holds, at most ``limit`` of them
     (the price table's "models without a rate": bounded, not paged).
     ``model`` is a ``String`` column, so ``DISTINCT`` runs on HANA too."""
-    result = await session.execute(select(ModelUsage.model).distinct().limit(limit))
+    result = await session.execute(
+        select(ModelUsage.model).distinct().order_by(ModelUsage.model).limit(limit))
     return [name for (name,) in result.all()]
 
 
@@ -105,30 +103,6 @@ async def counts_by_parent(
     """The ledger's per-model counts summed per parent (``parent_id``: the
     workflow run of its steps, the conversation of its turns)."""
     return await _counts_by(session, source, ids, ModelUsage.parent_id)
-
-
-async def costs_for(
-    session: AsyncSession,
-    source: str,
-    ids: list[str],
-    *,
-    by: Literal["ref", "parent"] = "ref",
-    book: PriceBook | None = None,
-) -> dict[str, dict | None]:
-    """``{id: cost}`` for the run answers (``model_prices.cost``: ``None`` or
-    ``{amount, currency, complete}``). Without a CU price every id is
-    ``None`` and the ledger is not read. Lives here rather than in
-    ``model_prices`` because it is a ledger read; pass ``book`` to price
-    several reads of one answer with one load."""
-    from agents import model_prices  # deferred: model_prices imports this module
-
-    if book is None:
-        book = await model_prices.load(session)
-    if book.cu_price is None:
-        return dict.fromkeys(ids)
-    reader = counts_by_parent if by == "parent" else counts_by_ref
-    counts = await reader(session, source, ids)
-    return {i: model_prices.cost(book, counts.get(i, {})) for i in ids}
 
 
 async def chat_ledger_refs(session: AsyncSession, conversation_id: str) -> set[str]:

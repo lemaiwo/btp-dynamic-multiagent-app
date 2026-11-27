@@ -84,6 +84,8 @@ def _merged(by_source: dict[str, dict[str, dict[str, int]]]) -> dict[str, dict[s
 def _actual(usage: Any, label: str) -> tuple[dict | None, str]:
     if usage.state != "ok":
         return None, usage.state
+    if label in getattr(usage, "unreadable_months", ()):
+        return None, "unreadable"  # rows in two currencies: only this month
     month = usage.months.get(label)
     if month is None:
         return None, "no_data"

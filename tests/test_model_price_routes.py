@@ -41,13 +41,18 @@ EMPTY = {"currency": "EUR", "capacity_unit_price": None, "prices": [],
 @pytest.fixture(autouse=True)
 async def clean():
     await init_db()
-    async with SessionLocal() as session:
-        await session.execute(delete(ModelPrice))
-        await session.execute(delete(ModelUsage))
-        await session.execute(update(OrchestratorConfig).values(
-            capacity_unit_price=None, prices_updated_at=None))
-        await session.commit()
+
+    async def clear() -> None:
+        async with SessionLocal() as session:
+            await session.execute(delete(ModelPrice))
+            await session.execute(delete(ModelUsage))
+            await session.execute(update(OrchestratorConfig).values(
+                capacity_unit_price=None, prices_updated_at=None))
+            await session.commit()
+
+    await clear()
     yield
+    await clear()  # no price left behind for the files that run after this one
 
 
 @pytest.fixture
@@ -243,6 +248,22 @@ async def test_a_refusal_names_the_field_never_the_value(client, payload, detail
     assert response.json() == {"detail": detail}
     assert SECRETISH not in response.text
     assert (await client.get(URL)).json() == EMPTY
+
+
+async def test_a_value_error_of_the_database_phase_is_a_fixed_500(client, monkeypatch, caplog):
+    from agents import model_prices
+
+    async def broken(session):
+        raise ValueError(SECRETISH)
+
+    monkeypatch.setattr(model_prices, "begin_exclusive_write", broken)
+    caplog.set_level(logging.DEBUG)
+    response = await client.put(URL, json=body())
+    assert response.status_code == 500
+    assert response.json() == {"detail": "The prices could not be saved"}
+    assert SECRETISH not in response.text
+    assert all(SECRETISH not in r.getMessage() for r in caplog.records)
+    assert any("ValueError" in r.getMessage() for r in caplog.records)
 
 
 async def test_a_body_that_is_not_json_is_refused(client):

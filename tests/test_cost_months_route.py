@@ -181,6 +181,21 @@ async def test_without_the_usage_service_the_estimates_stay(client, monkeypatch,
                                               "complete": True}
 
 
+async def test_a_month_of_two_currencies_alone_is_unreadable(client, monkeypatch):
+    async def fake(first, last):
+        return btp_usage.UsageAnswer("ok", {"2026-10": {
+            "amount": 7.5, "currency": "EUR", "capacity_units": 5.0,
+            "estimated": False, "metrics": []}}, frozenset({"2026-11"}))
+
+    monkeypatch.setattr(cost_routes.btp_usage, "monthly_cost", fake)
+    data = (await client.get(URL, params={"months": 3})).json()
+    assert data["usage_service"] == "ok"
+    nov, oct_, sep = data["months"]
+    assert nov["actual"] is None and nov["actual_status"] == "unreadable"
+    assert oct_["actual"]["amount"] == 7.5 and oct_["actual_status"] == "ok"
+    assert sep["actual"] is None and sep["actual_status"] == "no_data"
+
+
 async def test_a_model_without_a_rate(client, monkeypatch):
     usage_service(monkeypatch, state="off")
     await prices()

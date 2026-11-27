@@ -43,6 +43,7 @@ Field names are those of the recorded answer
 from __future__ import annotations
 
 import asyncio
+import decimal
 import json
 import logging
 import math
@@ -51,6 +52,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from datetime import date
+from decimal import Decimal
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -88,6 +90,8 @@ FAIL_CACHE_SECONDS = 300
 TIMEOUT_SECONDS = 20
 MAX_BYTES = 4 * 1024 * 1024
 MAX_CACHE_ENTRIES = 32
+# The month sums: wide enough that adding the rows of a month never rounds.
+_SUM = decimal.Context(prec=60)
 
 STATES = frozenset({
     "ok", "off", "no_subaccount", "destination_error", "unauthorized",
@@ -115,6 +119,8 @@ class UsageAnswer:
 
     state: str
     months: dict[str, dict] = field(default_factory=dict)
+    # ``ok`` only: months whose rows could not be one amount (two currencies).
+    unreadable_months: frozenset[str] = frozenset()
 
 
 class _Refused(Exception):
@@ -167,11 +173,14 @@ def _month_param(day: date) -> str:
     return f"{day.year:04d}{day.month:02d}"
 
 
-def _number(value: Any) -> float | None:
+def _number(value: Any) -> Decimal | None:
+    """A JSON number as the ``Decimal`` of its shortest text, so a month's
+    sum is exact (``0.1 + 0.2`` is ``0.3``); a float only at the end."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    number = float(value)
-    return number if math.isfinite(number) else None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return Decimal(str(value))
 
 
 def _month_label(value: Any) -> str | None:
@@ -184,16 +193,28 @@ def _month_label(value: Any) -> str | None:
 
 
 def parse(payload: Any, subaccount: str, first: date, last: date) -> dict[str, dict]:
-    """The AI Core months of ``subaccount`` between ``first`` and ``last``.
+    """The AI Core months of ``subaccount`` between ``first`` and ``last``
+    (a month of two currencies left out; see :func:`parse_months`)."""
+    return parse_months(payload, subaccount, first, last)[0]
+
+
+def parse_months(payload: Any, subaccount: str, first: date,
+                 last: date) -> tuple[dict[str, dict], frozenset[str]]:
+    """``(months, unreadable)``: the AI Core months of ``subaccount`` between
+    ``first`` and ``last``, and the labels of the months that cannot be one
+    amount (rows in two currencies), which are not in ``months``: only THAT
+    month is unreadable, the others stay.
 
     Raises ``_Refused("unreadable")`` for a shape this module does not know.
     Rows of another subaccount or service are skipped before any of their
     other fields is looked at; only the kept rows are validated field by field.
+    Amounts are summed as ``Decimal`` and become floats once, at the end.
     """
     if not isinstance(payload, dict) or not isinstance(payload.get(FIELD_CONTENT), list):
         raise _Refused("unreadable")
     low, high = f"{first.year:04d}-{first.month:02d}", f"{last.year:04d}-{last.month:02d}"
     months: dict[str, dict] = {}
+    unreadable: set[str] = set()
     for row in payload[FIELD_CONTENT]:
         if not isinstance(row, dict):
             raise _Refused("unreadable")
@@ -212,23 +233,28 @@ def parse(payload: Any, subaccount: str, first: date, last: date) -> dict[str, d
                 or not isinstance(metric, str) or not _METRIC_RE.fullmatch(metric)
                 or not isinstance(estimated, bool)):
             raise _Refused("unreadable")
-        if not (low <= label <= high):
+        if not (low <= label <= high) or label in unreadable:
             continue
         month = months.setdefault(label, {
-            "amount": 0.0, "currency": currency, "capacity_units": 0.0,
+            "amount": Decimal(0), "currency": currency, "capacity_units": Decimal(0),
             "estimated": False, "metrics": []})
         if month["currency"] != currency:
             # Two currencies in one month cannot be one amount.
-            raise _Refused("unreadable")
-        month["amount"] += cost
+            unreadable.add(label)
+            del months[label]
+            continue
+        month["amount"] = _SUM.add(month["amount"], cost)
         if metric == CAPACITY_UNITS_METRIC:
-            month["capacity_units"] += usage
+            month["capacity_units"] = _SUM.add(month["capacity_units"], usage)
         month["estimated"] = month["estimated"] or estimated
         month["metrics"].append({"name": metric, "usage": usage, "cost": cost})
     for month in months.values():
-        month["amount"] = round(month["amount"], 6)
-        month["capacity_units"] = round(month["capacity_units"], 6)
-    return months
+        month["amount"] = float(month["amount"])
+        month["capacity_units"] = float(month["capacity_units"])
+        for metric_row in month["metrics"]:
+            metric_row["usage"] = float(metric_row["usage"])
+            metric_row["cost"] = float(metric_row["cost"])
+    return months, frozenset(unreadable)
 
 
 def _resolver(name: str, cfg: Any) -> Any:
@@ -335,7 +361,10 @@ async def monthly_cost(first: date, last: date) -> UsageAnswer:
     try:
         async with deadline:
             payload = await _fetch(resolver, first, last)
-        answer = UsageAnswer("ok", parse(payload, subaccount, first, last))
+        months, unreadable = parse_months(payload, subaccount, first, last)
+        if unreadable:
+            logger.warning("btp usage: %d month(s) refused (two currencies)", len(unreadable))
+        answer = UsageAnswer("ok", months, unreadable)
     except _Refused as refused:
         if refused.code in ("not_json", "unreadable", "too_large"):
             logger.warning("btp usage: answer refused (%s)", refused.code)
@@ -343,5 +372,8 @@ async def monthly_cost(first: date, last: date) -> UsageAnswer:
     except TimeoutError:
         logger.warning("btp usage: request failed (%s)",
                        "deadline" if deadline.expired() else "TimeoutError")
+        answer = UsageAnswer("usage_unavailable")
+    except Exception as exc:  # noqa: BLE001 - never raises; a cancel is no Exception
+        logger.warning("btp usage: request failed (%s)", type(exc).__name__)
         answer = UsageAnswer("usage_unavailable")
     return _remember(key, answer)

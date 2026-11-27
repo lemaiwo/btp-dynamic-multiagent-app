@@ -1551,7 +1551,11 @@ async def write_model_usage_separately(
     Called AFTER the run's outcome was committed, so a failing DELETE or
     INSERT here can neither roll back nor lose that outcome: the ledger is a
     side record. A failure is rolled back and logged by exception class only.
-    Answers whether the rows were written (``None`` rows: nothing to do, True)."""
+    Answers whether the rows were written (``None`` rows: nothing to do, True).
+
+    A ``CancelledError`` during the write is not caught (it is no
+    ``Exception``) and passes through to the caller: the run's outcome is
+    already committed, and only that run's ledger rows are lost."""
     if rows is None:
         return True
     try:
@@ -4240,6 +4244,13 @@ def _next_odata_stamp(previous: datetime | None) -> datetime:
     if stored is None or now > stored:
         return now
     return stored + timedelta(microseconds=1)
+
+
+# Public names of the two stamp helpers for modules outside this one (the
+# price table of agents/model_prices.py); the private names stay for the
+# OData and InA code that has always used them.
+next_stamp = _next_odata_stamp
+as_utc = _odata_utc
 
 
 def _warn_generic_kind(name: str) -> None:

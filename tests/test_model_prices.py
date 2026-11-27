@@ -54,9 +54,47 @@ def test_a_null_cache_rate_prices_cached_input_as_input():
     assert mp.cost(BOOK, {"b": _use(1_000, 0, 500)})["amount"] == 7.5
 
 
-def test_more_cached_than_input_never_goes_negative():
-    # a: (0 * 0.5 + 2000 * 0.05) / 1000 = 0.1 CU -> 0.75 EUR
-    assert mp.cost(BOOK, {"a": _use(1_000, 0, 2_000)})["amount"] == 0.75
+def test_more_cached_than_input_is_clamped_to_the_input():
+    # cached is part of the input: clamped to 1000; a: 1000 * 0.05 / 1000 = 0.05 CU -> 0.375
+    assert mp.cost(BOOK, {"a": _use(1_000, 0, 2_000)})["amount"] == 0.375
+
+
+def test_negative_counts_are_clamped_to_zero():
+    # a: input -5 -> 0, cached -7 -> 0, output 1000 -> 2 CU -> 15 EUR
+    assert mp.cost(BOOK, {"a": _use(-5, 1_000, -7)})["amount"] == 15.0
+    # output -1000 -> 0: only the 1000 input tokens, 0.5 CU -> 3.75 EUR
+    assert mp.cost(BOOK, {"a": _use(1_000, -1_000, 0)})["amount"] == 3.75
+
+
+def test_absurdly_large_counts_do_not_raise():
+    huge = 10**60  # the old round(euros, 6) raised InvalidOperation past 60 digits
+    got = mp.cost(BOOK, {"a": _use(huge, huge, 0)})
+    # (1e60 * 0.5 + 1e60 * 2) / 1000 CU * 7.5 EUR = 1.875e58
+    assert got["amount"] == pytest.approx(1.875e58)
+    assert got["complete"] is True
+
+
+def test_the_amount_rounds_half_up_at_six_decimals():
+    book = mp.PriceBook(cu_price=mp.parse_amount("0.0000005", "c"),
+                        rates={"m": (mp.parse_amount("1", "i"), 0, None)})
+    # 1000 tokens -> 1 CU * 0.0000005 EUR = 0.0000005 -> half up -> 0.000001
+    assert mp.cost(book, {"m": _use(1_000, 0, 0)})["amount"] == 0.000001
+
+
+@pytest.mark.parametrize("name", [" gpt-4o", "gpt-4o ", "é"])
+def test_a_model_name_with_edge_whitespace_or_not_nfc_is_refused(name):
+    data = {"expected_updated_at": None, "capacity_unit_price": None,
+            "prices": [{"model": name, "input_rate": 1, "output_rate": 1}]}
+    with pytest.raises(ValueError) as e:
+        mp.validate(data)
+    assert str(e.value) == (
+        "prices[0].model: no leading or trailing whitespace, in Unicode NFC")
+
+
+def test_an_nfc_name_is_accepted():
+    data = {"expected_updated_at": None, "capacity_unit_price": None,
+            "prices": [{"model": "é-model", "input_rate": 1, "output_rate": 1}]}
+    assert mp.validate(data)[2][0][0] == "é-model"
 
 
 def test_a_missing_rate_makes_it_incomplete_and_no_cu_price_makes_it_null():

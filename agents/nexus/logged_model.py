@@ -528,9 +528,11 @@ class NexusLoggedModel(WrapperModel):
         except BaseException as exc:
             _finish_failed(call, exc, streamed=streamed)
             raise
-        _finish_stream(call, streamed, tracker)
+        # Normal exit: count the request first (``add`` never raises), so a
+        # raise of the register logging below cannot leave it out.
         if streamed is not None:
             model_usage.add(self._deployment, streamed.usage())
+        _finish_stream(call, streamed, tracker)
 
 
 def wrap(model: Model, deployment: str) -> Model:

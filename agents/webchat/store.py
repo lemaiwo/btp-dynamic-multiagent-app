@@ -465,8 +465,13 @@ async def finish_turn(
             .execution_options(synchronize_session=False)
         )
     await db.commit()
+    # A turn without spend writes nothing (no DELETE either). Safe for the
+    # replace rule: the assistant message id is new per turn and its run
+    # finalizes once (``run._finalize``, ``turn.finalized``), so no earlier
+    # attempt can have left rows of this message to replace.
     await write_model_usage_separately(
-        db, source="chat", ref_id=message_id, parent_id=conversation_id, rows=model_usage,
+        db, source="chat", ref_id=message_id, parent_id=conversation_id,
+        rows=model_usage or None,
     )
 
 

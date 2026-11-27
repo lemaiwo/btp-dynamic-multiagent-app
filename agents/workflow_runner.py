@@ -688,7 +688,7 @@ async def _run_step(
             async with SessionLocal() as session:
                 await finish_step_run(session, step_run.id, status="failed", error=message,
                                       usage=job_runner.usage_counts(usage),
-                                  model_usage=collector.rows())
+                                      model_usage=collector.rows())
         except Exception:  # noqa: BLE001
             logger.exception(
                 "Workflow run %s step %s: could not mark the step failed either",

@@ -383,6 +383,22 @@ async def test_finish_turn_replaces_the_rows_of_its_message(client):
     assert counts(await ledger("chat")) == [("model-a", 1, 1, 0, 1)]
 
 
+async def test_a_turn_without_spend_sends_no_ledger_statement(client, monkeypatch):
+    cid = await new_conversation(client)
+    calls = []
+
+    async def recording(*args, **kwargs):
+        calls.append(kwargs["rows"])
+        return True
+
+    monkeypatch.setattr(store, "write_model_usage_separately", recording)
+    async with SessionLocal() as s:
+        await store.finish_turn(s, conversation_id=cid, message_id="m-empty", status="done",
+                                content="x", parts=[], model_json=None, error=None,
+                                title=None, model_usage=[])
+    assert calls == [None]  # None: the helper does nothing, no DELETE
+
+
 async def test_a_chat_purge_leaves_the_ledger(client, monkeypatch, real_agents_and_mcp):
     use_model(monkeypatch, Script().text)
     cid = await new_conversation(client)

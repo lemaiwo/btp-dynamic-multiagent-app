@@ -55,6 +55,7 @@ from agents.db import (  # noqa: E402
     ChatUserSkill,
     InaQuery,
     ODataService,
+    OrchestratorConfig,
     SessionLocal,
     SkillConfig,
     init_db,
@@ -145,6 +146,10 @@ async def _clean(monkeypatch):
     await wipe()
     async with SessionLocal() as s:
         await set_orchestrator_instructions(s, ORCH_TEXT)
+        # No CU price unless a test sets one, whatever an earlier file left.
+        await s.execute(update(OrchestratorConfig).values(
+            capacity_unit_price=None, prices_updated_at=None))
+        await s.commit()
     yield
     await run.cancel_all_chat_runs()
     run._turns.clear()

@@ -33,8 +33,8 @@ import re
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
-from decimal import Decimal
-from typing import Any
+from decimal import ROUND_HALF_UP, Decimal
+from typing import Any, Literal
 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -43,10 +43,10 @@ from agents import model_usage_store
 from agents.db import (
     ModelPrice,
     OrchestratorConfig,
-    _next_odata_stamp,  # the strictly increasing stamp of every expected_updated_at
-    _odata_utc,  # naive (SQLite, HANA) means UTC
+    as_utc,  # naive (SQLite, HANA) means UTC
     begin_exclusive_write,
     has_row_locks,
+    next_stamp,  # the strictly increasing stamp of every expected_updated_at
     stamp_moved,
 )
 
@@ -62,6 +62,7 @@ _BODY_KEYS = ("expected_updated_at", "capacity_unit_price", "prices")
 _ROW_KEYS = ("model", "input_rate", "output_rate", "cache_read_rate")
 # Room for tokens * rate * price without rounding inside the maths.
 _CONTEXT = decimal.Context(prec=60)
+_MICRO = Decimal("0.000001")
 
 STALE_TEXT = "The prices were changed meanwhile: reload them"
 MISSING_ROW_TEXT = "The settings row is missing: restart the app"
@@ -133,6 +134,12 @@ def cost(book: PriceBook, by_model: dict[str, dict[str, int]]) -> dict | None:
     ``None`` without a CU price or without any answered request; otherwise
     ``{amount, currency, complete}``, ``complete`` false when a model that
     answered has no rate (its tokens are then not in ``amount``).
+
+    Counts are clamped before pricing (input and output to >= 0, cached to
+    ``[0, input]``): a cached count is part of the input, so more cached than
+    input is a reading error, never a charge. ``amount`` is rounded once, at
+    the end, to 6 decimals half up (``ROUND_HALF_UP``), in a precision wide
+    enough for any count, so no size of count raises ``InvalidOperation``.
     """
     if book.cu_price is None:
         return None
@@ -150,23 +157,49 @@ def cost(book: PriceBook, by_model: dict[str, dict[str, int]]) -> dict | None:
         input_rate, output_rate, cache_rate = rate
         if cache_rate is None:
             cache_rate = input_rate
-        tokens_in = int(usage.get("input_tokens") or 0)
-        cached = int(usage.get("cache_read_tokens") or 0)
-        tokens_out = int(usage.get("output_tokens") or 0)
+        tokens_in = max(int(usage.get("input_tokens") or 0), 0)
+        cached = min(max(int(usage.get("cache_read_tokens") or 0), 0), tokens_in)
+        tokens_out = max(int(usage.get("output_tokens") or 0), 0)
         units = _CONTEXT.add(
             _CONTEXT.add(
-                _CONTEXT.multiply(Decimal(max(tokens_in - cached, 0)), Decimal(input_rate)),
+                _CONTEXT.multiply(Decimal(tokens_in - cached), Decimal(input_rate)),
                 _CONTEXT.multiply(Decimal(cached), Decimal(cache_rate)),
             ),
             _CONTEXT.multiply(Decimal(tokens_out), Decimal(output_rate)),
         )
         total_cu = _CONTEXT.add(total_cu, _CONTEXT.divide(units, _CONTEXT.multiply(scale, 1000)))
     euros = _CONTEXT.multiply(total_cu, _CONTEXT.divide(Decimal(book.cu_price), scale))
-    return {"amount": float(round(euros, 6)), "currency": CURRENCY, "complete": complete}
+    # Digits before the point plus the 6 kept: quantize refuses a result
+    # longer than its context's precision.
+    wide = decimal.Context(prec=max(_CONTEXT.prec, euros.adjusted() + 8))
+    amount = euros.quantize(_MICRO, rounding=ROUND_HALF_UP, context=wide)
+    return {"amount": float(amount), "currency": CURRENCY, "complete": complete}
+
+
+async def costs_for(
+    session: AsyncSession,
+    source: str,
+    ids: list[str],
+    *,
+    by: Literal["ref", "parent"] = "ref",
+    book: PriceBook | None = None,
+) -> dict[str, dict | None]:
+    """``{id: cost}`` for the run answers (``cost``: ``None`` or ``{amount,
+    currency, complete}``). Without a CU price every id is ``None`` and the
+    ledger is not read; pass ``book`` to price several reads of one answer
+    with one load."""
+    if book is None:
+        book = await load(session)
+    if book.cu_price is None:
+        return dict.fromkeys(ids)
+    reader = (model_usage_store.counts_by_parent if by == "parent"
+              else model_usage_store.counts_by_ref)
+    counts = await reader(session, source, ids)
+    return {i: cost(book, counts.get(i, {})) for i in ids}
 
 
 def _stamp_text(value: datetime | None) -> str | None:
-    moment = _odata_utc(value)
+    moment = as_utc(value)
     return moment.isoformat() if moment else None
 
 
@@ -197,11 +230,16 @@ async def read_table(session: AsyncSession) -> dict[str, Any]:
 
 
 def _model_name(value: Any, field: str) -> str:
+    """A model name exactly as the ledger stores it: the collector strips
+    the name and the deployment names are NFC, so a name with edge
+    whitespace or in another normal form would never match a ledger row."""
     rule = ValueError(f"{field}: 1 to {MODEL_MAX_CHARS} characters without control characters")
     if not isinstance(value, str) or not 1 <= len(value) <= MODEL_MAX_CHARS:
         raise rule
     if any(unicodedata.category(ch) in ("Cc", "Cf", "Cs", "Zl", "Zp") for ch in value):
         raise rule
+    if value != value.strip() or unicodedata.normalize("NFC", value) != value:
+        raise ValueError(f"{field}: no leading or trailing whitespace, in Unicode NFC")
     return value
 
 
@@ -213,7 +251,7 @@ def _expected(value: Any) -> datetime | None:
         raise rule
     try:
         moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        return _odata_utc(moment)
+        return as_utc(moment)
     except (ValueError, OverflowError):
         raise rule from None
 
@@ -221,8 +259,11 @@ def _expected(value: Any) -> datetime | None:
 _Row = tuple[str, int, int, int | None]
 
 
-def _validate(data: Any) -> tuple[datetime | None, int | None, list[_Row]]:
-    """The whole body, checked before anything is read or written."""
+def validate(data: Any) -> tuple[datetime | None, int | None, list[_Row]]:
+    """The whole ``PUT`` body, checked before anything is read or written:
+    ``(expected_updated_at, cu_price, rows)``, or a ``ValueError`` of a fixed
+    ``<field>: <rule>`` that never holds a submitted value (the route's only
+    422)."""
     if not isinstance(data, dict):
         raise ValueError("body: a JSON object")
     if set(data) - set(_BODY_KEYS):
@@ -275,7 +316,7 @@ async def replace_table(session: AsyncSession, data: Any) -> dict[str, Any]:
     write are one transaction: ``BEGIN IMMEDIATE`` on SQLite, the
     orchestrator row ``FOR UPDATE`` on Postgres and HANA.
     """
-    expected, cu_price, rows = _validate(data)
+    expected, cu_price, rows = validate(data)
     await begin_exclusive_write(session)
     query = select(OrchestratorConfig).where(OrchestratorConfig.id == 1)
     if has_row_locks(session):
@@ -291,7 +332,7 @@ async def replace_table(session: AsyncSession, data: Any) -> dict[str, Any]:
     if stale:
         await session.rollback()
         raise StalePrices()
-    stamp = _next_odata_stamp(stored)
+    stamp = next_stamp(stored)
     await session.execute(delete(ModelPrice))
     session.add_all(
         ModelPrice(model=model, input_rate=i, output_rate=o, cache_read_rate=c, updated_at=stamp)

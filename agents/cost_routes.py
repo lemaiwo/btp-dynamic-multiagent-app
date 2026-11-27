@@ -26,6 +26,7 @@ from agents.db import SessionLocal
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api")
 BODY_BYTES = 65_536
+SAVE_FAILED_TEXT = "The prices could not be saved"
 
 
 @router.get("/model-prices", dependencies=[Depends(require_admin)])
@@ -43,15 +44,22 @@ async def save_prices(request: Request) -> dict[str, Any]:
         data = json.loads(raw)
     except (ValueError, UnicodeDecodeError, RecursionError):
         raise HTTPException(status_code=422, detail="body: a JSON object") from None
+    # Only the body check answers 422 with its fixed ``<field>: <rule>``: an
+    # error of the database phase must never reach the client as text.
+    try:
+        model_prices.validate(data)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
     try:
         async with SessionLocal() as session:
             answer = await model_prices.replace_table(session, data)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from None
     except model_prices.StalePrices:
         raise HTTPException(status_code=409, detail=model_prices.STALE_TEXT) from None
     except model_prices.SettingsRowMissing:
         raise HTTPException(status_code=503, detail=model_prices.MISSING_ROW_TEXT) from None
+    except Exception as exc:  # noqa: BLE001 - a fixed 500, the class to the log only
+        logger.warning("model prices not saved (%s)", type(exc).__name__)
+        raise HTTPException(status_code=500, detail=SAVE_FAILED_TEXT) from None
     # Who and how many, never a rate.
     logger.info("model prices saved by %s: %d models",
                 current_principal.get() or "unknown", len(answer["prices"]))

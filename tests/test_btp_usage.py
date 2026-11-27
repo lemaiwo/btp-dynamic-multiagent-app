@@ -162,6 +162,61 @@ async def test_months_outside_the_window_are_left_out(env, monkeypatch):
     assert list(answer.months) == ["2026-11"]
 
 
+def _our_row(month: int, cost, usage, currency="EUR") -> dict:
+    template = next(r for r in FIXTURE["content"] if r["subaccountId"] == OURS
+                    and r["serviceId"] == "ai-core")
+    return dict(template, reportYearMonth=month, cost=cost, usage=usage, currency=currency)
+
+
+async def test_a_month_is_summed_exactly_as_decimals(env, monkeypatch):
+    # float: 0.1 + 0.2 = 0.30000000000000004, 1.1 + 2.2 = 3.3000000000000003
+    use(monkeypatch, Api(payload={"content": [
+        _our_row(202611, 0.1, 1.1), _our_row(202611, 0.2, 2.2)]}))
+    answer = await btp_usage.monthly_cost(FIRST, LAST)
+    assert answer.state == "ok"
+    month = answer.months["2026-11"]
+    assert month["amount"] == 0.3 and month["capacity_units"] == 3.3
+    assert [m["cost"] for m in month["metrics"]] == [0.1, 0.2]
+    assert all(isinstance(m["cost"], float) for m in month["metrics"])
+
+
+async def test_two_currencies_make_only_that_month_unreadable(env, monkeypatch):
+    use(monkeypatch, Api(payload={"content": [
+        _our_row(202610, 7.5, 5.0),
+        _our_row(202611, 1.0, 1.0), _our_row(202611, 2.0, 2.0, currency="USD"),
+        _our_row(202611, 3.0, 3.0)]}))
+    answer = await btp_usage.monthly_cost(FIRST, LAST)
+    assert answer.state == "ok"
+    assert list(answer.months) == ["2026-10"]
+    assert answer.unreadable_months == frozenset({"2026-11"})
+
+
+async def test_an_unexpected_error_is_usage_unavailable(env, monkeypatch, caplog):
+    use(monkeypatch, Api())
+
+    def broken(*args, **kwargs):
+        raise KeyError(SERVICE_TEXT)
+
+    monkeypatch.setattr(btp_usage, "parse_months", broken)
+    caplog.set_level(logging.DEBUG)
+    answer = await btp_usage.monthly_cost(FIRST, LAST)
+    assert answer.state == "usage_unavailable" and answer.months == {}
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("KeyError" in m for m in messages)
+    assert all("secret" not in m for m in messages)
+
+
+async def test_a_cancel_passes_through(env, monkeypatch):
+    import asyncio
+
+    async def cancelled(*args, **kwargs):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(btp_usage, "_fetch", cancelled)
+    with pytest.raises(asyncio.CancelledError):
+        await btp_usage.monthly_cost(FIRST, LAST)
+
+
 def test_a_global_account_row_never_matches_an_empty_subaccount():
     # Defence in depth: an empty id is no id, so "" rows can never be "ours".
     assert btp_usage.subaccount_id({"USAGE_SUBACCOUNT_ID": "  "}) is None
