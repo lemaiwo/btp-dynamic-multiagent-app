@@ -113,8 +113,7 @@ _transport: httpx.AsyncBaseTransport | None = None
 @dataclass
 class UsageAnswer:
     """``state`` one of :data:`STATES`; ``months`` only for ``ok``:
-    ``{"YYYY-MM": {amount, currency, capacity_units, estimated, metrics:
-    [{name, usage, cost}]}}``, only months that have an AI Core row of this
+    ``{"YYYY-MM": {amount, currency, capacity_units, estimated}}``, only months that have an AI Core row of this
     subaccount."""
 
     state: str
@@ -237,7 +236,7 @@ def parse_months(payload: Any, subaccount: str, first: date,
             continue
         month = months.setdefault(label, {
             "amount": Decimal(0), "currency": currency, "capacity_units": Decimal(0),
-            "estimated": False, "metrics": []})
+            "estimated": False})
         if month["currency"] != currency:
             # Two currencies in one month cannot be one amount.
             unreadable.add(label)
@@ -247,13 +246,9 @@ def parse_months(payload: Any, subaccount: str, first: date,
         if metric == CAPACITY_UNITS_METRIC:
             month["capacity_units"] = _SUM.add(month["capacity_units"], usage)
         month["estimated"] = month["estimated"] or estimated
-        month["metrics"].append({"name": metric, "usage": usage, "cost": cost})
     for month in months.values():
         month["amount"] = float(month["amount"])
         month["capacity_units"] = float(month["capacity_units"])
-        for metric_row in month["metrics"]:
-            metric_row["usage"] = float(metric_row["usage"])
-            metric_row["cost"] = float(metric_row["cost"])
     return months, frozenset(unreadable)
 
 

@@ -2494,7 +2494,10 @@ function runCost(cost) {
 function runCostText(cost) {
     const c = runCost(cost);
     if (!c) return '';
-    const text = c.amount > 0 && c.amount < 0.005 ? '< \u20ac 0.01' : `\u2248 \u20ac ${c.amount.toFixed(2)}`;
+    // Half up to cents, as the other UIs show it (toFixed alone shows 0.045 as 0.04;
+    // toPrecision first so 1.005 * 100 = 100.49999... still rounds up).
+    const cents = Math.round(Number((c.amount * 100).toPrecision(12))) / 100;
+    const text = c.amount > 0 && c.amount < 0.005 ? '< \u20ac 0.01' : `\u2248 \u20ac ${cents.toFixed(2)}`;
     return c.complete ? text : `${text} (partly priced)`;
 }
 function runCostHtml(cost) {

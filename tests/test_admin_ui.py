@@ -4419,6 +4419,9 @@ async function main() {
         { ...runs[0], id: 'c-3', cost: C(0.0421, false) },
         { ...runs[0], id: 'c-4', cost: null },
         { ...runs[0], id: 'c-5', cost: { amount: '<b>1</b>', currency: 'EUR', complete: true } },
+        { ...runs[0], id: 'c-6', cost: C(0.045) },
+        { ...runs[0], id: 'c-7', cost: C(1.005) },
+        { ...runs[0], id: 'c-8', cost: C(0.005) },
     ];
     await loadRuns();
     const cc = [...byId('runs-list').querySelectorAll('td.run-tokens')]
@@ -4428,6 +4431,9 @@ async function main() {
     assert.strictEqual(cc[2].textContent, '≈ € 0.04 (partly priced)');
     assert.strictEqual(cc[3], null, 'null cost shows nothing');
     assert.strictEqual(cc[4], null, 'malformed cost shows nothing');
+    assert.strictEqual(cc[5].textContent, '≈ € 0.05', 'half up, as the other UIs (toFixed alone: 0.04)');
+    assert.strictEqual(cc[6].textContent, '≈ € 1.01', 'half up despite 1.005 * 100 < 100.5 in binary');
+    assert.strictEqual(cc[7].textContent, '≈ € 0.01', '0.005 is a cent');
     assert.ok(!byId('runs-list').querySelector('b'));
     answer = { ...runs[0], report: null, cost: C(0.0421) };
     await showRun('r-1');

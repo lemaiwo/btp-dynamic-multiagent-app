@@ -120,10 +120,9 @@ async def test_months_must_be_1_to_12(client, monkeypatch, months):
 async def test_the_months_newest_first_with_actual_and_estimate(client, monkeypatch):
     calls = usage_service(monkeypatch, months={
         "2026-11": {"amount": 12.0, "currency": "EUR", "capacity_units": 8.0,
-                    "estimated": True, "metrics": [{"name": "capacity_units",
-                                                    "usage": 8.0, "cost": 12.0}]},
+                    "estimated": True},
         "2026-10": {"amount": 7.5, "currency": "EUR", "capacity_units": 5.0,
-                    "estimated": False, "metrics": []},
+                    "estimated": False},
     })
     await prices()
     # 1,000 in + 1,000 out of gpt-4o = 1 + 2 = 3 CU = 6 EUR per row.
@@ -185,7 +184,7 @@ async def test_a_month_of_two_currencies_alone_is_unreadable(client, monkeypatch
     async def fake(first, last):
         return btp_usage.UsageAnswer("ok", {"2026-10": {
             "amount": 7.5, "currency": "EUR", "capacity_units": 5.0,
-            "estimated": False, "metrics": []}}, frozenset({"2026-11"}))
+            "estimated": False}}, frozenset({"2026-11"}))
 
     monkeypatch.setattr(cost_routes.btp_usage, "monthly_cost", fake)
     data = (await client.get(URL, params={"months": 3})).json()

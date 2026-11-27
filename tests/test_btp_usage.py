@@ -135,11 +135,9 @@ async def test_only_ai_core_rows_of_this_subaccount_are_kept(env, monkeypatch):
     assert answer.state == "ok"
     assert answer.months == {
         "2026-10": {"amount": 7.5, "currency": "EUR", "capacity_units": 5.0,
-                    "estimated": False,
-                    "metrics": [{"name": "capacity_units", "usage": 5.0, "cost": 7.5}]},
+                    "estimated": False},
         "2026-11": {"amount": 12.0, "currency": "EUR", "capacity_units": 8.0,
-                    "estimated": True,
-                    "metrics": [{"name": "capacity_units", "usage": 8.0, "cost": 12.0}]},
+                    "estimated": True},
     }
     text = json.dumps(answer.months)
     for mark in FOREIGN_MARKS + ("cloud-logging", "linux-container", "customdomain"):
@@ -152,8 +150,7 @@ async def test_another_subaccount_sees_only_its_own_row(env, monkeypatch):
     answer = await btp_usage.monthly_cost(FIRST, LAST)
     assert answer.state == "ok"
     assert answer.months == {"2026-11": {
-        "amount": 1.5, "currency": "EUR", "capacity_units": 1.0, "estimated": True,
-        "metrics": [{"name": "capacity_units", "usage": 1.0, "cost": 1.5}]}}
+        "amount": 1.5, "currency": "EUR", "capacity_units": 1.0, "estimated": True}}
 
 
 async def test_months_outside_the_window_are_left_out(env, monkeypatch):
@@ -176,8 +173,8 @@ async def test_a_month_is_summed_exactly_as_decimals(env, monkeypatch):
     assert answer.state == "ok"
     month = answer.months["2026-11"]
     assert month["amount"] == 0.3 and month["capacity_units"] == 3.3
-    assert [m["cost"] for m in month["metrics"]] == [0.1, 0.2]
-    assert all(isinstance(m["cost"], float) for m in month["metrics"])
+    assert isinstance(month["amount"], float)
+    assert "metrics" not in month
 
 
 async def test_two_currencies_make_only_that_month_unreadable(env, monkeypatch):
