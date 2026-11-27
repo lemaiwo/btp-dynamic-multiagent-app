@@ -88,6 +88,7 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 
+from agents import model_usage
 from agents.access import BASIC, current_access
 from agents.db import SessionLocal
 from agents.errors import describe_exception, mask_text
@@ -237,6 +238,10 @@ class Turn:
     finalized: bool = False
     closed: bool = False
     started: float = field(default_factory=time.monotonic)
+    # The turn's per-model token counts (agents/model_usage.py), bound in
+    # ``_run`` and stored by ``_finalize`` on every outcome.
+    usage_collector: model_usage.UsageCollector = field(
+        default_factory=model_usage.UsageCollector)
 
     def elapsed_ms(self) -> int:
         return int((time.monotonic() - self.started) * 1000)
@@ -803,6 +808,7 @@ async def _finalize(turn: Turn, rec: TurnRecorder | None, *, status: str,
                 db, conversation_id=turn.conversation_id,
                 message_id=turn.assistant_message_id, status=status, content=content,
                 parts=parts, model_json=model_json, error=error, title=title,
+                model_usage=turn.usage_collector.rows(),
             )
     except Exception as exc:  # noqa: BLE001
         logger.warning("webchat: storing turn %s failed (%s)", turn.assistant_message_id,
@@ -878,7 +884,8 @@ async def _run(turn: Turn, data: TurnInput) -> None:
             # agents and sub-agents included, shares it (sync managers, so
             # they bind and reset in this task).
             with nexus_run(f"chat-{data.assistant_message_id}"), \
-                    calling_agent(runner.nexus_agent):
+                    calling_agent(runner.nexus_agent), \
+                    model_usage.collecting(turn.usage_collector):
                 result = await runner.agent.run(
                     data.prompt,
                     message_history=data.history or None,

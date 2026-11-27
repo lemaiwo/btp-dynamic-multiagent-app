@@ -1537,6 +1537,38 @@ async def replace_model_usage(
         ))
 
 
+async def write_model_usage_separately(
+    session: AsyncSession,
+    *,
+    source: str,
+    ref_id: str,
+    parent_id: str | None,
+    rows: list[dict[str, Any]] | None,
+    at: datetime | None = None,
+) -> bool:
+    """Write the ledger rows of one run in a transaction of their own; never raises.
+
+    Called AFTER the run's outcome was committed, so a failing DELETE or
+    INSERT here can neither roll back nor lose that outcome: the ledger is a
+    side record. A failure is rolled back and logged by exception class only.
+    Answers whether the rows were written (``None`` rows: nothing to do, True)."""
+    if rows is None:
+        return True
+    try:
+        await replace_model_usage(session, source=source, ref_id=ref_id,
+                                  parent_id=parent_id, rows=rows, at=at)
+        await session.commit()
+        return True
+    except Exception as exc:  # noqa: BLE001 - the ledger never fails its caller
+        logger.warning("model usage ledger not written for %s (%s)", source,
+                       type(exc).__name__)
+        try:
+            await session.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
+
 class WorkflowRun(Base):
     """One execution of a workflow.
 
@@ -5180,9 +5212,13 @@ async def finish_step_run(
     output: str | None = None,
     error: str | None = None,
     usage: dict[str, int] | None = None,
+    model_usage: list[dict[str, Any]] | None = None,
 ) -> None:
     """Write a step's outcome. ``usage``: its token counts, or ``None`` to
-    leave the columns NULL (a deterministic step, nothing spent)."""
+    leave the columns NULL (a deterministic step, nothing spent).
+    ``model_usage``: the step's per-model ledger rows, written after the
+    outcome's commit in a transaction of their own (a ledger failure is
+    logged, the outcome stays); ``None`` leaves the ledger alone."""
     row = await session.get(WorkflowStepRun, step_run_id)
     if row is None:
         return
@@ -5190,8 +5226,14 @@ async def finish_step_run(
     row.output = output
     row.error = error
     _write_usage(row, usage)
-    row.finished_at = datetime.now(timezone.utc)
+    finished_at = datetime.now(timezone.utc)
+    row.finished_at = finished_at
+    parent_id = row.workflow_run_id
     await session.commit()
+    await write_model_usage_separately(
+        session, source="workflow_step", ref_id=step_run_id, parent_id=parent_id,
+        rows=model_usage, at=finished_at,
+    )
 
 
 # IN lists are sent in chunks of at most this many ids (HANA and Postgres
