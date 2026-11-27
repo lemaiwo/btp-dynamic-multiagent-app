@@ -2,7 +2,7 @@ import { ValueState } from "sap/ui/core/library";
 import NumberFormat from "sap/ui/core/format/NumberFormat";
 import formatMessage from "sap/base/strings/formatMessage";
 import type {
-    McpServer, RunStatus, RunUsage, TokenState, WorkflowItemStatus, WorkflowRunStatus
+    McpServer, RunCost, RunStatus, RunUsage, TokenState, WorkflowItemStatus, WorkflowRunStatus
 } from "../service/types";
 
 import oauthConfig from "./oauthConfig";
@@ -86,6 +86,25 @@ function readUsage(value: unknown): RunUsage | null {
     });
     return ok ? value as RunUsage : null;
 }
+
+/**
+ * A run's `cost` when it is the object the server promises: a finite,
+ * non-negative `amount`, `currency` exactly "EUR" and a boolean `complete`.
+ * Anything else is "no cost", so nothing is shown rather than a wrong sum.
+ */
+function readCost(value: unknown): RunCost | null {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+        return null;
+    }
+    const source = value as Record<string, unknown>;
+    const amount = source.amount;
+    const ok = typeof amount === "number" && Number.isFinite(amount) && amount >= 0
+        && source.currency === "EUR" && typeof source.complete === "boolean";
+    return ok ? value as RunCost : null;
+}
+
+/** Below this an amount would round to 0.00 although it is not zero. */
+const SMALLEST_SHOWN = 0.005;
 
 /** A token count with the locale's grouping (`12,345` in English). */
 function tokenCount(count: number): string {
@@ -255,6 +274,33 @@ export default {
             return formatMessage(cached, [total, input, output, tokenCount(read.cache_read_tokens), requests]);
         }
         return formatMessage(plain, [total, input, output, requests]);
+    },
+
+    /** Whether a run has an estimated cost to show; false for null or a
+     * value that is not the promised object. */
+    hasCost(cost: unknown): boolean {
+        return readCost(cost) !== null;
+    },
+
+    /**
+     * A run's estimated cost in euros. Each pattern is an i18n text passed
+     * as a binding part: `pattern` takes the amount as `{0}` (two decimals,
+     * locale-grouped), `small` is the text for an amount above zero that
+     * would round to 0.00, and `partly` wraps either as `{0}` when a model
+     * of the run has no price (`complete: false`; a zero then is a floor,
+     * never "free"). Empty without a readable cost.
+     */
+    costText(pattern: string, small: string, partly: string, cost: unknown): string {
+        const read = readCost(cost);
+        if (!read || !pattern || !small || !partly) {
+            return "";
+        }
+        const text = read.amount > 0 && read.amount < SMALLEST_SHOWN
+            ? small
+            : formatMessage(pattern, [NumberFormat.getFloatInstance({
+                minFractionDigits: 2, maxFractionDigits: 2, groupingEnabled: true
+            }).format(read.amount)]);
+        return read.complete ? text : formatMessage(partly, [text]);
     },
 
     /** Renders a workflow item's selected branches as a comma list. Empty

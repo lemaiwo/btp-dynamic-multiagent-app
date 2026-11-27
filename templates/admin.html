@@ -2023,7 +2023,7 @@ function renderWorkflowRuns() {
                 <td><span class="status-badge status-${escapeHtml(r.status)}">${escapeHtml(r.status)}</span></td>
                 <td>${escapeHtml(counts)}</td>
                 <td>${r.started_at ? escapeHtml(new Date(r.started_at).toLocaleString()) : ''}</td>
-                <td class="run-tokens" style="text-align:right" title="${escapeHtml(runTokensSplit(r.usage))}">${escapeHtml(runTokensTotal(r.usage))}</td>
+                <td class="run-tokens" style="text-align:right" title="${escapeHtml(runTokensSplit(r.usage))}">${escapeHtml(runTokensTotal(r.usage))}${runCostHtml(r.cost)}</td>
                 <td class="row-actions">
                     <button class="small secondary">View</button>
                 </td>
@@ -2079,7 +2079,7 @@ async function showWorkflowRun(runId) {
             <td>${s.position}</td>
             <td>${escapeHtml(s.agent_name)}</td>
             <td><span class="status-badge status-${escapeHtml(s.status)}">${escapeHtml(s.status)}</span></td>
-            <td class="step-tokens" style="text-align:right" title="${escapeHtml(runTokensSplit(s.usage))}">${escapeHtml(runTokensTotal(s.usage))}</td>
+            <td class="step-tokens" style="text-align:right" title="${escapeHtml(runTokensSplit(s.usage))}">${escapeHtml(runTokensTotal(s.usage))}${runCostHtml(s.cost)}</td>
             <td>${body}</td>
         </tr>
     `;
@@ -2090,6 +2090,7 @@ async function showWorkflowRun(runId) {
         <h3>${escapeHtml(run.workflow_name)} — <span class="status-badge status-${escapeHtml(run.status)}">${escapeHtml(run.status)}</span></h3>
         <p class="hint">Trigger: ${escapeHtml(run.trigger)} · Started: ${run.started_at ? escapeHtml(new Date(run.started_at).toLocaleString()) : ''}${run.finished_at ? ' · Finished: ' + escapeHtml(new Date(run.finished_at).toLocaleString()) : ''}</p>
         ${runUsage(run.usage) ? `<p class="hint run-tokens">Tokens: ${escapeHtml(runTokensLine(run.usage))}</p>` : ''}
+        ${runCostText(run.cost) ? `<p class="hint run-cost">Estimated cost: ${escapeHtml(runCostText(run.cost))}</p>` : ''}
         ${run.summary ? `<p>${escapeHtml(run.summary)}</p>` : ''}
         ${run.error ? `<p class="error">${escapeHtml(run.error)}</p>` : ''}
         <h4>Items</h4>
@@ -2484,6 +2485,25 @@ function runUsage(usage) {
     return RUN_USAGE_KEYS.every(k => typeof usage[k] === 'number' && Number.isFinite(usage[k]) && usage[k] >= 0)
         ? usage : null;
 }
+// `cost` is null (no price set, or a run before 2.50.0) or {amount, currency: "EUR", complete}.
+function runCost(cost) {
+    if (!cost || typeof cost !== 'object' || Array.isArray(cost)) return null;
+    return typeof cost.amount === 'number' && Number.isFinite(cost.amount) && cost.amount >= 0
+        && cost.currency === 'EUR' && typeof cost.complete === 'boolean' ? cost : null;
+}
+function runCostText(cost) {
+    const c = runCost(cost);
+    if (!c) return '';
+    // Half up to cents, as the other UIs show it (toFixed alone shows 0.045 as 0.04;
+    // toPrecision first so 1.005 * 100 = 100.49999... still rounds up).
+    const cents = Math.round(Number((c.amount * 100).toPrecision(12))) / 100;
+    const text = c.amount > 0 && c.amount < 0.005 ? '< \u20ac 0.01' : `\u2248 \u20ac ${cents.toFixed(2)}`;
+    return c.complete ? text : `${text} (partly priced)`;
+}
+function runCostHtml(cost) {
+    const t = runCostText(cost);
+    return t ? `<div class="run-cost hint" title="Estimate at today's model prices">${escapeHtml(t)}</div>` : '';
+}
 function runTokensTotal(usage) {
     const u = runUsage(usage);
     return u ? u.total_tokens.toLocaleString() : '';
@@ -2516,7 +2536,7 @@ async function loadRuns() {
             <td><span class="status-badge status-${esc(r.status)}">${esc(r.status)}</span></td>
             <td>${r.started_at ? esc(new Date(r.started_at).toLocaleString()) : ''}</td>
             <td>${esc(r.trigger)}</td>
-            <td class="run-tokens" style="text-align:right" title="${esc(runTokensSplit(r.usage))}">${esc(runTokensTotal(r.usage))}</td>
+            <td class="run-tokens" style="text-align:right" title="${esc(runTokensSplit(r.usage))}">${esc(runTokensTotal(r.usage))}${runCostHtml(r.cost)}</td>
             <td>${esc(r.summary || r.error || '')}</td>
           </tr>`).join('') + '</tbody></table>';
     el.querySelectorAll('.run-row').forEach(row =>
@@ -2629,6 +2649,7 @@ async function showRun(id) {
     el.innerHTML = `<h3>${esc(run.agent_name)} — <span class="status-badge status-${esc(run.status)}">${esc(run.status)}</span></h3>`
         + `<p class="hint">Trigger: ${esc(run.trigger)} · Started: ${run.started_at ? esc(new Date(run.started_at).toLocaleString()) : ''}${run.finished_at ? ' · Finished: ' + esc(new Date(run.finished_at).toLocaleString()) : ''}</p>`
         + (runUsage(run.usage) ? `<p class="hint run-tokens">Tokens: ${esc(runTokensLine(run.usage))}</p>` : '')
+        + (runCostText(run.cost) ? `<p class="hint run-cost">Estimated cost: ${esc(runCostText(run.cost))}</p>` : '')
         + (run.summary ? `<p>${esc(run.summary)}</p>` : '')
         + (run.error ? `<p class="error">${esc(run.error)}</p>` : '');
     try {

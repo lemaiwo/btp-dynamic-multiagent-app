@@ -162,6 +162,8 @@ from agents.ina.models import QUERY_NAME_RE, check_query_names, validate_ina_que
 from agents.invoke_config import check_result_schema, clean_limits
 from agents.jira_tools import BUILTIN_JIRA_URL
 from agents.mail_render import MailTheme
+from agents.model_prices import costs_for
+from agents.model_prices import load as load_prices
 from agents.odata import BUILTIN_ODATA_URL
 from agents.odata.models import MAX_DEFINITION_BYTES, SERVICE_NAME_RE
 from agents.outlook_tools import BUILTIN_OUTLOOK_URL
@@ -2382,7 +2384,9 @@ async def api_list_runs(
 
     async with SessionLocal() as session:
         rows = await list_job_runs(session, limit=limit, agent_id=agent_id)
-        return [r.to_dict() for r in rows]
+        # The estimated cost of each run: one grouped ledger read per list.
+        costs = await costs_for(session, "job", [r.id for r in rows])
+        return [{**r.to_dict(), "cost": costs.get(r.id)} for r in rows]
 
 
 @router.get("/api/runs/{run_id}", dependencies=[Depends(require_admin)])
@@ -2394,6 +2398,7 @@ async def api_get_run(run_id: str) -> dict[str, Any]:
         if row is None:
             raise HTTPException(status_code=404, detail="Run not found")
         data = row.to_dict()
+        data["cost"] = (await costs_for(session, "job", [run_id])).get(run_id)
         data["report"] = row.report
         # A live run's activity is only in memory; a finished one's is stored.
         from agents.run_activity import live_activity
@@ -2629,7 +2634,10 @@ async def api_list_workflow_runs(
         # The token total of each run, summed from its step rows in one
         # grouped statement for the whole list.
         usage = await workflow_runs_usage(session, [r.id for r in rows])
-        return [{**r.to_dict(), "usage": usage.get(r.id)} for r in rows]
+        # Its estimated cost likewise, from the steps' ledger rows by run.
+        costs = await costs_for(session, "workflow_step", [r.id for r in rows], by="parent")
+        return [{**r.to_dict(), "usage": usage.get(r.id), "cost": costs.get(r.id)}
+                for r in rows]
 
 
 @router.get("/api/workflow-runs/{run_id}", dependencies=[Depends(require_admin)])
@@ -2641,10 +2649,13 @@ async def api_get_workflow_run(run_id: str) -> dict[str, Any]:
         items = await list_item_runs(session, run_id)
         steps = await list_step_runs(session, run_id)
         usage = await workflow_runs_usage(session, [run_id])
+        book = await load_prices(session)
+        run_cost = await costs_for(session, "workflow_step", [run_id], by="parent", book=book)
+        step_costs = await costs_for(session, "workflow_step", [s.id for s in steps], book=book)
         return {
-            "run": {**row.to_dict(), "usage": usage.get(run_id)},
+            "run": {**row.to_dict(), "usage": usage.get(run_id), "cost": run_cost.get(run_id)},
             "items": [i.to_dict() for i in items],
-            "steps": [s.to_dict() for s in steps],
+            "steps": [{**s.to_dict(), "cost": step_costs.get(s.id)} for s in steps],
         }
 
 
@@ -4328,3 +4339,8 @@ router.include_router(_ina_router)
 from agents.model_provider_routes import router as _model_providers_router  # noqa: E402
 
 router.include_router(_model_providers_router)
+
+# The cost in euros: the model price table (/admin/api/model-prices).
+from agents.cost_routes import router as _cost_router  # noqa: E402
+
+router.include_router(_cost_router)

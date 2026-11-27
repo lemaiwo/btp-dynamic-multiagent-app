@@ -29,7 +29,13 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agents.auth import current_principal
-from agents.db import ChatConversation, ChatFile, ChatMessage, ReconcileRun
+from agents.db import (
+    ChatConversation,
+    ChatFile,
+    ChatMessage,
+    ReconcileRun,
+    write_model_usage_separately,
+)
 from agents.ide.models import iso_utc
 from agents.ide.store import _chunks, env_int
 from agents.notifications import _marker_key as principal_key
@@ -432,9 +438,13 @@ async def finish_turn(
     db: AsyncSession, *, conversation_id: str, message_id: str, status: str,
     content: str | None, parts: list[dict[str, Any]], model_json: str | None,
     error: str | None, title: str | None,
+    model_usage: list[dict[str, Any]] | None = None,
 ) -> None:
     """Store the assistant message's outcome and release the run lock; a
-    ``title`` replaces the default title only."""
+    ``title`` replaces the default title only. ``model_usage``: the turn's
+    per-model ledger rows, written after that commit in a transaction of
+    their own (no FK: they survive the conversation's purge); a ledger
+    failure is logged and never loses the turn."""
     await db.execute(
         update(ChatMessage).where(ChatMessage.id == message_id)
         .values(status=status, content=content, parts_json=json.dumps(parts),
@@ -455,6 +465,14 @@ async def finish_turn(
             .execution_options(synchronize_session=False)
         )
     await db.commit()
+    # A turn without spend writes nothing (no DELETE either). Safe for the
+    # replace rule: the assistant message id is new per turn and its run
+    # finalizes once (``run._finalize``, ``turn.finalized``), so no earlier
+    # attempt can have left rows of this message to replace.
+    await write_model_usage_separately(
+        db, source="chat", ref_id=message_id, parent_id=conversation_id,
+        rows=model_usage or None,
+    )
 
 
 async def get_file(db: AsyncSession, fid: str, principal: str) -> ChatFile | None:

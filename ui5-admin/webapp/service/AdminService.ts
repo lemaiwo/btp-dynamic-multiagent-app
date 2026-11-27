@@ -16,6 +16,7 @@ import type {
 import type {
     ModelProviderName, ModelProviderSave, ModelProviderTestResult, ModelProvidersSaved, ModelProvidersStatus
 } from "./modelProviderTypes";
+import type { CostMonths, ModelPrices, ModelPricesSave } from "./costTypes";
 
 /**
  * A non-2xx response from the admin API.
@@ -561,5 +562,41 @@ export default class AdminService {
         return this.request<ModelProviderTestResult>(`model-providers/${encodeURIComponent(provider)}/test`, {
             method: "POST"
         });
+    }
+
+    // --- model prices ---
+    // The CU price and the rate per model (`/admin/api/model-prices`).
+    // Amounts are decimal strings both ways.
+
+    /** The CU price, the stored rates (sorted), the models seen without a rate, the stamp. */
+    public getModelPrices(): Promise<ModelPrices> {
+        return this.request<ModelPrices>("model-prices");
+    }
+
+    /**
+     * Replaces the table. The body is exactly `{expected_updated_at,
+     * capacity_unit_price, prices}`: a 409 says the stamp moved (somebody
+     * else saved), a 422 `detail` is `<field>: <rule>`. Answers the new state.
+     */
+    public setModelPrices(body: ModelPricesSave): Promise<ModelPrices> {
+        const sent: ModelPricesSave = {
+            expected_updated_at: body.expected_updated_at,
+            capacity_unit_price: body.capacity_unit_price,
+            prices: body.prices.map((row) => ({
+                model: row.model, input_rate: row.input_rate, output_rate: row.output_rate,
+                cache_read_rate: row.cache_read_rate
+            }))
+        };
+        return this.request<ModelPrices>("model-prices", { method: "PUT", ...AdminService.json(sent) });
+    }
+
+    // --- AI Core cost per month ---
+
+    /**
+     * The actual AI Core cost per UTC month next to this app's estimate,
+     * newest first (`/admin/api/cost/months`). `months` is 1 to 12.
+     */
+    public getCostMonths(months = 6): Promise<CostMonths> {
+        return this.request<CostMonths>(`cost/months?months=${encodeURIComponent(String(months))}`);
     }
 }

@@ -55,6 +55,7 @@ from agents.db import (  # noqa: E402
     ChatUserSkill,
     InaQuery,
     ODataService,
+    OrchestratorConfig,
     SessionLocal,
     SkillConfig,
     init_db,
@@ -145,6 +146,10 @@ async def _clean(monkeypatch):
     await wipe()
     async with SessionLocal() as s:
         await set_orchestrator_instructions(s, ORCH_TEXT)
+        # No CU price unless a test sets one, whatever an earlier file left.
+        await s.execute(update(OrchestratorConfig).values(
+            capacity_unit_price=None, prices_updated_at=None))
+        await s.commit()
     yield
     await run.cancel_all_chat_runs()
     run._turns.clear()
@@ -357,7 +362,8 @@ async def test_the_context_of_a_personal_agent(client, monkeypatch, real_agents_
     ]
     assert out["usage"]["turns"] == 1 and out["usage"]["requests"] == 1
     assert set(out["usage"]) == {"input_tokens", "output_tokens", "total_tokens",
-                                 "requests", "turns"}
+                                 "requests", "turns", "cost"}
+    assert out["usage"]["cost"] is None  # no CU price set
 
 
 async def test_admin_text_is_shown_to_an_admin_only(client, roles):

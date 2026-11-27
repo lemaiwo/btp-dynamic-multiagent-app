@@ -172,6 +172,14 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   repairs, unchanged) and `_deploy_hana_schema` (HANA: `agents/hana_hdi.py`
   instead of all of that; the repairs are for rows of versions that never ran
   on HANA and are not run). The orchestrator row is ensured on all three.
+  **Cost tables** (2.50.0, HANA schema generation 14): `ModelUsage` (`model_usage`,
+  the ledger: `source`, `ref_id`, `parent_id`, `model`, four counts, `created_at`;
+  indexes `ix_model_usage_ref`, `ix_model_usage_parent`), `ModelPrice` (`model_prices`,
+  one row per model) and `OrchestratorConfig.capacity_unit_price` (BIGINT, 10^-9 units)
+  with `prices_updated_at`, both nullable and added last; `replace_model_usage`
+  (delete the rows of one `(source, ref_id)`, insert the new ones, no commit; a model
+  with 0 requests is skipped) and `write_model_usage_separately` (the same in a
+  transaction of its own that never raises). See `agents/model_usage.py` below.
   **On HANA the models are the only DDL: a new NOT NULL column needs a
   `server_default`** (HDI adds it to a table that holds rows;
   `tests/test_hana_hdi.py` pins the NOT NULL columns without one that exist
@@ -2632,6 +2640,114 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   which answers `count` as the total, as the page length or not at all, is
   `tests/aicore_helpers.py`). 693 lines: the credential resolution is the split
   candidate (`agents/aicore_credentials.py`)
+- `agents/model_usage.py` + `agents/model_usage_store.py` + `agents/model_prices.py` +
+  `agents/cost_routes.py` + `agents/btp_usage.py` + `agents/cost_months.py` — the
+  **cost in euros** (2.50.0): an estimate per agent run, workflow step and run and web
+  chat conversation, and the billed AI Core cost per month next to it.
+  - `model_usage.py` — the collector, standard library only: `UsageCollector`,
+    `collecting()` (a ContextVar set and reset in the same task), `current()`, `add()`
+    (does nothing without a bound collector; a blank or non-string model name is dropped
+    silently, an unreadable usage or negative counts with one WARNING naming the class;
+    a name is stripped and cut to 128 characters; never raises). **What is counted is an answered
+    request**: `NexusLoggedModel.request` adds the response's own usage after the call
+    returned, and `request_stream` only when the stream context manager exits normally
+    (a consumer that raises or is cancelled records nothing), with the register on or off
+    (`get_model`'s fallback to the unwrapped model collects nothing). Bound at the job
+    runner (`execute_run`), the invoke run, each workflow agent step and the web chat
+    turn; **not** at the classic chat, A2A and the IDE, which have no ledger.
+  - **The ledger** (`model_usage`, rows per model with input, output, cache-read tokens
+    and requests; the table is in `agents/db.py`): the run's outcome is committed FIRST,
+    then the rows are written in a transaction of their own that never raises (a failing
+    ledger write is one WARNING naming the source and the class, and the run keeps its
+    status; a crash between the two commits loses that run's rows). Rows are replaced per
+    `(source, ref_id)`, so a repeated finish leaves one set: `source` `job` (ref the
+    `job_runs` id; also invoke runs), `workflow_step` (ref the step run id, `parent_id`
+    the workflow run id), `chat` (ref the assistant message id, `parent_id` the
+    conversation id). Written for every outcome after the model call (success, failure,
+    sign-in prompt, timeout, cancel). `model_usage_store.py` holds the grouped reads
+    (`counts_by_ref`, `counts_by_parent`: one `GROUP BY` statement per 500 ids,
+    `seen_models`, `chat_ledger_refs`) and the retention: `MODEL_USAGE_RETENTION_DAYS`
+    (default 400, `0` keeps, capped at 36,500) in the app's daily retention pass
+    (`purge_model_usage`); a chat purge leaves the rows.
+  - `model_prices.py` — the price table and the maths. A rate is **capacity units per
+    1,000 tokens** (`input_rate`, `output_rate`, optional `cache_read_rate`) and the
+    price of one capacity unit (`capacity_unit_price`, euro; the currency is fixed
+    `EUR`), stored as integers of 10^-9 (`parse_amount` takes a JSON number or an ASCII
+    decimal string of 0 to 1,000,000 with at most 9 decimals; a refusal names the field,
+    never the value). **Cost** = for each model `((input - cached) x input_rate + cached x
+    cache_rate + output x output_rate) / 1000 x capacity_unit_price`, where `cached` is
+    clamped to `[0, input]`, a missing `cache_read_rate` prices cached tokens at the
+    input rate and negative counts count as 0; summed as `Decimal` and rounded half up
+    to 6 decimals. `cost(book, by_model)` answers `{amount, currency: "EUR", complete}`
+    or `null`: **`null` when there is no capacity-unit price or no model has an answered
+    request; `complete: false` when a model with requests has no rate** (it adds 0, so
+    the amount is a floor). `costs_for(session, source, ids, by="ref"|"parent")` reads
+    the ledger and answers one cost per id (all `null` without reading when no price is
+    set). **Computed at read time, never stored on a run row**: a changed price table
+    changes the figures of past runs, which is the intent (an estimate, not an invoice).
+    The answers that carry `cost` next to `usage`: `GET /admin/api/runs[/{id}]`,
+    `/workflow-runs` (per run), `/workflow-runs/{id}` (the run and each step) and the web
+    chat's `/context` (`usage.cost`); not the invoke poll answer.
+  - `cost_routes.py` (each route its own `require_admin`): `GET /admin/api/model-prices`
+    answers `{currency, capacity_unit_price` (string or `null`)`, prices: [{model,
+    input_rate, output_rate, cache_read_rate}]` (sorted)`, unpriced_models` (models the
+    ledger has seen without a row)`, updated_at}`; `PUT` takes exactly
+    `{expected_updated_at, capacity_unit_price, prices}` (all three required, at most 200
+    rows, a model name 1 to 128 characters without control or format characters, edge
+    whitespace or a non-NFC form, no duplicate; body at most 64 KiB, else 413) and replaces
+    the table whole under a lock, stamping the rows and the orchestrator row with one
+    strictly increasing `prices_updated_at`. **`expected_updated_at: null` means "never
+    saved"**, not "no check" as in the OData routes: `null` on a saved table, or a stamp on
+    a never-saved one, is 409 `The prices were changed meanwhile: reload them` (stamps are
+    compared as instants); a missing settings row is 503. A save logs one INFO line naming
+    the principal and the number of models, never a rate, and reloads nothing.
+    `GET /admin/api/cost/months?months=1..12` (default 6, newest first, the current UTC
+    month included) answers `{usage_service, currency, months: [{month, actual,
+    actual_status, estimated, by_source, by_model}]}`: `estimated` is `cost()` over the
+    month's ledger rows (`created_at` in the UTC month), `by_source` per `job` /
+    `workflow_step` / `chat`, `by_model` the tokens and a per-model amount (`null` when
+    unpriced); `actual` is `{amount, currency, capacity_units, estimated}` from the usage
+    service or `null`, with `actual_status` one of `ok`, `no_data` (the service answered
+    but holds no AI Core row of this subaccount for that month), `unreadable` (that
+    month's rows are of two currencies) or, for every month at once, the service's state.
+  - `btp_usage.py` — the reader of the **Usage Data Management reporting API**
+    (`GET /reports/v1/monthlySubaccountsCost?fromDate=YYYYMM&toDate=YYYYMM`) through a
+    BTP destination: `BTP_USAGE` by default (the destination name is a code default,
+    `USAGE_DESTINATION` overrides it); **off when the destination does not exist**
+    (`usage_service: off`, no other call), and `no_subaccount` when the subaccount id is
+    unknown: `USAGE_SUBACCOUNT_ID` when set (blank counts as unset; a value that does not
+    have the form of an id is `no_subaccount`, never a fallback), else
+    `credentials.subaccountid` of the XSUAA binding.
+    **The credential reads the whole global account** (the API ignores a `subaccountId`
+    parameter), so the filter is the module's: a row is read at all only when its
+    `subaccountId` equals this subaccount exactly and its `serviceId` is `ai-core`, and
+    only such rows ever leave the module (a global-account row has `subaccountId: ""`,
+    which no accepted id equals). Per month it sums `cost` and the `capacity_units`
+    usage as `Decimal`, one currency per month. Fixed codes in `usage_service`: `ok`,
+    `off`, `no_subaccount`, `destination_error`, `unauthorized`, `usage_unavailable`,
+    `too_large`, `not_json`, `unreadable`; any unexpected error is `usage_unavailable`,
+    logged by class. Transport: `https` destination only, no redirect, `trust_env` off,
+    the destination's `content-length`, `content-type`, `transfer-encoding`, `host` and
+    `cookie` headers (any case) and `URL.queries.*` not sent, one 20 s deadline, a 4 MB read cap (the body of an error status is never read),
+    a 401 / 403 drops the cached destination; httpx's request line is kept out of the log
+    by the filter of `agents/bitbucket_tools.py`. **Cache**: per process, 6 h for an `ok`
+    answer, 5 min for any other, at most 32 keys; a change in the destination shows up
+    after the cache. `cost_months.py` builds the months (one ledger `GROUP BY` per month,
+    aware UTC bounds, no SQL date function).
+  - Tests: `tests/test_model_usage_collector.py`, `test_model_usage_ledger.py`,
+    `test_model_usage_ledger_workflow_chat.py`, `test_model_usage_retention.py`,
+    `test_model_prices.py`, `test_model_price_routes.py`, `test_cost_answers.py`,
+    `test_btp_usage.py`, `test_cost_months_route.py`, `test_hana_hdi.py` (generation 14);
+    the recorded answer is `tests/fixtures/btp_usage/` (synthetic values, real structure).
+    **Seen on the real API** (the probe's recording, 2026-11-27): the month still open is
+    flagged `estimated` by the API (`estimated: true` on its rows).
+  - **Not verified**: the reader has not run against the real usage API from the app
+    (only the recorded answer of a probe, as a fixture); the opt-in PostgreSQL and HANA suites were not run
+    for this release (the suite's HANA statement compile check ran over every statement);
+    the HDI deploy of generation 14 on a landscape has not run. Known limits: an
+    estimate prices the models the app saw, not other consumers of the same AI Core; a
+    request that failed is not counted; a stream left early by a consumer that does not
+    raise is counted with its partial usage.
 - `agents/nexus/` — the **agent register** integration: an optional side channel that
   reports every model request of the app to an agent register reached through a BTP
   destination, and registers the app's agents there so an admin of the register can assign
@@ -2698,7 +2814,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     of as the user (`user_fallback`) are logged at most once per 5 minutes as counts plus the
     last class or status, never a URL, body, header or exception text. A worker whose event
     loop closed counts as not running.
-  - `logged_model.py` — `NexusLoggedModel`, a pydantic-ai `WrapperModel`; **`agents/shared.get_model`
+  - `logged_model.py` — (2.50.0: the wrapper also feeds the cost collector,
+    `agents/model_usage.py`, after every answered request, whether the register is on or
+    off) `NexusLoggedModel`, a pydantic-ai `WrapperModel`; **`agents/shared.get_model`
     returns it** (the real model is at `.wrapped`; the per-name cache holds the wrapped
     object; a failure to import or build the wrapper falls back to the unwrapped model with
     one WARNING per process, class only). Every model request, from every entry point (web
@@ -3095,7 +3213,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   used. `GET /admin/api/workflow-runs` answers `usage` on every run, `GET
   /admin/api/workflow-runs/{id}` on the run and on each step; the shape and
   the `null` rule are `db.usage_answer`, shared with `JobRun`
-  (`tests/test_workflow_token_usage.py`)
+  (`tests/test_workflow_token_usage.py`). **Cost**: the same answers carry a `cost`
+  next to each `usage` (`{amount, currency: "EUR", complete}` or `null`), computed at
+  read time from the model usage ledger and the price table, never stored on the run
+  row (`agents/model_prices.py`, `model_usage.py`; `tests/test_cost_answers.py`)
 - `agents/ide/` — the backend of the **ABAP Assistant** (the UI's name; the
   code, `/ide/api`, the `developer` scope and the role collection
   `ABAP IDE Developer` keep the old naming): a staged chat that analyses,
@@ -3592,7 +3713,14 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     and `parent`, `delegation_end` with `ok`, `output`, `usage`,
     `duration_ms`; all keyword arguments with defaults, so
     `agents/run_activity.py` and `agents/chat_app.py` are unchanged.
-    `tests/test_delegation_usage.py`
+    `tests/test_delegation_usage.py`. **Cost**: a turn's per-model counts go to the
+    ledger (`source` `chat`, `ref_id` the assistant message id, `parent_id` the
+    conversation id) by `finish_turn`, after the turn is stored; the context view's
+    `usage.cost` is the estimate of the whole conversation from the ledger, plus, for an
+    assistant message without ledger rows (before 2.50.0), its stored `usage` part counts
+    under the part's model (no model name: unpriced, `complete: false`); the web chat shows
+    it as an "Estimated cost" row of the context drawer with a hint
+    (`static/chat/state.js` `costLabel`, `render/contextDrawer.js`)
   - CSRF: the middleware's Origin check (`app.py`) covers `/chat/api` as well
     as `/admin`; the client sends `X-Requested-With: XMLHttpRequest` on every
     call. Tests: `tests/test_webchat_api.py`, `tests/test_webchat_docgen.py`,
@@ -4091,7 +4219,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   another toolset unticks both), with a fixed question of its own at the
   tick and again at the save when the row lists a system its answer did not
   cover, and sent only as `true` next to `allow_select: true`; two such rows
-  are refused before the save
+  are refused before the save. The runs list, the workflow runs list, both run details
+  and the workflow step rows show the answer's `cost` as an estimate under the token
+  counts (`runCost`, `runCostText`, `runCostHtml`: `≈ € 0.04`, `< € 0.01` below a cent,
+  `(partly priced)` when `complete` is false; nothing for `null`); `tests/test_admin_ui.py`
 - `ui5-admin/` — SAPUI5 (TypeScript) rebuild of the admin UI, deployed to the
   BTP HTML5 Application Repository and served at `/ui5admin`. Runs **alongside**
   `templates/admin.html`, which is still the supported admin at `/admin`. All HTTP goes through `webapp/service/AdminService.ts`, which sends
@@ -4336,6 +4467,17 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     record of the systems it was agreed for (`confirmedAll`,
     `hanaEntry.selectAllNewlyAllowed`): an answer to one question never
     counts for the other. `hanaEntry.qunit.ts`, `AgentHanaJourney.ts`
+  - Cost under the token counts (`model/formatter.ts` `costText` / `hasCost`: the
+    answer's `cost` read by positive recognition, `≈ € 0.04`, `< € 0.01` below a cent,
+    `(partly priced)` when `complete` is false, nothing for `null` or a malformed value):
+    a muted line in the Tokens column of the Runs and Workflow runs lists, a form row
+    "Estimated cost" under Tokens on both detail pages and a line on each workflow step
+    row (i18n `runCost*`, `colCost`). Two panels of the Settings page, "Model prices"
+    (the table of `GET`/`PUT /admin/api/model-prices`) and "AI Core cost" (the estimate
+    against the billed cost per month of `GET /admin/api/cost/months`; `< € 0.01` for an
+    amount that two decimals would show as zero, and no difference against a partly
+    priced estimate, which is a floor: `model/costMonths.ts`), are fed by those routes
+    (`agents/cost_routes.py`); see the cost entry above
   - Karma runs in a fixed desktop window (`karma.conf.js`, launcher
     `ChromeHeadlessDesktop`, 1440x900): at headless Chrome's default 800x600
     what fits in an `OverflowToolbar` depends on the machine's fonts, and on
@@ -4629,7 +4771,21 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   when read, not stored): four nullable columns on each of the two tables (`input_tokens`,
   `output_tokens`, `cache_read_tokens`, `requests`), HANA schema generation 13 (added to
   the tables in place by the HDI deploy, nothing undeployed, no `HANA_HDI_ALLOW_DROP`); no
-  new resource, environment variable or role
+  new resource, environment variable or role;
+  2.50.0 adds the estimated cost in euros of every agent run, workflow step and run and web
+  chat conversation (from a per-model token ledger and an admin price table: rates in
+  capacity units per 1,000 tokens and the price of one capacity unit) and, optionally, the
+  billed AI Core cost per month from the Usage Data Management reporting API through a
+  destination: two new tables (`model_usage`, `model_prices`) and two nullable columns on
+  `orchestrator_config` (`capacity_unit_price`, `prices_updated_at`), HANA schema generation
+  14 (added in place by the HDI deploy, nothing undeployed, no `HANA_HDI_ALLOW_DROP`); no new
+  resource or role. `MODEL_USAGE_RETENTION_DAYS`, `USAGE_DESTINATION` and
+  `USAGE_SUBACCOUNT_ID` are not in the descriptor (set per landscape in an `.mtaext`); the
+  `uas` service instance (plan `reporting-ga-admin`) and the destination to its reporting API
+  are made per landscape, not by the deploy. Without them the estimate works and the billed
+  cost reads "off". Unverified: the app's own reader against the real usage API (only the
+  recorded answer, as a fixture, and unit tests) and the opt-in Postgres and HANA suites
+  (only the statement compile check ran)
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets
@@ -4639,8 +4795,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   history**: `agent_configs` (every column), `skill_configs`, the
   orchestrator row, `workflows` with branches and steps, `odata_services`
   (with their `kind`), `ina_queries` (by name, with the stored description and
-  its stamp), `ide_conventions`, `mcp_oauth_clients`, `mcp_oauth_tokens`; not
-  job or workflow runs, the audit logs, IDE sessions and their children, OAuth
+  its stamp), `model_prices` (by model; the CU price and its stamp travel with the
+  orchestrator row), `ide_conventions`, `mcp_oauth_clients`, `mcp_oauth_tokens`; not
+  job or workflow runs, the model usage ledger (`model_usage`: history), the audit logs, IDE sessions and their children, OAuth
   flow states, the notification read markers (`admin_notification_state`),
   the web chat's tables and the data catalogue (`data_catalog_*`: the app
   rebuilds the graph from the registrations at start, so an admin's hints and

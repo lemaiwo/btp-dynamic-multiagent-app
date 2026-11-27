@@ -54,6 +54,14 @@
                         id="runTokens"
                         text="{ parts: ['i18n>runTokensDetail', 'i18n>runTokensDetailCached', 'i18n>runTokensRequestOne', 'i18n>runTokensRequests', 'run>/data/usage'], formatter: '.formatter.tokenDetail' }"
                         visible="{ path: 'run>/data/usage', formatter: '.formatter.hasTokenUsage' }" />
+                    <Label
+                        text="{i18n>colCost}"
+                        visible="{ path: 'run>/data/cost', formatter: '.formatter.hasCost' }" />
+                    <Text
+                        id="runCost"
+                        text="{ parts: ['i18n>runCost', 'i18n>runCostSmall', 'i18n>runCostPartly', 'run>/data/cost'], formatter: '.formatter.costText' }"
+                        tooltip="{i18n>runCostHint}"
+                        visible="{ path: 'run>/data/cost', formatter: '.formatter.hasCost' }" />
 
                     <Label text="{i18n>colSummary}" />
                     <Text text="{run>/data/summary}" />

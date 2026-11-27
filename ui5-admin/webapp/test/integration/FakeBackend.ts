@@ -4,9 +4,11 @@ import type {
     ODataServiceInput, ODataServiceSummary, ODataTestResult, ODataUsedBy, Skill, WorkflowDetail, WorkflowRunDetail
 } from "com/agent/admin/service/types";
 import { DEEP_DEFAULTS } from "com/agent/admin/service/types";
+import FakeCostMonths from "./FakeCostMonths";
 import FakeDataCatalog from "./FakeDataCatalog";
 import FakeEmbeddings from "./FakeEmbeddings";
 import FakeIna from "./FakeIna";
+import FakeModelPrices from "./FakeModelPrices";
 import FakeModelProviders from "./FakeModelProviders";
 
 /** What `FakeBackend#failNext` accepts: the next call to `path` answers with `body`/`status` instead. */
@@ -56,6 +58,10 @@ export default class FakeBackend {
     public ina = new FakeIna();
     /** The `model-providers...` routes: the direct model providers, never a key in an answer. */
     public modelProviders = new FakeModelProviders();
+    /** The `model-prices` route: the CU price, the rate per model and the stamp (409 when stale). */
+    public modelPrices = new FakeModelPrices();
+    /** The `cost/months` route: the bill and the estimate per month (`usageService` sets the state). */
+    public costMonths = new FakeCostMonths();
     /**
      * --- hana --- A refusal of the next agent save at
      * `mcp_servers[server]` naming `oauth.systems[system].<field>`, as
@@ -172,6 +178,8 @@ export default class FakeBackend {
         this.embeddings.reset();
         this.ina.reset();
         this.modelProviders.reset();
+        this.modelPrices.reset();
+        this.costMonths.reset();
         this.hanaRefuseNext = null;
         this.requests = [];
         this.bodies = {};
@@ -259,13 +267,14 @@ export default class FakeBackend {
                 usage: {
                     input_tokens: 10000, output_tokens: 2345, cache_read_tokens: 1200,
                     total_tokens: 12345, requests: 7
-                }
+                },
+                cost: { amount: 0.0421, currency: "EUR", complete: true }
             },
             {
                 id: "run-2", agent_id: 100, agent_name: "btp-agent", trigger: "schedule",
                 status: "running", started_at: "2026-08-24T09:00:00",
                 finished_at: null, summary: null, error: null,
-                notified: false, created_by: "scheduler", report: null, usage: null
+                notified: false, created_by: "scheduler", report: null, usage: null, cost: null
             },
             {
                 id: "run-3", agent_id: 101, agent_name: "gmail-agent", trigger: "manual",
@@ -313,7 +322,9 @@ export default class FakeBackend {
                 usage: {
                     input_tokens: 3000, output_tokens: 500, cache_read_tokens: 0,
                     total_tokens: 3500, requests: 2
-                }
+                },
+                // One model of the run has no price: the amount is a floor.
+                cost: { amount: 0.0123, currency: "EUR", complete: false }
             },
             items: [
                 {
@@ -335,7 +346,8 @@ export default class FakeBackend {
                     started_at: "2026-08-24T10:00:00", finished_at: "2026-08-24T10:00:05",
                     // No model usage, as a deterministic step (condition,
                     // transform, http, python) or an old step answers.
-                    usage: null
+                    usage: null,
+                    cost: null
                 },
                 {
                     id: "step-2", workflow_run_id: "wf-run-1", item_run_id: "item-1",
@@ -345,7 +357,8 @@ export default class FakeBackend {
                     usage: {
                         input_tokens: 3000, output_tokens: 500, cache_read_tokens: 0,
                         total_tokens: 3500, requests: 2
-                    }
+                    },
+                    cost: { amount: 0.003, currency: "EUR", complete: true }
                 }
             ]
         }, {
@@ -354,7 +367,7 @@ export default class FakeBackend {
                 trigger: "schedule", status: "running",
                 started_at: "2026-08-25T08:00:00", finished_at: null,
                 items_total: 0, items_succeeded: 0, items_failed: 0, items_skipped: 0,
-                summary: null, error: null, created_by: "scheduler", usage: null
+                summary: null, error: null, created_by: "scheduler", usage: null, cost: null
             },
             items: [],
             steps: []
@@ -1804,6 +1817,14 @@ export default class FakeBackend {
             this.reloadKeys());
         if (providers) {
             return providers;
+        }
+        const prices = this.modelPrices.handle(path, method, body, (b, s, h) => this.json(b, s, h));
+        if (prices) {
+            return prices;
+        }
+        const cost = this.costMonths.handle(path, method, query, (b, s, h) => this.json(b, s, h));
+        if (cost) {
+            return cost;
         }
         const ina = this.ina.handle(path, method, body, (b, s, h) => this.json(b, s, h), this.reloadKeys());
         if (ina) {

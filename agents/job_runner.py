@@ -13,6 +13,7 @@ from typing import Any
 
 from pydantic_ai.usage import RunUsage
 
+from agents import model_usage
 from agents.auth import run_as
 from agents.db import (
     DEFAULT_RUN_PROMPT,
@@ -302,6 +303,11 @@ async def _finalize(run_id: str, **kwargs) -> None:
             logger.warning("Run %s: activity not stored (%s)",
                            run_id, type(exc).__name__)
             kwargs["activity"] = None
+    if "model_usage" not in kwargs:
+        # The ledger per model of the run bound by execute_run (or invoke);
+        # read once, so every retry writes the same rows.
+        collector = model_usage.current()
+        kwargs["model_usage"] = collector.rows() if collector is not None else None
     delays = tuple(FINALIZE_RETRY_DELAYS)
     for attempt in range(len(delays) + 1):
         if attempt:
@@ -327,7 +333,7 @@ async def _finalize(run_id: str, **kwargs) -> None:
 async def execute_run(run_id: str, agent_id: int) -> None:
     """Run the agent, recording what it does as it goes (agents.run_activity),
     and record the outcome. See _execute_run."""
-    with recording(run_id), nexus_run(run_id):
+    with recording(run_id), nexus_run(run_id), model_usage.collecting():
         await _execute_run(run_id, agent_id)
 
 

@@ -27,7 +27,7 @@ def _resources() -> dict:
 
 
 def test_mta_version():
-    assert mta()["version"] == "2.49.0"
+    assert mta()["version"] == "2.50.0"
 
 
 def test_the_hdi_container_is_declared_and_switched_off():

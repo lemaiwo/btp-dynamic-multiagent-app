@@ -9,9 +9,12 @@ import importBundle, { type BundleOpens } from "../model/importBundle";
 import bitbucketEntry from "../model/bitbucketEntry";
 import type { ImportPayload, ImportResult } from "../service/types";
 import type { Router$RouteMatchedEvent } from "sap/ui/core/routing/Router";
+import CostMonths from "./settings/CostMonths";
 import Embeddings from "./settings/Embeddings";
+import ModelPrices from "./settings/ModelPrices";
 import ModelProviders from "./settings/ModelProviders";
 import type Event from "sap/ui/base/Event";
+import type { SegmentedButton$SelectionChangeEvent } from "sap/m/SegmentedButton";
 
 /** How an import names the fields of `odata_identity_changes`. */
 const IDENTITY_FIELD_TEXT: Record<string, string> = {
@@ -39,6 +42,12 @@ export default class Settings extends BaseController {
     /** The "Model providers" panel. */
     private modelProviders!: ModelProviders;
 
+    /** The "Model prices" panel. */
+    private modelPrices!: ModelPrices;
+
+    /** The "AI Core cost" panel. */
+    private costMonths!: CostMonths;
+
     /** An import is being asked about or sent: no second one meanwhile. */
     private importing = false;
 
@@ -64,10 +73,24 @@ export default class Settings extends BaseController {
         });
         this.setModel(this.modelProviders.model, "mp");
 
+        this.modelPrices = new ModelPrices({
+            service: () => this.getAdminService(),
+            text: (key, args) => this.text(key, args)
+        });
+        this.setModel(this.modelPrices.model, "prices");
+
+        this.costMonths = new CostMonths({
+            service: () => this.getAdminService(),
+            text: (key, args) => this.text(key, args)
+        });
+        this.setModel(this.costMonths.model, "cost");
+
         this.getRouter().getRoute("settings")?.attachPatternMatched(() => {
             void this.load();
             void this.modelProviders.load();
             void this.embeddings.show();
+            void this.modelPrices.load();
+            void this.costMonths.load();
         });
         // Another page, by a route or by an address that matches none
         // (`bypassed`): the embeddings panel stops polling.
@@ -155,6 +178,34 @@ export default class Settings extends BaseController {
         if (saved) {
             MessageToast.show(this.text("modelSaved"));
         }
+    }
+
+    // --- model prices (controller/settings/ModelPrices.ts) ---
+
+    public onAddModelPrice(): void {
+        this.modelPrices.addRow();
+    }
+
+    public onRemoveModelPrice(event: Event): void {
+        this.modelPrices.removeRow(event);
+    }
+
+    public onSaveModelPrices(): void {
+        void this.modelPrices.save();
+    }
+
+    public onRetryModelPrices(): void {
+        void this.modelPrices.load();
+    }
+
+    // --- AI Core cost per month (controller/settings/CostMonths.ts) ---
+
+    public onRefreshCostMonths(): void {
+        void this.costMonths.load();
+    }
+
+    public onCostMonthsChange(event: SegmentedButton$SelectionChangeEvent): void {
+        this.costMonths.choose(String(event.getParameter("item")?.getKey() ?? ""));
     }
 
     // --- data catalogue embeddings (controller/settings/Embeddings.ts) ---

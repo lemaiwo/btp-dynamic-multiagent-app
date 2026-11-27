@@ -111,6 +111,7 @@ from pydantic_ai.output import ToolOutput
 from pydantic_ai.usage import RunUsage
 from sqlalchemy import select, update
 
+from agents import model_usage
 from agents.auth import (
     current_base_url,
     current_claims,
@@ -131,6 +132,7 @@ from agents.db import (
     get_agent_by_slug,
     get_job_run,
     has_hana_entry,
+    write_model_usage_separately,
 )
 from agents.errors import describe_exception
 from agents.invoke_config import (
@@ -438,10 +440,12 @@ class _RunState:
     (cancelled before its first step, or something escaped), the done
     callback writes ``interrupted`` so the row never stays ``running``.
     ``usage`` is the run's token counter (filled in place by pydantic-ai),
-    here so a cancel records what was spent up to it."""
+    here so a cancel records what was spent up to it; ``collector`` is the
+    same split per model (``agents.model_usage``), for the same reason."""
 
     finalized: bool = False
     usage: RunUsage = field(default_factory=RunUsage)
+    collector: model_usage.UsageCollector = field(default_factory=model_usage.UsageCollector)
 
 
 async def cancel_all_invoke_runs() -> None:
@@ -477,12 +481,20 @@ async def _interrupted(run_id: str, state: _RunState) -> None:
     values.update(usage_counts(state.usage) or {})
     try:
         async with SessionLocal() as session:
-            await session.execute(
+            result = await session.execute(
                 update(JobRun)
                 .where(JobRun.id == run_id, JobRun.status == ACTIVE_RUN_STATUS)
                 .values(**values)
             )
+            closed = result.rowcount == 1
             await session.commit()
+            # The ledger only when this write closed the row (after a
+            # committed _finalize the rows it stored stay as they are), and
+            # in a transaction of its own: it never loses the cancel.
+            if closed:
+                await write_model_usage_separately(
+                    session, source="job", ref_id=run_id, parent_id=None,
+                    rows=state.collector.rows(), at=values["finished_at"])
     except Exception as exc:  # noqa: BLE001
         logger.warning("Invoke run %s: recording the cancel failed (%s); the stale "
                        "sweep closes the row", run_id, type(exc).__name__)
@@ -504,7 +516,8 @@ async def _run(run_id: str, key: _SlotKey, agent_id: int, text: str,
                attachments: list[Attachment], state: _RunState,
                technical: bool = False) -> None:
     try:
-        with recording(run_id) as activity, nexus_run(run_id):
+        with (recording(run_id) as activity, nexus_run(run_id),
+              model_usage.collecting(state.collector)):
             await _execute(run_id, activity, agent_id, key[0], text, attachments, state,
                            technical)
     finally:

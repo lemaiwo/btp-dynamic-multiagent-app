@@ -62,6 +62,7 @@ from pydantic_ai.settings import ModelSettings
 if TYPE_CHECKING:
     from pydantic_ai import RunContext
 
+from agents import model_usage
 from agents.errors import describe_exception, mask_text
 from agents.model_call_headers import sending
 from agents.nexus import sender, state
@@ -468,7 +469,10 @@ class NexusLoggedModel(WrapperModel):
     async def request(self, messages: list[ModelMessage], model_settings: ModelSettings | None,
                       model_request_parameters: ModelRequestParameters) -> ModelResponse:
         if not state.enabled():
-            return await self.wrapped.request(messages, model_settings, model_request_parameters)
+            response = await self.wrapped.request(messages, model_settings,
+                                                  model_request_parameters)
+            model_usage.add(self._deployment, response.usage)
+            return response
         correlation_id = str(uuid.uuid4())
         call = _begin(self._deployment, model_settings, messages, correlation_id,
                       aicore=self._aicore)
@@ -481,6 +485,7 @@ class NexusLoggedModel(WrapperModel):
             _finish_failed(call, exc)
             raise
         _finish(call, response)
+        model_usage.add(self._deployment, response.usage)
         return response
 
     @asynccontextmanager
@@ -494,6 +499,9 @@ class NexusLoggedModel(WrapperModel):
                                                    model_request_parameters,
                                                    run_context) as streamed:
                 yield streamed
+            # Normal exit only: a stream that raised or was left early is not
+            # an answered request (pydantic-ai's RunUsage does not count it).
+            model_usage.add(self._deployment, streamed.usage())
             return
         correlation_id = str(uuid.uuid4())
         call = _begin(self._deployment, model_settings, messages, correlation_id,
@@ -520,6 +528,10 @@ class NexusLoggedModel(WrapperModel):
         except BaseException as exc:
             _finish_failed(call, exc, streamed=streamed)
             raise
+        # Normal exit: count the request first (``add`` never raises), so a
+        # raise of the register logging below cannot leave it out.
+        if streamed is not None:
+            model_usage.add(self._deployment, streamed.usage())
         _finish_stream(call, streamed, tracker)
 
 

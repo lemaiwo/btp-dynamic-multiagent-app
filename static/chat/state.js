@@ -472,9 +472,20 @@ export function contextViewModel(ctx) {
   const tools = TOOL_GROUPS.map(([kind, label]) => ({ kind, label, items: byKind.get(kind) })).filter((g) => g.items.length);
   const total = int(usage.total_tokens);
   const usageOut = {
+    costText: costLabel(usage.cost),
     total,
     totalText: `${formatTokens(total)} tokens`,
     detail: `${formatTokens(int(usage.input_tokens))} in / ${formatTokens(int(usage.output_tokens))} out · ${plural(int(usage.requests), 'request', 'requests')} over ${plural(int(usage.turns), 'turn', 'turns')}`,
   };
   return { who, instructions, history, tools, usage: usageOut };
+}
+
+// `cost` is null (no price set) or {amount, currency: "EUR", complete}; anything else shows nothing.
+export function costLabel(cost) {
+  if (!cost || typeof cost !== 'object' || Array.isArray(cost)) return null;
+  if (typeof cost.amount !== 'number' || !Number.isFinite(cost.amount) || cost.amount < 0) return null;
+  if (cost.currency !== 'EUR' || typeof cost.complete !== 'boolean') return null;
+  const fmt = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'EUR', currencyDisplay: 'narrowSymbol' });
+  const money = cost.amount > 0 && cost.amount < 0.005 ? '< \u20ac 0.01' : `\u2248 \u20ac ${fmt.format(cost.amount).replace(/[^0-9.,]/g, '')}`;
+  return cost.complete ? money : `${money} (partly priced)`;
 }

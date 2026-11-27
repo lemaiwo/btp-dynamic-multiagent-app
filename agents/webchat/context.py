@@ -60,6 +60,7 @@ from pydantic_ai.messages import (
 )
 from sqlalchemy import select, update
 
+from agents import model_prices, model_usage_store
 from agents.access import BASIC, agent_allowed, is_admin, tier_of
 from agents.data_catalog.scope import allowed_sources_of
 from agents.data_catalog.tool import TOOL_NAMES as DATA_CATALOG_TOOL_NAMES
@@ -326,13 +327,52 @@ async def _stored_turns(db: Any, cid: str) -> list[_Turn]:
     return turns
 
 
-async def _usage(db: Any, cid: str) -> dict[str, int]:
+_PART_COUNTS = ("input_tokens", "output_tokens", "cache_read_tokens", "requests")
+
+
+def _part_int(value: Any) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+async def _usage(db: Any, cid: str) -> dict[str, Any]:
+    """The conversation's token total plus ``cost``, its estimated euros.
+
+    The cost is the ledger's rows of the conversation (``source="chat"``,
+    by ``parent_id``) plus, for a turn stored before the ledger (no ledger
+    row of its message id), the counts of its ``usage`` part under the part's
+    ``model``; a part without one is counted under ``""``, which has no rate,
+    so the figure says ``complete: false``. Only the figure: no rate leaves.
+    """
     rows = (await db.execute(
-        select(ChatMessage.role, ChatMessage.parts_json)
+        select(ChatMessage.id, ChatMessage.role, ChatMessage.parts_json)
         .where(ChatMessage.conversation_id == cid, ChatMessage.role == "assistant")
     )).all()
-    return store.conversation_usage(
-        [{"role": r.role, "parts": store._parts(r.parts_json)} for r in rows])
+    messages = [{"id": r.id, "role": r.role, "parts": store._parts(r.parts_json)}
+                for r in rows]
+    usage: dict[str, Any] = store.conversation_usage(messages)
+    usage["cost"] = await _cost(db, cid, messages)
+    return usage
+
+
+async def _cost(db: Any, cid: str, messages: list[dict[str, Any]]) -> dict | None:
+    book = await model_prices.load(db)
+    if book.cu_price is None:
+        return None
+    by_model = (await model_usage_store.counts_by_parent(db, "chat", [cid])).get(cid, {})
+    if messages:
+        in_ledger = await model_usage_store.chat_ledger_refs(db, cid)
+        for msg in messages:
+            if msg["id"] in in_ledger:
+                continue
+            for part in msg["parts"]:
+                if not isinstance(part, dict) or part.get("type") != "usage":
+                    continue
+                model = part.get("model")
+                key = model if isinstance(model, str) else ""
+                slot = by_model.setdefault(key, dict.fromkeys(_PART_COUNTS, 0))
+                for name in _PART_COUNTS:
+                    slot[name] += _part_int(part.get(name))
+    return model_prices.cost(book, by_model)
 
 
 def _deep_tool_names(name: str) -> list[str]:

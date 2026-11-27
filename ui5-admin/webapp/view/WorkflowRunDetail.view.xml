@@ -57,6 +57,14 @@
                         id="workflowRunTokens"
                         text="{ parts: ['i18n>runTokensDetail', 'i18n>runTokensDetailCached', 'i18n>runTokensRequestOne', 'i18n>runTokensRequests', 'run>/data/usage'], formatter: '.formatter.tokenDetail' }"
                         visible="{ path: 'run>/data/usage', formatter: '.formatter.hasTokenUsage' }" />
+                    <Label
+                        text="{i18n>colCost}"
+                        visible="{ path: 'run>/data/cost', formatter: '.formatter.hasCost' }" />
+                    <Text
+                        id="workflowRunCost"
+                        text="{ parts: ['i18n>runCost', 'i18n>runCostSmall', 'i18n>runCostPartly', 'run>/data/cost'], formatter: '.formatter.costText' }"
+                        tooltip="{i18n>runCostHint}"
+                        visible="{ path: 'run>/data/cost', formatter: '.formatter.hasCost' }" />
 
                     <Label text="{i18n>colSummary}" />
                     <Text text="{run>/data/summary}" />
@@ -154,6 +162,11 @@
                                     text="{ parts: ['i18n>runTokensStep', 'run>usage'], formatter: '.formatter.tokenStep' }"
                                     visible="{ path: 'run>usage', formatter: '.formatter.hasTokenUsage' }"
                                     class="workflowStepTokens agentAdminMutedText sapUiTinyMarginBegin" />
+                                <Text
+                                    text="{ parts: ['i18n>runCost', 'i18n>runCostSmall', 'i18n>runCostPartly', 'run>cost'], formatter: '.formatter.costText' }"
+                                    tooltip="{i18n>runCostHint}"
+                                    visible="{ path: 'run>cost', formatter: '.formatter.hasCost' }"
+                                    class="workflowStepCost agentAdminMutedText sapUiTinyMarginBegin" />
                             </HBox>
                             <Text text="{run>output}" class="workflowStepOutput sapUiTinyMarginTop" />
                             <MessageStrip
@@ -202,6 +215,11 @@
                                                 text="{ parts: ['i18n>runTokensStep', 'run>usage'], formatter: '.formatter.tokenStep' }"
                                                 visible="{ path: 'run>usage', formatter: '.formatter.hasTokenUsage' }"
                                                 class="workflowStepTokens agentAdminMutedText sapUiTinyMarginBegin" />
+                                            <Text
+                                                text="{ parts: ['i18n>runCost', 'i18n>runCostSmall', 'i18n>runCostPartly', 'run>cost'], formatter: '.formatter.costText' }"
+                                                tooltip="{i18n>runCostHint}"
+                                                visible="{ path: 'run>cost', formatter: '.formatter.hasCost' }"
+                                                class="workflowStepCost agentAdminMutedText sapUiTinyMarginBegin" />
                                         </HBox>
                                         <Text text="{run>output}" class="workflowStepOutput sapUiTinyMarginTop" />
                                         <MessageStrip

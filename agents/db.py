@@ -27,6 +27,7 @@ from typing import Any
 from urllib.parse import SplitResult, urlsplit
 
 from sqlalchemy import (
+    BigInteger,
     DateTime,
     ForeignKey,
     Index,
@@ -865,6 +866,12 @@ class OrchestratorConfig(Base):
         Integer, nullable=False, default=1, server_default="1"
     )
     embedding_model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # EUR per capacity unit in units of 10^-9, and the stamp of the price
+    # table as a whole (the CU price and every rate; agents/model_prices.py).
+    # Nullable, appended last: HDI alters the table in place (generation 14).
+    capacity_unit_price: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    prices_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
 
 
 class SkillConfig(Base):
@@ -1491,6 +1498,81 @@ def _write_usage(row: Any, usage: dict[str, int] | None) -> None:
     row.requests = int(usage.get("requests") or 0)
 
 
+LEDGER_SOURCES = ("job", "workflow_step", "chat")
+
+
+async def replace_model_usage(
+    session: AsyncSession,
+    *,
+    source: str,
+    ref_id: str,
+    parent_id: str | None,
+    rows: list[dict[str, Any]] | None,
+    at: datetime | None = None,
+) -> None:
+    """Stage the ledger rows of one run in the caller's transaction (no commit).
+
+    ``None`` leaves what is stored; a list replaces the rows of
+    ``(source, ref_id)``, because ``_finalize`` retries and a workflow step
+    can be finished twice: one set of rows per run, never a sum of attempts.
+    A model with no answered request is not stored."""
+    if rows is None:
+        return
+    await session.execute(
+        delete(ModelUsage)
+        .where(ModelUsage.source == source, ModelUsage.ref_id == ref_id)
+        .execution_options(synchronize_session=False)
+    )
+    stamp = at or datetime.now(timezone.utc)
+    for r in rows:
+        if int(r.get("requests") or 0) <= 0:
+            continue
+        session.add(ModelUsage(
+            source=source, ref_id=ref_id, parent_id=parent_id,
+            model=str(r["model"])[:128],
+            input_tokens=int(r.get("input_tokens") or 0),
+            output_tokens=int(r.get("output_tokens") or 0),
+            cache_read_tokens=int(r.get("cache_read_tokens") or 0),
+            requests=int(r["requests"]), created_at=stamp,
+        ))
+
+
+async def write_model_usage_separately(
+    session: AsyncSession,
+    *,
+    source: str,
+    ref_id: str,
+    parent_id: str | None,
+    rows: list[dict[str, Any]] | None,
+    at: datetime | None = None,
+) -> bool:
+    """Write the ledger rows of one run in a transaction of their own; never raises.
+
+    Called AFTER the run's outcome was committed, so a failing DELETE or
+    INSERT here can neither roll back nor lose that outcome: the ledger is a
+    side record. A failure is rolled back and logged by exception class only.
+    Answers whether the rows were written (``None`` rows: nothing to do, True).
+
+    A ``CancelledError`` during the write is not caught (it is no
+    ``Exception``) and passes through to the caller: the run's outcome is
+    already committed, and only that run's ledger rows are lost."""
+    if rows is None:
+        return True
+    try:
+        await replace_model_usage(session, source=source, ref_id=ref_id,
+                                  parent_id=parent_id, rows=rows, at=at)
+        await session.commit()
+        return True
+    except Exception as exc:  # noqa: BLE001 - the ledger never fails its caller
+        logger.warning("model usage ledger not written for %s (%s)", source,
+                       type(exc).__name__)
+        try:
+            await session.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
+
 class WorkflowRun(Base):
     """One execution of a workflow.
 
@@ -1759,6 +1841,50 @@ class ModelProvider(Base):
     base_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     models_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     updated_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class ModelUsage(Base):
+    """Append-only token ledger per model (cost in euros, part 1): one row per
+    model a job run, workflow step or chat turn used. No principal, no text;
+    survives the purge of runs and conversations (MODEL_USAGE_RETENTION_DAYS).
+    String and integer columns only (grouped on HANA). Generation 14."""
+
+    __tablename__ = "model_usage"
+    __table_args__ = (
+        Index("ix_model_usage_ref", "source", "ref_id"),
+        Index("ix_model_usage_parent", "source", "parent_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source: Mapped[str] = mapped_column(String(16), nullable=False)  # LEDGER_SOURCES
+    ref_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    parent_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    model: Mapped[str] = mapped_column(String(128), nullable=False)
+    input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    output_tokens: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    cache_read_tokens: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    requests: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), index=True
+    )
+
+
+class ModelPrice(Base):
+    """An admin's rate of one model in capacity units per 1,000 tokens, stored
+    as an integer in units of 10^-9 (``agents/model_prices.py``): ``Numeric``
+    would be a float on SQLite, so the tests would not run the exact maths
+    HANA and Postgres do. ``cache_read_rate`` NULL: cached input is priced as
+    input. Generation 14."""
+
+    __tablename__ = "model_prices"
+
+    model: Mapped[str] = mapped_column(String(128), primary_key=True)
+    input_rate: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    output_rate: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    cache_read_rate: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -2264,6 +2390,9 @@ async def _create_and_migrate() -> None:
         await _ensure_column(conn, "workflow_step_runs", "output_tokens", "INTEGER")
         await _ensure_column(conn, "workflow_step_runs", "cache_read_tokens", "INTEGER")
         await _ensure_column(conn, "workflow_step_runs", "requests", "INTEGER")
+        # Cost in euros (2.50.0).
+        await _ensure_column(conn, "orchestrator_config", "capacity_unit_price", "BIGINT")
+        await _ensure_column(conn, "orchestrator_config", "prices_updated_at", tstz)
         await _backfill_ide_revisions(conn)
         await _resync_ide_revisions(conn)
         # create_all only creates indexes together with a new table; an
@@ -4117,6 +4246,13 @@ def _next_odata_stamp(previous: datetime | None) -> datetime:
     return stored + timedelta(microseconds=1)
 
 
+# Public names of the two stamp helpers for modules outside this one (the
+# price table of agents/model_prices.py); the private names stay for the
+# OData and InA code that has always used them.
+next_stamp = _next_odata_stamp
+as_utc = _odata_utc
+
+
 def _warn_generic_kind(name: str) -> None:
     """One WARNING when a write sets a service's kind to ``generic``.
 
@@ -5087,9 +5223,13 @@ async def finish_step_run(
     output: str | None = None,
     error: str | None = None,
     usage: dict[str, int] | None = None,
+    model_usage: list[dict[str, Any]] | None = None,
 ) -> None:
     """Write a step's outcome. ``usage``: its token counts, or ``None`` to
-    leave the columns NULL (a deterministic step, nothing spent)."""
+    leave the columns NULL (a deterministic step, nothing spent).
+    ``model_usage``: the step's per-model ledger rows, written after the
+    outcome's commit in a transaction of their own (a ledger failure is
+    logged, the outcome stays); ``None`` leaves the ledger alone."""
     row = await session.get(WorkflowStepRun, step_run_id)
     if row is None:
         return
@@ -5097,8 +5237,14 @@ async def finish_step_run(
     row.output = output
     row.error = error
     _write_usage(row, usage)
-    row.finished_at = datetime.now(timezone.utc)
+    finished_at = datetime.now(timezone.utc)
+    row.finished_at = finished_at
+    parent_id = row.workflow_run_id
     await session.commit()
+    await write_model_usage_separately(
+        session, source="workflow_step", ref_id=step_run_id, parent_id=parent_id,
+        rows=model_usage, at=finished_at,
+    )
 
 
 # IN lists are sent in chunks of at most this many ids (HANA and Postgres
@@ -5577,10 +5723,15 @@ async def finish_job_run(
     error: str | None = None,
     activity: dict[str, Any] | None = None,
     usage: dict[str, int] | None = None,
+    model_usage: list[dict[str, Any]] | None = None,
 ) -> None:
     """Write a run's outcome. ``usage``: the run's token counts
     (``input_tokens``, ``output_tokens``, ``cache_read_tokens``,
-    ``requests``), or ``None`` to leave the columns NULL."""
+    ``requests``), or ``None`` to leave the columns NULL. ``model_usage``:
+    the same split per model (``agents.model_usage``), written to the ledger
+    after the outcome's commit in a transaction of its own (a ledger failure
+    is logged, the outcome stays), replacing the run's rows; ``None`` leaves
+    them."""
     row = await session.get(JobRun, run_id)
     if row is None:
         return
@@ -5591,8 +5742,15 @@ async def finish_job_run(
     if activity is not None:
         row.activity_json = json.dumps(activity)
     _write_usage(row, usage)
-    row.finished_at = datetime.now(timezone.utc)
+    finished_at = datetime.now(timezone.utc)
+    row.finished_at = finished_at
     await session.commit()
+    # After the outcome's commit, in a transaction of its own: a ledger
+    # failure is logged and never undoes (or retries) the outcome.
+    await write_model_usage_separately(
+        session, source="job", ref_id=run_id, parent_id=None,
+        rows=model_usage, at=finished_at,
+    )
 
 
 async def get_job_run(session: AsyncSession, run_id: str) -> JobRun | None:
