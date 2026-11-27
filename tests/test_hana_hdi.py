@@ -117,11 +117,10 @@ def test_generation_10_appends_the_embedding_setting_to_the_orchestrator_row():
     assert GEN >= 10
     lines = [line.strip().rstrip(",")
              for line in FILES["src/orchestrator_config.hdbtable"].splitlines()[1:-1]]
-    assert lines[-3:] == [
-        "embeddings_enabled INTEGER DEFAULT '1' NOT NULL",
-        "embedding_model NVARCHAR(128)",
-        "PRIMARY KEY (id)",
-    ]
+    # Generation 14 appends two more columns after these two.
+    at = lines.index("embeddings_enabled INTEGER DEFAULT '1' NOT NULL")
+    assert lines[at + 1] == "embedding_model NVARCHAR(128)"
+    assert lines[-1] == "PRIMARY KEY (id)"
 
 
 def test_generation_11_adds_the_reconcile_runs_table():
@@ -150,6 +149,19 @@ def test_generation_11_adds_the_reconcile_runs_table():
     assert FILES["src/ix_reconcile_runs_conversation_id.hdbindex"] == (
         "INDEX ix_reconcile_runs_conversation_id ON reconcile_runs (conversation_id)\n"
     )
+
+
+def test_generation_14_adds_the_cost_tables_and_appends_two_orchestrator_columns():
+    """Cost in euros: the token ledger and the price table are new tables;
+    the CU price and the price table's stamp are appended, nullable, to the
+    orchestrator row (HDI alters it in place)."""
+    assert GEN >= 14
+    assert "src/model_usage.hdbtable" in FILES
+    assert "src/model_prices.hdbtable" in FILES
+    lines = [line.strip().rstrip(",")
+             for line in FILES["src/orchestrator_config.hdbtable"].splitlines()[1:-1]]
+    assert lines[-3:] == ["capacity_unit_price BIGINT", "prices_updated_at TIMESTAMP",
+                          "PRIMARY KEY (id)"]
 
 
 def test_a_unique_constraint_and_a_partial_index_are_plain_unique_indexes():
